@@ -345,3 +345,19 @@ proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSl
       skip q
     while q.hasMore: skip q
   result = slots
+
+proc isLeafArg*(a: Cursor): bool =
+  ## A scalar argument that phase 2 can load into its ABI register from where
+  ## it lives, with nothing computed that could touch another register: a
+  ## literal, a symbol (a home, a global, a thread-local, a proc), or a
+  ## literal wrapper around one. Everything else is computed in phase 1.
+  case a.kind
+  of IntLit, UIntLit, CharLit, StrLit, Symbol: true
+  of TagLit:
+    case a.exprKind
+    of NilC, TrueC, FalseC: true
+    of SufC, ParC:
+      var inner = a; inc inner
+      isLeafArg(inner)
+    else: false
+  else: false

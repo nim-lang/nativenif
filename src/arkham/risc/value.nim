@@ -3077,154 +3077,205 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     for j in 0 ..< argCurs.len:
       if plan.args[j].isWideScalar or g.isWideExpr(argCurs[j]):
         wideArgSlots[j] = g.wideValueIntoTemp(argCurs[j])
-    # From here to the `(call)` marker, an argument that has been staged is LIVE in
-    # its ABI register: nothing else may take it, and on Cortex-M — whose only
-    # volatiles are these four — the last-resort scratch draw would otherwise be
-    # entitled to. Each argument's register is claimed BEFORE its own evaluation,
-    # not after: the value lands there at the end of that evaluation, and a draw
-    # made during it would be handing out the destination.
+    # ── Two phases, the x64 twin's shape (chibicc's `push_args` / `ND_FUNCALL`,
+    # see `x64/value.nim`, MODEL: proofs/call_marshal.tla): first EVERY argument
+    # expression runs, then the ABI registers are loaded in order. No RISC
+    # machine here pins an argument register to an instruction (`divRemReg` /
+    # `shiftCountReg` are `NoReg`), so nothing an expression runs can destroy a
+    # loaded argument and no park is ever needed: a computed scalar goes straight
+    # into its own ABI register in phase 1 — claimed first, so no later expression
+    # draws it as scratch — and everything else (a leaf, an aggregate, a wide
+    # value already in its temp slot) is loaded in phase 2 from where it lives. A
+    # stack-passed argument is stored to the outgoing area in phase 1: memory is
+    # the park that survives everything. A float goes into its v-register in
+    # phase 1 and is sealed.
+    #
+    # From here to the `(call)` marker, an argument that has been loaded is LIVE in
+    # its ABI register: nothing else may take it (`stagedArgs`), and on Cortex-M —
+    # whose only volatiles are these four — the last-resort scratch draw would
+    # otherwise be entitled to. A register is claimed BEFORE the value is built
+    # into it, never after: a draw made during the evaluation would be handing
+    # out the destination.
     #
     # Leng calls are FLAT — an argument is never itself a call — so this is one
     # window per call and not a stack of them.
+    assert g.md.divRemReg == NoReg and g.md.shiftCountReg == NoReg,
+           "arkham risc: a fixed-role argument register needs the x64 park (`takeParked`)"
+    type RSrc = enum rsDone, rsLeaf, rsAggrLval, rsAggrMem, rsWideTrunc, rsWide
+    var srcs = newSeq[RSrc](argCurs.len)
+    var aggrHome = newSeq[string](argCurs.len)
+    var aggrGlobal = newSeq[bool](argCurs.len)
+    var aggrTvar = newSeq[bool](argCurs.len)
+    var sealedFArgs: set[FReg] = {}
+    proc claim(g: var CodeGen; pl: ParamPlace; aSym: string) =
+      ## The argument's register(s) are ours from here on. A stale binding on one
+      ## is dropped BEFORE the value is built into it, or `emReg` spells the new
+      ## value under the dead local's name and its type does not admit it.
+      for k in 0 ..< max(pl.words, 1):
+        g.releaseArgDest(g.md.gprAt(pl, k), aSym)
+        g.stagedArgs.incl g.md.gprAt(pl, k)
+    template bindArg(j: int; r: Reg) =
+      g.ab.tree MovA64:
+        g.ab.tree ArgX: g.ab.sym paramName(j)
+        g.emReg r
+    template bindArgWords(j: int; pl: ParamPlace) =
+      for k in 0 ..< pl.words:
+        g.ab.tree MovA64:
+          g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
+          g.emReg g.md.gprAt(pl, k)
     g.stagedArgs = {}
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
-      var stackArgs: seq[int] = @[]
+      # ── phase 1: every argument expression runs ──────────────────────────────
       for j in 0 ..< argCurs.len:
         let a = argCurs[j]
         let pl = plan.args[j]
-        if not pl.onStack and not pl.isFloat:
-          # A stale binding on the register is dropped BEFORE the value is built into
-          # it, or `emReg` spells the new value under the dead local's name and its
-          # type does not admit it (`releaseArgDest`).
-          let aSym = if a.kind == Symbol: symName(a) else: ""
-          for k in 0 ..< max(pl.words, 1):
-            g.releaseArgDest(g.md.gprAt(pl, k), aSym)
-            g.stagedArgs.incl g.md.gprAt(pl, k)
-        var tn = NoTypeSym
-        if pl.isAgg:
-          let tcur = g.getType(a)
-          if tcur.kind != Symbol:
-            raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
-          tn = tcur.symId
+        let aSym = if a.kind == Symbol: symName(a) else: ""
+        srcs[j] = rsDone
         if pl.onStack:
-          stackArgs.add j
-          continue
-        if pl.isAgg:
-          if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
-            # The address is consumed within THIS arg's own marshalling (any
-            # embedded call runs during the premat, before the lea writes it),
-            # so a pool temp serves when no callee-saved survivor is free, and
-            # a bridge serves when both pools are dry — never a hard failure.
-            var srcAddr: Reg
-            var addrBridge = NoReg
-            var hr = g.pickHeldReg()
-            if hr == NoReg: hr = g.pickTempReg()
-            if hr != NoReg:
-              g.pickedRegs.incl hr
-              heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
-              srcAddr = hr
-            else:
-              addrBridge = g.takeBridge()
-              srcAddr = addrBridge
-            g.emitLvalue2(a)                 # pick embedded base/index regs
-            g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
-            if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
-            else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
-            if addrBridge != NoReg: g.dropBridge addrBridge
-            else: g.unbindTemp(srcAddr)
-            g.freeLvalTemps2(a)
+          # The outgoing slot IS the park: stored now, from wherever the value is.
+          if g.exprSlot(a).kind == AMem:
+            g.marshalStackAggrArg(a, paramName(j))
+          elif g.isWideExpr(a):
+            g.wideArgToStack(wideArgSlots[j], paramName(j))
           else:
-            var home = ""
-            var isGlobal = false
-            var isTvar = false
+            var aD = needsReg(g.valueSlot(a))
+            g.emitValue2(a, aD)
+            var srcReg: Reg
+            var srcBridge = NoReg
+            if aD.kind == InReg: srcReg = aD.r
+            else:
+              srcBridge = g.takeBridge(aD.typ)
+              g.place2(aD, srcBridge)
+              srcReg = srcBridge
+            g.ab.tree MovA64:
+              g.ab.tree MemX:
+                g.emReg SP
+                g.ab.tree ArgX: g.ab.sym paramName(j)
+              g.emReg srcReg
+            if srcBridge != NoReg: g.dropBridge srcBridge
+            g.freeVal(aD)
+        elif pl.isAgg:
+          if g.getType(a).kind != Symbol:
+            raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
+          if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+            srcs[j] = rsAggrLval           # the address is computed at load time
+          else:
+            # In memory already — or BUILT into memory here (an `(oconstr …)`
+            # into its synthetic slot), which is what phase 1 exists for.
             if a.kind == Symbol:
               case g.lookupSym(symName(a)).cat
-              of scGlobal: isGlobal = true
-              of scTvar: (isGlobal = true; isTvar = true)
-              else: home = symName(a)
+              of scGlobal: aggrGlobal[j] = true
+              of scTvar: (aggrGlobal[j] = true; aggrTvar[j] = true)
+              else: aggrHome[j] = symName(a)
             else:
-              let p = g.posOf(a)
-              home = synth("aggtmp") & $p & ".0"
-              g.emTypedStackVar(home, g.getType(a))
-              g.varType[home] = tn
-              g.genStore2(a, namedStackLoc(home, callArgSlots[j]))
-            let hh = g.plan.homeOfSym(home)
-            if pl.byRef:
-              if isTvar: g.genTlvAddr(symName(a), g.md.gprAt(pl))
-              elif isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
-              elif hh.kind == InReg:
-                g.movReg(g.md.gprAt(pl), hh.r)
-              elif hh.kind == StackPtr:
-                # Forwarding a by-ref param whose own pointer spilled: pass the pointer
-                # the slot HOLDS. (`lea &slot` would pass the address OF the pointer —
-                # what this arm did before the home could say so.)
-                g.emScalarLoad(g.md.gprAt(pl), hh.ptrName)
-              else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
-            else:
-              if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst, isTvar)
-              else: g.structToRegs(home, tn, pl.gpFirst)
-          if pl.byRef:
-            g.ab.tree MovA64:
-              g.ab.tree ArgX: g.ab.sym paramName(j)
-              g.emReg g.md.gprAt(pl)
-          else:
-            for k in 0 ..< pl.words:
-              g.ab.tree MovA64:
-                g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
-                g.emReg g.md.gprAt(pl, k)
-        elif g.isWideExpr(a) and not pl.isWideScalar:
-          g.wideArgTruncated(wideArgSlots[j], g.md.gprAt(pl))
-          g.ab.tree MovA64:
+              let tn = g.getType(a).symId
+              aggrHome[j] = synth("aggtmp") & $g.posOf(a) & ".0"
+              g.emTypedStackVar(aggrHome[j], g.getType(a))
+              g.varType[aggrHome[j]] = tn
+              g.genStore2(a, namedStackLoc(aggrHome[j], callArgSlots[j]))
+            srcs[j] = rsAggrMem
+        elif pl.isFloat:
+          # Straight into its v-register, SEALED for the rest of the marshalling.
+          # The width is the argument's OWN: `emitFValue2` picks a LITERAL's bit
+          # pattern from the destination slot, and a `float32` literal materialized
+          # as the double pattern has a zero low half (the half `fmov s, s` reads).
+          var fSlot = g.exprSlot(a)
+          if fSlot.kind != AFloat: fSlot = defaultFloatSlot()
+          let bits = fSlot.size * 8
+          var fD = fregLoc(g.md.floatArgRegs[pl.fpIndex], fSlot)
+          g.emitFValue2(a, fD)
+          g.rb.sealF fD.f; sealedFArgs.incl fD.f
+          g.ab.tree FmovA64:
             g.ab.tree ArgX: g.ab.sym paramName(j)
-            g.emReg g.md.gprAt(pl)
+            g.emFReg(fD.f, bits)
+        elif g.isWideExpr(a) and not pl.isWideScalar:
+          srcs[j] = rsWideTrunc              # the value sits in `wideArgSlots[j]`
         elif pl.isWideScalar:
+          srcs[j] = rsWide
+        elif isLeafArg(a):
+          srcs[j] = rsLeaf
+        else:
+          # Computed: into its own ABI register, claimed first. The temp binding
+          # is released so the register is referenced RAW where it can be; where
+          # it CANNOT — the allocator also homes plain locals in the volatile arg
+          # registers, and nifasm insists a bound register be named — the name
+          # carries the local's own type, and a wider one marshalling into a
+          # sub-width param is the ABI truncation `movTypeOk`'s `narrowingArg`
+          # arm admits (memfiles' `close`, where `canRaise` lives in x0 and is
+          # dead across the `raiseOSError(cint)` it stages).
+          g.claim(pl, aSym)
+          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
+          g.emitValue2(a, aD)
+          g.unbindTemp(aD.r)
+          bindArg(j, aD.r)
+      # ── phase 2: load the ABI registers, in order ────────────────────────────
+      for j in 0 ..< argCurs.len:
+        if srcs[j] == rsDone: continue
+        let a = argCurs[j]
+        let pl = plan.args[j]
+        let aSym = if a.kind == Symbol: symName(a) else: ""
+        g.claim(pl, aSym)
+        case srcs[j]
+        of rsLeaf:
+          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
+          g.emitValue2(a, aD)
+          g.unbindTemp(aD.r)
+          bindArg(j, aD.r)
+        of rsAggrLval:
+          # The address is consumed within THIS argument's own loading, so a pool
+          # temp serves when no callee-saved survivor is free, and a bridge serves
+          # when both pools are dry — never a hard failure.
+          let tn = g.getType(a).symId
+          var srcAddr: Reg
+          var addrBridge = NoReg
+          var hr = g.pickHeldReg()
+          if hr == NoReg: hr = g.pickTempReg()
+          if hr != NoReg:
+            g.pickedRegs.incl hr
+            heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
+            srcAddr = hr
+          else:
+            addrBridge = g.takeBridge()
+            srcAddr = addrBridge
+          g.emitLvalue2(a)                 # pick embedded base/index regs
+          g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
+          if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
+          else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
+          if addrBridge != NoReg: g.dropBridge addrBridge
+          else: g.unbindTemp(srcAddr)
+          g.freeLvalTemps2(a)
+          if pl.byRef: bindArg(j, g.md.gprAt(pl)) else: bindArgWords(j, pl)
+        of rsAggrMem:
+          let tn = g.getType(a).symId
+          let home = aggrHome[j]
+          let hh = g.plan.homeOfSym(home)
+          if pl.byRef:
+            if aggrTvar[j]: g.genTlvAddr(symName(a), g.md.gprAt(pl))
+            elif aggrGlobal[j]: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
+            elif hh.kind == InReg:
+              g.movReg(g.md.gprAt(pl), hh.r)
+            elif hh.kind == StackPtr:
+              # Forwarding a by-ref param whose own pointer spilled: pass the pointer
+              # the slot HOLDS. (`lea &slot` would pass the address OF the pointer —
+              # what this arm did before the home could say so.)
+              g.emScalarLoad(g.md.gprAt(pl), hh.ptrName)
+            else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
+            bindArg(j, g.md.gprAt(pl))
+          else:
+            if aggrGlobal[j]: g.globalToRegs(symName(a), tn, pl.gpFirst, aggrTvar[j])
+            else: g.structToRegs(home, tn, pl.gpFirst)
+            bindArgWords(j, pl)
+        of rsWideTrunc:
+          g.wideArgTruncated(wideArgSlots[j], g.md.gprAt(pl))
+          bindArg(j, g.md.gprAt(pl))
+        of rsWide:
           # Two consecutive argument registers, filled from the value's eight
           # bytes and then bound as `(arg pN 0)` / `(arg pN 1)` — the same shape
           # a two-eightbyte aggregate uses, because it is the same ABI question.
           g.wideArgToRegs(wideArgSlots[j], pl.gpFirst)
-          for k in 0 ..< pl.words:
-            g.ab.tree MovA64:
-              g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
-              g.emReg g.md.gprAt(pl, k)
-        else:
-          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
-          g.emitValue2(a, aD)                  # → its ABI register directly
-          # Release the temp binding so the arg register is referenced RAW where it
-          # can be. Where it CANNOT — the allocator also homes plain locals in the
-          # volatile arg registers, and nifasm insists a bound register be named —
-          # the name carries the local's own type, and a wider one marshalling into
-          # a sub-width param is the ABI truncation `movTypeOk`'s `narrowingArg` arm
-          # admits (memfiles' `close`, where `canRaise` lives in x0 and is dead
-          # across the `raiseOSError(cint)` it stages). That arm was x86-64-only
-          # until the rule was unified — this path would have been rejected here.
-          g.unbindTemp(aD.r)
-          g.ab.tree MovA64:
-            g.ab.tree ArgX: g.ab.sym paramName(j)
-            g.emReg aD.r
-      for j in stackArgs:
-        let a = argCurs[j]
-        if g.exprSlot(a).kind == AMem:
-          g.marshalStackAggrArg(a, paramName(j))
-        elif g.isWideExpr(a):
-          g.wideArgToStack(wideArgSlots[j], paramName(j))
-        else:
-          var aD = needsReg(g.valueSlot(a))
-          g.emitValue2(a, aD)
-          var srcReg: Reg
-          var srcBridge = NoReg
-          if aD.kind == InReg: srcReg = aD.r
-          else:
-            srcBridge = g.takeBridge(aD.typ)
-            g.place2(aD, srcBridge)
-            srcReg = srcBridge
-          g.ab.tree MovA64:
-            g.ab.tree MemX:
-              g.emReg SP
-              g.ab.tree ArgX: g.ab.sym paramName(j)
-            g.emReg srcReg
-          if srcBridge != NoReg: g.dropBridge srcBridge
-          g.freeVal(aD)
+          bindArgWords(j, pl)
+        of rsDone: discard
       # Every argument is in place; the call itself clobbers all four, so from the
       # marker on nobody's claim survives.
       g.stagedArgs = {}
@@ -3244,11 +3295,19 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         # `emitSemihostRuntime` emitted under the same name — there is no trap
         # instruction to reach an OS with, because there is no OS.
         g.ab.keyword CallA64
-      if not doTail and hasResult and not resultByRef and not resultIsFloat and
+      if not doTail and hasResult and not resultByRef and
          resSlot.kind != AMem and not g.isWideSlot(resSlot):
-        g.ab.tree MovA64:
-          g.emReg g.md.intRetReg
-          g.ab.tree ResX: g.ab.sym synth("ret.0")
+        # The binding-establishing move; a float result is announced into its
+        # v-register the same way (nifasm elides both same-register moves).
+        if resultIsFloat:
+          g.ab.tree FmovA64:
+            g.emFReg(g.md.floatRetReg, (if resSlot.size == 4: 32 else: 64))
+            g.ab.tree ResX: g.ab.sym synth("ret.0")
+        else:
+          g.ab.tree MovA64:
+            g.emReg g.md.intRetReg
+            g.ab.tree ResX: g.ab.sym synth("ret.0")
+    for f in sealedFArgs: g.rb.unsealF f
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)

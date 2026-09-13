@@ -107,7 +107,8 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   # Verify call was emitted and all bindings are done
   if ctx.callContext.state == CallContextState.NormalCall:
     for param in ctx.callContext.typ.params:
-      if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
+      if not param.typ.isOnStack and param.regs.len > 0 and
+         param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
     if not ctx.callContext.isTailcall:
@@ -1416,7 +1417,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       let single = isA64FpSingle(n, ctx)
       let rd = parseFloatOperandA64(n, ctx)
       if isA64FpOperand(n, ctx):
-        arm64.emitFmov(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
+        # A same-register copy is elided, as `mov`'s is: `(fmov (arg pN) (dN))`
+        # and `(fmov (d0) (res ret.0))` are the declarative-call markers
+        # resolving to the register the value already sits in.
+        let rs = parseFloatOperandA64(n, ctx)
+        if rd != rs: arm64.emitFmov(ctx.buf.data, rd, rs, single)
       else:
         arm64.emitFmovFromGpr(ctx.buf.data, rd, parseGprA64(n, ctx), single)
     else:

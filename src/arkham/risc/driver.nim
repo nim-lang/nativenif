@@ -476,7 +476,11 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.entryExits = linux
   g.oneThread = linux
   g.ab.arch = "a64"                # BodyLib entries this target may splice
-  g.prog = collect(buf, inputPath, tags, darwin = not linux)
+  # `fullSigs`: every AArch64 proc boundary is declarative — the typed signature
+  # carries float params/results (`(dN)`/`(sN)`) too. RV32 and Cortex-M keep the
+  # manual path for floats; a Darwin extern declares no signature and keeps it as
+  # well (`collect` leaves those non-declarative).
+  g.prog = collect(buf, inputPath, tags, darwin = not linux, fullSigs = true)
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")

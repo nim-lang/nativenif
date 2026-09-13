@@ -154,7 +154,8 @@ float result is declared the same way, `(result :ret.0 (xmm0) (f 64))`. Like a
 assigned with `(movsd (arg x.0) <xmm or float variable>)` (`movss` for an `(f 32)`)
 and the result bound with `(movsd <xmm or float variable> (res ret.0))`; both are
 checked for exactly-once assignment like their GPR counterparts, and a same-register
-move is elided.
+move is elided. On AArch64 the locations are `(dN)` / `(sN)` and the moves are
+`(fmov (arg x.0) …)` and `(fmov … (res ret.0))`.
 
 ### Stack parameters
 

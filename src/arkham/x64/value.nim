@@ -3365,22 +3365,6 @@ type
     home: string
     ptrReg: Reg
 
-proc isLeafArg(a: Cursor): bool =
-  ## A scalar argument that phase 2 can load into its ABI register from where
-  ## it lives, with nothing computed that could touch another register: a
-  ## literal, a symbol (a home, a global, a thread-local, a proc), or a
-  ## literal wrapper around one. Everything else is computed in phase 1.
-  case a.kind
-  of IntLit, UIntLit, CharLit, StrLit, Symbol: true
-  of TagLit:
-    case a.exprKind
-    of NilC, TrueC, FalseC: true
-    of SufC, ParC:
-      var inner = a; inc inner
-      isLeafArg(inner)
-    else: false
-  else: false
-
 proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                     tail = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg

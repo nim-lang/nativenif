@@ -874,7 +874,14 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                 c.into:                         # (param :name pragmas type)
                   inc c                         # name → positional pN.0
                   skip c                        # pragmas
-                  if pl.isAgg or pl.isWideScalar:
+                  if pl.isFloat:
+                    g.ab.tree ParamD:           # a v-register location, see `emitSignature`
+                      g.ab.symDef paramName(pl.ord)
+                      if not pl.onStack:
+                        g.ab.freg(g.md.floatArgRegs[pl.fpIndex], slotOf(g.prog, c).size * 8)
+                      else: g.ab.keyword SO
+                      g.genPointee(c)
+                  elif pl.isAgg or pl.isWideScalar:
                     # Aggregate param: >16B by-ref pointer in one x-reg, ≤16B by-value
                     # over `pl.words` consecutive x-regs (`(arg pN k)` selects word k).
                     # A scalar too wide for one register (`(i 64)` on Cortex-M) takes
@@ -907,6 +914,10 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             # ≤16B by-value aggregate result → x0:x1 raw, EMPTY result slot (see
             # emitSignature): the caller reads the return registers directly.
             skip c
+          elif slotOf(g.prog, c).kind == AFloat:
+            g.ab.symDef synth("ret.0")
+            g.ab.freg(g.md.floatRetReg, slotOf(g.prog, c).size * 8)
+            g.genPointee(c)
           else:
             g.ab.symDef synth("ret.0")
             g.ab.rawReg g.md.intRetReg                     # raw reg *location* of the result

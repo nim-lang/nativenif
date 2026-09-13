@@ -775,8 +775,16 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
                 inc c                         # name → use positional p{ord}
                 skip c                        # pragmas
                 if pl.isFloat:
-                  raiseAssert "arkham a64: float param in signature not yet supported"
-                if pl.isWideScalar:
+                  # A float param travels in a v-register: `(param :pN.0 (dK|sK) (f N))`.
+                  # nifasm binds no AArch64 param, so the body reads it raw
+                  # (`emitParamMoves`); a call site assigns it with `(fmov (arg pN) …)`.
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(pl.ord)
+                    if not pl.onStack:
+                      g.ab.freg(g.md.floatArgRegs[pl.fpIndex], slotOf(g.prog, c).size * 8)
+                    else: g.ab.keyword SO       # 9th+ float: stack-passed
+                    g.genTypeBody(c)
+                elif pl.isWideScalar:
                   # A scalar too wide for one register (`(i 64)` on Cortex-M).
                   # `(regs …)` is the SAME location form a multi-word aggregate
                   # uses, and for the same reason: the halves have no Leng type
@@ -833,8 +841,13 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
         else:
           let rs = slotOf(g.prog, c)
           if rs.kind == AFloat:
-            raiseAssert "arkham a64: float result in signature not yet supported"
-          if g.isWideSlot(rs):
+            # `(result :ret.0 (d0|s0) (f N))`: the caller binds it with
+            # `(fmov (d0) (res ret.0))` right after the call, the twin of the x0
+            # announcement for a scalar.
+            g.ab.symDef synth("ret.0")
+            g.ab.freg(g.md.floatRetReg, rs.size * 8)
+            g.genTypeBody(c)
+          elif g.isWideSlot(rs):
             # A 64-bit result travels in r0:r1 with an EMPTY result slot, exactly
             # as a two-word aggregate does: nifasm's `(ret …)` names ONE register,
             # and declaring only the low half is how a truncated return would look

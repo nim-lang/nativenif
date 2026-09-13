@@ -268,8 +268,10 @@ Recent miscompiles whose fix was a *protocol* rule rather than an encoding detai
 - the 13 remaining `takeHeld` sites — `call_marshal` covers the park; each of
   those holds a value across something else (a call, an index expression that
   calls) and needs its own demand modelled the same way;
-- the RISC backends' call marshalling: they still run the fused loop and keep a
-  manual path for floats (`isDeclarativeAbi` without `fullSigs`); AArch64 has no
-  ISA-pinned argument register, so the phase split is a simplification there
-  rather than a fix, but the float signature is the same work;
+- the RISC emitter runs the same two phases (AArch64 has no ISA-pinned argument
+  register, so it never parks: a computed scalar goes into its own register in
+  phase 1 and an aggregate lvalue's address is computed at load time), and
+  AArch64 boundaries are fully declarative. RV32 and Cortex-M still keep the
+  manual path for floats, and a Darwin extern declares no signature; both are
+  the remaining non-declarative call sites;
 - a tlanif port of `call_marshal`.

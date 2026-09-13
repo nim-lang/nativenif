@@ -1048,6 +1048,11 @@ exec "nim c -r src/nifasm/nifasm tests/a64_noreturn_clobber.nif"
 # register. It targets `linux_arm64`, so unlike the Darwin a64 fixtures it produces an
 # ELF this host can run under qemu (see the guarded `execRun` further down).
 exec "nim c -r src/nifasm/nifasm tests/a64_slot_base_free.nif"
+# The AArch64 twin of `x64_float_sig`: a float parameter `(d0)`, a float result
+# `(d0)` and an empty `(regs)` parameter in a typed signature, assigned with
+# `(fmov (arg p0.0) …)` and bound with `(fmov (d0) (res ret.0))`. Run under qemu below.
+exec "nim c -r src/nifasm/nifasm tests/a64_float_sig.nif"
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_float_sig_missing.nif", "Missing argument: p0.0")
 # The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
 # Reading a local homed in one of them afterwards must be rejected here — otherwise the
 # only symptom is a silently wrong value at run time.
@@ -2496,6 +2501,10 @@ when defined(linux):
     if sbfCode != 0:
       quit "FAILURE a64_slot_base_free: exit " & $sbfCode & "\n" & sbfOut
     echo "1 / 1 a64 base-free slot addressing tests successful"
+    let (fsOut, fsCode) = runProgram(findExe("qemu-aarch64"), ["tests" / "a64_float_sig"])
+    if fsCode != 0:
+      quit "FAILURE a64_float_sig: exit " & $fsCode & "\n" & fsOut
+    echo "1 / 1 a64 float-signature tests successful"
   else:
     echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 
