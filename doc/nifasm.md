@@ -238,7 +238,10 @@ For example:
 ```
 
 A call to a proc imported from a dynamic library (declared with `(extproc :name.0 "_name")`)
-uses `(extcall)` in place of `(call)`; a tail call uses `(tailcall)`.
+uses `(extcall)` in place of `(call)`; a tail call uses `(tailcall)`. An `(extproc …)`
+may carry `(params …) (result …) (clobber …)` after the external name, and then its
+call sites bind `(arg name)` / `(res name)` and are checked exactly like calls to a
+proc in the image.
 
 ### Stack arguments with `(csize)`
 

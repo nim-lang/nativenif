@@ -125,10 +125,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     # A dynamic import: the invocation is an indirect `(extcall)` through the IAT/GOT
-    # slot rather than a `call rel32`. If the decl carried a signature (the Windows
-    # form — see `parseExtprocSig`) it is checked and laid out exactly like any other
-    # call; a bare Darwin extern has no signature to check against, so its call site
-    # marshals into raw ABI registers and only the marker is verified below.
+    # slot rather than a `call rel32`. If the decl carried a signature (see
+    # `parseExtprocSig`) it is checked and laid out exactly like any other call; a
+    # bare extern has no signature to check against, so only the marker is verified.
     ctx.callContext.state = CallContextState.ExternalCall
     ctx.callContext.typ = sym.typ
     for i, ext in ctx.extProcs:

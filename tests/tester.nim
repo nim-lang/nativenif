@@ -183,7 +183,11 @@ const arkhamOsxOnly: seq[string] =
   # `ulock_wake` calls `__ulock_wake`, the real libSystem symbol `syslocks` uses on
   # macOS. It links only against libSystem, so it's skipped on Linux (native x64 and
   # the linux_arm64 qemu path), where the symbol doesn't exist.
-  @["ulock_wake"]
+  @["ulock_wake",
+    # A `{.varargs.}` libSystem call (`snprintf`): the fixed parameters go through
+    # the extern's signature, the variadic tail down Apple's stack-passed path.
+    # Linux assembles it (`arkhamDarwinAssembleTests`); only macOS can run it.
+    "darwin_varargs"]
 
 const arkhamRejections: seq[(string, string)] = @[
   # Arkham owns the `{.assembler.}` rules outright — nimony's sem only forwards
@@ -487,6 +491,7 @@ const ithaquaUnsupported: seq[string] = @[
   # 3. `ulock_wake` is a Darwin syscall fixture: the syscall has no host import
   #    to map onto, so the proc has no definition to emit.
   "ulock_wake",
+  "darwin_varargs",     # a libSystem `{.varargs.}` extern: Darwin-only, see arkhamOsxOnly
   # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
   #    Each one aborts loudly today; none of them miscompiles.
   "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
@@ -2202,7 +2207,7 @@ const cortexMUnsupported: seq[string] = @[
   # slot, which is a decision about the board and not about the ISA — a Cortex-M
   # part with four cores has four threads and is refused by name until the
   # SP-masked thread-local base exists.
-  "mmap_anon", "futex_wake", "ulock_wake", "naked_stacktrace_x64",
+  "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
@@ -2468,6 +2473,54 @@ when defined(linux):
 # absent). Gives the arm64 path end-to-end coverage without a macOS machine.
 when defined(linux) and defined(amd64):
   arkhamQemuTests()
+
+# The DARWIN arm64 variant of the same corpus, assembled to a Mach-O image and not
+# run: no host here can execute it, but the Darwin-only code — every `importc` is
+# a libSystem extern with a signature, thread-locals go through TLV descriptors —
+# has to keep emitting and assembling. A stem in the known list is x86-64-pinned;
+# anything else failing is new breakage. (The foreign-module fixtures resolve
+# because the earlier passes left the `mod_*` modules in the same nimcache.)
+const arkhamDarwinAssembleKnown: seq[string] = @[
+  "assembler_x64", "intrinsics_x64", "naked_stacktrace_x64",   # x86-64-pinned
+]
+proc arkhamDarwinAssembleTests() =
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  var total, passed, expectedFail = 0
+  var newFailures: seq[string] = @[]
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let base = extractFilename(file)
+    if base.startsWith("mod_") or base.startsWith("err_"): continue
+    let name = base[0 ..< base.len - ".c.nif".len]
+    inc total
+    let asmNif = workDir / (name & ".darwin.nif")
+    let img = workDir / (name & ".darwin.out")
+    var failed = ""
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:arm64 -o:" &
+                             quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0:
+      failed = "codegen: " & ao.splitLines[^2 .. ^1].join(" ").strip
+    else:
+      let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(img) &
+                               " " & quoteShell(asmNif))
+      if nc != 0: failed = "assemble: " & no.splitLines[^1].strip
+    if failed.len == 0:
+      if name in arkhamDarwinAssembleKnown:
+        echo "NOTE: ", name, " now assembles for Darwin — remove it from arkhamDarwinAssembleKnown"
+      inc passed
+    elif name in arkhamDarwinAssembleKnown:
+      inc expectedFail
+    else:
+      newFailures.add name & " — " & failed
+  echo passed, " / ", total - expectedFail, " arkham darwin arm64 assemble tests successful (",
+       expectedFail, " known)"
+  if newFailures.len > 0:
+    quit "FAILURE arkham darwin arm64 assemble found NEW breakage:\n  " &
+         newFailures.join("\n  ")
+when defined(linux) and defined(amd64):
+  arkhamDarwinAssembleTests()
 
 # On an AArch64 Linux host (a Raspberry Pi is the common one) the `linux_arm64`
 # binaries are NATIVE: the same corpus runs without an emulator, and it is the only

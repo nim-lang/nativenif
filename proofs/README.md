@@ -271,7 +271,8 @@ Recent miscompiles whose fix was a *protocol* rule rather than an encoding detai
 - the RISC emitter runs the same two phases (no RISC machine here pins an
   argument register, so it never parks: a computed scalar goes into its own
   register in phase 1 and an aggregate lvalue's address is computed at load
-  time), and AArch64, RV32 and Cortex-M boundaries are fully declarative. A
-  Darwin extern declares no signature; that is the one remaining
-  non-declarative call site (and the manual path's only user);
+  time), and every boundary on every backend is declarative — a Darwin extern
+  declares its signature too (the fixed parameters of a `{.varargs.}` one; the
+  variadic tail is Apple's stack-passed one, laid out by the call site after
+  phase 2). There is no manual marshalling path left;
 - a tlanif port of `call_marshal`.

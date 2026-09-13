@@ -495,10 +495,16 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # to `svc` syscalls — the static ELF needs no imports.)
       if g.prog.needsLibSystem or g.tvars.len > 0:
         g.ab.tree ImpD: g.ab.str DarwinLibSystem
+      # Each extern carries its FULL AAPCS64 signature, so a call to it goes
+      # through the declarative `(arg pN)`/`(res ret.0)` path like any other call
+      # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
+      # only; the variadic tail is Apple's stack-passed one, which the call site
+      # lays out itself (see `emitCall2Inner`).
       for ex in g.prog.externOrder:
         g.ab.tree ExtprocD:
           g.ab.symDef ex.asmName
           g.ab.str ex.extName
+          g.emitSignature(ex.decl, declarative = true)
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:

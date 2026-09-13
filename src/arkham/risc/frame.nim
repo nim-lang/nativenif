@@ -17,7 +17,7 @@
 ## in `g.md`.
 
 import std / [assertions, tables]
-import nifcore
+import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, regbind, abi]
@@ -769,6 +769,16 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
           var pIdx = 0
           c.into:
             while c.hasMore:
+              block:                          # a `{.varargs.}` marker is not a param
+                var tc = c
+                var isMarker = false
+                tc.into:
+                  inc tc; skip tc
+                  isMarker = tc.kind == TagLit and tc.typeKind == VarargsT
+                  while tc.hasMore: skip tc
+                if isMarker:
+                  skip c
+                  continue
               let pl = plan.args[pIdx]
               inc pIdx
               c.into:                         # (param :name pragmas type)

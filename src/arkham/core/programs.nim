@@ -886,7 +886,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # out at the 6 SysV argument registers.
           let fixed = fixedParamCount(procStart)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
-                                                declarative: windows and isDeclarativeAbi(result, procStart),
+                                                declarative: (windows or result.fullSigs) and
+                                                             isDeclarativeAbi(result, procStart),
                                                 isVarargs: fixed >= 0, fixedParams: fixed,
                                                 retFloat: retFloat, retType: retType, sigType: sigType)
           result.needsLibSystem = true
@@ -1052,7 +1053,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     # the externOrder naming in `collect`).
     p.needsLibSystem = true
     result = CallTarget(asmName: extprocAsmName(importcN, s.module), extern: true, retFloat: retFloat,
-                        declarative: p.windows and isDeclarativeAbi(p, declCur),
+                        declarative: (p.windows or p.fullSigs) and isDeclarativeAbi(p, declCur),
                         retType: retType, sigType: sigType)
   else:
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
