@@ -3408,7 +3408,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   var fnptrLoc = dontCare                            # the held fn-ptr value (freed post-call)
   if indirect:
     let proctype = g.proctypeOfTarget(targetCur)
-    let declarative = isDeclarativeAbi(g.prog, proctype)
     var retType = proctype
     block:
       var q = proctype
@@ -3435,8 +3434,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
       fnptrReg = stagedFnptr
     let foreignAbi = isForeignAbiProctype(g.prog, proctype)
     if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
-      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur),
-                       retType: retType, foreignAbi: foreignAbi)
+      tgt = CallTarget(asmName: symName(targetCur), retType: retType, foreignAbi: foreignAbi)
     else:
       let nm = g.rb.freshTmpName("fntmp")
       g.ab.tree RebindX64:
@@ -3446,8 +3444,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.ab.rawReg fnptrReg
       g.rb.bindScratch(fnptrReg, nm, isPtr = false)
       fnTargetName = nm
-      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType,
-                       foreignAbi: foreignAbi)
+      tgt = CallTarget(asmName: nm, retType: retType, foreignAbi: foreignAbi)
   else:
     if not g.callTarget.hasKey(fsym):
       let si = g.lookupSym(fsym)
@@ -3458,7 +3455,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
           inc d; skip d
           proctype = resolveType(g.prog, d)
           while d.hasMore: skip d
-        g.callTarget[fsym] = CallTarget(declarative: isDeclarativeAbi(g.prog, proctype),
+        g.callTarget[fsym] = CallTarget(
           indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl),
           foreignAbi: isForeignAbiProctype(g.prog, proctype))
       else:
@@ -3565,7 +3562,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         if not bound: g.unbindTemp(RAX)
       else: raiseAssert "arkham x64n: call result dest " & $dest.kind
 
-  assert tgt.declarative, "arkham x64: every call boundary is declarative (`fullSigs`)"
   # ── Two phases, chibicc's shape (codegen.c `push_args` / `ND_FUNCALL`): first
   # EVERY argument expression runs, then the ABI registers are loaded. No ABI
   # register holds a value while an argument expression can still run, so

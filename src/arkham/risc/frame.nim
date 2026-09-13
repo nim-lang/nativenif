@@ -740,14 +740,14 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.movReg(loc.r, g.md.gprAt(pl))
         else: raiseAssert "arkham v1: stack-resident parameter: " & nm
 
-proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
-  ## Emit the proc's `(params)/(result)/(clobber)`. When `declarative`, the ABI
-  ## is stated explicitly — positional `p{i}` register params and an `x0` result
-  ## — so nifasm cross-checks every call site; otherwise both stay empty and
-  ## arkham marshals by hand (floats/aggregates/by-ref/>8/named types). The
-  ## clobber set is always the convention's, derived here (never per-proc
-  ## precomputed), which is reliable across modules.
-  if declarative:
+proc emitSignature*(g: var CodeGen; decl: Cursor) =
+  ## Emit the proc's `(params)/(result)/(clobber)`: the ABI stated explicitly —
+  ## positional `p{i}` register params (v-registers for floats, `(regs …)` for
+  ## aggregates and wide scalars, `(s)` past the register file) and an `x0` /
+  ## `d0` result — so nifasm cross-checks every call site. The clobber set is
+  ## always the convention's, derived here (never per-proc precomputed), which
+  ## is reliable across modules.
+  block:
     var c = decl
     c.into:
       inc c                                   # name → params slot
@@ -874,9 +874,6 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
             g.ab.rawReg g.md.intRetReg                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
-  else:
-    g.ab.keyword ParamsD
-    g.ab.keyword ResultD
   g.ab.tree ClobberD:
     # A diverging callee returns to nobody, so no caller can observe what it
     # destroyed — declaring clobbers only forces every proc with a cold guard onto

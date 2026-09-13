@@ -903,10 +903,6 @@ proc genAsmProc2*(g: var CodeGen; info: ProcInfo) =
   g.plan = Plan()
   if info.isEntry:
     lengError info.decl, "the program entry point cannot be an `.assembler` proc", g.asmInfo
-  if not isDeclarativeAbi(g.prog, info.decl):
-    lengError info.decl, "an `.assembler` proc's parameters and result must be " &
-              "integers or pointers (float and small-aggregate boundaries are not " &
-              "modelled in the typed signature yet)", g.asmInfo
   var used: set[Reg] = {}
   g.asmCheckAbi(info, used)
   block:                                         # the result register
@@ -950,7 +946,7 @@ proc genAsmProc2*(g: var CodeGen; info: ProcInfo) =
   if info.isNaked: g.hasFrame = false
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
-    g.emitSignature(info.decl, declarative = true)
+    g.emitSignature(info.decl)
     g.ab.tree StmtsA64:
       g.enterScope()
       if not info.isNaked:

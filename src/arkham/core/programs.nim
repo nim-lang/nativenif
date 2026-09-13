@@ -54,9 +54,6 @@ type
     sigType*: Cursor         ## the proc's SIGNATURE as a `(proctype …)` — the type of the
                              ## proc used as a VALUE, so `getType` treats a proc symbol like
                              ## any other fn-ptr (its return type drives a call's result type)
-    declarative*: bool       ## true → emit/use nifasm's declarative call ABI
-                             ## (typed params + `(arg)`/`(res)` cross-checking);
-                             ## false → manual marshalling (floats/aggregates/…)
     isVarargs*: bool         ## a `{.varargs.}` importc (C `printf`/`open`/`fcntl`). Default
                              ## false, so a `CallTarget` built anywhere else stays fixed-arity.
     fixedParams*: int        ## meaningful only with `isVarargs`: how many parameters the decl
@@ -128,10 +125,6 @@ type
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
-    fullSigs*: bool                         ## every proc boundary is declarative — the typed
-                                            ## signature carries float params/results and
-                                            ## zero-size aggregates too (x86-64; the RISC
-                                            ## backends still marshal those by hand)
     windows*: bool                          ## PE/Win64 target: every `importc` binds through
                                             ## the import table (no Linux syscalls), and the
                                             ## image is single-threaded, so a Nim thread-local
@@ -511,20 +504,6 @@ proc fixedParamCount(decl: Cursor): int =
 proc resolveType*(p: var Program; c: Cursor): Cursor
 proc slotOf*(p: var Program; c: Cursor): AsmSlot
 
-proc abiScalarType(p: var Program; c: Cursor): bool =
-  ## A type that travels in a single GPR with no layout resolution needed:
-  ## a primitive non-float scalar (`(i N)`/`(u N)`/`(c N)`/`(bool)`), a pointer
-  ## (`(ptr …)`/`(aptr …)`/`(proctype …)`), or a named type that resolves to one of
-  ## those — notably an `enum`, which collapses to its base integer. Floats and
-  ## aggregates (objects/unions/arrays) conservatively answer false so they keep
-  ## the manual marshalling path.
-  var t = c
-  if t.kind == Symbol: t = resolveType(p, t)
-  if t.kind != TagLit: return false
-  case t.typeKind
-  of IT, UT, CT, BoolT, PtrT, AptrT, ProctypeT, EnumT: true
-  else: false
-
 proc hasStdcallPragma(c: Cursor): bool =
   ## Does the `(pragmas …)` node at `c` name the `stdcall` calling convention?
   if c.substructureKind != PragmasU: return false
@@ -579,44 +558,6 @@ const FullSigAggrByRefThreshold = 16
   ## The SysV/AAPCS64 by-value aggregate threshold (both targets use 16). Aggregates
   ## larger than this travel by reference. Kept here so `isDeclarativeAbi` (which has
   ## no `MachineDesc`) can classify a result the same way the code generator does.
-
-proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
-  ## Whether `decl`'s call boundary uses the FULL typed signature (the declarative
-  ## `(arg pN [k])` / `(res ret.0)` scheme). With `fullSigs` (x86-64) it always
-  ## does: the signature states float params `(xmmN)`, a float result `(xmm0)` and
-  ## a zero-size aggregate `(regs)` as well, and there is no manual-marshalling
-  ## path left. Without it (the RISC backends) every parameter must be a
-  ## scalar/pointer OR an aggregate (passed by-value in consecutive registers when
-  ## ≤16B, by a pointer otherwise), and the result void, a scalar, or a >16B
-  ## by-reference aggregate (returned through a hidden result pointer); float
-  ## params/results and zero-size aggregates keep the empty-signature path there.
-  if p.fullSigs: return true
-  var c = decl
-  c.into:
-    inc c                                     # name → params slot
-    if c.kind == TagLit:                      # (params (param :n prag type) …)
-      var pc = c
-      pc.into:
-        while pc.hasMore:
-          var notFullSig = false
-          pc.into:                            # (param :name pragmas type)
-            inc pc                            # name
-            skip pc                           # pragmas
-            let ps = slotOf(p, pc)
-            # Float params aren't in the typed signature yet; a zero-size aggregate
-            # param (an empty object/tuple) would emit an empty `(regs)` location — both
-            # keep the empty-signature manual-marshalling path (which passes 0 words).
-            notFullSig = ps.kind == AFloat or (ps.kind == AMem and ps.size == 0)
-            while pc.hasMore: skip pc          # type (+ anything else)
-          if notFullSig: return false
-    skip c                                    # params
-    # return type: void / scalar / aggregate (≤16B by-value in rax:rdx, >16B by-ref via
-    # the hidden pointer) ok — all declarative. Only a FLOAT result is not yet modelled.
-    if not (c.kind == DotToken or (c.kind == TagLit and c.typeKind == VoidT)):
-      let rs = slotOf(p, c)
-      if rs.kind == AFloat: return false
-    while c.hasMore: skip c                   # return type, pragmas, body
-  result = true
 
 proc syprocAsmName*(cname, module: string): string =
   ## The asm symbol for the syscall syproc wrapping the C function `cname`:
@@ -690,7 +631,7 @@ proc procSigType(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false; windows = false; fullSigs = false): Program =
+              darwin = false; windows = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -713,7 +654,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
                    pool: buf.pool,
-                   darwin: darwin, fullSigs: fullSigs, windows: windows)
+                   darwin: darwin, windows: windows)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -742,7 +683,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.boolType = beginRead(btBuf)
   assert buf.beginRead().stmtKind == StmtsS, "Leng top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
-  # param/return types via `isDeclarativeAbi`, and a proc may reference a type
+  # param/return types for the signature, and a proc may reference a type
   # declared *later* in the module (e.g. a tuple-instance returned by a helper),
   # so all types must be in `typeDecls` before any proc is processed.
   var ct = buf.beginRead()
@@ -856,7 +797,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = syprocAsmName(importcN, thisModuleSuffix(result))
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
-                                                declarative: true, retType: retType, sigType: sigType)
+                                                retType: retType, sigType: sigType)
           # Record one syproc decl per distinct syscall symbol.
           var already = false
           for sp in result.syscalls:
@@ -886,8 +827,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # out at the 6 SysV argument registers.
           let fixed = fixedParamCount(procStart)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
-                                                declarative: (windows or result.fullSigs) and
-                                                             isDeclarativeAbi(result, procStart),
                                                 isVarargs: fixed >= 0, fixedParams: fixed,
                                                 retFloat: retFloat, retType: retType, sigType: sigType)
           result.needsLibSystem = true
@@ -901,7 +840,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = if entry: "main.0" else: pname
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
-                                                declarative: isDeclarativeAbi(result, procStart),
                                                 # A `stdcall` DEFINITION receives Windows'
                                                 # convention (`isWin64AbiProc`), so a call to
                                                 # it from inside the image must send that —
@@ -1045,7 +983,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
     result = CallTarget(asmName: syprocAsmName(importcN, s.module), extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
-                        declarative: true, retType: retType, sigType: sigType)
+                        retType: retType, sigType: sigType)
   elif importcN.len > 0:
     # A genuine libc extern (the foreign module records it in its own externOrder
     # + needsLibSystem; here we only need the matching call target). The asm name
@@ -1053,12 +991,10 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     # the externOrder naming in `collect`).
     p.needsLibSystem = true
     result = CallTarget(asmName: extprocAsmName(importcN, s.module), extern: true, retFloat: retFloat,
-                        declarative: (p.windows or p.fullSigs) and isDeclarativeAbi(p, declCur),
                         retType: retType, sigType: sigType)
   else:
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,
-                        declarative: isDeclarativeAbi(p, declCur),
                         foreignAbi: isWin64AbiProc(p, declCur))
 
 proc instrTargetOf*(p: var Program; name: string): InstrTarget =

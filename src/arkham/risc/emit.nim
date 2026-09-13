@@ -841,16 +841,11 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
   ## pointer is still 8 bytes (nifasm sizes `ProcT` as a pointer); the signature is
   ## metadata for call sites.
   ##
-  ## The signature mirrors `emitSignature`'s declarative split. A DECLARATIVE proctype
-  ## (all single-GPR scalar params + scalar/void result) states the positional
-  ## `pN.0`/`ret.0` ABI so an indirect `(prepare …)` is cross-checked via `(arg pN)`/
-  ## `(res ret.0)`. A NON-declarative one (a float/aggregate param or an aggregate
-  ## return — e.g. a CPS continuation `proc(c): Continuation`) emits EMPTY `(params)`/
-  ## `(result)`, exactly as a non-declarative concrete proc does, so nifasm requires no
-  ## per-param bindings and the call site marshals args into raw ABI registers itself.
-  let declarative = isDeclarativeAbi(g.prog, c)
+  ## The signature mirrors `emitSignature` exactly: the positional `pN.0`/`ret.0`
+  ## ABI, floats and aggregates included, so an indirect `(prepare …)` is
+  ## cross-checked via `(arg pN)`/`(res ret.0)` like a direct call.
   g.ab.proctypeType:
-    if declarative:
+    block:
       c.into:
         skip c                                  # the Empty slot (a proc has its name here)
         # A >16B by-ref aggregate result travels via x8 (handled raw at the call site),
@@ -924,10 +919,6 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             g.ab.rawReg g.md.intRetReg                     # raw reg *location* of the result
             g.genPointee(c)                     # return type BY REFERENCE (named → sym)
         while c.hasMore: skip c                  # pragmas
-    else:
-      g.ab.keyword ParamsD
-      g.ab.keyword ResultD
-      skip c                                     # advance past the whole proctype node
     g.ab.tree ClobberD:
       g.emConvClobbers()
 

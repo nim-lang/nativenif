@@ -107,7 +107,6 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   # (The frame itself is finalized INSIDE emitProcBody2, after the body —
   # body-buffer model.)
-  let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
@@ -126,7 +125,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     dbgPeakHeldAtRecursion = 0
     tightCompositions = 0
     lastResortTakes = 0
-  g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
+  g.emitProcBody2(info, frameHasCall = an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE peak=" & $dbgPeakBridges & " heldAtRecursion=" &
                      $dbgPeakHeldAtRecursion & " tight=" & $tightCompositions &
@@ -276,10 +275,7 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.oneThread = not board.given or board.slotCount <= 1
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
-  # `fullSigs`: every Cortex-M boundary is declarative — a float param/result is
-  # an `(sN)` location in the typed signature (FPv4-SP: single precision only, a
-  # double is refused before it gets here).
-  g.prog = collect(buf, inputPath, tags, darwin = false, fullSigs = true)
+  g.prog = collect(buf, inputPath, tags, darwin = false)
   g.rejectForThumbM()
   g.adoptProgram()
   g.ab.tree StmtsA64:
@@ -430,9 +426,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                  else: Rv32DefaultStackTop
   g.ab.renderReg = machine_rv32.regNameRv     # `(x0)`..`(x30)`/`(sp)`
   g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
-  # `fullSigs`: every RV32 boundary is declarative — a float param/result is a
-  # `(sN)`/`(dN)` location (fa0–fa7) in the typed signature.
-  g.prog = collect(buf, inputPath, tags, darwin = false, fullSigs = true)
+  g.prog = collect(buf, inputPath, tags, darwin = false)
   # No `rejectForRv32` twin of Cortex-M's declaration-time refusals: RV32IMAFD
   # has both float precisions, hardware divide and self-ordering atomics, so what
   # it lacks is refused per intrinsic (`BitScanOps`, narrow atomics) instead.
@@ -481,10 +475,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.entryExits = linux
   g.oneThread = linux
   g.ab.arch = "a64"                # BodyLib entries this target may splice
-  # `fullSigs`: every AArch64 proc boundary is declarative — the typed signature
-  # carries float params/results (`(dN)`/`(sN)`) too. A Darwin extern declares no
-  # signature and keeps the manual path (`collect` leaves those non-declarative).
-  g.prog = collect(buf, inputPath, tags, darwin = not linux, fullSigs = true)
+  g.prog = collect(buf, inputPath, tags, darwin = not linux)
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")
@@ -504,7 +495,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         g.ab.tree ExtprocD:
           g.ab.symDef ex.asmName
           g.ab.str ex.extName
-          g.emitSignature(ex.decl, declarative = true)
+          g.emitSignature(ex.decl)
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:
