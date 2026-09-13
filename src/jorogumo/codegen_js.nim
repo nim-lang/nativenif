@@ -376,11 +376,16 @@ proc fieldOffsetIn(g: var JsGen; objType: Cursor; field: string;
         un.into:
           while un.hasMore:
             if not found:
-              var inner = false
-              let innerOff = fieldOffsetIn(g, un, field, inner)
-              if inner:
-                found = true
-                result = off + innerOff
+              # Object-variant branches are `(of RANGES BODY)` (the body may be
+              # `.` when the branch declares no fields); `{.union.}` children are
+              # bare objects. `unionBranchBody` normalizes both.
+              var bodyc = unionBranchBody(un)
+              if bodyc.kind != DotToken:
+                var inner = false
+                let innerOff = fieldOffsetIn(g, bodyc, field, inner)
+                if inner:
+                  found = true
+                  result = off + innerOff
             skip un
         if not found:
           off += int(usz)
