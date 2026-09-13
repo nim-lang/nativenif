@@ -58,6 +58,21 @@ when StressEnabled:
 else:
   const stressKeep* = 0
 
+when StressEnabled:
+  let stressParkMemory* = getEnv("ARKHAM_STRESS_PARK").strip == "mem"
+    ## `ARKHAM_STRESS_PARK=mem`: every call-argument PARK (`takeParked`) skips
+    ## its two register tiers and waits in a spill slot.
+    ##
+    ## Shrinking the pools does not reach that tier on x86-64, and no fixture can:
+    ## a park is needed only for an argument register a LATER argument is pinned
+    ## to by the ISA — rcx for a shift count, rdx for a division — so at most two
+    ## words park per call, and the survivor the planer reserves for the emitter
+    ## plus the first pool temp answer them. The memory tier is the one that has
+    ## to hold when a real program arrives with both dry, so the tester drives it
+    ## from here, against each fixture's own `.exitcode`.
+else:
+  const stressParkMemory* = false
+
 proc stressActive(): bool {.inline.} =
   when StressEnabled: stressKeep > 0
   else: false

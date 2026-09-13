@@ -829,6 +829,43 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
   raiseAssert "arkham x64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill)"
 
+proc takeParked*(g: var CodeGen; avoid: set[Reg]): Location =
+  ## A PARK: where one word of a call argument waits while the REST of the
+  ## arguments are marshalled, because a later argument's instruction destroys
+  ## the ABI register it belongs in (`fixedRegsClobberedBy`: `cl` for a variable
+  ## shift, rdx/rax for `idiv`). Not a survivor of the call itself — that is
+  ## `takeHeld` — only of the marshalling, which is what makes a VOLATILE a
+  ## sound park here. Total: a callee-saved register, else a pool temp outside
+  ## `avoid`, else a spill slot. The caller passes as `avoid` every register the
+  ## call still has a claim on — its argument registers, marshalled or not, and
+  ## the fixed registers its later arguments clobber — so a pool park can never
+  ## sit where the next argument lands. (A pool temp is otherwise refused only
+  ## once something is BOUND to it, and an argument register is bound by its
+  ## `(arg …)` move, after its value is computed — too late for a park taken
+  ## for an earlier argument.)
+  ##
+  ## A register park is BOUND on hand-out, whoever fills it: a marshalled
+  ## aggregate word has no producer to bind it, and R10/R11 refuse to be named
+  ## raw by `emReg`. A scalar producer (`emitValue2`) leaves an already-bound
+  ## temp alone. `freeVal` releases it after the call.
+  ##
+  ## MODEL: proofs/call_marshal.tla — `ParkReg` (`SurvivorOK` / `PoolOK`) and
+  ## `ParkMem`; `ParkStuck` is what `Bug = "survivorOnly"` (the old `takeHeld`)
+  ## reaches. The `avoid` rule is `Bug = "noAvoid"`.
+  var r = NoReg
+  if not stressParkMemory:
+    r = g.pickHeldReg()
+    if r == NoReg: r = g.pickTempReg(avoid)
+  if r != NoReg:
+    g.pickedRegs.incl r
+    when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
+    g.releaseStaleName(r)
+    g.bindTemp(r, ScalarSlot)
+    return regLoc(r, ScalarSlot, isTemp = true)
+  let nm = g.mintSpillName("park")             # both pools dry (or `ARKHAM_STRESS_PARK=mem`)
+  g.declSpillSlot(nm, ScalarSlot, isFloat = false)
+  namedStackLoc(nm, ScalarSlot, spillTemp = true)
+
 proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
   ## Release a reserved/resolved temp — the emit-time `releaseTmp`: clear the
   ## pick flag and, if a consumer bound it, `(kill)` the binding so the
