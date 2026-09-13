@@ -103,6 +103,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "  if (typeof h === \"bigint\") return Number(h);\n" &
   "  return h < 1 ? null : JSP[h];\n" &
   "}\n" &
+  "const __internExt = ewrap; // splice-facing alias: intern a host value as a handle\n" &
   # The osalloc contract is wasm's: size in 64 KiB pages, grow returns the old
   # page count or -1. Not bytes — osalloc multiplies by 65536 itself.
   "function memorySize() { return JMEM.byteLength >> 16; }\n" &
@@ -249,6 +250,22 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "  U8.set(enc, p); U8[p + n] = 0;\n" &
   "  return p;\n" &
   "}\n" &
+  # Length-based bridges, for the C shapes that are neither a Nim string nor
+  # a NUL-terminated cstring: a (data, length) view. `strViewToJs` decodes a
+  # WGPUStringView (WebGPU's string shape — NOT NUL-terminated); `memView`
+  # hands the host a live subarray of linear memory (queue.writeBuffer data),
+  # re-reading U8 at call time so a grown memory is never stale.
+  "function strViewToJs(p, n) {\n" &
+  "  if (n === 0 || p === 0) return \"\";\n" &
+  "  if (n < 0) {\n" &
+  "    // WGPUStringView's WGPU_STRLEN sentinel (high(csize_t) crosses as -1):\n" &
+  "    // the string is NUL-terminated, so find the end before decoding.\n" &
+  "    let z = U8.indexOf(0, p);\n" &
+  "    n = z < 0 ? U8.length - p : z - p;\n" &
+  "  }\n" &
+  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(p, p + n));\n" &
+  "}\n" &
+  "function memView(p, n) { return U8.subarray(p, p + n); }\n" &
   # The shadow stack is reused memory, so an uninitialized local would read the
   # previous frame's bytes; the back end zeroes what Leng leaves undefined.
   "function zeroMem(d, n) { U8.fill(0, d, d + n); }\n" &

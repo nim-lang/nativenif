@@ -900,7 +900,7 @@ proc slotAddr(g: var JsGen; off: int) =
   g.outp.numLit int64(off)
   g.outp.closeTag
 
-proc takeTemp(g: var JsGen; size: int): int =
+proc takeTemp(g: var JsGen; size: int; what: string = ""): int =
   ## The next planned temporary. `planFrame` walked the same tree in the same
   ## preorder and reserved an offset for every node that must be materialized;
   ## consuming that plan here is what keeps layout and codegen from disagreeing
@@ -908,15 +908,15 @@ proc takeTemp(g: var JsGen; size: int): int =
   ## an internal error, reported as a refusal rather than emitting a program
   ## that reads the wrong slot.
   if g.p.tmpAt >= g.p.tmpPlan.len:
-    err g, "internal: unplanned temporary of " & $size & " bytes"
+    err g, "internal: unplanned temporary of " & $size & " bytes in `" & g.p.jsName & "`"
   if g.p.tmpPlan[g.p.tmpAt].size != size:
     # A short slice of the plan around the divergence names the frame offset
     # that broke, which is far quicker to trace than the raw index.
     var dump = ""
     for q in max(0, g.p.tmpAt - 6) ..< min(g.p.tmpPlan.len, g.p.tmpAt + 3):
       dump.add ' ' & $q & ':' & $g.p.tmpPlan[q].size
-    err g, "internal: temporary plan mismatch (planned " &
-           $g.p.tmpPlan[g.p.tmpAt].size & ", asked " & $size & ")" & dump
+    err g, "internal: temporary plan mismatch in `" & g.p.jsName & "` [" & what &
+           "] (planned " & $g.p.tmpPlan[g.p.tmpAt].size & ", asked " & $size & ")" & dump
   result = g.p.tmpPlan[g.p.tmpAt].off
   inc g.p.tmpAt
 
@@ -1323,6 +1323,12 @@ type
     taken: HashSet[string]
     off: int
 
+proc isHostDeclaration(decl: Cursor): bool
+  ## Forward declaration; defined with `ensureProc`. `genCallFrom` needs it to
+  ## refuse a bodyless extern (importc/importcpp/importjs) at the call site.
+proc hasPragma(decl: Cursor; want: LengPragma): bool
+  ## Forward declaration; defined with the pragma helpers. `genCallFrom` needs
+  ## it to route a bodyless `importjs` proc to the splice.
 proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
   if c.kind != TagLit: return
   if c.stmtKind == VarS:
@@ -1395,6 +1401,31 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
       pl.off = align(pl.off, dal)
       g.p.tmpPlan.add TempSlot(off: pl.off, size: dsz)
       pl.off += max(dsz, 8)
+  # An `importjs` splice takes bridge-typed arguments (string, cstring, handle,
+  # callback) as JS values, NOT as fresh Nim copies — `genCallArgs` emits the
+  # conversion instead of `genAggArg`. The plan must skip those reservations or
+  # the two walks desynchronize.
+  var spliceBridges: seq[JsBridgeKind]
+  if c.exprKind == CallC:
+    var tg = sub(c)
+    if tg.kind == Symbol:
+      var found = false
+      let decl = procDeclOf(g, symName(tg), found)
+      if found and not hasBody(decl) and hasPragma(decl, ImportjsP):
+        var p = decl
+        p.into:
+          inc p                                # name
+          p.into:                              # params
+            while p.hasMore:
+              var q = p
+              q.into:
+                inc q                          # name
+                skip q                         # pragmas
+                spliceBridges.add jsBridgeKind(g, q)
+                while q.hasMore: skip q
+              skip p
+          skip p                                 # result type
+          while p.hasMore: skip p                # pragmas, body
   var t = c
   t.into:
     var idx = 0                                # child 0 is the target, not an arg;
@@ -1426,11 +1457,15 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
         # The aggregate argument's fresh copy is reserved HERE, before the walk
         # into the argument: `genAggArg` takes it ahead of any temporary the
         # argument's own subtree needs — the same order, or `takeTemp` refuses.
-        let (csz, cal) = aggArgDestSize(g, t)
-        if csz > 0:
-          pl.off = align(pl.off, cal)
-          g.p.tmpPlan.add TempSlot(off: pl.off, size: csz)
-          pl.off += max(csz, 8)
+        # A splice's bridge argument rides across as a JS value instead, so
+        # `genCallArgs` takes no temp for it and none is planned.
+        let bi = idx - argFrom
+        if not (bi < spliceBridges.len and spliceBridges[bi] != jbNone):
+          let (csz, cal) = aggArgDestSize(g, t)
+          if csz > 0:
+            pl.off = align(pl.off, cal)
+            g.p.tmpPlan.add TempSlot(off: pl.off, size: csz)
+            pl.off += max(csz, 8)
       planNode(g, pl, t, childTemp)
       skip t
       inc idx
@@ -1673,7 +1708,7 @@ proc genExpr(g: var JsGen; c: Cursor) =
     of OconstrC, AconstrC:
       # A constructor in value position materializes in its planned slot and
       # travels as that slot's address.
-      let off = takeTemp(g, constrSize(g, c))
+      let off = takeTemp(g, constrSize(g, c), "ctor")
       genCtorInto(g, off, c)
     of CallC: genCall(g, c, wantValue = true)
     else: err g, "unsupported expression: " & $c.exprKind
@@ -1779,7 +1814,7 @@ proc genAggArg(g: var JsGen; t: Cursor; sz: int) =
   ## visible in the caller's object. `copyAgg` returns the destination, so the
   ## copy IS the argument expression. The temp is taken BEFORE the source is
   ## walked, exactly the order `planFrame` reserved it in.
-  let dst = takeTemp(g, sz)
+  let dst = takeTemp(g, sz, "aggArg")
   g.outp.openTree Call
   g.outp.ident "copyAgg"
   genExpr(g, t)
@@ -1813,7 +1848,7 @@ proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
   g.outp.ident "FTAB"
   genCalleeValue(g, target)
   g.outp.closeTag
-  if aggRet: slotAddr(g, takeTemp(g, byteSize(g, retT)))
+  if aggRet: slotAddr(g, takeTemp(g, byteSize(g, retT), "ind-sret"))
   if paramsT.kind == TagLit:
     paramsT.into:
       while paramsT.hasMore:
@@ -2118,12 +2153,7 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
     else:
       err g, "(instr …) not lowered by jorogumo: " & $it.op
 
-proc isHostDeclaration(decl: Cursor): bool
-  ## Forward declaration; defined with `ensureProc`. `genCallFrom` needs it to
-  ## refuse a bodyless extern (importc/importcpp/importjs) at the call site.
-proc hasPragma(decl: Cursor; want: LengPragma): bool
-  ## Forward declaration; defined with the pragma helpers. `genCallFrom` needs
-  ## it to route a bodyless `importjs` proc to the splice.
+
 
 proc importjsTemplate(decl: Cursor): string =
   ## The `{.importjs: "tpl".}` splice template, carried in the proc's pragma
@@ -2188,9 +2218,22 @@ proc callbackBridge(g: var JsGen; t: Cursor; pt: Cursor) =
     case jsBridgeKind(g, pty)
     of jbNone:
       if isAggType(g, pty):
-        err g, "a JS callback parameter cannot be an aggregate struct"
+        # An aggregate (a `WGPUStringView`, say) travels as the address of a
+        # materialized copy — the same rule `genCallArgs` uses for ordinary
+        # calls. A host that fires such a callback must hand over that
+        # address, which is exactly what the Nim-side fire splices do (they
+        # pass `cast[int](addr sv)`); a raw JS object here would be garbage,
+        # but no host we control does that.
+        discard
       argExprs.add a
-    of jbHandle:  argExprs.add "ewrap(" & a & ")"; bridged = true
+    of jbHandle:
+      # A host that hands over a JS object gets an EXT handle for it. A
+      # number is already a raw value — a Nim address (userdata) or an
+      # interned handle — and must pass through untouched, so a pointer a
+      # Nim caller stored in `userdata` arrives as the same pointer.
+      argExprs.add "(typeof " & a & " === \"object\" && " & a &
+                   " !== null ? ewrap(" & a & ") : " & a & ")"
+      bridged = true
     of jbString:  argExprs.add "jsToNimStr(" & a & ")"; bridged = true
     of jbCstring: argExprs.add "jsToCstr(" & a & ")"; bridged = true
     of jbCallback: err g, "a JS callback cannot take a Nim callback parameter"
@@ -2212,13 +2255,26 @@ proc callbackBridge(g: var JsGen; t: Cursor; pt: Cursor) =
     genExpr(g, t)
     g.outp.closeTag
     return
-  # A wrapper bridges the JS call to the Nim proc. The target must be a named
-  # proc (its slot is baked in); a capturing closure is out of reach because
-  # jorogumo carries no environment.
+  # A wrapper bridges the JS call to the Nim proc. A named proc bakes its slot
+  # in; a stored fn-ptr (a `callbackInfo.callback` field, a slot variable) is
+  # bridged around the value the operand evaluates to — `FTAB[h]` is the Nim
+  # proc itself, so only the arguments need converting. A capturing closure
+  # stays out of reach: jorogumo carries no environment.
   let sym = operandProcSym(g, t)
   if sym.len == 0:
-    err g, "a bridged JS callback must name a Nim proc directly (a stored fn-ptr " &
-           "or a capturing closure cannot be bridged here)"
+    let w = "__cb" & $g.callbacks.len
+    var dynCall = "slot(" & argExprs.join(", ") & ")"
+    if retBridge.len > 0: dynCall = retBridge & "(" & dynCall & ")"
+    g.callbacks.add "function " & w & "(slot) { return (...a) => " & dynCall &
+                    "; }\n"
+    g.outp.openTree Call
+    g.outp.ident w
+    g.outp.openTree Index
+    g.outp.ident "FTAB"
+    genExpr(g, t)
+    g.outp.closeTag
+    g.outp.closeTag
+    return
   var found = false
   let cdecl = procDeclOf(g, sym, found)
   if not found: err g, "unknown callback proc: " & sym
@@ -2435,7 +2491,7 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       # The struct-return destination is the CALLER's planned temporary, and it
       # is reserved before the arguments are walked: `planFrame` reserved it at
       # the call node, and any temporary an argument needs comes after it.
-      if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt)))
+      if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt), "sret"))
       genCallArgs(g, decl, t)
       g.outp.closeTag
 
