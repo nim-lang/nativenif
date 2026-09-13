@@ -347,17 +347,15 @@ proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSl
   result = slots
 
 proc isLeafArg*(a: Cursor): bool =
-  ## A scalar argument that phase 2 can load into its ABI register from where
-  ## it lives, with nothing computed that could touch another register: a
-  ## literal, a symbol (a home, a global, a thread-local, a proc), or a
-  ## literal wrapper around one. Everything else is computed in phase 1.
-  case a.kind
+  ## A scalar call argument that can be loaded into its ABI register from where
+  ## it lives, at any point of the marshalling: a literal or a symbol (a home,
+  ## a global, a thread-local, a proc) under any `cast`/`conv`/`suf`/`par`
+  ## wrappers (`leafCore`). Loading it writes that register alone and pins no
+  ## other — a sign/zero extension or a reinterpretation happens in place. What
+  ## it READS is the other question, `exprReadsReg`'s. Everything else is
+  ## computed in phase 1.
+  let c = leafCore(a)
+  case c.kind
   of IntLit, UIntLit, CharLit, StrLit, Symbol: true
-  of TagLit:
-    case a.exprKind
-    of NilC, TrueC, FalseC: true
-    of SufC, ParC:
-      var inner = a; inc inner
-      isLeafArg(inner)
-    else: false
+  of TagLit: c.exprKind in {NilC, TrueC, FalseC}
   else: false

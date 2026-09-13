@@ -389,25 +389,27 @@ proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bo
         while n.hasMore: (markArgParamsUnsafe(c, n, ordinal, cleanCall); skip n)
   else: discard
 
+proc leafCore*(n: Cursor): Cursor =
+  ## The operand under any `cast`/`conv`/`suf`/`par` wrappers — what an operand
+  ## IS once its spelling is peeled. The wrappers are not decoration: a front-end
+  ## spells a typed literal `(suf 511u "u32")` and an unsigned-normalized one
+  ## `(cast (u 64) (suf 4 "i64"))`, and a `kind in {IntLit,…}` test on the outer
+  ## node sees a `TagLit` and says no. Every leaf predicate starts here.
+  result = n
+  while result.kind == TagLit:
+    case result.exprKind
+    of CastC, ConvC:                       # `(cast TARGET value)` — skip the target type
+      var t = result; inc t; skip t; result = t
+    of SufC, ParC:                         # `(suf value "type")` / `(par value)`
+      var t = result; inc t; result = t
+    else: break
+
 proc isImmLeaf*(n: Cursor): bool =
   ## True when an operand is a compile-time immediate: a bare int/uint/char
-  ## literal, possibly wrapped in `cast`/`conv`/`suf`/`par`. Such an operand
-  ## materializes AT ITS POINT OF USE and so holds no register across a sibling
-  ## subtree — which is what lets the consumer evaluate the other operand
-  ## straight into the destination.
-  ##
-  ## The wrappers are not decoration. A front-end spells a typed literal
-  ## `(suf 511u "u32")` and an unsigned-normalized one `(cast (u 64) (suf 4
-  ## "i64"))`; a bare `kind in {IntLit,…}` test sees a `TagLit` and says no.
-  var c = n
-  while c.kind == TagLit:
-    case c.exprKind
-    of CastC, ConvC:                       # `(cast TARGET value)` — skip the target type
-      var t = c; inc t; skip t; c = t
-    of SufC, ParC:                         # `(suf value "type")` / `(par value)`
-      var t = c; inc t; c = t
-    else: break
-  result = c.kind in {IntLit, UIntLit, CharLit}
+  ## literal, possibly wrapped. Such an operand materializes AT ITS POINT OF USE
+  ## and so holds no register across a sibling subtree — which is what lets the
+  ## consumer evaluate the other operand straight into the destination.
+  leafCore(n).kind in {IntLit, UIntLit, CharLit}
 
 proc isConstShiftCount*(n: Cursor): bool {.inline.} =
   ## A shift count that is an immediate assembles as an `imm8` shift (`sar r, 4`),
