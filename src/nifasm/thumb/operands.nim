@@ -135,7 +135,11 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
           error("argument word index out of range for " & ctx.nameOf(argName), n)
         result.kind = okArg
         result.argName = argName
-        result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
+        if rawTagIsMFloatReg(paramPtr.regs[wordIdx]):   # a float argument's `(sN)`
+          result.isFloat = true
+          result.freg = tagToFloatRegisterM(paramPtr.regs[wordIdx], n)
+        else:
+          result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
         result.typ = argWordTypeM(paramPtr)
     elif t == ResTagId:
       # `(res name)` — a call's result, readable only after the call.
@@ -152,7 +156,11 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
       if resName in ctx.callContext.resultsSet:
         error("Result already bound: " & ctx.nameOf(resName), n)
       ctx.callContext.resultsSet.incl(resName)
-      result.reg = tagToRegisterM(resPtr.reg, n)
+      if rawTagIsMFloatReg(resPtr.reg):                # a float result's `(sN)`
+        result.isFloat = true
+        result.freg = tagToFloatRegisterM(resPtr.reg, n)
+      else:
+        result.reg = tagToRegisterM(resPtr.reg, n)
       result.typ = resPtr.typ
     elif t == CsizeTagId:
       # `(csize)` — the outgoing stack-argument area of the CURRENT call. The
@@ -534,7 +542,11 @@ proc parseDestM*(n: var Cursor; ctx: var GenContext): OperandM =
       error("argument word index out of range for " & ctx.nameOf(argName), n)
     result.kind = okArg
     result.argName = argName
-    result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
+    if rawTagIsMFloatReg(paramPtr.regs[wordIdx]):       # a float argument's `(sN)`
+      result.isFloat = true
+      result.freg = tagToFloatRegisterM(paramPtr.regs[wordIdx], n)
+    else:
+      result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
     result.typ = argWordTypeM(paramPtr)
   elif n.kind == TagLit and (n.tag == MemTagId or n.tag == CastTagId):
     # `(cast T (mem …))` as a DESTINATION retypes — and thereby sizes — the

@@ -155,7 +155,8 @@ assigned with `(movsd (arg x.0) <xmm or float variable>)` (`movss` for an `(f 32
 and the result bound with `(movsd <xmm or float variable> (res ret.0))`; both are
 checked for exactly-once assignment like their GPR counterparts, and a same-register
 move is elided. On AArch64 the locations are `(dN)` / `(sN)` and the moves are
-`(fmov (arg x.0) …)` and `(fmov … (res ret.0))`.
+`(fmov (arg x.0) …)` and `(fmov … (res ret.0))`; RV32 (`(sN)`/`(dN)` naming
+fa0–fa7) and Cortex-M (`(sN)`, single precision only) spell them the same way.
 
 ### Stack parameters
 

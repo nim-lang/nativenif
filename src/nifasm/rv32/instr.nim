@@ -355,7 +355,8 @@ proc genPrepareRv(n: var Cursor; ctx: var GenContext) =
       genInstRv(n, ctx)
 
   for param in ctx.callContext.typ.params:
-    if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
+    if not param.typ.isOnStack and param.regs.len > 0 and
+       param.name notin ctx.callContext.argsSet:
       error("Missing argument: " & ctx.nameOf(param.name), hdr)
   for res in ctx.callContext.typ.results:
     if res.name notin ctx.callContext.resultsSet:
@@ -514,7 +515,11 @@ proc genMovRv(n: var Cursor; ctx: var GenContext) =
   let src = parseOperandRv(n, ctx)
   if dst.isFloat:
     if src.isFloat:
-      rv.emitFmv(ctx.buf.data, dst.freg, src.freg, dst.fw)
+      # A same-register move is elided, as the integer one is: `(fmov (arg pN)
+      # (sN))` / `(fmov (s10) (res ret.0))` are the declarative-call markers
+      # resolving to the register the value already sits in.
+      if dst.freg != src.freg:
+        rv.emitFmv(ctx.buf.data, dst.freg, src.freg, dst.fw)
     elif src.kind == okMem:
       emitFpMemAccessRv(ctx, dst.freg, src.mem, dst.fw, isLoad = true, n = n)
     elif dst.fw == rv.FpS:

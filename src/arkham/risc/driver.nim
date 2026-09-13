@@ -276,7 +276,10 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.oneThread = not board.given or board.slotCount <= 1
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
-  g.prog = collect(buf, inputPath, tags, darwin = false)
+  # `fullSigs`: every Cortex-M boundary is declarative — a float param/result is
+  # an `(sN)` location in the typed signature (FPv4-SP: single precision only, a
+  # double is refused before it gets here).
+  g.prog = collect(buf, inputPath, tags, darwin = false, fullSigs = true)
   g.rejectForThumbM()
   g.adoptProgram()
   g.ab.tree StmtsA64:
@@ -427,7 +430,9 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                  else: Rv32DefaultStackTop
   g.ab.renderReg = machine_rv32.regNameRv     # `(x0)`..`(x30)`/`(sp)`
   g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
-  g.prog = collect(buf, inputPath, tags, darwin = false)
+  # `fullSigs`: every RV32 boundary is declarative — a float param/result is a
+  # `(sN)`/`(dN)` location (fa0–fa7) in the typed signature.
+  g.prog = collect(buf, inputPath, tags, darwin = false, fullSigs = true)
   # No `rejectForRv32` twin of Cortex-M's declaration-time refusals: RV32IMAFD
   # has both float precisions, hardware divide and self-ordering atomics, so what
   # it lacks is refused per intrinsic (`BitScanOps`, narrow atomics) instead.
@@ -477,9 +482,8 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.oneThread = linux
   g.ab.arch = "a64"                # BodyLib entries this target may splice
   # `fullSigs`: every AArch64 proc boundary is declarative — the typed signature
-  # carries float params/results (`(dN)`/`(sN)`) too. RV32 and Cortex-M keep the
-  # manual path for floats; a Darwin extern declares no signature and keeps it as
-  # well (`collect` leaves those non-declarative).
+  # carries float params/results (`(dN)`/`(sN)`) too. A Darwin extern declares no
+  # signature and keeps the manual path (`collect` leaves those non-declarative).
   g.prog = collect(buf, inputPath, tags, darwin = not linux, fullSigs = true)
   g.adoptProgram()
   g.ab.tree StmtsA64:

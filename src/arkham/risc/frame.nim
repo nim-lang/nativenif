@@ -781,7 +781,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
                   g.ab.tree ParamD:
                     g.ab.symDef paramName(pl.ord)
                     if not pl.onStack:
-                      g.ab.freg(g.md.floatArgRegs[pl.fpIndex], slotOf(g.prog, c).size * 8)
+                      g.ab.freg(g.md.floatArgRegs[pl.fpIndex], floatBitsFor(slotOf(g.prog, c).size))
                     else: g.ab.keyword SO       # 9th+ float: stack-passed
                     g.genTypeBody(c)
                 elif pl.isWideScalar:
@@ -845,7 +845,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
             # `(fmov (d0) (res ret.0))` right after the call, the twin of the x0
             # announcement for a scalar.
             g.ab.symDef synth("ret.0")
-            g.ab.freg(g.md.floatRetReg, rs.size * 8)
+            g.ab.freg(g.md.floatRetReg, floatBitsFor(rs.size))
             g.genTypeBody(c)
           elif g.isWideSlot(rs):
             # A 64-bit result travels in r0:r1 with an EMPTY result slot, exactly

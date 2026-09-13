@@ -1,0 +1,94 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (type :Empty.0
+  (object))
+ (proc :twice.0
+  (params
+   (param :p0.0
+    (s0)
+    (f 32))
+   (param :p1.0
+    (regs)Empty.0)
+   (param :p2.0
+    (r0)
+    (i 32)))
+  (result :ret.0
+   (s0)
+   (f 32))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (fadd
+    (s0)
+    (s0))
+   (scvtf
+    (s1)
+    (r0))
+   (fadd
+    (s0)
+    (s1))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (r0)
+   (i 32))
+  (stmts
+   (var :code.0
+    (r4)
+    (i 32))
+   (var :blo.0
+    (s)
+    (i 32))
+   (var :bhi.0
+    (s)
+    (i 32))
+   (sub
+    (sp)
+    (ssize))
+   (mov
+    (r0)3758157192)
+   (ldr
+    (r1)
+    (mem
+     (r0)0))
+   (orr
+    (r1)15728640)
+   (str
+    (mem
+     (r0)0)
+    (r1))
+   (dsb)
+   (isb)
+   (mov
+    (r2)1077936128)
+   (fmov
+    (s3)
+    (r2))
+   (prepare twice.0
+    (fmov
+     (arg p0.0)
+     (s3))
+    (mov
+     (arg p2.0)36)
+    (call)
+    (fmov
+     (s0)
+     (res ret.0)))
+   (fcvtzs code.0
+    (s0))
+   (mov
+    (r2)131110)
+   (mov blo.0
+    (r2))
+   (mov bhi.0 code.0)
+   (lea
+    (r1)blo.0)
+   (mov
+    (r0)32)
+   (bkpt 171)
+   (ret))))

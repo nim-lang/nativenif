@@ -878,7 +878,8 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                     g.ab.tree ParamD:           # a v-register location, see `emitSignature`
                       g.ab.symDef paramName(pl.ord)
                       if not pl.onStack:
-                        g.ab.freg(g.md.floatArgRegs[pl.fpIndex], slotOf(g.prog, c).size * 8)
+                        g.ab.freg(g.md.floatArgRegs[pl.fpIndex],
+                                  floatBitsFor(slotOf(g.prog, c).size))
                       else: g.ab.keyword SO
                       g.genPointee(c)
                   elif pl.isAgg or pl.isWideScalar:
@@ -916,7 +917,7 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             skip c
           elif slotOf(g.prog, c).kind == AFloat:
             g.ab.symDef synth("ret.0")
-            g.ab.freg(g.md.floatRetReg, slotOf(g.prog, c).size * 8)
+            g.ab.freg(g.md.floatRetReg, floatBitsFor(slotOf(g.prog, c).size))
             g.genPointee(c)
           else:
             g.ab.symDef synth("ret.0")

@@ -268,10 +268,10 @@ Recent miscompiles whose fix was a *protocol* rule rather than an encoding detai
 - the 13 remaining `takeHeld` sites — `call_marshal` covers the park; each of
   those holds a value across something else (a call, an index expression that
   calls) and needs its own demand modelled the same way;
-- the RISC emitter runs the same two phases (AArch64 has no ISA-pinned argument
-  register, so it never parks: a computed scalar goes into its own register in
-  phase 1 and an aggregate lvalue's address is computed at load time), and
-  AArch64 boundaries are fully declarative. RV32 and Cortex-M still keep the
-  manual path for floats, and a Darwin extern declares no signature; both are
-  the remaining non-declarative call sites;
+- the RISC emitter runs the same two phases (no RISC machine here pins an
+  argument register, so it never parks: a computed scalar goes into its own
+  register in phase 1 and an aggregate lvalue's address is computed at load
+  time), and AArch64, RV32 and Cortex-M boundaries are fully declarative. A
+  Darwin extern declares no signature; that is the one remaining
+  non-declarative call site (and the manual path's only user);
 - a tlanif port of `call_marshal`.

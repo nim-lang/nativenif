@@ -205,7 +205,8 @@ proc genPrepareM(n: var Cursor; ctx: var GenContext) =
       genInstM(n, ctx)
 
   for param in ctx.callContext.typ.params:
-    if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
+    if not param.typ.isOnStack and param.regs.len > 0 and
+       param.name notin ctx.callContext.argsSet:
       error("Missing argument: " & ctx.nameOf(param.name), hdr)
   for res in ctx.callContext.typ.results:
     if res.name notin ctx.callContext.resultsSet:
@@ -672,7 +673,10 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     let d = parseDestM(n, ctx)
     let sOp = parseOperandM(n, ctx)
     if d.isFloat and sOp.isFloat:
-      thumb2.emitVmovReg(ctx.buf.data, d.freg, sOp.freg)
+      # A same-register move is elided: `(fmov (arg pN) (sN))` and
+      # `(fmov (s0) (res ret.0))` are the declarative-call markers resolving to
+      # the register the value already sits in.
+      if d.freg != sOp.freg: thumb2.emitVmovReg(ctx.buf.data, d.freg, sOp.freg)
     elif d.isFloat:
       var sr: thumb2.Register
       if sOp.kind in {okReg, okArg} and not sOp.isFloat: sr = sOp.reg

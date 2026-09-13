@@ -128,6 +128,11 @@ proc defaultFloatSlot*(): AsmSlot {.inline.} =
   ## literal carries no width of its own, and picking one that the target cannot
   ## encode turns "no width stated" into a refusal.
   AsmSlot(cls: AFloat, size: maxFloatSize(), align: maxFloatSize())
+proc floatBitsFor*(size: int): int {.inline.} =
+  ## The float WIDTH a slot of `size` bytes has on this target: a 64-bit float
+  ## is 32 bits where the target has no wider one (Cortex-M's FPv4-SP). The one
+  ## rule for a signature location's `(sN)`/`(dN)` and for the value moves.
+  if size == 4 or maxFloatSize() == 4: 32 else: 64
 proc wordBits*(): int {.inline.} = targetWord.ptrSize * 8
   ## The native register width in BITS — what a temp or a raw register operand is
   ## declared at in the emitted asm-NIF. 64 on x86-64 and AArch64, 32 on Cortex-M.

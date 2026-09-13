@@ -1386,7 +1386,11 @@ proc rv32AsmTests() =
     return
   let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
   const fixtures = ["riscv32_alu", "riscv32_call", "riscv32_stackargs",
-                    "riscv32_global", "riscv32_branch", "riscv32_float"]
+                    "riscv32_global", "riscv32_branch", "riscv32_float",
+                    # a float param `(s10)`, a float result `(s10)` and an empty
+                    # `(regs)` param in a typed signature: `(fmov (arg p0.0) …)`
+                    # assigns, `(fmov (s10) (res ret.0))` binds (3+3+36 = 42)
+                    "riscv32_float_sig"]
   var passed = 0
   for name in fixtures:
     let src = "tests" / (name & ".nif")
@@ -1761,7 +1765,9 @@ proc cortexMAsmTests() =
                     ("cortex_m_call", 42, ""),
                     ("cortex_m_stackargs", 42, ""),
                     ("cortex_m_global", 42, ""),
-                    ("cortex_m_aggr", 42, "")]
+                    ("cortex_m_aggr", 42, ""),
+                    # the Cortex-M twin of `riscv32_float_sig` (FPv4-SP: `(s0)`)
+                    ("cortex_m_float_sig", 42, "")]
   var passed = 0
   for (stem, wantCode, wantOut) in fixtures:
     let src = "tests" / (stem & ".nif")
