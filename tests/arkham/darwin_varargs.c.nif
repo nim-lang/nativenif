@@ -19,4 +19,4 @@
    (var :k.0 . (i 64) 7)
    (var :r.0 . (i 32)
     (call snprintf.0 (addr buf.1) (suf 32u "u64") "%lld %g %s" k.0 2.5 "x"))
-   (call exit.0 (sub (i 32) r.0 9)))))
+   (call exit.0 (sub (i 32) r.0 7)))))   # "7 2.5 x" is 7 chars: exit 0 iff the tail arrived

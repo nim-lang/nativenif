@@ -3579,13 +3579,18 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   # the address of an aggregate lvalue; a stack-passed argument is stored into
   # the outgoing area outright (memory survives everything); a float goes
   # straight into its xmm and is sealed (no argument expression pins an xmm).
-  # The one liberty taken: a computed scalar whose ABI register NO later
-  # argument clobbers is computed straight into it — the register is sealed
-  # from then on, so no later expression stages through it, and the `(mov (arg
-  # pN) rN)` phase 2 emits for it is elided by nifasm.
   #
-  # Phase 2 loads the ABI registers in order from the sources and binds each
-  # with `(arg pN [k])`. Its only computation is address arithmetic on
+  # The liberty, and it is what keeps the common case free: an argument whose
+  # register(s) NO later argument clobbers is loaded right away, in source
+  # order — a computed scalar straight into its ABI register (sealed from then
+  # on, so no later expression stages through it), a leaf or an aggregate
+  # through the same loader phase 2 uses. A leaf's load then overlaps the
+  # computation of the arguments after it, as it always did; loading every
+  # leaf late cost nifbench's parse phase 3 % for nothing. Only an argument a
+  # later one clobbers is deferred.
+  #
+  # Phase 2 loads the deferred arguments in order from their sources and binds
+  # each with `(arg pN [k])`. Its only computation is address arithmetic on
   # registers that are parks or homes, and it writes only the register(s) of
   # the argument being loaded.
   #
@@ -3614,151 +3619,31 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.ab.tree ArgX: g.ab.sym paramName(0)
         g.emReg amd.intArgRegs[0]
       g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0]
-    # ── phase 1: every argument expression runs ──────────────────────────────
-    for j in 0 ..< argCurs.len:
-      let a = argCurs[j]
-      let pl = plan.args[j]
-      let nameIdx = pl.ord
-      srcs[j] = ArgSrc(kind: asDone, ptrReg: NoReg)
-      if pl.isAgg:
-        let tcur = g.getType(a)
-        if tcur.kind != Symbol:
-          raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
-        let tn = tcur.symId
-        let isLval = a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}
-        if pl.onStack:
-          # Stack-passed: the outgoing slot IS the park. Word by word through a
-          # staging register, now, from wherever the aggregate is.
-          g.plan.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
-          var srcAddr = NoReg
-          var srcSpilled = false
-          var srcOwned = true
-          if isLval:
-            let addrHeld = g.takeHeld("an aggregate-arg address", canSpill = true)
-            heldArgs.add addrHeld
-            let recorded = (if addrHeld.kind == InReg: addrHeld.r else: NoReg)
-            g.emitLvalue2(a)
-            (srcAddr, srcSpilled) = g.aggrArgAddr(a, recorded, [])
-          else:
-            let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
-            if ptrReg != NoReg:
-              srcAddr = ptrReg; srcOwned = false
-            else:
-              srcAddr = g.pickStagingSealed("a stack aggregate-arg address", AddrSlot)
-              srcSpilled = true
-              let hl = (if home.len > 0 and a.kind == Symbol:
-                          g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
-                        else: noLoc)
-              if hl.kind == InRegPair: g.emPairHomeAddr(srcAddr, a, hl, tcur, tn)
-              elif home.len > 0: g.emAggrHomeAddr(srcAddr, home)
-              elif isTvar: g.emTvarAddr(srcAddr, symName(a))
-              else: g.emGlobalAddr(srcAddr, symName(a))
-          if pl.byRef:
-            g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcAddr)
-          else:
-            for k in 0 ..< pl.words:
-              let w = g.pickStagingSealed("a stack aggregate-arg word", AddrSlot)
-              g.ab.tree MovX64: (g.emReg w; g.emWordThroughPtr(srcAddr, k))
-              g.ab.tree MovX64: (outgoingSlot(nameIdx, k, true); g.emReg w)
-              g.giveBack w
-          if srcOwned:
-            if srcSpilled: g.giveBack srcAddr else: g.unbindTemp srcAddr
-          if isLval: g.freeLvalTemps2(a)
-        elif isLval:
-          # The address is the computed part: it is parked, the words are read
-          # through it in phase 2.
-          g.emitLvalue2(a)                     # pick embedded base/index regs
-          let p = g.park(j, AddrSlot)
-          if p.kind == InReg:
-            g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)   # bound by `takeParked`
-          else:
-            let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
-            g.aggrAddrInto(a, s, AddrSlot, doBind = false)
-            g.emitStoreLoc(p, s)
-            g.giveBack s
-          g.freeLvalTemps2(a)
-          srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
-        else:
-          # In memory already — or BUILT into memory here (an `(oconstr …)` into
-          # its synthetic slot), which is the computation phase 1 exists for.
-          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
-          srcs[j] =
-            if ptrReg != NoReg: ArgSrc(kind: asAggrPtr, ptrReg: ptrReg)
-            elif home.len > 0: ArgSrc(kind: asAggrHome, home: home, ptrReg: NoReg)
-            elif isTvar: ArgSrc(kind: asAggrTvar, ptrReg: NoReg)
-            else: ArgSrc(kind: asAggrGlobal, ptrReg: NoReg)
-      elif g.isFloatExpr(a):
-        # Straight into its xmm argument register, SEALED for the rest of the
-        # marshalling: a later argument's float staging (`pickFStaging` draws on
-        # xmm0–7) must not pass through it. The width is the argument's OWN —
-        # `emitFValue2` picks a LITERAL's bit pattern from the destination slot,
-        # so a `float32` literal materialized as the double pattern has a zero
-        # low half. A variadic float reaches here already promoted to double, so
-        # its `exprSlot` is `(f 64)`.
-        if pl.onStack: raiseAssert "arkham x64: >8 float arguments (stack TODO)"
-        var fSlot = g.exprSlot(a)
-        if fSlot.kind != AFloat: fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
-        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex], fSlot)
-        g.emitFValue2(a, fD)
-        g.rb.sealF fD.f; sealedFArgs.incl fD.f
-        g.ab.tree (if fSlot.size == 4: MovssX64 else: MovsdX64):
-          g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
-          g.emFReg fD.f
-      elif pl.onStack:
-        # 7th+ scalar: any register, stored into its outgoing slot, released.
-        g.plan.hasStackVars = true             # outgoing stack-arg area ⇒ frame sub
-        var aD = needsReg(ScalarSlot)
-        g.emitValue2(a, aD)
-        var srcReg = NoReg
-        var ownSrc = false
-        if aD.kind == InReg:
-          srcReg = aD.r
-        else:                                  # pool-dry etmp: staged reload
-          srcReg = g.pickStaging("a spilled call-arg reload")
-          g.bindTemp(srcReg, ScalarSlot)
-          g.emitLoadLoc(aD, srcReg)
-          ownSrc = true
-        g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcReg)
-        if ownSrc: g.giveBack srcReg else: g.freeVal(aD)
-      elif isLeafArg(a):
-        srcs[j] = ArgSrc(kind: asLeaf, ptrReg: NoReg)
-      else:
-        # Computed. Its own ABI register when nothing later clobbers it (sealed
-        # from here on, see above); otherwise a park.
-        let abi = amd.gprAt(pl)
-        var aD: Location
-        if abi notin laterClob[j+1]:
-          g.releaseArgDest(abi, "")
-          g.rb.sealAccum abi; sealedArgs.incl abi
-          aD = regLoc(abi, ScalarSlot)
-        else:
-          aD = g.park(j, ScalarSlot)
-        let want = aD
-        g.emitValue2(a, aD)
-        assert aD.kind == want.kind and (aD.kind != InReg or aD.r == want.r),
-               "arkham x64n: a computed argument moved under its producer"
-        srcs[j] = ArgSrc(kind: asPark, loc: aD, ptrReg: NoReg)
-    # ── phase 2: load the ABI registers, in order ────────────────────────────
+    # ── the loader: an argument's ABI register(s) from its source, and its
+    # `(arg pN [k])` binding. Phase 1 calls it at once for an argument no later
+    # argument clobbers — the value then loads in source order, as it always
+    # did, and a leaf's load overlaps the computation of what follows it — and
+    # phase 2 calls it for the rest, once every clobbering expression has run.
     var loaded: set[Reg] = {}
-    for j in 0 ..< argCurs.len:
+    proc loadArg(g: var CodeGen; j: int) =
       let a = argCurs[j]
       let pl = plan.args[j]
       let nameIdx = pl.ord
       let src = srcs[j]
-      if src.kind == asDone: continue
       let aSym = if a.kind == Symbol: symName(a) else: ""
       var dst: seq[Reg] = @[]
       for k in 0 ..< pl.words: dst.add amd.gprAt(pl, k)
       case src.kind
       of asLeaf:
         if a.kind == Symbol:
-          # A home in a register phase 2 has ALREADY loaded would be read as the
-          # earlier argument. The analyser keeps a local read by a call's
-          # arguments out of the argument registers; hold it to that.
+          # A home in a register already loaded would be read as the earlier
+          # argument. The analyser keeps a local read by a call's arguments out
+          # of the argument registers; hold it to that.
           let h = g.plan.locationOfSym(aSym, cursorToPosition(g.buf[], a))
           if h.kind == InReg and h.r in loaded:
-            raiseAssert "arkham x64n: argument `" & aSym & "` is homed in " & $h.r &
-                        ", an argument register already loaded, in proc " & g.curProcName
+            raiseAssert "arkham x64n: argument " & $j & " `" & aSym & "` of " & tgt.asmName &
+                        " is homed in " & $h.r & ", an argument register already loaded, " &
+                        "in proc " & g.curProcName
         g.releaseArgDest(dst[0], aSym)
         g.rb.sealAccum dst[0]; sealedArgs.incl dst[0]
         var aD = regLoc(dst[0], ScalarSlot)
@@ -3817,6 +3702,206 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
       for r in dst:
         loaded.incl r
         g.rb.sealAccum r; sealedArgs.incl r
+      srcs[j] = ArgSrc(kind: asDone, ptrReg: NoReg)
+    # ── phase 0: arguments that READ a register this call loads ──────────────
+    # A value homed in an argument register of ANOTHER argument is destroyed
+    # when that argument is loaded. The allocator relocates such a local for a
+    # returning call — its arguments cross the call — but a DIVERGING callee's
+    # arguments are not a crossing, so a parameter passed to `panic` may still
+    # sit in the register `panic`'s first argument lands in. Every such
+    # argument is evaluated FIRST, into a park, before any register is loaded
+    # (the swap-through-a-temp of a parallel move; `takeParked` is total).
+    var handled = newSeq[bool](argCurs.len)
+    for j in 0 ..< argCurs.len:
+      let a = argCurs[j]
+      let pl = plan.args[j]
+      if pl.onStack or pl.isFloat: continue
+      var own: set[Reg] = {}
+      for k in 0 ..< pl.words: own.incl amd.gprAt(pl, k)
+      var atRisk = false
+      for r in claims - own:
+        if g.exprReadsReg(a, r): atRisk = true
+      if not atRisk: continue
+      if pl.isAgg:
+        if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+          g.emitLvalue2(a)                   # its address into a park
+          let p = g.park(j, AddrSlot)
+          if p.kind == InReg:
+            g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)
+          else:
+            let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
+            g.aggrAddrInto(a, s, AddrSlot, doBind = false)
+            g.emitStoreLoc(p, s)
+            g.giveBack s
+          g.freeLvalTemps2(a)
+          srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+        else:
+          # A by-reference pointer param homed in one of the registers: park
+          # the pointer, the words are read through it at load time.
+          let tcur = g.getType(a)
+          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tcur.symId)
+          assert ptrReg != NoReg and home.len == 0 and not isTvar,
+                 "arkham x64n: an at-risk aggregate argument that is not a pointer"
+          let p = g.park(j, AddrSlot)
+          if p.kind == InReg: g.movReg(p.r, ptrReg)
+          else: g.emitStoreLoc(p, ptrReg)
+          srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+      else:
+        var aD = g.park(j, ScalarSlot)
+        let want = aD
+        g.emitValue2(a, aD)
+        assert aD.kind == want.kind and (aD.kind != InReg or aD.r == want.r),
+               "arkham x64n: an at-risk argument moved under its producer"
+        srcs[j] = ArgSrc(kind: asPark, loc: aD, ptrReg: NoReg)
+      handled[j] = true
+    # ── phase 1: every argument expression runs ──────────────────────────────
+    for j in 0 ..< argCurs.len:
+      if handled[j]: continue
+      let a = argCurs[j]
+      let pl = plan.args[j]
+      let nameIdx = pl.ord
+      srcs[j] = ArgSrc(kind: asDone, ptrReg: NoReg)
+      # Does a later argument clobber one of this argument's registers? If not,
+      # it loads right here, in source order.
+      var deferred = false
+      if not pl.onStack and not pl.isFloat:
+        for k in 0 ..< pl.words:
+          if amd.gprAt(pl, k) in laterClob[j+1]: deferred = true
+      if pl.isAgg:
+        let tcur = g.getType(a)
+        if tcur.kind != Symbol:
+          raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
+        let tn = tcur.symId
+        let isLval = a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}
+        if pl.onStack:
+          # Stack-passed: the outgoing slot IS the park. Word by word through a
+          # staging register, now, from wherever the aggregate is.
+          g.plan.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
+          var srcAddr = NoReg
+          var srcSpilled = false
+          var srcOwned = true
+          if isLval:
+            let addrHeld = g.takeHeld("an aggregate-arg address", canSpill = true)
+            heldArgs.add addrHeld
+            let recorded = (if addrHeld.kind == InReg: addrHeld.r else: NoReg)
+            g.emitLvalue2(a)
+            (srcAddr, srcSpilled) = g.aggrArgAddr(a, recorded, [])
+          else:
+            let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
+            if ptrReg != NoReg:
+              srcAddr = ptrReg; srcOwned = false
+            else:
+              srcAddr = g.pickStagingSealed("a stack aggregate-arg address", AddrSlot)
+              srcSpilled = true
+              let hl = (if home.len > 0 and a.kind == Symbol:
+                          g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
+                        else: noLoc)
+              if hl.kind == InRegPair: g.emPairHomeAddr(srcAddr, a, hl, tcur, tn)
+              elif home.len > 0: g.emAggrHomeAddr(srcAddr, home)
+              elif isTvar: g.emTvarAddr(srcAddr, symName(a))
+              else: g.emGlobalAddr(srcAddr, symName(a))
+          if pl.byRef:
+            g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcAddr)
+          else:
+            for k in 0 ..< pl.words:
+              let w = g.pickStagingSealed("a stack aggregate-arg word", AddrSlot)
+              g.ab.tree MovX64: (g.emReg w; g.emWordThroughPtr(srcAddr, k))
+              g.ab.tree MovX64: (outgoingSlot(nameIdx, k, true); g.emReg w)
+              g.giveBack w
+          if srcOwned:
+            if srcSpilled: g.giveBack srcAddr else: g.unbindTemp srcAddr
+          if isLval: g.freeLvalTemps2(a)
+        elif isLval:
+          # The address is the computed part. Deferred, it is parked and the
+          # words are read through it in phase 2; otherwise it lives in a
+          # staging register only for the marshalling that follows at once.
+          g.emitLvalue2(a)                     # pick embedded base/index regs
+          if deferred:
+            let p = g.park(j, AddrSlot)
+            if p.kind == InReg:
+              g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)   # bound by `takeParked`
+            else:
+              let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
+              g.aggrAddrInto(a, s, AddrSlot, doBind = false)
+              g.emitStoreLoc(p, s)
+              g.giveBack s
+            srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+          else:
+            for k in 0 ..< pl.words: g.plan.seal amd.gprAt(pl, k)   # the pick must not alias a word
+            let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
+            for k in 0 ..< pl.words: g.plan.unseal amd.gprAt(pl, k)
+            g.aggrAddrInto(a, s, AddrSlot, doBind = false)
+            srcs[j] = ArgSrc(kind: asAggrAddr, loc: regLoc(s, AddrSlot, isTemp = true),
+                             ptrReg: NoReg)
+            g.loadArg(j)
+            g.giveBack s
+          g.freeLvalTemps2(a)
+        else:
+          # In memory already — or BUILT into memory here (an `(oconstr …)` into
+          # its synthetic slot), which is the computation phase 1 exists for.
+          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
+          srcs[j] =
+            if ptrReg != NoReg: ArgSrc(kind: asAggrPtr, ptrReg: ptrReg)
+            elif home.len > 0: ArgSrc(kind: asAggrHome, home: home, ptrReg: NoReg)
+            elif isTvar: ArgSrc(kind: asAggrTvar, ptrReg: NoReg)
+            else: ArgSrc(kind: asAggrGlobal, ptrReg: NoReg)
+          if not deferred: g.loadArg(j)
+      elif g.isFloatExpr(a):
+        # Straight into its xmm argument register, SEALED for the rest of the
+        # marshalling: a later argument's float staging (`pickFStaging` draws on
+        # xmm0–7) must not pass through it. The width is the argument's OWN —
+        # `emitFValue2` picks a LITERAL's bit pattern from the destination slot,
+        # so a `float32` literal materialized as the double pattern has a zero
+        # low half. A variadic float reaches here already promoted to double, so
+        # its `exprSlot` is `(f 64)`.
+        if pl.onStack: raiseAssert "arkham x64: >8 float arguments (stack TODO)"
+        var fSlot = g.exprSlot(a)
+        if fSlot.kind != AFloat: fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
+        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex], fSlot)
+        g.emitFValue2(a, fD)
+        g.rb.sealF fD.f; sealedFArgs.incl fD.f
+        g.ab.tree (if fSlot.size == 4: MovssX64 else: MovsdX64):
+          g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
+          g.emFReg fD.f
+      elif pl.onStack:
+        # 7th+ scalar: any register, stored into its outgoing slot, released.
+        g.plan.hasStackVars = true             # outgoing stack-arg area ⇒ frame sub
+        var aD = needsReg(ScalarSlot)
+        g.emitValue2(a, aD)
+        var srcReg = NoReg
+        var ownSrc = false
+        if aD.kind == InReg:
+          srcReg = aD.r
+        else:                                  # pool-dry etmp: staged reload
+          srcReg = g.pickStaging("a spilled call-arg reload")
+          g.bindTemp(srcReg, ScalarSlot)
+          g.emitLoadLoc(aD, srcReg)
+          ownSrc = true
+        g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcReg)
+        if ownSrc: g.giveBack srcReg else: g.freeVal(aD)
+      elif isLeafArg(a):
+        srcs[j] = ArgSrc(kind: asLeaf, ptrReg: NoReg)
+        if not deferred: g.loadArg(j)
+      else:
+        # Computed. Its own ABI register when nothing later clobbers it (sealed
+        # from here on, see above); otherwise a park.
+        let abi = amd.gprAt(pl)
+        var aD: Location
+        if not deferred:
+          g.releaseArgDest(abi, "")
+          g.rb.sealAccum abi; sealedArgs.incl abi
+          aD = regLoc(abi, ScalarSlot)
+        else:
+          aD = g.park(j, ScalarSlot)
+        let want = aD
+        g.emitValue2(a, aD)
+        assert aD.kind == want.kind and (aD.kind != InReg or aD.r == want.r),
+               "arkham x64n: a computed argument moved under its producer"
+        srcs[j] = ArgSrc(kind: asPark, loc: aD, ptrReg: NoReg)
+        if not deferred: g.loadArg(j)
+    # ── phase 2: the deferred arguments, in order ────────────────────────────
+    for j in 0 ..< argCurs.len:
+      if srcs[j].kind != asDone: g.loadArg(j)
     if isSyscall: g.emSyscall()
     elif tgt.extern: g.ab.keyword ExtcallX64     # dynamic import → indirect via the IAT/GOT
     elif doTail:

@@ -15,6 +15,10 @@
 \*              IS the park (sealed from then on);
 \*   aggr       an aggregate in memory is a source; an aggregate LVALUE's address
 \*              is computed and parked (the words are read through it later).
+\* The same liberty applies to a leaf and to a memory aggregate: when no later
+\* argument clobbers its register(s) it is LOADED right away, in source order
+\* (`EarlyLoad`) — that is the common case, and loading everything late cost
+\* nifbench's parse phase 3 % for nothing.
 \* A park (`takeParked`) is a callee-saved survivor, else a pool temp, else a
 \* spill slot. The pool hands out r10 and the argument registers themselves
 \* (`intLocalTempRegs`), rdx/rcx only in a proc with no division / variable
@@ -48,8 +52,9 @@
 \*                   -> ParksIntact
 \*   "noLaterClob"   every computed scalar goes into its own ABI register
 \*                   -> ParksIntact: a later expression destroys it
-\*   "earlyLoad"     leaves and memory aggregates are loaded in PHASE 1, as the
-\*                   fused loop did before the split
+\*   "earlyLoad"     leaves and memory aggregates are loaded in phase 1 WHETHER
+\*                   OR NOT a later argument clobbers them, as the fused loop
+\*                   did before the split
 \*                   -> LoadedIntact: a later expression destroys the loaded word
 \*
 \* Layouts: every call of 1..MaxArgs arguments from `Shapes`: a leaf, a computed
@@ -235,12 +240,13 @@ Load ==
     /\ j' = j + 1
     /\ UNCHANGED <<args, phase, evaluated, placed, parkOf, slots>>
 
-\* `Bug = "earlyLoad"`: the fused loop — a leaf or a memory aggregate is
-\* marshalled into its ABI register as soon as its turn comes in phase 1.
+\* A leaf or a memory aggregate is loaded into its ABI register(s) as soon as
+\* its turn comes in phase 1, when no later argument clobbers them. `Bug =
+\* "earlyLoad"` drops that guard: the fused loop before the split.
 EarlyLoad ==
-    /\ Bug = "earlyLoad"
     /\ phase = "eval" /\ j <= N /\ ArgEvaluated(j) /\ ~OnStack(j)
     /\ Kind(j) = "leaf" \/ (Kind(j) = "aggr" /\ ~args[j].viaAddr)
+    /\ Bug = "earlyLoad" \/ \A k \in Ks(j) : Abi(j, k) \notin LaterClob(j)
     /\ ~\E k \in Ks(j) : Word(j, k) \in loaded
     /\ LoadArg(j)
     /\ UNCHANGED <<args, phase, j, evaluated, placed, parkOf, slots>>

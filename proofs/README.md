@@ -198,9 +198,12 @@ Phase 1, per argument in order: a computed scalar parks its VALUE, an aggregate
 lvalue parks its ADDRESS, a leaf or a memory aggregate parks nothing; then the
 expression runs (the clobbers land) and the value lands in the park. Phase 2 loads
 each argument's ABI register(s) from its source, in order, writing nothing else. The
-one liberty: a computed scalar whose ABI register no later argument clobbers is
-computed straight into it (sealed from then on), so nifasm elides its `(mov (arg pN)
-rN)`.
+liberty, for the common case: an argument whose register(s) no later argument
+clobbers is loaded right away, in source order — a computed scalar straight into
+its ABI register (sealed from then on, its `(mov (arg pN) rN)` elided by nifasm), a
+leaf or a memory aggregate through the loader phase 2 uses (`EarlyLoad`). Loading
+every leaf late instead cost nifbench's parse phase 3 %: the leaf's load no longer
+overlapped the computation of the arguments after it.
 
 The park tiers (`takeParked`), any of which the emitter may take:
 
@@ -230,15 +233,24 @@ correct spec passes; each injection fails the invariant it should:
 | `noAvoid` | the pool ignores the call's claims | `ParksIntact` — a phase-2 load lands on the park |
 | `noBound` | the pool ignores what a register holds | `ParksIntact` |
 | `noLaterClob` | every computed scalar into its own ABI register | `ParksIntact` — a later expression destroys it |
-| `earlyLoad` | leaves and memory aggregates loaded in phase 1, the fused loop before the split | `LoadedIntact` — a later expression destroys the loaded word |
+| `earlyLoad` | leaves and memory aggregates loaded in phase 1 whether or not a later argument clobbers them, the fused loop before the split | `LoadedIntact` — a later expression destroys the loaded word |
 
 Two probe rows assert that `NoPoolPark` and `NoMemPark` FAIL on the correct spec —
 the pool and memory tiers are actually reached, so the invariants are not vacuous.
 
 Not modelled: byte layout (that is `aggr_marshal`), the hidden result pointer (one
 more claim), floats (they go straight into their sealed xmm; no argument expression
-pins an xmm), the inside of an argument's own expression. The procs carry `MODEL:`
-back-pointers.
+pins an xmm), the inside of an argument's own expression, and where an argument's
+VALUE lives before the call. That last gap is a real class the loader's assertion
+found on 2026-09-13 while this was being ported: an argument whose value is homed
+in an argument register of ANOTHER argument is destroyed when that argument loads.
+The allocator relocates such a local for a returning call, but a DIVERGING callee's
+arguments are not a crossing, so a parameter passed to `panic` still sat in the
+register `panic`'s first argument lands in — both backends passed the message's
+second word as the value (`tests/arkham/noreturn_arg_clobber`, exit 2 for 150).
+The emitters now evaluate such arguments first, into a park (phase 0). Modelling it
+means giving a leaf a HOME register and a load the power to destroy it; it belongs
+in this model's next revision. The procs carry `MODEL:` back-pointers.
 
 ## tlanif dialect notes (learned porting)
 

@@ -3110,13 +3110,31 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     # window per call and not a stack of them.
     assert g.md.divRemReg == NoReg and g.md.shiftCountReg == NoReg,
            "arkham risc: a fixed-role argument register needs the x64 park (`takeParked`)"
-    type RSrc = enum rsDone, rsLeaf, rsAggrLval, rsAggrMem, rsWideTrunc, rsWide
+    type RSrc = enum rsDone, rsLeaf, rsAggrLval, rsAggrMem, rsWideTrunc, rsWide,
+                     rsPark,      ## a value evaluated ahead of everything, in `parkLoc`
+                     rsAggrAddr   ## an aggregate whose address waits in `parkLoc`
     var srcs = newSeq[RSrc](argCurs.len)
+    var parkLoc = newSeq[Location](argCurs.len)
     var aggrHome = newSeq[string](argCurs.len)
     var aggrGlobal = newSeq[bool](argCurs.len)
     var aggrTvar = newSeq[bool](argCurs.len)
     var sealedFArgs: set[FReg] = {}
     var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
+    # Which argument registers does a LATER argument overwrite by ISA fiat?
+    # Empty on every RISC machine here, so nothing is ever deferred — the same
+    # rule as x86-64's, kept in one shape.
+    var laterClob: seq[set[Reg]] = @[]
+    block:
+      var per: seq[set[Reg]] = @[]
+      for a in argCurs: per.add g.fixedRegsClobberedBy(a)
+      laterClob = newSeq[set[Reg]](per.len + 1)
+      for i in countdown(per.len - 1, 0): laterClob[i] = laterClob[i+1] + per[i]
+    proc deferred(g: var CodeGen; j: int): bool =
+      let pl = plan.args[j]
+      if pl.onStack or pl.isFloat: return false
+      for k in 0 ..< max(pl.words, 1):
+        if g.md.gprAt(pl, k) in laterClob[j+1]: return true
+      false
     var tailGp = plan.gpUsed                 # the registers the tail would have taken
     var tailFp = plan.fpUsed
     proc claim(g: var CodeGen; pl: ParamPlace; aSym: string) =
@@ -3138,8 +3156,153 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     g.stagedArgs = {}
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
+      # ── the loader: an argument's ABI register(s) from its source, and its
+      # `(arg pN [k])` binding. Phase 1 calls it at once for an argument no later
+      # argument clobbers (every one, on a machine with no fixed-role argument
+      # register — see the assert above), phase 2 for the rest.
+      proc loadArg(g: var CodeGen; j: int) =
+        let a = argCurs[j]
+        let pl = plan.args[j]
+        let aSym = if a.kind == Symbol: symName(a) else: ""
+        g.claim(pl, aSym)
+        case srcs[j]
+        of rsLeaf:
+          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
+          g.emitValue2(a, aD)
+          g.unbindTemp(aD.r)
+          bindArg(j, aD.r)
+        of rsPark:
+          let p = parkLoc[j]
+          if p.kind == InReg:
+            bindArg(j, p.r)                  # nifasm moves it (or elides)
+          else:
+            g.place2(p, g.md.gprAt(pl))      # an etmp slot: reload into the register
+            bindArg(j, g.md.gprAt(pl))
+        of rsAggrAddr:
+          let tn = g.getType(a).symId
+          let p = parkLoc[j]
+          var addrReg = NoReg
+          var addrBridge = NoReg
+          if p.kind == InReg:
+            addrReg = p.r
+          else:
+            addrBridge = g.takeBridge(addrSlot())
+            g.place2(p, addrBridge)
+            addrReg = addrBridge
+          if pl.byRef: g.movReg(g.md.gprAt(pl), addrReg)
+          else: g.marshalAggrFromAddr(addrReg, tn, pl.gpFirst)
+          if addrBridge != NoReg: g.dropBridge addrBridge
+          if pl.byRef: bindArg(j, g.md.gprAt(pl)) else: bindArgWords(j, pl)
+        of rsAggrLval:
+          # The address is consumed within THIS argument's own loading, so a pool
+          # temp serves when no callee-saved survivor is free, and a bridge serves
+          # when both pools are dry — never a hard failure.
+          let tn = g.getType(a).symId
+          var srcAddr: Reg
+          var addrBridge = NoReg
+          var hr = g.pickHeldReg()
+          if hr == NoReg: hr = g.pickTempReg()
+          if hr != NoReg:
+            g.pickedRegs.incl hr
+            heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
+            srcAddr = hr
+          else:
+            addrBridge = g.takeBridge()
+            srcAddr = addrBridge
+          g.emitLvalue2(a)                 # pick embedded base/index regs
+          g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
+          if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
+          else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
+          if addrBridge != NoReg: g.dropBridge addrBridge
+          else: g.unbindTemp(srcAddr)
+          g.freeLvalTemps2(a)
+          if pl.byRef: bindArg(j, g.md.gprAt(pl)) else: bindArgWords(j, pl)
+        of rsAggrMem:
+          let tn = g.getType(a).symId
+          let home = aggrHome[j]
+          let hh = g.plan.homeOfSym(home)
+          if pl.byRef:
+            if aggrTvar[j]: g.genTlvAddr(symName(a), g.md.gprAt(pl))
+            elif aggrGlobal[j]: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
+            elif hh.kind == InReg:
+              g.movReg(g.md.gprAt(pl), hh.r)
+            elif hh.kind == StackPtr:
+              # Forwarding a by-ref param whose own pointer spilled: pass the pointer
+              # the slot HOLDS. (`lea &slot` would pass the address OF the pointer —
+              # what this arm did before the home could say so.)
+              g.emScalarLoad(g.md.gprAt(pl), hh.ptrName)
+            else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
+            bindArg(j, g.md.gprAt(pl))
+          else:
+            if aggrGlobal[j]: g.globalToRegs(symName(a), tn, pl.gpFirst, aggrTvar[j])
+            else: g.structToRegs(home, tn, pl.gpFirst)
+            bindArgWords(j, pl)
+        of rsWideTrunc:
+          g.wideArgTruncated(wideArgSlots[j], g.md.gprAt(pl))
+          bindArg(j, g.md.gprAt(pl))
+        of rsWide:
+          # Two consecutive argument registers, filled from the value's eight
+          # bytes and then bound as `(arg pN 0)` / `(arg pN 1)` — the same shape
+          # a two-eightbyte aggregate uses, because it is the same ABI question.
+          g.wideArgToRegs(wideArgSlots[j], pl.gpFirst)
+          bindArgWords(j, pl)
+        of rsDone: discard
+        srcs[j] = rsDone
+      # ── phase 0: arguments that READ a register this call loads ──────────────
+      # See the x64 twin: a parameter passed to a DIVERGING callee may still sit
+      # in a register that callee's earlier argument lands in — the allocator
+      # relocates it only for a call its arguments cross. Evaluated FIRST, into
+      # a temp (a register, or an `etmp` slot when the pools are dry), before
+      # any argument register is claimed.
+      var handled = newSeq[bool](argCurs.len)
+      var claims: set[Reg] = {}
+      for pl in plan.args:
+        if not pl.onStack and not pl.isFloat:
+          for k in 0 ..< max(pl.words, 1): claims.incl g.md.gprAt(pl, k)
+      for j in 0 ..< argCurs.len:
+        let a = argCurs[j]
+        let pl = plan.args[j]
+        if pl.onStack or pl.isFloat or (variadicFrom >= 0 and j >= variadicFrom): continue
+        var own: set[Reg] = {}
+        for k in 0 ..< max(pl.words, 1): own.incl g.md.gprAt(pl, k)
+        var atRisk = false
+        for r in claims - own:
+          if g.exprReadsReg(a, r): atRisk = true
+        if not atRisk: continue
+        if pl.isAgg:
+          let p = g.takeTmp(addrSlot())
+          heldArgs.add p
+          if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+            g.emitLvalue2(a)
+            if p.kind == InReg:
+              g.aggrAddrInto(a, p.r, addrSlot(), doBind = true)
+            else:
+              let b = g.takeBridge(addrSlot())
+              g.aggrAddrInto(a, b, addrSlot(), doBind = false)
+              g.storeReg2(p, b)
+              g.dropBridge b
+            g.freeLvalTemps2(a)
+          else:
+            let hh = g.plan.homeOfSym(symName(a))
+            assert a.kind == Symbol and hh.kind == InReg,
+                   "arkham risc: an at-risk aggregate argument that is not a pointer"
+            if p.kind == InReg:
+              g.bindTemp(p.r, addrSlot())
+              g.movReg(p.r, hh.r)
+            else:
+              g.storeReg2(p, hh.r)
+          parkLoc[j] = p
+          srcs[j] = rsAggrAddr
+        else:
+          var aD = g.takeTmp(ScalarSlot)
+          heldArgs.add aD
+          g.emitValue2(a, aD)
+          parkLoc[j] = aD
+          srcs[j] = rsPark
+        handled[j] = true
       # ── phase 1: every argument expression runs ──────────────────────────────
       for j in 0 ..< argCurs.len:
+        if handled[j]: continue
         let a = argCurs[j]
         let pl = plan.args[j]
         let aSym = if a.kind == Symbol: symName(a) else: ""
@@ -3249,73 +3412,12 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           g.emitValue2(a, aD)
           g.unbindTemp(aD.r)
           bindArg(j, aD.r)
-      # ── phase 2: load the ABI registers, in order ────────────────────────────
+        # Nothing later clobbers it (no RISC machine here pins an argument
+        # register): load it now, in source order.
+        if srcs[j] != rsDone and not g.deferred(j): g.loadArg(j)
+      # ── phase 2: the deferred arguments, in order ────────────────────────────
       for j in 0 ..< argCurs.len:
-        if srcs[j] == rsDone: continue
-        let a = argCurs[j]
-        let pl = plan.args[j]
-        let aSym = if a.kind == Symbol: symName(a) else: ""
-        g.claim(pl, aSym)
-        case srcs[j]
-        of rsLeaf:
-          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
-          g.emitValue2(a, aD)
-          g.unbindTemp(aD.r)
-          bindArg(j, aD.r)
-        of rsAggrLval:
-          # The address is consumed within THIS argument's own loading, so a pool
-          # temp serves when no callee-saved survivor is free, and a bridge serves
-          # when both pools are dry — never a hard failure.
-          let tn = g.getType(a).symId
-          var srcAddr: Reg
-          var addrBridge = NoReg
-          var hr = g.pickHeldReg()
-          if hr == NoReg: hr = g.pickTempReg()
-          if hr != NoReg:
-            g.pickedRegs.incl hr
-            heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
-            srcAddr = hr
-          else:
-            addrBridge = g.takeBridge()
-            srcAddr = addrBridge
-          g.emitLvalue2(a)                 # pick embedded base/index regs
-          g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
-          if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
-          else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
-          if addrBridge != NoReg: g.dropBridge addrBridge
-          else: g.unbindTemp(srcAddr)
-          g.freeLvalTemps2(a)
-          if pl.byRef: bindArg(j, g.md.gprAt(pl)) else: bindArgWords(j, pl)
-        of rsAggrMem:
-          let tn = g.getType(a).symId
-          let home = aggrHome[j]
-          let hh = g.plan.homeOfSym(home)
-          if pl.byRef:
-            if aggrTvar[j]: g.genTlvAddr(symName(a), g.md.gprAt(pl))
-            elif aggrGlobal[j]: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
-            elif hh.kind == InReg:
-              g.movReg(g.md.gprAt(pl), hh.r)
-            elif hh.kind == StackPtr:
-              # Forwarding a by-ref param whose own pointer spilled: pass the pointer
-              # the slot HOLDS. (`lea &slot` would pass the address OF the pointer —
-              # what this arm did before the home could say so.)
-              g.emScalarLoad(g.md.gprAt(pl), hh.ptrName)
-            else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
-            bindArg(j, g.md.gprAt(pl))
-          else:
-            if aggrGlobal[j]: g.globalToRegs(symName(a), tn, pl.gpFirst, aggrTvar[j])
-            else: g.structToRegs(home, tn, pl.gpFirst)
-            bindArgWords(j, pl)
-        of rsWideTrunc:
-          g.wideArgTruncated(wideArgSlots[j], g.md.gprAt(pl))
-          bindArg(j, g.md.gprAt(pl))
-        of rsWide:
-          # Two consecutive argument registers, filled from the value's eight
-          # bytes and then bound as `(arg pN 0)` / `(arg pN 1)` — the same shape
-          # a two-eightbyte aggregate uses, because it is the same ABI question.
-          g.wideArgToRegs(wideArgSlots[j], pl.gpFirst)
-          bindArgWords(j, pl)
-        of rsDone: discard
+        if srcs[j] != rsDone: g.loadArg(j)
       # Drop the variadic tail into a freshly carved outgoing area at [sp+0…]. The
       # frame nifasm sizes has no room for it (that reservation follows the callee's
       # DECLARED signature, which names the fixed params only), so carve it here and
