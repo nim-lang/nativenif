@@ -9,6 +9,7 @@
 #   noBound       the pool ignores what a register holds                           FAIL
 #   noLaterClob   every computed scalar into its own ABI register                  FAIL
 #   earlyLoad     leaves/aggregates loaded in phase 1 (the old fused loop)         FAIL
+#   noPhase0      an argument homed in another argument's register not parked     FAIL
 # Two more rows are reachability probes on the correct spec: `NoPoolPark` and
 # `NoMemPark` must FAIL, or the pool / memory tiers were never exercised.
 
@@ -29,7 +30,8 @@ cp call_marshal.tla "$TMP/"
 status=0
 for row in none:pass: survivorOnly:FAIL:NotStuck noAvoid:FAIL:ParksIntact \
            noBound:FAIL:ParksIntact noLaterClob:FAIL:ParksIntact \
-           earlyLoad:FAIL:LoadedIntact probe-NoPoolPark:FAIL:NoPoolPark \
+           earlyLoad:FAIL:LoadedIntact noPhase0:FAIL:LoadedIntact \
+           probe-NoPoolPark:FAIL:NoPoolPark \
            probe-NoMemPark:FAIL:NoMemPark; do
   IFS=: read -r bug want wantInv <<<"$row"
   if [[ "$bug" == probe-* ]]; then

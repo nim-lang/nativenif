@@ -14,7 +14,7 @@ count, and `run_tlanif.sh` asserts it. `call_marshal` is TLC-only so far.
 ```bash
 ./proofs/run_arkham_bindings_tlc.sh   # ~9 s
 ./proofs/run_aggr_marshal_tlc.sh      # 8 configurations, expected verdicts asserted
-./proofs/run_call_marshal_tlc.sh      # 8 rows: correct + 5 injections + 2 probes, ~35 s
+./proofs/run_call_marshal_tlc.sh      # 9 rows: correct + 6 injections + 2 probes, ~3.5 min
 ./proofs/run_tlanif.sh                # the first two models, ~5 s with --jobs (all cores)
 ```
 
@@ -192,7 +192,15 @@ computed scalar with any subset of the fixed registers as its clobbers, or a 1- 
 2-word aggregate either in memory or behind a computed address (with its own
 clobbers); an argument past the register file is stack-passed — its expression
 still runs in phase 1, but it is stored to the outgoing area and never loaded.
-Values are word identities.
+A leaf or computed scalar also has a HOME — memory, or any register the planer
+could put a local in (never a fixed register the proc clobbers; distinct
+arguments never share one) — and what its expression reads is that register's
+content, or garbage once something overwrote it. Values are word identities.
+
+Phase 0: an argument whose home is an argument register of ANOTHER argument
+would be destroyed by that argument's load. Every such argument is evaluated
+first, into a park outside the call's claims (`ParkAtRisk`); a park that cannot
+be served is `stuck` here too.
 
 Phase 1, per argument in order: a computed scalar parks its VALUE, an aggregate
 lvalue parks its ADDRESS, a leaf or a memory aggregate parks nothing; then the
@@ -223,9 +231,10 @@ granularity, so it is not offered as an injection.)
 ### Invariants and bug injections
 
 `ParksIntact` (a placed park still holds its word until consumed), `LoadedIntact`
-(a word loaded into its ABI register stays there until the call), `ArgsInPlace`
-(at the call every register-passed word is in its ABI register), `NotStuck`. The
-correct spec passes; each injection fails the invariant it should:
+(a word loaded into its ABI register stays there until the call — and is the
+word, not what a clobbered home yielded), `ArgsInPlace` (at the call every
+register-passed word is in its ABI register), `NotStuck`. The correct spec passes
+(7,224,507 states); each injection fails the invariant it should:
 
 | `Bug` | injected | fails |
 |---|---|---|
@@ -234,23 +243,24 @@ correct spec passes; each injection fails the invariant it should:
 | `noBound` | the pool ignores what a register holds | `ParksIntact` |
 | `noLaterClob` | every computed scalar into its own ABI register | `ParksIntact` — a later expression destroys it |
 | `earlyLoad` | leaves and memory aggregates loaded in phase 1 whether or not a later argument clobbers them, the fused loop before the split | `LoadedIntact` — a later expression destroys the loaded word |
+| `noPhase0` | an argument homed in another argument's register is not parked first — every backend before 2026-09-13 | `LoadedIntact` — the load reads the register after the earlier argument overwrote it (`tests/arkham/noreturn_arg_clobber`) |
 
 Two probe rows assert that `NoPoolPark` and `NoMemPark` FAIL on the correct spec —
 the pool and memory tiers are actually reached, so the invariants are not vacuous.
 
+Where an argument's value lives was the dimension the first revision lacked, and
+the loader's assertion found the class it hides while the split was being ported:
+the allocator relocates a local that a returning call's arguments read, but a
+DIVERGING callee's arguments are not a crossing, so a parameter passed to `panic`
+still sat in the register `panic`'s first argument lands in — both backends passed
+the message's second word as the value (exit 2 for 150). The home dimension and
+phase 0 are that revision.
+
 Not modelled: byte layout (that is `aggr_marshal`), the hidden result pointer (one
 more claim), floats (they go straight into their sealed xmm; no argument expression
-pins an xmm), the inside of an argument's own expression, and where an argument's
-VALUE lives before the call. That last gap is a real class the loader's assertion
-found on 2026-09-13 while this was being ported: an argument whose value is homed
-in an argument register of ANOTHER argument is destroyed when that argument loads.
-The allocator relocates such a local for a returning call, but a DIVERGING callee's
-arguments are not a crossing, so a parameter passed to `panic` still sat in the
-register `panic`'s first argument lands in — both backends passed the message's
-second word as the value (`tests/arkham/noreturn_arg_clobber`, exit 2 for 150).
-The emitters now evaluate such arguments first, into a park (phase 0). Modelling it
-means giving a leaf a HOME register and a load the power to destroy it; it belongs
-in this model's next revision. The procs carry `MODEL:` back-pointers.
+pins an xmm), the inside of an argument's own expression beyond which home it
+reads, and two arguments reading the SAME home (the same local twice: no hazard, a
+read is not a write). The procs carry `MODEL:` back-pointers.
 
 ## tlanif dialect notes (learned porting)
 
