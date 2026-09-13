@@ -1,0 +1,55 @@
+(.nif27)
+(stmts
+ (type :Pair.0 . (object . (fld :pa.0 . (u 64)) (fld :pb.0 . (u 64))))
+ (proc :exit.0 (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :take.0
+  (params
+   (param :c.0 . (ptr (i 64)))
+   (param :lo.0 . Pair.0)
+   (param :hi.0 . Pair.0)
+   (param :f1.0 . (bool))
+   (param :f2.0 . (bool))
+   (param :f3.0 . (bool))).
+  (pragmas (noinline))
+  (stmts
+   (if
+    (elif (and (and f1.0 f2.0) f3.0)
+     (stmts
+      (asgn (deref c.0)
+       (conv (i 64) (add (u 64) (dot lo.0 pa.0 0) (dot hi.0 pa.0 0)))))))))
+ (proc :keep.0
+  (params
+   (param :c.1 . (ptr (i 64)))
+   (param :a.0 . (bool))
+   (param :b.0 . (bool))).
+  (pragmas (noinline))
+  (stmts
+   (if
+    (elif (and a.0 b.0)
+     (stmts
+      (asgn (deref c.1) (add (i 64) (deref c.1) 1)))))))
+ (proc :work.0
+  (params
+   (param :c.2 . (ptr (i 64)))
+   (param :n.0 . (i 64))
+   (param :flags.0 . (u 16))
+   (param :shift.0 . (u 64))).
+  (pragmas (noinline))
+  (stmts
+   (var :lo.1 . Pair.0
+    (oconstr Pair.0 (kv pa.0 (suf 1u "u64")) (kv pb.0 (suf 0u "u64"))))
+   (var :hi.1 . Pair.0
+    (oconstr Pair.0 (kv pa.0 (suf 2u "u64")) (kv pb.0 (suf 0u "u64"))))
+   (var :b1.0 . (bool) (lt 0 n.0))
+   (var :b2.0 . (bool) (lt 1 n.0))
+   (call take.0 c.2 lo.1 hi.1 b1.0 b2.0
+    (not (eq (shr (u 16) flags.0 shift.0) (suf 0u "u16"))))
+   (call keep.0 c.2 b1.0 b2.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :q.0 . (i 64) 1)
+   (call work.0 (addr q.0) 2 (suf 65535u "u16") (suf 11u "u64"))
+   (ret (conv (i 32) q.0)))))

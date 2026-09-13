@@ -642,10 +642,13 @@ const arkhamStressKnown: seq[string] = @[
   # goes away when a vector local can spill (which needs memory-operand forms of
   # the SSE rows) or when the pool is not artificially squeezed.
   "a64_vec_instr",
-  # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
-  # live local. 11 of the 15 `takeHeld` sites across both backends do.
-  "aggr_arg_parked",
-  "aggr_arg_parked_manual",
+  # (`aggr_arg_parked` and `aggr_arg_parked_manual` sat here for "`takeHeld`
+  # with `canSpill = false` asserts instead of evicting a live local". A call
+  # argument's park is now `takeParked` — callee-saved, pool temp outside the
+  # call's own registers, spill slot — and the memory tier gets its own pass
+  # below (`ARKHAM_STRESS_PARK=mem`). The 13 remaining `takeHeld` sites still
+  # fail on their first tier; each needs its own answer to "what does this
+  # value have to survive".)
   # `atomic_cas_regpressure`, `atomic_cas_operand_home` and `aggr_arg_parked_byref`
   # all sat here for the "intrinsic-operand pick has no steal/spill arm" reason and
   # all three now PASS. The missing arm was `pickTempReg`'s volatile candidate list,
@@ -719,11 +722,13 @@ const
     ## limit. Those are the backend's stated contracts, not findings.
 
 proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
-                       known: seq[string]; level: int) =
+                       known: seq[string]; level: int; park = "") =
   ## Re-emit + assemble + RUN the corpus with the register file starved to `level`
   ## registers per pool. Uses its own `bin/arkham_stress` binary so the shipped
   ## `bin/arkham` cannot be perturbed by a stray environment variable. `runner`
   ## prefixes the produced executable (`qemu-aarch64` for the `linux_arm64` pass).
+  ## `park = "mem"` additionally sends every call-argument park to memory
+  ## (`ARKHAM_STRESS_PARK`), the tier no register shortage can reach.
   exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
   let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
@@ -731,6 +736,7 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   createDir workDir
   # Inherited by the arkham children.
   putEnv("ARKHAM_STRESS", if level > 0: $level else: "")
+  putEnv("ARKHAM_STRESS_PARK", park)
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &
@@ -778,8 +784,10 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
     else:
       newFailures.add name & " — " & failed
   delEnv("ARKHAM_STRESS")
+  delEnv("ARKHAM_STRESS_PARK")
   echo passed, " / ", total - expectedFail, " arkham ", arch,
-       " stress tests successful (k=", level, ", ", expectedFail, " known-broken)"
+       " stress tests successful (k=", level,
+       (if park.len > 0: ", park=" & park else: ""), ", ", expectedFail, " known-broken)"
   if newFailures.len > 0:
     quit "FAILURE arkham register-pressure stress (" & arch &
          ") found NEW breakage:\n  " & newFailures.join("\n  ")
@@ -2405,6 +2413,13 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
                              else: arkhamStressKnown),
                     level = (when defined(macosx): arkhamStressA64Level
                              else: arkhamStressLevel))
+  # …and once more with every call-argument park in MEMORY. x86-64 only: a park
+  # exists because a later argument's `idiv`/variable shift destroys an argument
+  # register by ISA fiat, and AArch64 has no such register.
+  when not defined(macosx):
+    arkhamStressTests(arch = "x64", skip = arkhamOsxOnly & arkhamX64Unsupported,
+                      known = arkhamStressKnown, level = arkhamStressLevel,
+                      park = "mem")
 
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`), but
 # they are COMPILE-only — arkham is told `-a:x64` and the expectation is an error

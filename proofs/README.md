@@ -1,18 +1,21 @@
 # Arkham models
 
-Two TLA+ models of the arkham backend, each in two dialects: classic TLA+ for TLC
-(`.tla` + `.cfg`) and the NIF dialect for [tlanif](../../tlanif) (`.nif`). Both
-checkers must agree on the distinct-state count; `run_tlanif.sh` asserts it.
+Three TLA+ models of the arkham backend. The first two exist in two dialects:
+classic TLA+ for TLC (`.tla` + `.cfg`) and the NIF dialect for
+[tlanif](../../tlanif) (`.nif`); both checkers must agree on the distinct-state
+count, and `run_tlanif.sh` asserts it. `call_marshal` is TLC-only so far.
 
 | model | what it abstracts | TLC | tlanif |
 |---|---|---|---|
 | `arkham_bindings` | the register-binding protocol: locals, bound temps, steals, raw staging, fixed-register clobbers, plan/emit replay | `run_arkham_bindings_tlc.sh` | `run_tlanif.sh` |
 | `aggr_marshal` | by-value aggregate marshalling: the trailing partial word, four strategies, two storage kinds | `run_aggr_marshal_tlc.sh` | `run_tlanif.sh` |
+| `call_marshal` | call-argument marshalling under register pressure: exposure, the three park tiers, stash and delivery, a park DEMAND that must be served | `run_call_marshal_tlc.sh` | — |
 
 ```bash
 ./proofs/run_arkham_bindings_tlc.sh   # ~9 s
 ./proofs/run_aggr_marshal_tlc.sh      # 8 configurations, expected verdicts asserted
-./proofs/run_tlanif.sh                # both models, ~5 s with --jobs (all cores)
+./proofs/run_call_marshal_tlc.sh      # 9 rows: correct + 6 injections + 2 probes, ~8 s
+./proofs/run_tlanif.sh                # the first two models, ~5 s with --jobs (all cores)
 ```
 
 The TLC runners use `tlc` from `PATH`, `../yrc-proof/tlc`,
@@ -162,6 +165,69 @@ over the 495-file `tests/arkham` corpus and 3,325 `.c.nif` files from every nimo
 
 ---
 
+## 3. `call_marshal` — call-argument marshalling under register pressure
+
+The x86-64 `emitCall2Inner` / `takeParked` protocol. Arguments are marshalled
+left to right into the ABI registers; a LATER argument's expression may destroy
+an argument register by ISA fiat (`idiv` writes rdx, a variable shift reads `cl`),
+so an earlier argument whose register a later one clobbers is **exposed** and every
+word of it must **park** until the last argument has run, then be delivered just
+before the `(call)`.
+
+Why it exists: that park was a callee-saved-only `takeHeld` which asserted "out of
+registers" when the file was dry — `aggr_arg_parked` on `arkhamStressKnown` from
+#98 until 2026-09-13 — and neither model above could state the class. `arkham_bindings`
+enables a borrow only when a register is free, under `CHECK_DEADLOCK FALSE`, so "a
+value MUST be held and nothing is free" is not a state it reaches; `aggr_marshal`
+has no registers as a resource. This model has a **demand**: an exposed word must
+park, an unservable park is the `stuck` phase, and deadlock checking is on.
+
+### What it models
+
+Every call of 1..3 arguments, each 1 or 2 words (a scalar or a ≤2-word aggregate)
+whose expression clobbers any subset of the fixed registers; an argument past the
+register file is stack-passed (nothing to park, but it still clobbers). Values are
+word identities. Per argument, in order: park each word if exposed → evaluate (the
+clobbers land) → place each word (a register park is already reserved; an unparked
+word or a memory park lands in its ABI register, overwriting whatever was there —
+`releaseArgDest`) → stash memory parks → next. Then deliver every park to its ABI
+register in the order taken, and call.
+
+The park tiers (`takeParked`), any of which the emitter may take:
+
+| tier | code | what makes it sound |
+|---|---|---|
+| survivor | `pickHeldReg` | callee-saved; the planer reserves one for the emitter |
+| pool | `pickTempReg(avoid)` | r10 and the argument registers themselves (`intLocalTempRegs`), rdx/rcx only in a proc with no division/shift (the whole-proc gate), nothing bound, and nothing in `avoid` — the call's **claims** (its argument registers, marshalled or not) plus the later arguments' clobbers |
+| memory | spill slot | stored from the ABI register before the next argument (`stashParks`), reloaded at delivery (`deliverParks`) |
+
+The pool's `avoid` is the rule the first fix lacked: an argument register is
+otherwise refused only once something is BOUND to it, which happens when the
+argument's value lands — too late for a park taken for an earlier argument.
+
+### Invariants and bug injections
+
+`ParksIntact` (an undelivered park still holds its word), `MarshalledIntact` (an
+unparked placed word stays in its register), `ArgsInPlace` (at the call every
+register-passed word is in its ABI register), `NotStuck`. The correct spec passes
+(26,004 states); each injection fails the invariant it should:
+
+| `Bug` | injected | fails |
+|---|---|---|
+| `survivorOnly` | the old `takeHeld(canSpill = false)`: tier one only | `NotStuck` — a 2-word exposed aggregate, one survivor: the `aggr_arg_parked` assert |
+| `noAvoid` | the pool ignores the call's claims | `ParksIntact` — the next word lands on the park |
+| `noProcGate` | rdx/rcx handed out in a proc that divides/shifts | `ParksIntact` — the clobber hits the park |
+| `noBound` | the pool ignores what a register holds | `ParksIntact` |
+| `lateStash` | a memory park stored after the next argument ran | `ParksIntact` — the word is gone from its register |
+| `noExpose` | `laterClob` empty, nothing parked | `MarshalledIntact` |
+
+Two probe rows assert that `NoPoolPark` and `NoMemPark` FAIL on the correct spec —
+the pool and memory tiers are actually reached, so the invariants are not vacuous.
+
+Not modelled: the manual/declarative split (both paths call the same three procs
+now), byte layout (that is `aggr_marshal`), the hidden result pointer (one more
+claim), float arguments (never parked). The procs carry `MODEL:` back-pointers.
+
 ## tlanif dialect notes (learned porting)
 
 - Comments are `#text#` attached directly to a token (`(def#text# :X.0.`,
@@ -186,4 +252,8 @@ Recent miscompiles whose fix was a *protocol* rule rather than an encoding detai
 - the fixed-role interval proof that copy-inherit and `trySteal` skipped — extend
   `arkham_bindings` with a fixed-role register whose name may be stale;
 - the frame-base setup that ended nifasm's prologue run before the frame `sub`'s
-  CFI step — a prologue/epilogue state machine with `(popframe)` tail calls.
+  CFI step — a prologue/epilogue state machine with `(popframe)` tail calls;
+- the 13 remaining `takeHeld` sites — `call_marshal` covers the park; each of
+  those holds a value across something else (a call, an index expression that
+  calls) and needs its own demand modelled the same way;
+- a tlanif port of `call_marshal`.

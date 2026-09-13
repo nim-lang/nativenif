@@ -191,15 +191,19 @@ when defined(arkhamTempDbg):
       " accum=" & $tempRefusals[2] & " bound=" & $tempRefusals[3] &
       " home=" & $tempRefusals[4]
 
-proc pickTempReg*(g: var CodeGen): Reg =
+proc pickTempReg*(g: var CodeGen; avoid: set[Reg] = {}): Reg =
   ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
   ## register (recorded in `plan.usedCallee` so the prologue saves it — the frame
   ## is finalized AFTER body emission in the merged core). `NoReg` when every
   ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
   ## the backend's produce-into path), keeping temp allocation total exactly
   ## like the old `reserveTmp` fallback.
+  ##
+  ## `avoid`: registers the caller knows are spoken for although nothing is bound
+  ## to them yet — a call's argument registers while its arguments are still being
+  ## marshalled (`takeParked`). MODEL: `PoolOK` in proofs/call_marshal.tla.
   forEachVolatileTempCand(g, r):
-    if regFreeForTemp(g, r):
+    if r notin avoid and regFreeForTemp(g, r):
       when defined(arkhamTempDbg): inc tempVolatileHits
       return r
   when defined(arkhamTempDbg):
@@ -213,7 +217,7 @@ proc pickTempReg*(g: var CodeGen): Reg =
       elif g.rb.isBound(r): inc tempRefusals[3]
       elif g.regHoldsHome(r): inc tempRefusals[4]
   for r in g.md.intCalleeSaved:
-    if regFreeForTemp(g, r):
+    if r notin avoid and regFreeForTemp(g, r):
       g.plan.usedCallee.incl r
       return r
   NoReg
