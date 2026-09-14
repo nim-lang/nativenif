@@ -1589,6 +1589,13 @@ proc genInstr(g: var WasmGen; c: Cursor; wantValue: bool) =
       if sc.kind == skI64 and retSc.kind != skI64: g.op OpI32WrapI64
       elif sc.kind != skI64 and retSc.kind == skI64: g.op OpI64ExtendI32U
       if not wantValue: g.op OpDrop
+    of CpuRelaxOp:
+      # The spin-wait hint. wasm32 is single-threaded, so there is nothing to
+      # yield to and no instruction to emit; the row lowers to nothing. That
+      # is what lets `std/ticketlocks`, whose contention loop spins on it,
+      # compile for this target at all.
+      while t.hasMore: skip t
+      if wantValue: err g, "(instr …) cpu relax has no value"
     else:
       err g, "(instr …) row not supported on wasm32: " & $it.op
 
