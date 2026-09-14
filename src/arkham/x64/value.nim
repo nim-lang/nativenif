@@ -438,23 +438,6 @@ proc place2*(g: var CodeGen; src: Location; dest: Reg) =
   else: raiseAssert "arkham x64n: place2 src " & $s.kind
 
 proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
-proc aggrArgAddr*(g: var CodeGen; a: Cursor; recorded: Reg; avoid: openArray[Reg]): (Reg, bool) =
-  ## Materialize `&a` (an aggregate-LVALUE call argument) into a bound register, ready to
-  ## marshal from. `recorded` is the allocator's reserved callee-saved survivor; `NoReg`
-  ## means it spilled (the `reserveHeldScratch` totality backstop), so re-derive the
-  ## address into a transient staging register instead — sealing the marshal destinations
-  ## `avoid` (the arg registers about to receive the words, not yet sealed here) so the
-  ## pick cannot alias a word being written. Returns `(addr reg, wasSpilled)`; the caller
-  ## releases with `giveBack` (spilled) or `unbindTemp`.
-  let slot = addrSlot()
-  if recorded != NoReg:
-    g.aggrAddrInto(a, recorded, slot, doBind = true)
-    return (recorded, false)
-  for r in avoid: g.plan.seal r
-  let s = g.pickStagingSealed("an aggregate-arg address", slot)
-  for r in avoid: g.plan.unseal r
-  g.aggrAddrInto(a, s, slot, doBind = false)   # already bound by pickStagingSealed
-  (s, true)
 proc genConstr2*(g: var CodeGen; c: Cursor; dst: Location)
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location)
 proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
@@ -496,34 +479,6 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
     g.varType[home] = tn
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
   (home, ptrReg, isTvar)
-
-proc emPairHomeAddr(g: var CodeGen; dest: Reg; a: Cursor; hl: Location;
-                    tcur: Cursor; tn: SymId) =
-  ## `dest <- &a` for an aggregate local/param the allocator homed in a GPR PAIR.
-  ##
-  ## A pair home declares NO `(s)` slot: the eightbytes are the value, and every
-  ## other reader gets at them positionally (`transferAggrWords` returns early on
-  ## `InRegPair` for exactly that reason). Taking the address by name therefore
-  ## emitted `lea dest, <name>` for a slot that was never declared, and nifasm
-  ## rejected it as "Unknown or invalid symbol".
-  ##
-  ## So give the value an address: a slot of its own, written from the pair. The
-  ## shape that reaches here is a pair-homed aggregate marshalled onto the
-  ## OUTGOING STACK — `semos.buildPlugin` handing its `exefile: string` to a call
-  ## that needs seven integer words, so the last argument is passed in memory,
-  ## the one path that wants an address rather than the words.
-  ##
-  ## The words go through `dest` rather than slot-directly: `dest` is the staging
-  ## register being filled anyway, so the `lea` is not extra, and a synthetic slot
-  ## is not an allocator-known name (`homeOfSym` answers `NoLoc` for it) — the
-  ## slot-direct readers key on exactly that. No partial tail to worry about
-  ## either: `canHomeInRegPair` admits only aggregates whose every eightbyte is a
-  ## full 8-byte word.
-  let slot = synth("pairaddr") & $cursorToPosition(g.buf[], a) & ".0"
-  g.emTypedStackVar(slot, tcur)
-  g.emStackAddr(dest, slot)
-  for k in 0 ..< aggrWordCount(g.prog, tn):
-    g.ab.tree MovX64: (g.emWordThroughPtr(dest, k); g.emReg pairWord(hl, k))
 
 proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
   ## `dest op= <memory operand>` (a `NamedStack` slot or a `Mem` access chain `opCur`),
@@ -3346,34 +3301,45 @@ proc callClaims(md: MachineDesc; plan: CallPlan; hiddenPtr: bool): set[Reg] =
       for k in 0 ..< pl.words: result.incl md.gprAt(pl, k)
 
 type
-  ArgSrcKind = enum
-    ## Where a register-passed argument's value is once phase 1 of the
-    ## marshalling has run — what phase 2 loads its ABI register(s) from.
-    asDone        ## nothing to load: stack-passed (stored in phase 1), or a float
-                  ## already in its xmm
-    asLeaf        ## a scalar leaf: loaded from where it lives
-    asPark        ## a computed scalar, in `loc`: its own ABI register, a park
-                  ## register, or a park slot
-    asAggrAddr    ## an aggregate lvalue whose address is parked in `loc`
-    asAggrHome    ## an aggregate in the named stack home `home`
-    asAggrPtr     ## an aggregate reached through the pointer in register `ptrReg`
-    asAggrGlobal  ## a module-level aggregate
-    asAggrTvar    ## a thread-local aggregate
-  ArgSrc = object
-    kind: ArgSrcKind
+  MoveSrc = enum
+    ## Where a register-passed argument word comes from once phase 1 has run.
+    ## None of them is computed any more: each is a register, a place in memory,
+    ## or an address, and phase 2 only moves.
+    msLeaf         ## a scalar leaf expression `cur` (a literal, a symbol), loaded
+                   ## by `emitValue2`/`emitFValue2` — an extension happens in place
+    msReg          ## register `r` (a float move: `f`): a park, a pair-home word
+    msLoc          ## the park slot `loc`
+    msSlotWord     ## word `idx` of the named stack slot `name`
+    msPtrWord      ## word `idx` of the aggregate the register `r` points to
+    msSlotPtrWord  ## word `idx` of the aggregate the slot `loc` holds a pointer to
+    msGlobalWord   ## word `idx` of the global (or thread-local) `name`
+    msHomeAddr     ## `&name`, a stack home (a `StackPtr` home: the pointer it holds)
+    msGlobalAddr   ## `&name`, a module-level global
+    msTvarAddr     ## `&name`, a thread-local
+  ArgMove = object
+    dst: Reg                     ## the ABI register — or, for a float, `fdst`
+    fdst: FReg
+    nameIdx, word: int           ## binds `(arg pN [word])`; `word < 0`: unindexed
+    kind: MoveSrc
+    cur: Cursor
+    r: Reg
+    f: FReg
     loc: Location
-    home: string
-    ptrReg: Reg
+    name: string
+    idx, bytes: int              ## the word index; `bytes < 8`: a partial tail
+                                 ## (a float: its width)
+    isTvar: bool
+    valueSym: string             ## a leaf's own symbol, which may stay bound to `dst`
+    reads: set[Reg]              ## the registers loading this move reads
+    freads: set[FReg]
 
 proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                     tail = false) =
-  ## FUSED call. allocCall's placement decisions run inline: each scalar arg
-  ## dest-threads straight into its ABI register (or a parked callee-saved
-  ## survivor when a later argument's shift/div would clobber it — decided by
-  ## `fixedRegsClobberedBy` right here); aggregate args reserve their held
-  ## scratches at the point of use; the result settles from rax/xmm0 into
-  ## `dest`. `hiddenPtr` documents a >16B-result call whose rdi the caller
-  ## pre-loaded; the plan derives the same fact from the callee's return type.
+  ## A call: every argument expression runs, each register-passed word becomes a
+  ## move into its ABI register, and the moves are performed as one parallel move
+  ## (see the phases below); the result settles from rax/xmm0 into `dest`.
+  ## `hiddenPtr` documents a >16B-result call whose rdi the caller pre-loaded;
+  ## the plan derives the same fact from the callee's return type.
   ##
   ## `tail` marks a call in `(ret (call …))` position. Leng binds every call and
   ## forbids nesting them, so that shape is not an expression the backend gets to
@@ -3562,46 +3528,68 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         if not bound: g.unbindTemp(RAX)
       else: raiseAssert "arkham x64n: call result dest " & $dest.kind
 
-  # ── Two phases, chibicc's shape (codegen.c `push_args` / `ND_FUNCALL`): first
-  # EVERY argument expression runs, then the ABI registers are loaded. No ABI
-  # register holds a value while an argument expression can still run, so
-  # nothing an expression destroys by ISA fiat (`fixedRegsClobberedBy`) can hit a
-  # marshalled argument — the property chibicc gets from pushing everything and
-  # popping into the argument registers at the end.
+  # ── chibicc's shape (codegen.c `push_args` / `ND_FUNCALL`), with registers.
   #
-  # Phase 1 reduces each argument to a SOURCE nothing later can disturb: a leaf
-  # (a literal, a symbol) is already one and emits nothing; an aggregate in
-  # memory is one; a computed scalar goes into a park (`takeParked`), and so does
-  # the address of an aggregate lvalue; a stack-passed argument is stored into
-  # the outgoing area outright (memory survives everything); a float goes
-  # straight into its xmm and is sealed (no argument expression pins an xmm).
+  # Phase 1 runs EVERY argument expression and reduces each register-passed word
+  # to a MOVE: a source that is no longer computed (a register, a place in memory,
+  # an address) and the ABI register it belongs in. Phase 2 performs the moves as
+  # ONE PARALLEL MOVE. That is the whole design; what follows are its two rules.
   #
-  # The liberty, and it is what keeps the common case free: an argument whose
-  # register(s) NO later argument clobbers is loaded right away, in source
-  # order — a computed scalar straight into its ABI register (sealed from then
-  # on, so no later expression stages through it), a leaf or an aggregate
-  # through the same loader phase 2 uses. A leaf's load then overlaps the
-  # computation of the arguments after it, as it always did; loading every
-  # leaf late cost nifbench's parse phase 3 % for nothing. Only an argument a
-  # later one clobbers is deferred.
+  # A source must SURVIVE phase 1. Memory does. A register does unless a later
+  # argument destroys it by ISA fiat (`fixedRegsClobberedBy`: rcx for a variable
+  # shift, rdx/rax for a division): a source reading such a register is
+  # materialized into a park now. A park itself is never an argument register.
   #
-  # Phase 2 loads the deferred arguments in order from their sources and binds
-  # each with `(arg pN [k])`. Its only computation is address arithmetic on
-  # registers that are parks or homes, and it writes only the register(s) of
-  # the argument being loaded.
+  # A move may be performed EARLY, during phase 1, when its ABI register is
+  # destroyed by no later argument and read by no other argument — then nothing
+  # can observe the difference. It keeps the common case in source order and
+  # lets a computed scalar be built straight in its register. Nothing else is
+  # special: a source that sits in ANOTHER argument's ABI register (a parameter
+  # still in its incoming register, a pair home, a by-reference pointer) is just
+  # a move whose read the resolver orders — or, in a cycle, stashes.
   #
-  # MODEL: proofs/call_marshal.tla — phase 1 is `Park*`/`Evaluate`/`Place`,
-  # phase 2 is `Load`; the own-ABI-register liberty is `OwnAbiOK` (its
-  # injection `noLaterClob`), the old fused loop is the `earlyLoad` injection.
+  # MODEL: proofs/call_marshal.tla — phase 1 is `EvalHome`/`EvalComp`/`EvalAddr`,
+  # `placeNow` is `PlaceNow`, a `redirect` for exposure is the park in `EvalHome`,
+  # `resolve` is `Load`/`Stash`; `ARKHAM_STRESS_MOVES=late` is `Route`'s late
+  # branch, which the model may always take.
   var sealedArgs: set[Reg] = {}
   var sealedFArgs: set[FReg] = {}
-  var srcs = newSeq[ArgSrc](argCurs.len)
+  var pending: seq[ArgMove] = @[]
+  var stashes: seq[Reg] = @[]
+  var fclaims: set[FReg] = {}
+  for pl in plan.args:
+    if pl.isFloat and not pl.onStack: fclaims.incl amd.floatArgRegs[pl.fpIndex]
+  var reads = newSeq[set[Reg]](argCurs.len)      # among the claimed registers
+  var freads = newSeq[set[FReg]](argCurs.len)
+  for j in 0 ..< argCurs.len:
+    for r in claims:
+      if g.exprReadsReg(argCurs[j], r): reads[j].incl r
+    for f in fclaims:
+      if g.exprReadsFReg(argCurs[j], f): freads[j].incl f
+  proc placeNow(j: int; m: ArgMove; computes = false): bool =
+    ## May argument `j`'s move `m` write its ABI register during phase 1? A move
+    ## that `computes` its value is evaluation, not movement: the stress mode
+    ## leaves it be (see `stressLateMoves`).
+    if stressLateMoves and not computes: return false
+    if m.fdst != NoFReg:
+      for k in 0 ..< freads.len:
+        if k != j and m.fdst in freads[k]: return false
+      return true
+    if m.dst in laterClob[j+1]: return false
+    for k in 0 ..< reads.len:
+      if k != j and m.dst in reads[k]: return false
+    true
   proc park(g: var CodeGen; j: int; slot: AsmSlot): Location =
     ## A park for argument `j`, sealed for the rest of the call and freed after it.
     result = g.takeParked(claims + laterClob[j+1], slot)
     heldArgs.add result
     if result.kind == InReg:
       g.rb.sealAccum result.r; sealedArgs.incl result.r
+  proc fpark(g: var CodeGen; bytes: int): Location =
+    ## A float park: a SIMD temp (never an argument register), or a spill slot.
+    result = g.takeFTmp(AsmSlot(cls: AFloat, size: bytes, align: bytes))
+    heldArgs.add result
+    if result.kind == InFReg: g.bindFTmp(result.f)
   template outgoingSlot(nameIdx, k: int; indexed: bool) =
     g.ab.tree MemX:
       g.ab.rawReg RSP
@@ -3615,270 +3603,254 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.ab.tree ArgX: g.ab.sym paramName(0)
         g.emReg amd.intArgRegs[0]
       g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0]
-    # ── the loader: an argument's ABI register(s) from its source, and its
-    # `(arg pN [k])` binding. Phase 1 calls it at once for an argument no later
-    # argument clobbers — the value then loads in source order, as it always
-    # did, and a leaf's load overlaps the computation of what follows it — and
-    # phase 2 calls it for the rest, once every clobbering expression has run.
-    var loaded: set[Reg] = {}
-    proc loadArg(g: var CodeGen; j: int) =
-      let a = argCurs[j]
-      let pl = plan.args[j]
-      let nameIdx = pl.ord
-      let src = srcs[j]
-      let aSym = if a.kind == Symbol: symName(a) else: ""
-      var dst: seq[Reg] = @[]
-      for k in 0 ..< pl.words: dst.add amd.gprAt(pl, k)
-      case src.kind
-      of asLeaf:
-        if a.kind == Symbol:
-          # A home in a register already loaded would be read as the earlier
-          # argument. The analyser keeps a local read by a call's arguments out
-          # of the argument registers; hold it to that.
-          let h = g.plan.locationOfSym(aSym, cursorToPosition(g.buf[], a))
-          if h.kind == InReg and h.r in loaded:
-            raiseAssert "arkham x64n: argument " & $j & " `" & aSym & "` of " & tgt.asmName &
-                        " is homed in " & $h.r & ", an argument register already loaded, " &
-                        "in proc " & g.curProcName
-        g.releaseArgDest(dst[0], aSym)
-        g.rb.sealAccum dst[0]; sealedArgs.incl dst[0]
-        var aD = regLoc(dst[0], ScalarSlot)
-        g.emitValue2(a, aD)
-        assert aD.kind == InReg and aD.r == dst[0],
+    proc bindArg(g: var CodeGen; dst: Reg; nameIdx, word: int) =
+      g.ab.tree MovX64:
+        g.ab.tree ArgX:
+          g.ab.sym paramName(nameIdx)
+          if word >= 0: g.ab.intLit word.int64
+        g.emReg dst
+      g.rb.sealAccum dst; sealedArgs.incl dst
+    proc loadWord(g: var CodeGen; dst, p: Reg; idx, bytes: int) =
+      if bytes < 8: g.loadPartialThroughPtr(dst, p, idx * 8, bytes)
+      else:
+        g.ab.tree MovX64: (g.emReg dst; g.emWordThroughPtr(p, idx))
+    proc load(g: var CodeGen; m: ArgMove; dst: Reg) =
+      ## `dst` ← the move's source.
+      case m.kind
+      of msLeaf:
+        var aD = regLoc(dst, ScalarSlot)
+        g.emitValue2(m.cur, aD)
+        assert aD.kind == InReg and aD.r == dst,
                "arkham x64n: a leaf argument was loaded outside its ABI register"
-        g.ab.tree MovX64:
-          g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
-          g.emReg dst[0]
-      of asPark:
-        var s = NoReg
-        if src.loc.kind == InReg:
-          s = src.loc.r                        # its own ABI register, or a park
-        else:                                  # a park slot: staged reload
-          s = g.pickStaging("a parked call-arg reload")
-          g.bindTemp(s, ScalarSlot)
-          g.emitLoadLoc(src.loc, s)
-        g.ab.tree MovX64:
-          g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
-          g.emReg s
-        if src.loc.kind != InReg: g.giveBack s
-      of asAggrAddr, asAggrHome, asAggrPtr, asAggrGlobal, asAggrTvar:
-        let tn = g.getType(a).symId
-        for r in dst: g.releaseArgDest(r, aSym)
-        var addrReg = NoReg
-        var staged = false
-        if src.kind == asAggrAddr:
-          if src.loc.kind == InReg:
-            addrReg = src.loc.r
-          else:                                # parked in memory: reload it
-            for r in dst: g.plan.seal r        # not yet sealed — the pick must not alias a word
-            addrReg = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
-            for r in dst: g.plan.unseal r
-            g.emitLoadLoc(src.loc, addrReg)
-            staged = true
-        elif src.kind == asAggrPtr:
-          addrReg = src.ptrReg
-        if pl.byRef:
-          if addrReg != NoReg: g.movReg(dst[0], addrReg)
-          elif src.kind == asAggrHome: g.emAggrHomeAddr(dst[0], src.home)
-          elif src.kind == asAggrTvar: g.emTvarAddr(dst[0], aSym)
-          else: g.emGlobalAddr(dst[0], aSym)
+      of msReg: g.movReg(dst, m.r)
+      of msLoc: g.emitLoadLoc(m.loc, dst)
+      of msSlotWord:
+        g.ab.tree MovX64: (g.emReg dst; g.emWordAtSlot(m.name, m.idx * 8))
+      of msPtrWord: g.loadWord(dst, m.r, m.idx, m.bytes)
+      of msSlotPtrWord, msGlobalWord:
+        let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
+        if m.kind == msSlotPtrWord: g.emitLoadLoc(m.loc, s)
+        elif m.isTvar: g.emTvarAddr(s, m.name)
+        else: g.emGlobalAddr(s, m.name)
+        g.loadWord(dst, s, m.idx, m.bytes)
+        g.giveBack s
+      of msHomeAddr: g.emAggrHomeAddr(dst, m.name)
+      of msGlobalAddr: g.emGlobalAddr(dst, m.name)
+      of msTvarAddr: g.emTvarAddr(dst, m.name)
+    proc emitMove(g: var CodeGen; m: ArgMove) =
+      if m.fdst != NoFReg:
+        let bits = m.bytes * 8
+        let slot = AsmSlot(cls: AFloat, size: m.bytes, align: m.bytes)
+        g.rb.sealF m.fdst; sealedFArgs.incl m.fdst
+        case m.kind
+        of msLeaf:
+          var fD = fregLoc(m.fdst, slot)
+          g.emitFValue2(m.cur, fD)
+          assert fD.kind == InFReg and fD.f == m.fdst,
+                 "arkham x64n: a float argument was loaded outside its ABI register"
+        of msReg: g.fmovF(m.fdst, m.f, bits)
+        of msLoc: g.emFloatScalarLoad(m.fdst, m.loc.name, bits)
+        else: raiseAssert "arkham x64n: a float argument move from " & $m.kind
+        g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+          g.ab.tree ArgX: g.ab.sym paramName(m.nameIdx)
+          g.emFReg m.fdst
+        return
+      if not (m.kind == msReg and m.r == m.dst):
+        g.releaseArgDest(m.dst, m.valueSym)
+      g.rb.sealAccum m.dst; sealedArgs.incl m.dst   # no staging inside the load
+      g.load(m, m.dst)
+      g.bindArg(m.dst, m.nameIdx, m.word)
+    proc storeOutgoing(g: var CodeGen; m: ArgMove) =
+      ## A stack-passed word: the outgoing slot IS its park, written at once.
+      let s = g.pickStagingSealed("a stack aggregate-arg word", AddrSlot)
+      g.load(m, s)
+      g.ab.tree MovX64: (outgoingSlot(m.nameIdx, m.idx, m.word >= 0); g.emReg s)
+      g.giveBack s
+    proc evalInto(g: var CodeGen; m: var ArgMove; p: Location) =
+      ## A leaf/computed move's expression, evaluated into `p` now; the move
+      ## then only moves from there.
+      var aD = p
+      if m.fdst != NoFReg: g.emitFValue2(m.cur, aD) else: g.emitValue2(m.cur, aD)
+      assert aD.kind == p.kind and (aD.kind != InReg or aD.r == p.r) and
+             (aD.kind != InFReg or aD.f == p.f),
+             "arkham x64n: a call argument moved under its producer"
+      m.valueSym = ""
+      m.reads = {}; m.freads = {}
+      case p.kind
+      of InReg: (m.kind = msReg; m.r = p.r; m.reads = {p.r})
+      of InFReg: (m.kind = msReg; m.f = p.f; m.freads = {p.f})
+      else: (m.kind = msLoc; m.loc = p)
+    proc redirect(g: var CodeGen; ms: var seq[ArgMove]; d: Reg; j: int; stash: bool) =
+      ## Every move in `ms` that reads register `d` reads a copy made NOW instead —
+      ## a park of argument `j`, or (`stash`) a staging register for the rest of
+      ## the call. The one tool for a source that cannot stay where it is: one a
+      ## later argument destroys, or one on a cycle of the parallel move.
+      proc place(g: var CodeGen; slot: AsmSlot): Location =
+        if stash:
+          let s = g.pickStagingSealed("a call-argument cycle", slot)
+          stashes.add s
+          regLoc(s, slot)
+        else: g.park(j, slot)
+      var copy = noLoc
+      for m in ms.mitems:
+        if d notin m.reads: continue
+        if m.kind == msLeaf:
+          g.evalInto(m, g.place(ScalarSlot))   # an expression is evaluated, not copied
+          continue
+        assert m.kind in {msReg, msPtrWord} and m.r == d,
+               "arkham x64n: a call-argument move reads a register it does not name"
+        if copy.kind == NoLoc:
+          copy = g.place(if m.kind == msPtrWord: AddrSlot else: ScalarSlot)
+          if copy.kind == InReg: g.movReg(copy.r, d) else: g.emitStoreLoc(copy, d)
+        if copy.kind == InReg:
+          m.r = copy.r; m.reads = {copy.r}
         else:
-          if addrReg != NoReg: g.marshalAggrFromAddr(addrReg, tn, dst)
-          elif src.kind == asAggrHome: g.structToRegs(src.home, tn, dst)
-          elif src.kind == asAggrTvar: g.tvarToRegs(aSym, tn, dst)
-          else: g.globalToRegs(aSym, tn, dst)
-        if staged: g.giveBack addrReg
-        for k in 0 ..< pl.words:
-          g.ab.tree MovX64:
-            g.ab.tree ArgX:
-              g.ab.sym paramName(nameIdx)
-              if not pl.byRef: g.ab.intLit k.int64
-            g.emReg dst[k]
-      of asDone: discard
-      for r in dst:
-        loaded.incl r
-        g.rb.sealAccum r; sealedArgs.incl r
-      srcs[j] = ArgSrc(kind: asDone, ptrReg: NoReg)
-    # ── phase 0: arguments that READ a register this call loads ──────────────
-    # A value homed in an argument register of ANOTHER argument is destroyed
-    # when that argument is loaded. The allocator relocates such a local for a
-    # returning call — its arguments cross the call — but a DIVERGING callee's
-    # arguments are not a crossing, so a parameter passed to `panic` may still
-    # sit in the register `panic`'s first argument lands in. Every such
-    # argument is evaluated FIRST, into a park, before any register is loaded
-    # (the swap-through-a-temp of a parallel move; `takeParked` is total).
-    var handled = newSeq[bool](argCurs.len)
+          m.kind = (if m.kind == msReg: msLoc else: msSlotPtrWord)
+          m.loc = copy; m.reads = {}
+    proc fredirect(g: var CodeGen; ms: var seq[ArgMove]; d: FReg) =
+      ## `redirect` for a float register (only a cycle needs it: no instruction
+      ## destroys a SIMD register by fiat). A float park is never an argument
+      ## register — the float temp pools exclude them on every target.
+      var copy = noLoc
+      for m in ms.mitems:
+        if d notin m.freads: continue
+        if m.kind == msLeaf:
+          g.evalInto(m, g.fpark(m.bytes))
+          continue
+        assert m.kind == msReg and m.f == d,
+               "arkham x64n: a float argument move reads a register it does not name"
+        if copy.kind == NoLoc:
+          copy = g.fpark(m.bytes)
+          if copy.kind == InFReg:
+            g.fmovF(copy.f, d, m.bytes * 8)
+          else: g.emitStoreFLoc(copy, d, m.bytes * 8)
+        if copy.kind == InFReg: (m.f = copy.f; m.freads = {copy.f})
+        else: (m.kind = msLoc; m.loc = copy; m.freads = {})
+    proc resolve(g: var CodeGen; ms: seq[ArgMove]) =
+      ## Perform `ms` as one parallel move: a move goes once no other remaining
+      ## move reads its destination. When none can go, every remaining
+      ## destination is read by another move — a cycle — and redirecting one
+      ## destination's readers to a stash breaks it.
+      var ms = ms
+      while ms.len > 0:
+        var pick = -1
+        for i in 0 ..< ms.len:
+          pick = i
+          for k in 0 ..< ms.len:
+            if k != i and (if ms[i].fdst != NoFReg: ms[i].fdst in ms[k].freads
+                           else: ms[i].dst in ms[k].reads):
+              pick = -1
+              break
+          if pick >= 0: break
+        if pick >= 0:
+          g.emitMove(ms[pick])
+          ms.delete pick
+        elif ms[0].fdst != NoFReg:
+          g.fredirect(ms, ms[0].fdst)
+        else:
+          var busy: set[Reg] = {}
+          for m in ms: busy = busy + m.reads + {m.dst}
+          var fresh: set[Reg] = {}
+          for r in busy:
+            if not g.plan.isSealed(r): fresh.incl r
+          g.plan.seal fresh                        # the stash must not alias a move
+          g.redirect(ms, ms[0].dst, -1, stash = true)
+          g.plan.unseal fresh
+    # ── phase 1: every argument expression runs ──────────────────────────────
     for j in 0 ..< argCurs.len:
       let a = argCurs[j]
       let pl = plan.args[j]
-      if pl.onStack or pl.isFloat: continue
-      var own: set[Reg] = {}
-      for k in 0 ..< pl.words: own.incl amd.gprAt(pl, k)
-      var atRisk = false
-      for r in claims - own:
-        if g.exprReadsReg(a, r): atRisk = true
-      if not atRisk: continue
+      let nameIdx = pl.ord
       if pl.isAgg:
+        let tcur = g.getType(a)
+        if tcur.kind != Symbol:
+          raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
+        let tn = tcur.symId
+        let byteSize = aggrByteSize(g.prog, tn)
+        if pl.onStack:
+          g.plan.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
+        var dsts: set[Reg] = {}
+        var now = true                         # a stack word is always stored now
+        var ms: seq[ArgMove] = @[]
+        for k in 0 ..< pl.words:
+          let dst = (if pl.onStack: NoReg else: amd.gprAt(pl, k))
+          ms.add ArgMove(dst: dst, fdst: NoFReg, f: NoFReg, nameIdx: nameIdx,
+                         word: (if pl.byRef: -1 else: k),
+                         idx: k, bytes: min(8, byteSize - k * 8), r: NoReg)
+          if dst != NoReg:
+            dsts.incl dst
+            if not placeNow(j, ms[^1]): now = false
+        template fromPtr(p: Location) =
+          ## Every word through the pointer at `p` (a register or a slot).
+          for m in ms.mitems:
+            if pl.byRef:
+              if p.kind == InReg: (m.kind = msReg; m.r = p.r; m.reads = {p.r})
+              else: (m.kind = msLoc; m.loc = p)
+            elif p.kind == InReg: (m.kind = msPtrWord; m.r = p.r; m.reads = {p.r})
+            else: (m.kind = msSlotPtrWord; m.loc = p)
+        var staged = NoReg
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
-          g.emitLvalue2(a)                   # its address into a park
-          let p = g.park(j, AddrSlot)
+          # The address is the computed part. When every word goes now it needs
+          # a register only for the moves that follow at once; else a park.
+          g.emitLvalue2(a)
+          var p: Location
+          if now:
+            g.plan.seal dsts                   # the pick must not alias a word
+            staged = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
+            g.plan.unseal dsts
+            p = regLoc(staged, AddrSlot)
+          else:
+            p = g.park(j, AddrSlot)
           if p.kind == InReg:
-            g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)
+            g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)   # bound by the pick
           else:
             let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
             g.aggrAddrInto(a, s, AddrSlot, doBind = false)
             g.emitStoreLoc(p, s)
             g.giveBack s
           g.freeLvalTemps2(a)
-          srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+          fromPtr(p)
         else:
-          let tcur = g.getType(a)
-          let tn = tcur.symId
+          # In memory already, or BUILT into memory here (a constructor into its
+          # synthetic slot) — which is what phase 1 exists for.
           let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
           let hl = (if home.len > 0 and a.kind == Symbol:
                       g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
                     else: noLoc)
           if ptrReg != NoReg:
-            # A by-reference pointer param homed in one of the registers: park
-            # the pointer, the words are read through it at load time.
-            let p = g.park(j, AddrSlot)
-            if p.kind == InReg: g.movReg(p.r, ptrReg)
-            else: g.emitStoreLoc(p, ptrReg)
-            srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
-          elif hl.kind == InRegPair:
-            # A pair-homed aggregate: its words ARE registers another argument
-            # loads. Copy them into a slot of their own now; phase 2 reads the
-            # slot like any other in-memory home.
-            let slot = synth("pairpark") & $cursorToPosition(g.buf[], a) & ".0"
-            g.emTypedStackVar(slot, tcur)
-            g.varType[slot] = tn
-            for k in 0 ..< aggrWordCount(g.prog, tn):
-              g.ab.tree MovX64: (g.emWordAtSlot(slot, k * 8); g.emReg pairWord(hl, k))
-            srcs[j] = ArgSrc(kind: asAggrHome, home: slot, ptrReg: NoReg)
+            fromPtr(regLoc(ptrReg, AddrSlot))
+          elif hl.kind == StackPtr:
+            fromPtr(namedStackLoc(hl.ptrName, AddrSlot))
+          elif hl.kind == InRegPair and not pl.byRef:
+            for m in ms.mitems:
+              m.kind = msReg; m.r = pairWord(hl, m.idx); m.reads = {m.r}
           else:
-            # A constructor, BUILT into its synthetic slot right here — before
-            # any argument register is loaded, so the registers it reads are
-            # still intact.
-            assert home.len > 0 and a.kind != Symbol,
-                   "arkham x64n: an at-risk aggregate argument in unexpected storage"
-            srcs[j] = ArgSrc(kind: asAggrHome, home: home, ptrReg: NoReg)
-      else:
-        var aD = g.park(j, ScalarSlot)
-        let want = aD
-        g.emitValue2(a, aD)
-        assert aD.kind == want.kind and (aD.kind != InReg or aD.r == want.r),
-               "arkham x64n: an at-risk argument moved under its producer"
-        srcs[j] = ArgSrc(kind: asPark, loc: aD, ptrReg: NoReg)
-      handled[j] = true
-    # ── phase 1: every argument expression runs ──────────────────────────────
-    for j in 0 ..< argCurs.len:
-      if handled[j]: continue
-      let a = argCurs[j]
-      let pl = plan.args[j]
-      let nameIdx = pl.ord
-      srcs[j] = ArgSrc(kind: asDone, ptrReg: NoReg)
-      # Does a later argument clobber one of this argument's registers? If not,
-      # it loads right here, in source order.
-      var deferred = false
-      if not pl.onStack and not pl.isFloat:
-        for k in 0 ..< pl.words:
-          if amd.gprAt(pl, k) in laterClob[j+1]: deferred = true
-      if pl.isAgg:
-        let tcur = g.getType(a)
-        if tcur.kind != Symbol:
-          raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
-        let tn = tcur.symId
-        let isLval = a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}
+            var name = home
+            if hl.kind == InRegPair:
+              # Passed by reference, so it needs an address: a slot of its own.
+              name = synth("pairaddr") & $cursorToPosition(g.buf[], a) & ".0"
+              g.emTypedStackVar(name, tcur)
+              for k in 0 ..< aggrWordCount(g.prog, tn):
+                g.ab.tree MovX64: (g.emWordAtSlot(name, k * 8); g.emReg pairWord(hl, k))
+            elif home.len == 0:
+              name = symName(a)
+            for m in ms.mitems:
+              m.name = name; m.isTvar = isTvar
+              m.kind =
+                if home.len > 0 or hl.kind == InRegPair:
+                  (if pl.byRef: msHomeAddr else: msSlotWord)
+                elif pl.byRef: (if isTvar: msTvarAddr else: msGlobalAddr)
+                else: msGlobalWord
         if pl.onStack:
-          # Stack-passed: the outgoing slot IS the park. Word by word through a
-          # staging register, now, from wherever the aggregate is.
-          g.plan.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
-          var srcAddr = NoReg
-          var srcSpilled = false
-          var srcOwned = true
-          if isLval:
-            let addrHeld = g.takeHeld("an aggregate-arg address", canSpill = true)
-            heldArgs.add addrHeld
-            let recorded = (if addrHeld.kind == InReg: addrHeld.r else: NoReg)
-            g.emitLvalue2(a)
-            (srcAddr, srcSpilled) = g.aggrArgAddr(a, recorded, [])
-          else:
-            let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
-            if ptrReg != NoReg:
-              srcAddr = ptrReg; srcOwned = false
-            else:
-              srcAddr = g.pickStagingSealed("a stack aggregate-arg address", AddrSlot)
-              srcSpilled = true
-              let hl = (if home.len > 0 and a.kind == Symbol:
-                          g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
-                        else: noLoc)
-              if hl.kind == InRegPair: g.emPairHomeAddr(srcAddr, a, hl, tcur, tn)
-              elif home.len > 0: g.emAggrHomeAddr(srcAddr, home)
-              elif isTvar: g.emTvarAddr(srcAddr, symName(a))
-              else: g.emGlobalAddr(srcAddr, symName(a))
-          if pl.byRef:
-            g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcAddr)
-          else:
-            for k in 0 ..< pl.words:
-              let w = g.pickStagingSealed("a stack aggregate-arg word", AddrSlot)
-              g.ab.tree MovX64: (g.emReg w; g.emWordThroughPtr(srcAddr, k))
-              g.ab.tree MovX64: (outgoingSlot(nameIdx, k, true); g.emReg w)
-              g.giveBack w
-          if srcOwned:
-            if srcSpilled: g.giveBack srcAddr else: g.unbindTemp srcAddr
-          if isLval: g.freeLvalTemps2(a)
-        elif isLval:
-          # The address is the computed part. Deferred, it is parked and the
-          # words are read through it in phase 2; otherwise it lives in a
-          # staging register only for the marshalling that follows at once.
-          g.emitLvalue2(a)                     # pick embedded base/index regs
-          if deferred:
-            let p = g.park(j, AddrSlot)
-            if p.kind == InReg:
-              g.aggrAddrInto(a, p.r, AddrSlot, doBind = false)   # bound by `takeParked`
-            else:
-              let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
-              g.aggrAddrInto(a, s, AddrSlot, doBind = false)
-              g.emitStoreLoc(p, s)
-              g.giveBack s
-            srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
-          else:
-            for k in 0 ..< pl.words: g.plan.seal amd.gprAt(pl, k)   # the pick must not alias a word
-            let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
-            for k in 0 ..< pl.words: g.plan.unseal amd.gprAt(pl, k)
-            g.aggrAddrInto(a, s, AddrSlot, doBind = false)
-            srcs[j] = ArgSrc(kind: asAggrAddr, loc: regLoc(s, AddrSlot, isTemp = true),
-                             ptrReg: NoReg)
-            g.loadArg(j)
-            g.giveBack s
-          g.freeLvalTemps2(a)
+          for m in ms: g.storeOutgoing(m)
+        elif now:
+          g.resolve(ms)
         else:
-          # In memory already — or BUILT into memory here (an `(oconstr …)` into
-          # its synthetic slot), which is the computation phase 1 exists for.
-          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
-          srcs[j] =
-            if ptrReg != NoReg: ArgSrc(kind: asAggrPtr, ptrReg: ptrReg)
-            elif home.len > 0: ArgSrc(kind: asAggrHome, home: home, ptrReg: NoReg)
-            elif isTvar: ArgSrc(kind: asAggrTvar, ptrReg: NoReg)
-            else: ArgSrc(kind: asAggrGlobal, ptrReg: NoReg)
-          if not deferred: g.loadArg(j)
-      elif g.isFloatExpr(a):
-        # Straight into its xmm argument register, SEALED for the rest of the
-        # marshalling: a later argument's float staging (`pickFStaging` draws on
-        # xmm0–7) must not pass through it. The width is the argument's OWN —
-        # `emitFValue2` picks a LITERAL's bit pattern from the destination slot,
-        # so a `float32` literal materialized as the double pattern has a zero
-        # low half. A variadic float reaches here already promoted to double, so
-        # its `exprSlot` is `(f 64)`.
-        if pl.onStack: raiseAssert "arkham x64: >8 float arguments (stack TODO)"
-        var fSlot = g.exprSlot(a)
-        if fSlot.kind != AFloat: fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
-        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex], fSlot)
-        g.emitFValue2(a, fD)
-        g.rb.sealF fD.f; sealedFArgs.incl fD.f
-        g.ab.tree (if fSlot.size == 4: MovssX64 else: MovsdX64):
-          g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
-          g.emFReg fD.f
+          for r in laterClob[j+1]: g.redirect(ms, r, j, stash = false)
+          pending.add ms
+        if staged != NoReg: g.giveBack staged
+      elif pl.onStack and g.isFloatExpr(a):
+        raiseAssert "arkham x64: >8 float arguments (stack TODO)"
       elif pl.onStack:
         # 7th+ scalar: any register, stored into its outgoing slot, released.
         g.plan.hasStackVars = true             # outgoing stack-arg area ⇒ frame sub
@@ -3895,29 +3867,36 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
           ownSrc = true
         g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcReg)
         if ownSrc: g.giveBack srcReg else: g.freeVal(aD)
-      elif isLeafArg(a):
-        srcs[j] = ArgSrc(kind: asLeaf, ptrReg: NoReg)
-        if not deferred: g.loadArg(j)
       else:
-        # Computed. Its own ABI register when nothing later clobbers it (sealed
-        # from here on, see above); otherwise a park.
-        let abi = amd.gprAt(pl)
-        var aD: Location
-        if not deferred:
-          g.releaseArgDest(abi, "")
-          g.rb.sealAccum abi; sealedArgs.incl abi
-          aD = regLoc(abi, ScalarSlot)
+        # A scalar, integer or float: one move into its register.
+        let isF = g.isFloatExpr(a)
+        var m = ArgMove(dst: NoReg, fdst: NoFReg, f: NoFReg, r: NoReg, nameIdx: nameIdx,
+                        word: -1, kind: msLeaf, cur: a)
+        if isF:
+          # The width is the argument's OWN — `emitFValue2` picks a LITERAL's bit
+          # pattern from the destination slot, so a `float32` literal materialized
+          # as the double pattern has a zero low half. A variadic float reaches
+          # here already promoted to double, so its `exprSlot` is `(f 64)`.
+          m.fdst = amd.floatArgRegs[pl.fpIndex]
+          m.bytes = (if g.exprSlot(a).kind == AFloat: g.exprSlot(a).size else: 8)
+          m.freads = freads[j]
         else:
-          aD = g.park(j, ScalarSlot)
-        let want = aD
-        g.emitValue2(a, aD)
-        assert aD.kind == want.kind and (aD.kind != InReg or aD.r == want.r),
-               "arkham x64n: a computed argument moved under its producer"
-        srcs[j] = ArgSrc(kind: asPark, loc: aD, ptrReg: NoReg)
-        if not deferred: g.loadArg(j)
-    # ── phase 2: the deferred arguments, in order ────────────────────────────
-    for j in 0 ..< argCurs.len:
-      if srcs[j].kind != asDone: g.loadArg(j)
+          m.dst = amd.gprAt(pl)
+          m.reads = reads[j]
+        let leaf = isLeafArg(a)
+        if leaf and leafCore(a).kind == Symbol: m.valueSym = symName(leafCore(a))
+        let readsOwn = (if isF: m.fdst in freads[j] else: m.dst in reads[j])
+        if placeNow(j, m, computes = not leaf) and (leaf or not readsOwn):
+          g.emitMove(m)                        # computed straight into its register
+        else:
+          if not leaf:
+            g.evalInto(m, (if isF: g.fpark(m.bytes) else: g.park(j, ScalarSlot)))
+          var ms = @[m]
+          for r in laterClob[j+1]: g.redirect(ms, r, j, stash = false)
+          pending.add ms
+    # ── phase 2: one parallel move ───────────────────────────────────────────
+    g.resolve(pending)
+    for s in stashes: g.giveBack s
     if isSyscall: g.emSyscall()
     elif tgt.extern: g.ab.keyword ExtcallX64     # dynamic import → indirect via the IAT/GOT
     elif doTail:

@@ -201,7 +201,7 @@ proc pickTempReg*(g: var CodeGen; avoid: set[Reg] = {}): Reg =
   ##
   ## `avoid`: registers the caller knows are spoken for although nothing is bound
   ## to them yet — a call's argument registers while its arguments are still being
-  ## marshalled (`takeParked`). MODEL: `PoolOK` in proofs/call_marshal.tla.
+  ## marshalled (`takeParked`). MODEL: `ParkRegs` in proofs/call_marshal.tla (`Bug = "noAvoid"`).
   forEachVolatileTempCand(g, r):
     if r notin avoid and regFreeForTemp(g, r):
       when defined(arkhamTempDbg): inc tempVolatileHits

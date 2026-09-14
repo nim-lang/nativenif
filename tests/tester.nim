@@ -727,13 +727,15 @@ const
     ## limit. Those are the backend's stated contracts, not findings.
 
 proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
-                       known: seq[string]; level: int; park = "") =
+                       known: seq[string]; level: int; park = ""; moves = "") =
   ## Re-emit + assemble + RUN the corpus with the register file starved to `level`
   ## registers per pool. Uses its own `bin/arkham_stress` binary so the shipped
   ## `bin/arkham` cannot be perturbed by a stray environment variable. `runner`
   ## prefixes the produced executable (`qemu-aarch64` for the `linux_arm64` pass).
   ## `park = "mem"` additionally sends every call-argument park to memory
   ## (`ARKHAM_STRESS_PARK`), the tier no register shortage can reach.
+  ## `moves = "late"` sends every call-argument move through the parallel-move
+  ## resolver in phase 2 (`ARKHAM_STRESS_MOVES`) — no early placement at all.
   exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
   let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
@@ -742,6 +744,7 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   # Inherited by the arkham children.
   putEnv("ARKHAM_STRESS", if level > 0: $level else: "")
   putEnv("ARKHAM_STRESS_PARK", park)
+  putEnv("ARKHAM_STRESS_MOVES", moves)
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &
@@ -790,9 +793,11 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
       newFailures.add name & " — " & failed
   delEnv("ARKHAM_STRESS")
   delEnv("ARKHAM_STRESS_PARK")
+  delEnv("ARKHAM_STRESS_MOVES")
   echo passed, " / ", total - expectedFail, " arkham ", arch,
        " stress tests successful (k=", level,
-       (if park.len > 0: ", park=" & park else: ""), ", ", expectedFail, " known-broken)"
+       (if park.len > 0: ", park=" & park else: ""),
+       (if moves.len > 0: ", moves=" & moves else: ""), ", ", expectedFail, " known-broken)"
   if newFailures.len > 0:
     quit "FAILURE arkham register-pressure stress (" & arch &
          ") found NEW breakage:\n  " & newFailures.join("\n  ")
@@ -1613,7 +1618,7 @@ const rv32StressLevel = 2
   ## offer at least as many registers as one emitter step may hold at once.
   ## Verified at k=2,3,4,6,8 and unstressed — 122/122 at every one.
 
-proc rv32StressTests() =
+proc rv32StressTests(moves = "") =
   ## The RV32 corpus again with the register file starved, against a
   ## `-d:arkhamStress` binary of its own so a stray environment variable cannot
   ## perturb the shipped `bin/arkham`.
@@ -1638,6 +1643,7 @@ proc rv32StressTests() =
   let arkhamExe = ("bin" / "arkham_stress").addFileExt(ExeExt)
   let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
   putEnv("ARKHAM_STRESS", $rv32StressLevel)
+  putEnv("ARKHAM_STRESS_MOVES", moves)
   var passed = 0
   var total = 0
   for file in walkFiles("tests/arkham_m/*.c.nif"):
@@ -1671,8 +1677,10 @@ proc rv32StressTests() =
     removeFile elf
     inc passed
   putEnv("ARKHAM_STRESS", "")
+  delEnv("ARKHAM_STRESS_MOVES")
   echo passed, " / ", total, " RV32 stress tests successful (ARKHAM_STRESS=",
-       rv32StressLevel, ", I1/I2 bridge-budget assertions compiled in)"
+       rv32StressLevel, (if moves.len > 0: ", moves=" & moves else: ""),
+       ", I1/I2 bridge-budget assertions compiled in)"
 
 
 proc arkhamAvrTests() =
@@ -2190,8 +2198,8 @@ const cortexMUnsupported: seq[string] = @[
   "float_global_read", "float_special_values", "fp3264", "fparg_spill",
   "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
-  "global_init_float", "spill_produce_float", "store_forward",
-  "uint_literal_to_float",
+  "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
+  "store_forward", "uint_literal_to_float",
 
   # ── float <-> 64-bit integer ────────────────────────────────────────────────
   # FPv4-SP converts to and from a THIRTY-TWO bit integer. `int64(f)` past 2^31
@@ -2406,6 +2414,7 @@ rv32AsmTests()
 rv32CodegenTests()
 rv32RejectionTests()
 rv32StressTests()
+rv32StressTests(moves = "late")
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
@@ -2443,6 +2452,11 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
     arkhamStressTests(arch = "x64", skip = arkhamOsxOnly & arkhamX64Unsupported,
                       known = arkhamStressKnown, level = arkhamStressLevel,
                       park = "mem")
+    # …and with every call-argument move LATE: the early move is an optimization
+    # the parallel-move resolver must never depend on.
+    arkhamStressTests(arch = "x64", skip = arkhamOsxOnly & arkhamX64Unsupported,
+                      known = arkhamStressKnown, level = arkhamStressLevel,
+                      moves = "late")
 
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`), but
 # they are COMPILE-only — arkham is told `-a:x64` and the expectation is an error
@@ -2579,3 +2593,8 @@ when defined(linux) and (defined(amd64) or defined(arm64)):
                              arkhamOsxOnly,
                       known = arkhamStressA64Known,
                       level = arkhamStressA64Level)
+    arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
+                      skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
+                             arkhamOsxOnly,
+                      known = arkhamStressA64Known,
+                      level = arkhamStressA64Level, moves = "late")

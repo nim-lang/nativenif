@@ -9,12 +9,12 @@ count, and `run_tlanif.sh` asserts it. `call_marshal` is TLC-only so far.
 |---|---|---|---|
 | `arkham_bindings` | the register-binding protocol: locals, bound temps, steals, raw staging, fixed-register clobbers, plan/emit replay | `run_arkham_bindings_tlc.sh` | `run_tlanif.sh` |
 | `aggr_marshal` | by-value aggregate marshalling: the trailing partial word, four strategies, two storage kinds | `run_aggr_marshal_tlc.sh` | `run_tlanif.sh` |
-| `call_marshal` | call-argument marshalling under register pressure: exposure, the three park tiers, stash and delivery, a park DEMAND that must be served | `run_call_marshal_tlc.sh` | — |
+| `call_marshal` | call-argument marshalling, both backends: phase 1 reduces arguments to moves (early or late, parks for exposure), phase 2 is one parallel move with stashes; integer and float, hidden pointer, pair / pointer homes, a park DEMAND that must be served | `run_call_marshal_tlc.sh` | — |
 
 ```bash
 ./proofs/run_arkham_bindings_tlc.sh   # ~9 s
 ./proofs/run_aggr_marshal_tlc.sh      # 8 configurations, expected verdicts asserted
-./proofs/run_call_marshal_tlc.sh      # 9 rows: correct + 6 injections + 2 probes, ~3.5 min
+./proofs/run_call_marshal_tlc.sh      # 14 rows: x64 + RISC + 8 injections + 4 probes, ~4 min
 ./proofs/run_tlanif.sh                # the first two models, ~5 s with --jobs (all cores)
 ```
 
@@ -165,102 +165,107 @@ over the 495-file `tests/arkham` corpus and 3,325 `.c.nif` files from every nimo
 
 ---
 
-## 3. `call_marshal` — call-argument marshalling under register pressure
+## 3. `call_marshal` — call-argument marshalling: two phases and a parallel move
 
-The x86-64 `emitCall2Inner` / `takeParked` protocol: two phases, chibicc's shape
-(codegen.c `push_args` / `ND_FUNCALL`). First EVERY argument expression runs, then
-the ABI registers are loaded. A later argument's expression may destroy a register
-by ISA fiat (`idiv` writes rdx, a variable shift reads `cl`); the phase split keeps
-that away from marshalled arguments because no ABI register holds a value while an
-expression can still run.
+The call emitters of both backends (x86-64 `emitCall2Inner`, RISC `emitCall2`)
+in chibicc's shape (codegen.c `push_args` / `ND_FUNCALL`), with registers.
+Phase 1 runs EVERY argument expression and reduces each register-passed word to a
+**move**: a source that is no longer computed — a register, a memory place, an
+address — and the ABI register it belongs in. Phase 2 performs the moves as ONE
+**parallel move**.
 
-Why it exists: before the split the loop was fused — argument j landed in its ABI
-register while arguments j+1… still ran — and an exposed argument had to **park**.
-That park was a callee-saved-only `takeHeld` which asserted "out of registers" when
-the file was dry, `aggr_arg_parked` on `arkhamStressKnown` from #98 until
-2026-09-13, and neither model above could state the class: `arkham_bindings`
-enables a borrow only when a register is free, under `CHECK_DEADLOCK FALSE`, so "a
-value MUST be held and nothing is free" is not a state it reaches; `aggr_marshal`
-has no registers as a resource. This model has a **demand**: an argument that needs
-a park must get one, an unservable park is the `stuck` phase, and deadlock checking
-is on.
+Why it exists: the first revisions of this model followed the emitter's cases —
+parks for a computed scalar, an early load "when no later argument clobbers it", a
+phase 0 for an argument homed in another argument's register — and each revision
+was the shape of the hole just found. The hole underneath was always the same: an
+argument's SOURCE may sit in another argument's DESTINATION (a parameter still in
+its incoming register, a pair home, a by-reference pointer), which is a parallel
+move, and was being solved one case at a time. The emitters now solve it as one;
+this model states the protocol, with a DEMAND (a park that must be served; the
+`stuck` phase; deadlock checking on) as before.
 
-### What it models
+### The protocol
 
-Every call of 1..3 arguments, each a leaf (a literal or symbol: nothing runs), a
-computed scalar with any subset of the fixed registers as its clobbers, or a 1- or
-2-word aggregate either in memory or behind a computed address (with its own
-clobbers); an argument past the register file is stack-passed — its expression
-still runs in phase 1, but it is stored to the outgoing area and never loaded.
-A leaf or computed scalar also has a HOME — memory, or any register the planer
-could put a local in (never a fixed register the proc clobbers; distinct
-arguments never share one) — and what its expression reads is that register's
-content, or garbage once something overwrote it. Values are word identities.
+- **A source must survive phase 1.** Memory does. A register does unless a later
+  argument destroys it by ISA fiat (`idiv` writes rdx): such a source is copied
+  into a **park** now (`redirect`). A computed value goes into a park, or straight
+  into its own ABI register when the next rule allows it.
+- **A move may go early** — during phase 1 — when no later argument destroys its
+  register and no other argument READS it (`placeNow`). Early is an optimization;
+  the model may always take the late branch instead (`Route`), and the corpus holds
+  the emitters to the same with `ARKHAM_STRESS_MOVES=late`.
+- **The resolver** takes any move whose destination no other remaining move reads.
+  When none can go every remaining destination is read — a cycle — and one
+  destination's readers are redirected to a **stash**, a copy in a register nothing
+  live occupies, or memory.
 
-Phase 0: an argument whose home is an argument register of ANOTHER argument
-would be destroyed by that argument's load. Every such argument is evaluated
-first, into a park outside the call's claims (`ParkAtRisk`); a park that cannot
-be served is `stuck` here too.
-
-Phase 1, per argument in order: a computed scalar parks its VALUE, an aggregate
-lvalue parks its ADDRESS, a leaf or a memory aggregate parks nothing; then the
-expression runs (the clobbers land) and the value lands in the park. Phase 2 loads
-each argument's ABI register(s) from its source, in order, writing nothing else. The
-liberty, for the common case: an argument whose register(s) no later argument
-clobbers is loaded right away, in source order — a computed scalar straight into
-its ABI register (sealed from then on, its `(mov (arg pN) rN)` elided by nifasm), a
-leaf or a memory aggregate through the loader phase 2 uses (`EarlyLoad`). Loading
-every leaf late instead cost nifbench's parse phase 3 %: the leaf's load no longer
-overlapped the computation of the arguments after it.
-
-The park tiers (`takeParked`), any of which the emitter may take:
+The park tiers (`takeParked`; `pickTempReg(avoid = claims)` on RISC; `takeFTmp`
+for a float), any of which the emitter may take:
 
 | tier | code | what makes it sound |
 |---|---|---|
 | survivor | `pickHeldReg` | callee-saved; the planer reserves one for the emitter |
-| pool | `pickTempReg(avoid)` | r10 and the argument registers themselves (`intLocalTempRegs`), nothing bound, and nothing in `avoid` — the call's **claims** (its argument registers, loaded or not) plus the later arguments' clobbers |
-| memory | spill slot | reloaded through staging in phase 2 |
+| pool | `pickTempReg(avoid)` | r10 and the argument registers themselves, nothing bound, nothing in `avoid` — the call's **claims** (its argument registers and the hidden result pointer) plus the later arguments' clobbers. The float pool holds no argument register on any target |
+| memory | spill slot | read back through staging in phase 2 |
 
-The pool's `avoid` is the rule the first fix lacked: an argument register is
-otherwise refused only once something is BOUND to it, which happens when it is
-loaded — too late for a park taken for an earlier argument. (`pickTempReg`'s
-whole-proc rdx/rcx gate is not a park rule: with the later clobbers in `avoid` it
-only adds protection inside an argument's own expression, below this model's
-granularity, so it is not offered as an injection.)
+### What varies
+
+Every call of 1..3 arguments, integer or float (an argument past its register file
+is stack-passed: its expression still runs and clobbers), with or without a hidden
+result pointer preloaded into the first argument register. Integer leaves and
+computed scalars read a **home**: memory or a register — possibly ANOTHER argument's
+ABI register — and two arguments may read the same local; a computed value may
+clobber the fixed register. Float leaves and computed floats read a float home (a
+computed float may still clobber an integer register). Aggregates of one or two
+words live in memory, behind a computed address (whose base is a home), behind a
+by-reference pointer homed in a register, or in a register pair. A home may sit in
+a register a LATER argument destroys (the exposure `redirect` answers), never in
+one an earlier argument already destroyed (the reactive eviction moves such a local
+first). Values are identities; a register holds one value or garbage. The `risc`
+row is the same spec with no fixed register.
 
 ### Invariants and bug injections
 
-`ParksIntact` (a placed park still holds its word until consumed), `LoadedIntact`
-(a word loaded into its ABI register stays there until the call — and is the
-word, not what a clobbered home yielded), `ArgsInPlace` (at the call every
-register-passed word is in its ABI register), `NotStuck`. The correct spec passes
-(7,224,507 states); each injection fails the invariant it should:
+`SourcesIntact` (every remaining move's source still holds what it will deliver),
+`LoadedIntact` (a loaded argument register keeps its word until the call),
+`ArgsInPlace` (at the call every register-passed word is in its ABI register and
+the hidden pointer is intact), `NotStuck`. The correct spec passes for x86-64
+(15,266,622 states) and for RISC (4,709,717); each injection fails the invariant
+it should:
 
 | `Bug` | injected | fails |
 |---|---|---|
-| `survivorOnly` | the old `takeHeld(canSpill = false)`: tier one only | `NotStuck` |
-| `noAvoid` | the pool ignores the call's claims | `ParksIntact` — a phase-2 load lands on the park |
-| `noBound` | the pool ignores what a register holds | `ParksIntact` |
-| `noLaterClob` | every computed scalar into its own ABI register | `ParksIntact` — a later expression destroys it |
-| `earlyLoad` | leaves and memory aggregates loaded in phase 1 whether or not a later argument clobbers them, the fused loop before the split | `LoadedIntact` — a later expression destroys the loaded word |
-| `noPhase0` | an argument homed in another argument's register is not parked first — every backend before 2026-09-13 | `LoadedIntact` — the load reads the register after the earlier argument overwrote it (`tests/arkham/noreturn_arg_clobber`) |
+| `survivorOnly` | a park is callee-saved or nothing — the old `takeHeld(canSpill = false)` | `NotStuck` |
+| `noAvoid` | a pool park may sit in a register the call claims | `SourcesIntact` — an early move lands on it |
+| `noBound` | a pool park ignores what a register holds | `SourcesIntact` |
+| `noLaterClob` | an early move ignores later arguments' clobbers | `LoadedIntact` |
+| `noReads` | an early move ignores other arguments' reads — the diverging-call clobber (`tests/arkham/noreturn_arg_clobber`, `noreturn_pair_arg_clobber`) | `SourcesIntact` |
+| `noExposure` | a source a later argument destroys is not parked | `SourcesIntact` |
+| `noOrder` | the resolver loads a move another remaining move still reads | `SourcesIntact` |
+| `stashBound` | a stash ignores what a register holds | `SourcesIntact` |
 
-Two probe rows assert that `NoPoolPark` and `NoMemPark` FAIL on the correct spec —
-the pool and memory tiers are actually reached, so the invariants are not vacuous.
+Four probe rows assert that `NoStash`, `NoFloatStash`, `NoPoolPark` and `NoMemPark`
+FAIL on the correct spec: cycles (integer and float), pool parks and memory parks
+are all reached, so the invariants are not vacuous for them.
 
-Where an argument's value lives was the dimension the first revision lacked, and
-the loader's assertion found the class it hides while the split was being ported:
-the allocator relocates a local that a returning call's arguments read, but a
-DIVERGING callee's arguments are not a crossing, so a parameter passed to `panic`
-still sat in the register `panic`'s first argument lands in — both backends passed
-the message's second word as the value (exit 2 for 150). The home dimension and
-phase 0 are that revision.
+The stash rule surprised: an injection letting a stash alias a remaining move's
+destination was expected to fail and passed, and the model was right — a stash
+that avoids only what is live is sound, which is now the correct spec's rule. A
+stash that lands on a pending destination is a source like any other, and the
+resolver will not load that destination while the stash is still read. The x86-64
+emitter seals those destinations anyway; that is a margin, not a rule.
 
-Not modelled: byte layout (that is `aggr_marshal`), the hidden result pointer (one
-more claim), floats (they go straight into their sealed xmm; no argument expression
-pins an xmm), the inside of an argument's own expression beyond which home it
-reads, and two arguments reading the SAME home (the same local twice: no hazard, a
-read is not a write). The procs carry `MODEL:` back-pointers.
+Float conflicts are reachable in the model but not, today, in the corpus: a proc
+that makes a call spills its float locals, so no float source sits in an argument
+register at a call. The float half of the resolver is there for totality — and the
+`NoFloatStash` probe is the only thing that exercises its cycle break.
+
+Not modelled: byte layout (that is `aggr_marshal`), the inside of an argument's own
+expression beyond which homes it reads, Darwin's variadic tail (laid out by the call
+site after phase 2), and the value core's spill tier — a computed argument parked
+at `ARKHAM_STRESS=2` on RV32 exhausts the two bridges inside its own expression
+(`nested_at_read`), which is why the late-moves stress mode leaves computed
+arguments in their own register. The procs carry `MODEL:` back-pointers.
 
 ## tlanif dialect notes (learned porting)
 
@@ -290,11 +295,7 @@ Recent miscompiles whose fix was a *protocol* rule rather than an encoding detai
 - the 13 remaining `takeHeld` sites — `call_marshal` covers the park; each of
   those holds a value across something else (a call, an index expression that
   calls) and needs its own demand modelled the same way;
-- the RISC emitter runs the same two phases (no RISC machine here pins an
-  argument register, so it never parks: a computed scalar goes into its own
-  register in phase 1 and an aggregate lvalue's address is computed at load
-  time), and every boundary on every backend is declarative — a Darwin extern
-  declares its signature too (the fixed parameters of a `{.varargs.}` one; the
-  variadic tail is Apple's stack-passed one, laid out by the call site after
-  phase 2). There is no manual marshalling path left;
+- the value core's spill tier under a starved pool: a computed call argument
+  parked at `ARKHAM_STRESS=2` on RV32 runs out of bridges inside its own
+  expression (`nested_at_read`) — a demand model for produce-into-memory;
 - a tlanif port of `call_marshal`.

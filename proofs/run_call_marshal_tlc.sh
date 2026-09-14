@@ -1,17 +1,22 @@
 #!/bin/bash
-# Run TLC on the call-argument marshalling model: the correct protocol, then each
-# bug injection, comparing every verdict with the expected one. Exit status 0 iff
-# all seven agree.
+# Run TLC on the call-argument marshalling model (the two phases and the
+# parallel-move resolver): the correct protocol for x86-64 and for RISC, then
+# each bug injection, comparing every verdict with the expected one. Exit status 0
+# iff every row agrees.
 #
-#   none          two phases; parks: survivor / pool-outside-the-claims / memory   pass
-#   survivorOnly  the old takeHeld(canSpill = false)                               FAIL (NotStuck)
-#   noAvoid       a pool park may sit where a later argument is loaded             FAIL
-#   noBound       the pool ignores what a register holds                           FAIL
-#   noLaterClob   every computed scalar into its own ABI register                  FAIL
-#   earlyLoad     leaves/aggregates loaded in phase 1 (the old fused loop)         FAIL
-#   noPhase0      an argument homed in another argument's register not parked     FAIL
-# Two more rows are reachability probes on the correct spec: `NoPoolPark` and
-# `NoMemPark` must FAIL, or the pool / memory tiers were never exercised.
+#   none           x86-64 (a division writes rdx)                            pass
+#   risc           no instruction writes an argument register by fiat         pass
+#   survivorOnly   a park is callee-saved or nothing (the old takeHeld)       FAIL (NotStuck)
+#   noAvoid        a pool park may sit in a register the call claims          FAIL (SourcesIntact)
+#   noBound        a pool park ignores what a register holds                  FAIL (SourcesIntact)
+#   noLaterClob    an early move ignores later arguments' clobbers            FAIL (LoadedIntact)
+#   noReads        an early move ignores other arguments' reads               FAIL (SourcesIntact)
+#   noExposure     a source a later argument destroys is not parked           FAIL (SourcesIntact)
+#   noOrder        the resolver ignores a remaining move's read               FAIL (SourcesIntact)
+#   stashBound     a stash ignores what a register holds                      FAIL (SourcesIntact)
+# Four more rows are reachability probes on the correct spec: `NoStash`,
+# `NoFloatStash`, `NoPoolPark` and `NoMemPark` must FAIL, or that path was never
+# exercised and the invariants above are vacuous for it.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,19 +33,22 @@ else echo "TLC not found." >&2; exit 1; fi
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cp call_marshal.tla "$TMP/"
 status=0
-for row in none:pass: survivorOnly:FAIL:NotStuck noAvoid:FAIL:ParksIntact \
-           noBound:FAIL:ParksIntact noLaterClob:FAIL:ParksIntact \
-           earlyLoad:FAIL:LoadedIntact noPhase0:FAIL:LoadedIntact \
-           probe-NoPoolPark:FAIL:NoPoolPark \
-           probe-NoMemPark:FAIL:NoMemPark; do
+for row in none:pass: risc:pass: survivorOnly:FAIL:NotStuck noAvoid:FAIL:SourcesIntact \
+           noBound:FAIL:SourcesIntact noLaterClob:FAIL:LoadedIntact \
+           noReads:FAIL:SourcesIntact noExposure:FAIL:SourcesIntact \
+           noOrder:FAIL:SourcesIntact stashBound:FAIL:SourcesIntact \
+           probe-NoStash:FAIL:NoStash probe-NoFloatStash:FAIL:NoFloatStash \
+           probe-NoPoolPark:FAIL:NoPoolPark probe-NoMemPark:FAIL:NoMemPark; do
   IFS=: read -r bug want wantInv <<<"$row"
   if [[ "$bug" == probe-* ]]; then
     sed -e "/^INVARIANT/d" call_marshal.cfg > "$TMP/$bug.cfg"
     echo "INVARIANT ${bug#probe-}" >> "$TMP/$bug.cfg"
+  elif [ "$bug" = risc ]; then
+    sed -e 's/Fixed = {"A2"}/Fixed = {}/' call_marshal.cfg > "$TMP/$bug.cfg"
   else
     sed -e "s/Bug = \"none\"/Bug = \"$bug\"/" call_marshal.cfg > "$TMP/$bug.cfg"
   fi
-  out="$("${TLC[@]}" -metadir "$TMP/meta-$bug" -config "$TMP/$bug.cfg" \
+  out="$("${TLC[@]}" -workers auto -metadir "$TMP/meta-$bug" -config "$TMP/$bug.cfg" \
         "$TMP/call_marshal.tla" 2>&1)"
   if grep -q "No error has been found" <<<"$out"; then got=pass
   elif grep -q "is violated" <<<"$out"; then got=FAIL

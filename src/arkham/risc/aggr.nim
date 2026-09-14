@@ -132,24 +132,6 @@ proc regsToStruct*(g: var CodeGen; varName: string; typeSym: SymId; firstArg: in
   ## x{firstArg+i} → aggregate (one GPR per 8-byte eightbyte).
   g.aggrWordsToFromRegs(varName, typeSym, firstArg, toRegs = false)
 
-proc globalToRegs*(g: var CodeGen; name: string; typeSym: SymId; firstArg: int; isTvar = false) =
-  ## Read a GLOBAL (or THREADVAR) aggregate's words into x{firstArg+i}. It is a label,
-  ## not a stack slot, so its address goes into a staging bridge and each word is read
-  ## through that pointer — a FULL eightbyte as a raw `(u 64)` word (handles packed
-  ## fields), a trailing PARTIAL eightbyte through `loadAggrTail`. For a global passed
-  ## by value as a call argument (`equalStrings(s, "")` where `s` is a global `string`).
-  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), name)   # see `aggrWordsToFromRegs`
-  let bridge = g.takeBridge()
-  if isTvar: g.genTlvAddr(name, bridge) else: g.emGlobalAddr(bridge, name)
-  let byteSize = aggrByteSize(g.prog, typeSym)
-  let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
-  for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * mw >= mw:
-      g.ab.tree MovA64: (g.emReg g.md.intArgRegs[firstArg + i]; g.emWordThroughPtr(bridge, i))
-    else:
-      g.loadAggrTail(g.md.intArgRegs[firstArg + i], bridge, byteSize, i * mw)
-  g.dropBridge bridge
-
 proc takeProduceBridge*(g: var CodeGen; typ = ScalarSlot): Reg =
   ## The PRODUCE bridge — the scratch a value is staged through on its way into
   ## memory — if it is free, and any other reserved bridge if it is not.

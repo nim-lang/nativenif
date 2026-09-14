@@ -849,9 +849,9 @@ proc takeParked*(g: var CodeGen; avoid: set[Reg]; slot = ScalarSlot): Location =
   ## `emReg`). A scalar producer (`emitValue2`) leaves an already-bound temp
   ## alone. `freeVal` releases it after the call.
   ##
-  ## MODEL: proofs/call_marshal.tla — `ParkReg` (`SurvivorOK` / `PoolOK`) and
-  ## `ParkMem`; `ParkStuck` is what `Bug = "survivorOnly"` (the old `takeHeld`)
-  ## reaches. The `avoid` rule is `Bug = "noAvoid"`.
+  ## MODEL: proofs/call_marshal.tla — `ParkRegs` / `ParkLocs`; `EvalStuck` is
+  ## what `Bug = "survivorOnly"` (the old `takeHeld`) reaches. The `avoid` rule
+  ## is `Bug = "noAvoid"`, the bound rule `Bug = "noBound"`.
   var r = NoReg
   if not stressParkMemory:
     r = g.pickHeldReg()

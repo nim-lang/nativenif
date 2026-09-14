@@ -67,6 +67,24 @@ proc exprReadsRegImpl(g: var CodeGen; n: var Cursor; reg: Reg): bool =
     inc n
   return false
 
+proc exprReadsFRegImpl(g: var CodeGen; n: var Cursor; f: FReg): bool =
+  if n.kind == Symbol:
+    let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+    inc n
+    return h.kind == InFReg and h.f == f
+  elif n.kind == TagLit:
+    n.into:
+      while n.hasMore:
+        if g.exprReadsFRegImpl(n, f): return true
+  else:
+    inc n
+  return false
+
+proc exprReadsFReg*(g: var CodeGen; n: Cursor; f: FReg): bool =
+  ## The SIMD twin of `exprReadsReg`: does the subtree read a symbol homed in `f`?
+  var c = n
+  g.exprReadsFRegImpl(c, f)
+
 proc exprReadsReg*(g: var CodeGen; n: Cursor; reg: Reg): bool =
   ## True iff the subtree at `n` reads a symbol homed in `reg` — the guard for
   ## computing a binop's left operand straight into a pinned `dest` register.

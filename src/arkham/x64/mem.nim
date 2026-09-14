@@ -610,38 +610,6 @@ proc storePartialThroughPtr*(g: var CodeGen; p, src: Reg; base, nbytes: int) =
   step(8)
   if scratch != NoReg: g.giveBack scratch
 
-proc globalToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray[Reg]) =
-  ## Read a GLOBAL aggregate's words into the by-value ABI arg GPRs `regs[i] ← word i`.
-  ## The global is RIP-relative (no stack slot), so its address goes into the staging
-  ## bridge and each word is read through that pointer — a FULL eightbyte as a raw
-  ## `(u 64)` word (handles packed fields), a trailing PARTIAL through
-  ## `loadPartialThroughPtr`.
-  ## The read-side twin of `regsToStructThroughPtr`, for a global passed by value as a
-  ## call argument (`equalStrings(s, "")` where `s` is a global `string`).
-  let p = g.pickStagingSealed("a global aggregate call-arg address", AddrSlot)
-  g.emGlobalAddr(p, name)
-  let byteSize = aggrByteSize(g.prog, typeSym)
-  for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:
-      g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(p, i))
-    else:
-      g.loadPartialThroughPtr(regs[i], p, i * 8, byteSize - i * 8)
-  g.giveBack p
-
-proc tvarToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray[Reg]) =
-  ## Read a THREAD-LOCAL aggregate's words into the by-value ABI arg GPRs
-  ## `regs[i] ← word i`. Like `globalToRegs`, but the address is the FS-relative
-  ## thread-var address (`emTvarAddr`) rather than a RIP-relative global.
-  let p = g.pickStagingSealed("a thread-local aggregate call-arg address", AddrSlot)
-  g.emTvarAddr(p, name)
-  let byteSize = aggrByteSize(g.prog, typeSym)
-  for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:
-      g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(p, i))
-    else:
-      g.loadPartialThroughPtr(regs[i], p, i * 8, byteSize - i * 8)
-  g.giveBack p
-
 proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
   ## `mov dest, <imm>` — emits `(mov dest (nil))` for a nil so the register binds to
   ## the `(nil)` type, else the ordinary `movImm`.
