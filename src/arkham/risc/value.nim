@@ -3205,6 +3205,14 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       if aggrSize - idx * w < w: g.loadAggrTail(dst, p, aggrSize, idx * w)
       else:
         g.ab.tree MovA64: (g.emReg dst; g.emWordThroughPtr(p, idx))
+    proc loadAddr(g: var CodeGen; m: ArgMove; b: Reg) =
+      ## `b` ← the address a `msSlotPtrWord` / `msHomeWord` / `msGlobalWord` reads through.
+      case m.kind
+      of msSlotPtrWord: g.place2(m.loc, b)
+      of msHomeWord:
+        g.ab.tree LeaA64: (g.emReg b; g.ab.sym m.name)
+      else:
+        if m.isTvar: g.genTlvAddr(m.name, b) else: g.emGlobalAddr(b, m.name)
     proc load(g: var CodeGen; m: ArgMove; dst: Reg) =
       ## `dst` ← the move's source.
       g.withBridges(bdTwoInRegs, "a call-argument move"):
@@ -3218,14 +3226,19 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         of msReg: g.movReg(dst, m.r)
         of msLoc: g.place2(m.loc, dst)
         of msPtrWord: g.loadWord(dst, m.r, m.idx, m.bytes)
-        of msSlotPtrWord, msHomeWord, msGlobalWord:
+        of msHomeWord:
+          if m.bytes - m.idx * wordSize() >= wordSize():
+            # A whole word needs no address: nifasm folds the offset into the
+            # slot's own frame displacement.
+            g.ab.tree MovA64: (g.emReg dst; g.emWordAtSlot(m.name, m.idx * wordSize()))
+          else:                                # a short tail reads exact bytes
+            let b = g.takeBridge()
+            g.loadAddr(m, b)
+            g.loadWord(dst, b, m.idx, m.bytes)
+            g.dropBridge b
+        of msSlotPtrWord, msGlobalWord:
           let b = g.takeBridge()
-          case m.kind
-          of msSlotPtrWord: g.place2(m.loc, b)
-          of msHomeWord:
-            g.ab.tree LeaA64: (g.emReg b; g.ab.sym m.name)
-          else:
-            if m.isTvar: g.genTlvAddr(m.name, b) else: g.emGlobalAddr(b, m.name)
+          g.loadAddr(m, b)
           g.loadWord(dst, b, m.idx, m.bytes)
           g.dropBridge b
         of msHomeAddr:
@@ -3256,6 +3269,22 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       g.stagedArgs.incl m.dst                  # claimed before the value is built
       g.load(m, m.dst)
       g.bindArg(m.dst, m.nameIdx, m.word)
+    proc sameAddr(a, b: ArgMove): bool =
+      ## Two moves reading their words through the same address.
+      a.kind == b.kind and a.kind in {msSlotPtrWord, msGlobalWord} and
+        a.nameIdx == b.nameIdx and a.name == b.name and a.isTvar == b.isTvar and
+        (a.kind != msSlotPtrWord or a.loc.name == b.loc.name)
+    proc emitAddrGroup(g: var CodeGen; grp: seq[ArgMove]) =
+      ## The words of one argument behind one address: the address is loaded once.
+      for m in grp:
+        g.releaseArgDest(m.dst, "")
+        g.stagedArgs.incl m.dst
+      g.withBridges(bdTwoInRegs, "an aggregate argument's words"):
+        let b = g.takeBridge()
+        g.loadAddr(grp[0], b)
+        for m in grp: g.loadWord(m.dst, b, m.idx, m.bytes)
+        g.dropBridge b
+      for m in grp: g.bindArg(m.dst, m.nameIdx, m.word)
     proc evalInto(g: var CodeGen; m: var ArgMove; p: Location) =
       ## A leaf/computed move's expression, evaluated into `p` now; the move
       ## then only moves from there.
@@ -3312,8 +3341,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       ## it lives.
       let leaf = isLeafArg(m.cur)
       if leaf and leafCore(m.cur).kind == Symbol: m.valueSym = symName(leafCore(m.cur))
-      let readsOwn = (if m.fdst != NoFReg: m.fdst in freads[j] else: m.dst in reads[j])
-      if placeNow(j, m, computes = not leaf) and (leaf or not readsOwn):
+      if placeNow(j, m, computes = not leaf):  # its own expression may read `dst`
         g.emitMove(m)                          # computed straight into its register
       else:
         if not leaf:
@@ -3325,17 +3353,28 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       ## destination is read by another move — a cycle — and redirecting one
       ## destination's readers to a copy breaks it.
       var ms = ms
+      proc eligible(ms: seq[ArgMove]; i: int): bool =
+        for k in 0 ..< ms.len:
+          if k != i and (if ms[i].fdst != NoFReg: ms[i].fdst in ms[k].freads
+                         else: ms[i].dst in ms[k].reads):
+            return false
+        true
       while ms.len > 0:
         var pick = -1
         for i in 0 ..< ms.len:
-          pick = i
-          for k in 0 ..< ms.len:
-            if k != i and (if ms[i].fdst != NoFReg: ms[i].fdst in ms[k].freads
-                           else: ms[i].dst in ms[k].reads):
-              pick = -1
-              break
-          if pick >= 0: break
-        if pick >= 0:
+          if eligible(ms, i):
+            pick = i
+            break
+        if pick >= 0 and ms[pick].kind in {msSlotPtrWord, msGlobalWord}:
+          # Every eligible word behind the same address goes with it.
+          let m0 = ms[pick]
+          var grp: seq[ArgMove] = @[]
+          for i in countdown(ms.len - 1, 0):
+            if sameAddr(ms[i], m0) and eligible(ms, i):
+              grp.insert(ms[i], 0)
+              ms.delete i
+          g.emitAddrGroup(grp)
+        elif pick >= 0:
           g.emitMove(ms[pick])
           ms.delete pick
         elif ms[0].fdst != NoFReg:

@@ -276,7 +276,7 @@ EvalComp ==
     /\ phase = "eval" /\ j <= N /\ ~evaluated /\ ~OnStack(j) /\ Kind(j) = "comp"
     /\ LET d == Dst(j, 0)
            v == IF HomeOK(j) THEN C(j) ELSE Garbage     \* read first, then clobber
-       IN \/ /\ PlaceNow(j, d) /\ d \notin Reads(j)
+       IN \/ /\ PlaceNow(j, d)                     \* the expression may read d itself
              /\ regVal' = [Clobbered(j) EXCEPT ![d] = v]
              /\ want' = [want EXCEPT ![d] = C(j)]
              /\ bound' = bound \cup {d}
@@ -323,7 +323,7 @@ EvalAddr ==
 
 \* A park demand nothing can serve.
 NeedsPark(i) ==
-    \/ Kind(i) = "comp" /\ ~(PlaceNow(i, Dst(i, 0)) /\ Dst(i, 0) \notin Reads(i))
+    \/ Kind(i) = "comp" /\ ~PlaceNow(i, Dst(i, 0))
     \/ Kind(i) = "addr" /\ ~\A k \in Ks(i) : PlaceNow(i, Dst(i, k))
     \/ Kind(i) \in {"leaf", "ptr", "pair"} /\ Bug # "noExposure" /\
        \E m \in HomeMoves(i) : m.rd \in LaterClob(i)

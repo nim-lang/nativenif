@@ -230,7 +230,7 @@ row is the same spec with no fixed register.
 `LoadedIntact` (a loaded argument register keeps its word until the call),
 `ArgsInPlace` (at the call every register-passed word is in its ABI register and
 the hidden pointer is intact), `NotStuck`. The correct spec passes for x86-64
-(15,266,622 states) and for RISC (4,709,717); each injection fails the invariant
+(16,465,724 states) and for RISC (5,026,508); each injection fails the invariant
 it should:
 
 | `Bug` | injected | fails |
