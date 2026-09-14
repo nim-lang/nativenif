@@ -743,17 +743,6 @@ proc takeWideRegs*(g: var CodeGen; n: int; what: string): seq[Reg] =
       g.bindTemp(r, ScalarSlot)
     result.add r
 
-proc wideArgToRegs*(g: var CodeGen; slotName: string; firstArg: int) =
-  ## A 64-bit call argument into `intArgRegs[firstArg]` and `[firstArg+1]`.
-  ##
-  ## Takes the SLOT the value was already produced into, not the expression:
-  ## producing it here would be inside the `(prepare …)` block, where any
-  ## instruction that clobbers r0–r3 destroys the arguments already staged there
-  ## — and a 64-bit `div` is a `bl` to the module's divider. See `wideArgSlots`.
-  let src = slotWide(slotName)
-  g.wideLoad(g.md.intArgRegs[firstArg], src, 0)
-  g.wideLoad(g.md.intArgRegs[firstArg + 1], src, 1)
-
 proc wideArgTruncated*(g: var CodeGen; slotName: string; dest: Reg) =
   ## A 64-bit argument passed to a NARROWER declared parameter: the low word,
   ## which is the truncation C performs and Leng's front end relies on

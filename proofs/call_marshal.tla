@@ -1,386 +1,423 @@
 ---- MODULE call_marshal ----
-\* TLA+ model of arkham's CALL-ARGUMENT MARSHALLING under register pressure —
-\* the x86-64 `emitCall2Inner` / `takeParked` protocol (src/arkham/x64/value.nim,
-\* emit.nim; grep MODEL:). Two phases, chibicc's shape (codegen.c `push_args`,
-\* `ND_FUNCALL`): first EVERY argument expression runs, then the ABI registers
-\* are loaded. A later argument's expression may destroy a register by ISA fiat
-\* — `idiv` writes rdx, a variable shift reads its count from `cl` — and the
-\* phase split is what keeps that away from marshalled arguments: no ABI
-\* register holds a value while an expression can still run.
+\* TLA+ model of arkham's CALL-ARGUMENT MARSHALLING: chibicc's two phases with
+\* a parallel-move resolver (x64 `emitCall2Inner`, RISC `emitCall2`; grep MODEL:).
 \*
-\* Phase 1 reduces each argument to a SOURCE nothing later disturbs:
-\*   leaf       a literal or a symbol — already one, nothing runs;
-\*   comp       a computed scalar: its value goes into a PARK. The one liberty:
-\*              when no later argument clobbers its ABI register, that register
-\*              IS the park (sealed from then on);
-\*   aggr       an aggregate in memory is a source; an aggregate LVALUE's address
-\*              is computed and parked (the words are read through it later).
-\* The same liberty applies to a leaf and to a memory aggregate: when no later
-\* argument clobbers its register(s) it is LOADED right away, in source order
-\* (`EarlyLoad`) — that is the common case, and loading everything late cost
-\* nifbench's parse phase 3 % for nothing.
+\* Phase 1 runs EVERY argument expression and reduces each register-passed word
+\* to a MOVE — a source that is no longer computed (a register, a memory place,
+\* an address) and the ABI register it belongs in. Phase 2 performs the moves
+\* as ONE PARALLEL MOVE. Everything else is two rules:
 \*
-\* Where an argument's value LIVES before the call is the second dimension: a
-\* leaf or a computed scalar reads a HOME, a register or memory. A home that is
-\* an argument register of ANOTHER argument is destroyed when that argument is
-\* loaded — the allocator relocates such a local for a returning call, but a
-\* DIVERGING callee's arguments are not a crossing, so a parameter passed to a
-\* panic still sat in the register the panic's first argument lands in, and
-\* both backends passed the message's second word as the value
-\* (tests/arkham/noreturn_arg_clobber). PHASE 0 evaluates every such argument
-\* first, into a park, before any register is loaded (`ParkAtRisk`).
-\* A park (`takeParked`) is a callee-saved survivor, else a pool temp, else a
-\* spill slot. The pool hands out r10 and the argument registers themselves
-\* (`intLocalTempRegs`), rdx/rcx only in a proc with no division / variable
-\* shift (the whole-proc gate), nothing bound, and nothing in `avoid`: the
-\* call's CLAIMS (its argument registers, loaded or not) plus the later
-\* arguments' clobbers. An argument register is otherwise refused only once
-\* something is BOUND to it, which happens when it is loaded — too late for a
-\* park taken for an earlier argument. (The whole-proc gate is `pickTempReg`'s
-\* rule for every temp and is not a park rule: with the later clobbers in
-\* `avoid`, what it adds is protection inside the argument's OWN expression,
-\* below this model's granularity — dropping it here produces no counterexample,
-\* so it is not offered as an injection.)
-\* Phase 2 loads each argument's ABI register(s) from its source, in order, and
-\* writes nothing else.
+\*   A source must SURVIVE phase 1. Memory does. A register does unless a later
+\*   argument destroys it by ISA fiat (`idiv` writes rdx): such a source is
+\*   copied into a PARK now (`redirect`). A computed value goes into a park, or
+\*   straight into its own ABI register when the next rule allows it.
 \*
-\* Why this exists (proofs/README.md, "call_marshal"): the park used to be a
-\* callee-saved-only `takeHeld` that asserted "out of registers" when the file
-\* was dry, and neither `arkham_bindings` nor `aggr_marshal` could state that
-\* (the former enables a borrow only when a register is free, under
-\* `CHECK_DEADLOCK FALSE`; the latter has no registers as a resource). Here an
-\* argument that needs a park DEMANDS one; a park that cannot be served is the
-\* `stuck` phase, and deadlock checking is on.
+\*   A move may go EARLY, during phase 1, when no later argument destroys its
+\*   register and no other argument READS it (`placeNow`). Early is an
+\*   optimization: every move may also wait for phase 2, and the model lets
+\*   it choose either way (`ARKHAM_STRESS_MOVES=late` is the corpus's half).
+\*
+\* The resolver takes any move whose destination no other remaining move reads;
+\* when none can go, every remaining destination is read — a cycle — and one
+\* destination's readers are redirected to a STASH: a copy in any register
+\* nothing live occupies, or memory. (It need not avoid the remaining moves'
+\* destinations: a stash that lands on one is a source like any other, and the
+\* resolver will not load that destination while the stash is still read. The
+\* x86-64 emitter seals them anyway; this spec does not, and passes — a margin,
+\* not a rule.)
+\*
+\* What varies (the whole protocol, not the last bug's axis):
+\*   - 1..MaxArgs arguments, integer or float; an argument past its register
+\*     file is stack-passed (its expression still runs and clobbers);
+\*   - an optional hidden result pointer, preloaded into the first argument
+\*     register by the caller and claimed like an argument;
+\*   - integer leaves / computed scalars read a HOME: memory or a register
+\*     (possibly ANOTHER argument's ABI register — a parameter passed to a
+\*     diverging callee stays where it arrived); two arguments may read the
+\*     same local; a computed scalar may clobber the fixed register;
+\*   - float leaves / computed floats read a float home; a computed float may
+\*     still clobber an integer register (`float(a div b)`);
+\*   - aggregates: in memory, behind a computed address (reading a pointer
+\*     home, clobbering), behind a by-reference POINTER homed in a register,
+\*     or homed in a register PAIR — one or two words;
+\*   - parks: survivor, pool (the argument registers count, outside the call's
+\*     claims), memory; stashes: any register of the class nothing touches, or
+\*     memory.
+\* Values are identities: a register holds one value or Garbage.
 \*
 \* Bug injection (`Bug`, proofs/run_call_marshal_tlc.sh — the correct spec
-\* passes, each injection produces a counterexample):
-\*   "survivorOnly"  the old `takeHeld(canSpill = false)`: tier one only
-\*                   -> NotStuck (the aggr_arg_parked assert, #98 .. 2026-09-13)
-\*   "noAvoid"       the pool ignores the call's claims
-\*                   -> ParksIntact: a phase-2 load lands on the park
-\*   "noBound"       the pool ignores what a register holds
-\*                   -> ParksIntact
-\*   "noLaterClob"   every computed scalar goes into its own ABI register
-\*                   -> ParksIntact: a later expression destroys it
-\*   "earlyLoad"     leaves and memory aggregates are loaded in phase 1 WHETHER
-\*                   OR NOT a later argument clobbers them, as the fused loop
-\*                   did before the split
-\*                   -> LoadedIntact: a later expression destroys the loaded word
-\*   "noPhase0"      an argument homed in another argument's register is not
-\*                   parked first — every backend before 2026-09-13
-\*                   -> LoadedIntact: the load reads the register after the
-\*                      earlier argument overwrote it
-\*
-\* Layouts: every call of 1..MaxArgs arguments from `Shapes`: a leaf, a computed
-\* scalar with any clobber set, a 1- or 2-word aggregate in memory or behind a
-\* computed address (with any clobber set for that computation); an argument
-\* past the register file is stack-passed — its expression still runs (and
-\* clobbers) in phase 1, but it is stored to the outgoing area and never loaded.
-\* A leaf or computed scalar also has a HOME: memory, or any register outside
-\* the fixed ones the call clobbers (the planer never homes a local there);
-\* distinct arguments have distinct register homes. Values are word
-\* IDENTITIES; `[j, 2]` is the ADDRESS of aggregate argument j.
+\* passes, each injection fails the named invariant):
+\*   "survivorOnly"  a park is callee-saved or nothing (the old takeHeld)  -> NotStuck
+\*   "noAvoid"       a pool park may sit in a register the call claims     -> SourcesIntact
+\*   "noBound"       a pool park ignores what a register holds             -> SourcesIntact
+\*   "noLaterClob"   an early move ignores later arguments' clobbers       -> LoadedIntact
+\*   "noReads"       an early move ignores other arguments' reads — the
+\*                   diverging-call clobber (tests/arkham/noreturn_*)       -> SourcesIntact
+\*   "noExposure"    a source a later argument destroys is not parked      -> SourcesIntact
+\*   "noOrder"       the resolver ignores a remaining move's read          -> SourcesIntact
+\*   "stashBound"    a stash ignores what a register holds                 -> SourcesIntact
+\* Probes, expected to FAIL on the correct spec (so the paths are reached):
+\*   NoStash, NoFloatStash, NoPoolPark, NoMemPark.
 
-EXTENDS Naturals, Sequences, FiniteSets
+EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
-    A0, A1, A2, A3,   \* the ABI argument registers, in order (rdi rsi rdx rcx)
-    S0,               \* the callee-saved survivor the planer reserves for the emitter
-    T0,               \* the volatile expression temp outside the argument file (r10)
     MaxArgs,          \* arguments per call, 1..MaxArgs
-    Free, Garbage,    \* what a register holds when it holds no live word
-    Mem, None,        \* a park in a spill slot / no park
-    Bug               \* see above
+    Fixed,            \* the argument registers an instruction may write by fiat
+                      \* ({"A2"}: rdx on x86-64; {} on every RISC machine)
+    Bug
 
-ArgRegs   == <<A0, A1, A2, A3>>
-Fixed     == {A2, A3}                 \* rdx (idiv), rcx (shift count)
-Survivors == {S0}
-Pool      == {T0}
-Regs      == {A0, A1, A2, A3, S0, T0}
-Bugs      == {"none", "survivorOnly", "noAvoid", "noBound", "noLaterClob", "earlyLoad",
-              "noPhase0"}
-ASSUME Bug \in Bugs
-ASSUME MaxArgs \in Nat \ {0}
+IntArgs   == <<"A0", "A1", "A2">>
+FltArgs   == <<"F0", "F1">>
+Survivors == {"S0"}
+IntPool   == {"T0"}                    \* r10; the argument registers join the pool
+FltPool   == {"FT"}                    \* xmm8..; never an argument register
+IntRegs   == {"A0", "A1", "A2", "S0", "T0"}
+FltRegs   == {"F0", "F1", "FT"}
+Regs      == IntRegs \cup FltRegs
+NoReg     == "none"
+Mem       == "mem"
+Bugs == {"none", "survivorOnly", "noAvoid", "noBound", "noLaterClob", "noReads",
+         "noExposure", "noOrder", "stashBound"}
+ASSUME Bug \in Bugs /\ MaxArgs \in Nat \ {0} /\ Fixed \subseteq {"A2"}
 
-Homes == Regs \cup {Mem}
+\* ---- values -----------------------------------------------------------------
+Free    == 0
+Garbage == -1
+Hidden  == 1
+RegNum  == [A0 |-> 0, A1 |-> 1, A2 |-> 2, S0 |-> 3, T0 |-> 4, F0 |-> 5, F1 |-> 6, FT |-> 7]
+V(h)    == 100 + RegNum[h]             \* the local homed in register h
+MV(i)   == 200 + i                     \* argument i's local in memory
+W(i, k) == 10 * i + k                  \* word k of aggregate i
+P(i)    == 10 * i + 2                  \* the address of aggregate i
+C(i)    == 10 * i + 3                  \* the computed value of argument i
+
+\* ---- argument shapes -----------------------------------------------------------
+IntHomes == {"A0", "A1", "A2", "T0", Mem}
+RegHomes == IntHomes \ {Mem}
+FltHomes == {"F0", "F1", Mem}
+Clobs    == {{}, Fixed}
+Shape(cls, kind, words, home, home2, clob) ==
+    [cls |-> cls, kind |-> kind, words |-> words, home |-> home, home2 |-> home2, clob |-> clob]
 Shapes ==
-    {[kind |-> "leaf", words |-> 1, viaAddr |-> FALSE, clob |-> {}, home |-> h] : h \in Homes} \cup
-    {[kind |-> "comp", words |-> 1, viaAddr |-> FALSE, clob |-> c, home |-> h] :
-        c \in SUBSET Fixed, h \in Homes} \cup
-    {[kind |-> "aggr", words |-> w, viaAddr |-> FALSE, clob |-> {}, home |-> Mem] : w \in {1, 2}} \cup
-    {[kind |-> "aggr", words |-> w, viaAddr |-> TRUE, clob |-> c, home |-> Mem] :
-        w \in {1, 2}, c \in SUBSET Fixed}
-
-WordIds == [j: 1..MaxArgs, k: 0..2]   \* k = 2: the address of aggregate j
-Word(j, k) == [j |-> j, k |-> k]
-AddrWord(j) == [j |-> j, k |-> 2]
-Range(s) == {s[i] : i \in 1..Len(s)}
+    {Shape("int", "leaf", 1, h, NoReg, {}) : h \in IntHomes} \cup
+    {Shape("int", "comp", 1, h, NoReg, c) : h \in IntHomes, c \in Clobs} \cup
+    {Shape("flt", "leaf", 1, h, NoReg, {}) : h \in FltHomes} \cup
+    {Shape("flt", "comp", 1, h, NoReg, c) : h \in FltHomes, c \in Clobs} \cup
+    {Shape("int", "mem", w, Mem, NoReg, {}) : w \in {1, 2}} \cup
+    {Shape("int", "addr", w, h, NoReg, c) : w \in {1, 2}, h \in {"A0", "A1", Mem}, c \in Clobs} \cup
+    {Shape("int", "ptr", w, h, NoReg, {}) : w \in {1, 2}, h \in RegHomes} \cup
+    {Shape("int", "pair", 2, hh[1], hh[2], {}) : hh \in {x \in RegHomes \X RegHomes : x[1] # x[2]}}
 
 VARIABLES
-    args,       \* the call: seq of shapes with `first` (index into ArgRegs)
-    phase,      \* "park0" | "eval" | "load" | "call" | "done" | "stuck"
-    j,          \* the argument in hand (Len(args)+1: the phase is complete)
-    evaluated,  \* phase 1: argument j's expression has run (its clobbers landed)
-    placed,     \* words whose value has landed in their park
-    parkOf,     \* [WordIds -> Regs \cup {Mem, None}]
-    regVal,     \* [Regs -> WordIds \cup {Free, Garbage}]
-    slots,      \* memory-parked words whose slot holds the word
-    loaded,     \* words sitting in their ABI register (phase 2 ran for them)
-    handled     \* arguments phase 0 evaluated and parked ahead of everything
+    args,       \* the call: seq of shapes, with `first` (ABI position) and `hidden`
+    phase,      \* "eval" | "resolve" | "call" | "stuck"
+    j,          \* the argument in hand
+    evaluated,  \* its expression has run
+    regVal,     \* [Regs -> value]
+    bound,      \* registers something live occupies: homes, parks, loaded arguments
+    slots,      \* values memory parks hold
+    queue,      \* moves resolving NOW (an early group)
+    pending,    \* moves waiting for phase 2
+    want,       \* [Regs -> value] what a loaded argument register must keep
+    stashes,    \* stashes taken
+    used        \* park/stash tiers reached (probes)
 
-vars == <<args, phase, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
+vars == <<args, phase, j, evaluated, regVal, bound, slots, queue, pending, want, stashes, used>>
 
-\* ---- the call shape ------------------------------------------------------------
-RECURSIVE WordsBefore(_, _)
-WordsBefore(ws, i) == IF i = 1 THEN 0 ELSE WordsBefore(ws, i - 1) + ws[i - 1]
-
-N          == Len(args)
-OnStack(i) == args[i].first + args[i].words - 1 > Len(ArgRegs)
-Abi(i, k)  == ArgRegs[args[i].first + k]
-Ks(i)      == 0..(args[i].words - 1)
-Kind(i)    == args[i].kind
+\* ---- the call shape ---------------------------------------------------------------
+N           == Len(args)
+HasHidden   == N > 0 /\ args[1].hidden
+Cls(i)      == args[i].cls
+Kind(i)     == args[i].kind
+Ks(i)       == 0..(args[i].words - 1)
+OnStack(i)  == IF Cls(i) = "flt" THEN args[i].first > Len(FltArgs)
+               ELSE args[i].first + args[i].words - 1 > Len(IntArgs)
+Dst(i, k)   == IF Cls(i) = "flt" THEN FltArgs[args[i].first] ELSE IntArgs[args[i].first + k]
+Want(i, k)  == CASE Kind(i) = "leaf" -> (IF args[i].home = Mem THEN MV(i) ELSE V(args[i].home))
+                 [] Kind(i) = "comp" -> C(i)
+                 [] OTHER            -> W(i, k)
+\* what `exprReadsReg` / `exprReadsFReg` see: the registers the expression reads
+Reads(i)    == (IF Kind(i) = "mem" THEN {} ELSE {args[i].home, args[i].home2}) \cap Regs
 LaterClob(i) == UNION {args[m].clob : m \in (i + 1)..N}
 ProcClob     == UNION {args[m].clob : m \in 1..N}
-Claims == UNION {{Abi(i, k) : k \in Ks(i)} : i \in {m \in 1..N : ~OnStack(m)}}
+RegPassed    == {i \in 1..N : ~OnStack(i)}
+Claims == UNION {{Dst(i, k) : k \in Ks(i)} : i \in RegPassed} \cup
+          (IF HasHidden THEN {"A0"} ELSE {})
+
+RECURSIVE Before(_, _, _)
+Before(sh, cls, i) == IF i = 1 THEN 0
+                      ELSE Before(sh, cls, i - 1) +
+                           (IF sh[i - 1].cls = cls THEN sh[i - 1].words ELSE 0)
 
 Init ==
-    \E n \in 1..MaxArgs :
+    \E n \in 1..MaxArgs, hid \in BOOLEAN :
       \E sh \in [1..n -> Shapes] :
-        LET ws == [i \in 1..n |-> sh[i].words]
-            pc == UNION {sh[m].clob : m \in 1..n} IN
-        \* a register home is never a fixed register the proc clobbers (the planer's
-        \* gate), and two arguments never share one
-        /\ \A i \in 1..n : sh[i].home \in Fixed => sh[i].home \notin pc
-        /\ \A i, m \in 1..n : (i # m /\ sh[i].home # Mem) => sh[i].home # sh[m].home
-        /\ args = [i \in 1..n |-> [kind |-> sh[i].kind, words |-> sh[i].words,
-                                   viaAddr |-> sh[i].viaAddr, clob |-> sh[i].clob,
-                                   home |-> sh[i].home,
-                                   first |-> WordsBefore(ws, i) + 1]]
-        /\ phase = "park0" /\ j = 1 /\ evaluated = FALSE
-        /\ placed = {} /\ loaded = {} /\ slots = {} /\ handled = {}
-        /\ parkOf = [w \in WordIds |-> None]
-        \* a leaf's / computed scalar's value sits in its register home
+        LET homeOf(i) == {sh[i].home, sh[i].home2} \cap Regs
+            \* a register holding a value that is ARGUMENT-SPECIFIC (a pointer, a pair word)
+            owned(i)  == IF sh[i].kind \in {"ptr", "pair"} THEN homeOf(i) ELSE {}
+        IN
+        \* a value an argument reads is not already destroyed by an earlier (or its
+        \* own) expression — the reactive eviction moves such a local first. A
+        \* LATER argument may destroy it: that is the exposure `redirect` answers.
+        /\ \A i \in 1..n : homeOf(i) \cap UNION {sh[m].clob : m \in 1..i} = {}
+        \* two arguments may read the same local, but an argument-specific value
+        \* sits in a register nothing else uses
+        /\ \A i, m \in 1..n : i # m => owned(i) \cap homeOf(m) = {}
+        \* the caller wrote the hidden pointer into A0: nothing lives there
+        /\ hid => \A i \in 1..n : "A0" \notin homeOf(i)
+        /\ args = [i \in 1..n |->
+                     [cls |-> sh[i].cls, kind |-> sh[i].kind, words |-> sh[i].words,
+                      home |-> sh[i].home, home2 |-> sh[i].home2, clob |-> sh[i].clob,
+                      first |-> Before(sh, sh[i].cls, i) + 1 +
+                                (IF hid /\ sh[i].cls = "int" THEN 1 ELSE 0),
+                      hidden |-> hid]]
         /\ regVal = [r \in Regs |->
-                      IF \E i \in 1..n : sh[i].home = r /\ sh[i].kind \in {"leaf", "comp"}
-                      THEN Word(CHOOSE i \in 1..n : sh[i].home = r, 0) ELSE Free]
+              IF hid /\ r = "A0" THEN Hidden
+              ELSE IF \E i \in 1..n : sh[i].kind = "ptr" /\ sh[i].home = r
+                   THEN P(CHOOSE i \in 1..n : sh[i].kind = "ptr" /\ sh[i].home = r)
+              ELSE IF \E i \in 1..n : sh[i].kind = "pair" /\ sh[i].home = r
+                   THEN W(CHOOSE i \in 1..n : sh[i].kind = "pair" /\ sh[i].home = r, 0)
+              ELSE IF \E i \in 1..n : sh[i].kind = "pair" /\ sh[i].home2 = r
+                   THEN W(CHOOSE i \in 1..n : sh[i].kind = "pair" /\ sh[i].home2 = r, 1)
+              ELSE IF \E i \in 1..n : r \in homeOf(i) THEN V(r)
+              ELSE Free]
+        /\ bound = UNION {homeOf(i) : i \in 1..n} \cup (IF hid THEN {"A0"} ELSE {})
+        /\ want = [r \in Regs |-> IF hid /\ r = "A0" THEN Hidden ELSE Free]
+        /\ phase = "eval" /\ j = 1 /\ evaluated = FALSE
+        /\ slots = {} /\ queue = {} /\ pending = {} /\ stashes = 0 /\ used = {}
 
-\* ---- parks -------------------------------------------------------------------------
-Holds(r) == regVal[r] \in WordIds        \* bound: a live word sits (or is reserved) there
-Home(i)  == args[i].home
-\* What argument i's expression READS right now: its home's content — the word,
-\* or Garbage once something overwrote the register.
-HomeVal(i) == IF Home(i) = Mem THEN Word(i, 0)
-              ELSE IF regVal[Home(i)] = Word(i, 0) THEN Word(i, 0) ELSE Garbage
-Own(i) == {Abi(i, k) : k \in Ks(i)}
-\* An argument whose home is an argument register of ANOTHER argument: a load
-\* destroys it. Phase 0 parks these first.
-AtRisk(i) == /\ ~OnStack(i) /\ Kind(i) \in {"leaf", "comp"}
-             /\ Home(i) \in Claims \ Own(i)
-Avoid(i) == IF Bug = "noAvoid" THEN {} ELSE Claims \cup LaterClob(i)
+\* ---- sources and moves ---------------------------------------------------------
+Move(dst, rd, slot, expect, val) ==
+    [dst |-> dst, rd |-> rd, slot |-> slot, expect |-> expect, val |-> val]
+SrcOK(m)   == /\ (m.rd = NoReg \/ regVal[m.rd] = m.expect)
+              /\ (m.slot = Garbage \/ m.slot \in slots)
+Clobbered(i) == [r \in Regs |-> IF r \in args[i].clob THEN Garbage ELSE regVal[r]]
+ClassRegs(r) == IF r \in FltRegs THEN FltRegs ELSE IntRegs
 
-\* `pickHeldReg`
-SurvivorOK(r) == r \in Survivors /\ ~Holds(r)
-\* `pickTempReg(avoid)`
-PoolOK(i, r) ==
-    /\ Bug # "survivorOnly"
-    /\ r \in Pool \cup Range(ArgRegs)
-    /\ Bug = "noBound" \/ ~Holds(r)
-    /\ r \notin Avoid(i)
-    /\ r \in Fixed => r \notin ProcClob
-MemOK == Bug # "survivorOnly"
+\* `placeNow`
+PlaceNow(i, dst) ==
+    /\ Bug = "noLaterClob" \/ dst \notin LaterClob(i)
+    /\ Bug = "noReads" \/ \A k \in 1..N : k # i => dst \notin Reads(k)
 
-\* What argument j parks in phase 1: a computed scalar its VALUE, an aggregate
-\* lvalue its ADDRESS; a leaf and a memory aggregate nothing. A stack-passed
-\* argument is stored to the outgoing area at once and parks nothing.
-ParkWord(i) ==
-    IF OnStack(i) THEN None
-    ELSE IF Kind(i) = "comp" THEN Word(i, 0)
-    ELSE IF Kind(i) = "aggr" /\ args[i].viaAddr THEN AddrWord(i)
-    ELSE None
-NeedsPark == /\ phase = "eval" /\ j <= N /\ ~evaluated /\ j \notin handled
-             /\ IF ParkWord(j) = None THEN FALSE ELSE parkOf[ParkWord(j)] = None
-\* The liberty: a computed scalar's own ABI register, when nothing later
-\* clobbers it. `Bug = "noLaterClob"` takes it unconditionally.
-OwnAbiOK == /\ Kind(j) = "comp"
-            /\ Bug = "noLaterClob" \/ Abi(j, 0) \notin LaterClob(j)
+Range(s) == {s[x] : x \in 1..Len(s)}
 
-ParkReg(r) ==
-    /\ NeedsPark
-    /\ \/ SurvivorOK(r) \/ PoolOK(j, r)
-       \/ (r = Abi(j, 0) /\ OwnAbiOK)
-    /\ parkOf' = [parkOf EXCEPT ![ParkWord(j)] = r]
-    /\ regVal' = [regVal EXCEPT ![r] = ParkWord(j)]     \* reserved: bound on hand-out
-    /\ UNCHANGED <<args, phase, j, evaluated, placed, slots, loaded, handled>>
+\* The park tiers (`takeParked` / `pickTempReg(avoid = claims)` / a spill slot;
+\* the float twin `takeFTmp`, whose pool holds no argument register).
+ParkRegs(i, cls) ==
+    IF cls = "flt"
+    THEN {r \in FltPool : r \notin bound}
+    ELSE {r \in Survivors : r \notin bound} \cup
+         (IF Bug = "survivorOnly" THEN {}
+          ELSE {r \in IntPool \cup Range(IntArgs) :
+                  /\ Bug = "noBound" \/ r \notin bound
+                  /\ Bug = "noAvoid" \/ r \notin Claims \cup LaterClob(i)})
+ParkLocs(i, cls) == ParkRegs(i, cls) \cup (IF Bug = "survivorOnly" THEN {} ELSE {Mem})
+Tier(p) == IF p = Mem THEN "mem" ELSE IF p \in Survivors THEN "survivor" ELSE "pool"
 
-ParkMem ==
-    /\ NeedsPark /\ MemOK
-    /\ parkOf' = [parkOf EXCEPT ![ParkWord(j)] = Mem]
-    /\ UNCHANGED <<args, phase, j, evaluated, placed, regVal, slots, loaded, handled>>
+\* Put value `v` (read now) into park `p`; the move then reads the park.
+ParkedMove(m, p, v) ==
+    IF p = Mem THEN [m EXCEPT !.rd = NoReg, !.slot = m.expect]
+    ELSE [m EXCEPT !.rd = p, !.slot = Garbage]
+ParkWrite(rv, p, v) == IF p = Mem THEN rv ELSE [rv EXCEPT ![p] = v]
+SlotWrite(p, v)     == IF p = Mem /\ v # Garbage THEN slots \cup {v} ELSE slots
+BoundWrite(p)       == IF p = Mem THEN bound ELSE bound \cup {p}
 
-\* The demand cannot be served: the hole this model exists for.
-ParkStuck ==
-    /\ NeedsPark /\ ~MemOK
-    /\ ~\E r \in Regs : SurvivorOK(r) \/ PoolOK(j, r) \/ (r = Abi(j, 0) /\ OwnAbiOK)
-    /\ phase' = "stuck"
-    /\ UNCHANGED <<args, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
+\* Early or late — both are the protocol. A group goes early only as a whole.
+Route(i, ms) ==
+    \/ /\ \A m \in ms : PlaceNow(i, m.dst)
+       /\ queue' = ms /\ UNCHANGED pending
+    \/ /\ queue' = {} /\ pending' = pending \cup ms
 
-\* ---- phase 0: what a load would destroy is evaluated into a park first ----------
-\* The expression runs now (its clobbers land now), the value lands in a park
-\* outside the call's claims — `takeParked` on x86-64, a pool temp or an etmp
-\* slot on the RISC side — and phase 1 skips the argument.
-Phase0Pending == {i \in 1..N : AtRisk(i) /\ i \notin handled}
-ParkAtRisk(i) ==
-    /\ phase = "park0" /\ Bug # "noPhase0" /\ i \in Phase0Pending
-    /\ \E loc \in Regs \cup {Mem} :
-         /\ loc = Mem \/ SurvivorOK(loc) \/ PoolOK(i, loc)
-         /\ (loc = Mem => MemOK)
-         /\ parkOf' = [parkOf EXCEPT ![Word(i, 0)] = loc]
-         /\ IF loc = Mem
-            THEN /\ slots' = IF HomeVal(i) = Word(i, 0) THEN slots \cup {Word(i, 0)} ELSE slots
-                 /\ regVal' = [r \in Regs |-> IF r \in args[i].clob THEN Garbage ELSE regVal[r]]
-            ELSE /\ slots' = slots
-                 /\ regVal' = [r \in Regs |-> IF r = loc THEN HomeVal(i)
-                                              ELSE IF r \in args[i].clob THEN Garbage
-                                              ELSE regVal[r]]
-    /\ placed' = placed \cup {Word(i, 0)}
-    /\ handled' = handled \cup {i}
-    /\ UNCHANGED <<args, phase, j, evaluated, loaded>>
-Phase0Stuck ==
-    /\ phase = "park0" /\ Bug # "noPhase0" /\ Phase0Pending # {}
-    /\ ~MemOK
-    /\ ~\E i \in Phase0Pending, r \in Regs : SurvivorOK(r) \/ PoolOK(i, r)
-    /\ phase' = "stuck"
-    /\ UNCHANGED <<args, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
-BeginEval ==
-    /\ phase = "park0" /\ (Bug = "noPhase0" \/ Phase0Pending = {})
-    /\ phase' = "eval"
-    /\ UNCHANGED <<args, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
+\* The moves of a leaf / pointer / pair / memory aggregate, before exposure.
+HomeMoves(i) ==
+    CASE Kind(i) = "leaf" ->
+           {Move(Dst(i, 0), IF args[i].home = Mem THEN NoReg ELSE args[i].home, Garbage,
+                 Want(i, 0), Want(i, 0))}
+      [] Kind(i) = "mem"  -> {Move(Dst(i, k), NoReg, Garbage, W(i, k), W(i, k)) : k \in Ks(i)}
+      [] Kind(i) = "ptr"  -> {Move(Dst(i, k), args[i].home, Garbage, P(i), W(i, k)) : k \in Ks(i)}
+      [] Kind(i) = "pair" -> {Move(Dst(i, k), IF k = 0 THEN args[i].home ELSE args[i].home2,
+                                   Garbage, W(i, k), W(i, k)) : k \in Ks(i)}
 
-\* ---- phase 1: the expression runs, the value lands in its park ---------------------
-\* A computed scalar's value is whatever its home holds when its expression
-\* runs; that is what lands in the park at `Place`.
-Evaluate ==
-    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ j \notin handled
-    /\ IF ParkWord(j) = None THEN TRUE ELSE parkOf[ParkWord(j)] # None
-    /\ regVal' = [r \in Regs |-> IF r \in args[j].clob THEN Garbage ELSE regVal[r]]
+\* ---- phase 1 ------------------------------------------------------------------------
+Unchanged1 == UNCHANGED <<args, phase, j, stashes>>
+
+EvalStack ==
+    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ OnStack(j)
+    /\ regVal' = Clobbered(j) /\ evaluated' = TRUE
+    /\ UNCHANGED <<bound, slots, queue, pending, want, used>> /\ Unchanged1
+
+\* A leaf, a pointer, a pair, a memory aggregate: nothing computes. A source a
+\* later argument destroys is copied into a park now (`redirect`); at most one
+\* home per argument is exposed (Fixed is one register).
+EvalHome ==
+    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ ~OnStack(j)
+    /\ Kind(j) \in {"leaf", "mem", "ptr", "pair"}
+    /\ LET ms == HomeMoves(j)
+           exposed == IF Bug = "noExposure" THEN {} ELSE {m \in ms : m.rd \in LaterClob(j)}
+       IN IF exposed = {}
+          THEN /\ Route(j, ms)
+               /\ UNCHANGED <<regVal, bound, slots, used>>
+          ELSE \E p \in ParkLocs(j, Cls(j)) :
+                 LET e  == CHOOSE m \in exposed : TRUE
+                     v  == IF SrcOK(e) THEN e.expect ELSE Garbage
+                     ms2 == {IF m.rd = e.rd THEN ParkedMove(m, p, v) ELSE m : m \in ms}
+                 IN /\ regVal' = ParkWrite(regVal, p, v)
+                    /\ slots' = SlotWrite(p, v) /\ bound' = BoundWrite(p)
+                    /\ used' = used \cup {Tier(p)}
+                    /\ Route(j, ms2)
     /\ evaluated' = TRUE
-    /\ UNCHANGED <<args, phase, j, placed, parkOf, slots, loaded, handled>>
+    /\ UNCHANGED want /\ Unchanged1
 
-Place ==
-    /\ phase = "eval" /\ j <= N /\ evaluated /\ j \notin handled
-    /\ ParkWord(j) # None /\ ParkWord(j) \notin placed
-    /\ LET w == ParkWord(j)
-           v == IF Kind(j) = "comp" THEN HomeVal(j) ELSE w IN
-         /\ placed' = placed \cup {w}
-         /\ IF parkOf[w] = Mem
-            THEN slots' = (IF v = w THEN slots \cup {w} ELSE slots) /\ UNCHANGED regVal
-            ELSE regVal' = [regVal EXCEPT ![parkOf[w]] = v] /\ UNCHANGED slots
-    /\ UNCHANGED <<args, phase, j, evaluated, parkOf, loaded, handled>>
+HomeOK(i) == args[i].home = Mem \/ regVal[args[i].home] = V(args[i].home)
 
-ArgEvaluated(i) == i \in handled \/
-                   (evaluated /\ (ParkWord(i) = None \/ ParkWord(i) \in placed))
+\* A computed scalar: straight into its own register (early), or into a park.
+EvalComp ==
+    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ ~OnStack(j) /\ Kind(j) = "comp"
+    /\ LET d == Dst(j, 0)
+           v == IF HomeOK(j) THEN C(j) ELSE Garbage     \* read first, then clobber
+       IN \/ /\ PlaceNow(j, d)                     \* the expression may read d itself
+             /\ regVal' = [Clobbered(j) EXCEPT ![d] = v]
+             /\ want' = [want EXCEPT ![d] = C(j)]
+             /\ bound' = bound \cup {d}
+             /\ UNCHANGED <<slots, queue, pending, used>>
+          \/ \E p \in ParkLocs(j, Cls(j)) :
+               /\ regVal' = ParkWrite(Clobbered(j), p, v)
+               /\ slots' = SlotWrite(p, v) /\ bound' = BoundWrite(p)
+               /\ used' = used \cup {Tier(p)}
+               /\ queue' = {}
+               /\ pending' = pending \cup
+                    {IF p = Mem THEN Move(d, NoReg, C(j), C(j), C(j))
+                     ELSE Move(d, p, Garbage, C(j), C(j))}
+               /\ UNCHANGED want
+    /\ evaluated' = TRUE
+    /\ Unchanged1
+
+\* An aggregate behind a computed address: when every word may go now, the
+\* address lives in a transient staging register and the words load at once;
+\* otherwise the address parks and the words wait.
+EvalAddr ==
+    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ ~OnStack(j) /\ Kind(j) = "addr"
+    /\ LET a == IF HomeOK(j) THEN P(j) ELSE Garbage
+           cl == Clobbered(j)
+       IN \/ /\ \A k \in Ks(j) : PlaceNow(j, Dst(j, k))
+             /\ regVal' = [r \in Regs |-> IF \E k \in Ks(j) : r = Dst(j, k)
+                            THEN (IF a = P(j) THEN W(j, CHOOSE k \in Ks(j) : r = Dst(j, k))
+                                  ELSE Garbage)
+                            ELSE cl[r]]
+             /\ want' = [r \in Regs |-> IF \E k \in Ks(j) : r = Dst(j, k)
+                          THEN W(j, CHOOSE k \in Ks(j) : r = Dst(j, k)) ELSE want[r]]
+             /\ bound' = bound \cup {Dst(j, k) : k \in Ks(j)}
+             /\ UNCHANGED <<slots, queue, pending, used>>
+          \/ \E p \in ParkLocs(j, "int") :
+               /\ regVal' = ParkWrite(cl, p, a)
+               /\ slots' = SlotWrite(p, a) /\ bound' = BoundWrite(p)
+               /\ used' = used \cup {Tier(p)}
+               /\ queue' = {}
+               /\ pending' = pending \cup
+                    {IF p = Mem THEN Move(Dst(j, k), NoReg, P(j), P(j), W(j, k))
+                     ELSE Move(Dst(j, k), p, Garbage, P(j), W(j, k)) : k \in Ks(j)}
+               /\ UNCHANGED want
+    /\ evaluated' = TRUE
+    /\ Unchanged1
+
+\* A park demand nothing can serve.
+NeedsPark(i) ==
+    \/ Kind(i) = "comp" /\ ~PlaceNow(i, Dst(i, 0))
+    \/ Kind(i) = "addr" /\ ~\A k \in Ks(i) : PlaceNow(i, Dst(i, k))
+    \/ Kind(i) \in {"leaf", "ptr", "pair"} /\ Bug # "noExposure" /\
+       \E m \in HomeMoves(i) : m.rd \in LaterClob(i)
+EvalStuck ==
+    /\ phase = "eval" /\ j <= N /\ ~evaluated /\ ~OnStack(j)
+    /\ NeedsPark(j) /\ ParkLocs(j, Cls(j)) = {}
+    /\ phase' = "stuck"
+    /\ UNCHANGED <<args, j, evaluated, regVal, bound, slots, queue, pending, want, stashes, used>>
 
 NextArg ==
-    /\ phase = "eval" /\ j <= N /\ ArgEvaluated(j)
+    /\ phase = "eval" /\ j <= N /\ evaluated /\ queue = {}
     /\ j' = j + 1 /\ evaluated' = FALSE
-    /\ UNCHANGED <<args, phase, placed, parkOf, regVal, slots, loaded, handled>>
+    /\ UNCHANGED <<args, phase, regVal, bound, slots, queue, pending, want, stashes, used>>
 
-BeginLoad ==
+BeginResolve ==
     /\ phase = "eval" /\ j = N + 1
-    /\ phase' = "load" /\ j' = 1
-    /\ UNCHANGED <<args, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
+    /\ phase' = "resolve"
+    /\ UNCHANGED <<args, j, evaluated, regVal, bound, slots, queue, pending, want, stashes, used>>
 
-\* ---- phase 2: load argument i's ABI register(s) from its source ------------------
-\* A parked word is read from its park (a register still holding it, or its
-\* slot); an aggregate behind a parked address needs that address intact; a leaf
-\* or a memory aggregate reads its home. Only the argument's own registers are
-\* written — `releaseArgDest` kills whatever was bound there.
-ParkVal(w) == IF parkOf[w] = Mem THEN (IF w \in slots THEN w ELSE Garbage)
-              ELSE IF regVal[parkOf[w]] = w THEN w ELSE Garbage
-LoadVal(i, k) ==
-    IF Kind(i) = "comp" THEN ParkVal(Word(i, 0))
-    ELSE IF Kind(i) = "leaf" THEN
-         (IF parkOf[Word(i, 0)] # None THEN ParkVal(Word(i, 0)) ELSE HomeVal(i))
-    ELSE IF Kind(i) = "aggr" /\ args[i].viaAddr THEN
-         (IF ParkVal(AddrWord(i)) = AddrWord(i) THEN Word(i, k) ELSE Garbage)
-    ELSE Word(i, k)
-LoadArg(i) ==
-    /\ regVal' = [r \in Regs |-> IF \E k \in Ks(i) : r = Abi(i, k)
-                                 THEN LoadVal(i, CHOOSE k \in Ks(i) : Abi(i, k) = r)
-                                 ELSE regVal[r]]
-    /\ loaded' = loaded \cup {Word(i, k) : k \in Ks(i)}
+\* ---- the resolver (an early group in phase 1, everything else in phase 2) ----------
+Resolving == IF phase = "eval" THEN queue ELSE pending
+SetResolving(q) == IF phase = "eval" THEN queue' = q /\ UNCHANGED pending
+                   ELSE pending' = q /\ UNCHANGED queue
+Active == (phase = "eval" /\ evaluated /\ queue # {}) \/ (phase = "resolve" /\ pending # {})
+
+Eligible(m, q) == Bug = "noOrder" \/ \A k \in q \ {m} : k.rd # m.dst
 
 Load ==
-    /\ phase = "load" /\ j <= N
-    /\ IF OnStack(j) \/ (\E k \in Ks(j) : Word(j, k) \in loaded)
-       THEN UNCHANGED <<regVal, loaded>>          \* nothing to load (or loaded early)
-       ELSE LoadArg(j)
-    /\ j' = j + 1
-    /\ UNCHANGED <<args, phase, evaluated, placed, parkOf, slots, handled>>
+    /\ Active
+    /\ \E m \in Resolving :
+         /\ Eligible(m, Resolving)
+         /\ regVal' = [regVal EXCEPT ![m.dst] = IF SrcOK(m) THEN m.val ELSE Garbage]
+         /\ want' = [want EXCEPT ![m.dst] = m.val]
+         /\ bound' = bound \cup {m.dst}
+         /\ SetResolving(Resolving \ {m})
+    /\ UNCHANGED <<args, phase, j, evaluated, slots, stashes, used>>
 
-\* A leaf or a memory aggregate is loaded into its ABI register(s) as soon as
-\* its turn comes in phase 1, when no later argument clobbers them. `Bug =
-\* "earlyLoad"` drops that guard: the fused loop before the split.
-EarlyLoad ==
-    /\ phase = "eval" /\ j <= N /\ ArgEvaluated(j) /\ ~OnStack(j)
-    /\ Kind(j) = "leaf" \/ (Kind(j) = "aggr" /\ ~args[j].viaAddr)
-    /\ Bug = "earlyLoad" \/ \A k \in Ks(j) : Abi(j, k) \notin LaterClob(j)
-    /\ ~\E k \in Ks(j) : Word(j, k) \in loaded
-    /\ LoadArg(j)
-    /\ UNCHANGED <<args, phase, j, evaluated, placed, parkOf, slots, handled>>
+Stash ==
+    /\ Active
+    /\ ~\E m \in Resolving : Eligible(m, Resolving)
+    /\ \E m \in Resolving :
+         LET d == m.dst IN
+         \E s \in {r \in ClassRegs(d) :
+                     Bug = "stashBound" \/ r \notin bound}
+                  \cup {Mem} :
+           LET c == regVal[d] IN
+              /\ regVal' = ParkWrite(regVal, s, c)
+              /\ slots' = SlotWrite(s, c) /\ bound' = BoundWrite(s)
+              /\ used' = used \cup {IF d \in FltRegs THEN "fstash" ELSE "stash"}
+              /\ SetResolving({IF k.rd = d THEN ParkedMove(k, s, c) ELSE k : k \in Resolving})
+    /\ stashes' = stashes + 1
+    /\ UNCHANGED <<args, phase, j, evaluated, want>>
 
 Call ==
-    /\ phase = "load" /\ j = N + 1
+    /\ phase = "resolve" /\ pending = {}
     /\ phase' = "call"
-    /\ UNCHANGED <<args, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
+    /\ UNCHANGED <<args, j, evaluated, regVal, bound, slots, queue, pending, want, stashes, used>>
 
-Finish == phase = "call" /\ phase' = "done" /\
-          UNCHANGED <<args, j, evaluated, placed, parkOf, regVal, slots, loaded, handled>>
-Done   == phase = "done" /\ UNCHANGED vars      \* deadlock checking is on: `done` is not one
+Done == phase \in {"call", "stuck"} /\ UNCHANGED vars
 
 Next ==
-    \/ \E i \in 1..N : ParkAtRisk(i)
-    \/ Phase0Stuck \/ BeginEval
-    \/ \E r \in Regs : ParkReg(r)
-    \/ ParkMem \/ ParkStuck
-    \/ Evaluate \/ Place \/ NextArg \/ EarlyLoad
-    \/ BeginLoad \/ Load \/ Call \/ Finish \/ Done
+    \/ EvalStack \/ EvalHome \/ EvalComp \/ EvalAddr \/ EvalStuck
+    \/ NextArg \/ BeginResolve
+    \/ Load \/ Stash
+    \/ Call \/ Done
 
 Spec == Init /\ [][Next]_vars
 
 \* ============================== invariants ====================================
 
 TypeOK ==
-    /\ Len(args) \in 1..MaxArgs
-    /\ phase \in {"park0", "eval", "load", "call", "done", "stuck"}
-    /\ handled \subseteq 1..MaxArgs
-    /\ j \in 1..(MaxArgs + 1)
-    /\ placed \subseteq WordIds /\ loaded \subseteq WordIds /\ slots \subseteq WordIds
-    /\ parkOf \in [WordIds -> Regs \cup {Mem, None}]
-    /\ regVal \in [Regs -> WordIds \cup {Free, Garbage}]
+    /\ phase \in {"eval", "resolve", "call", "stuck"}
+    /\ bound \subseteq Regs
+    /\ stashes \in 0..(2 * MaxArgs)
 
-\* A placed park not yet consumed still holds its word.
-ParksIntact ==
-    phase \in {"park0", "eval", "load"} =>
-        \A w \in placed : (w.k = 2 \/ w \notin loaded) =>
-            IF parkOf[w] = Mem THEN w \in slots ELSE regVal[parkOf[w]] = w
+\* Every remaining move's source still holds what the move will deliver.
+SourcesIntact == \A m \in queue \cup pending : SrcOK(m)
 
-\* A word loaded into its ABI register stays there until the call.
-LoadedIntact ==
-    phase \in {"park0", "eval", "load"} =>
-        \A w \in loaded : regVal[Abi(w.j, w.k)] = w
+\* A loaded argument register keeps its word until the call.
+LoadedIntact == \A r \in Regs : want[r] # Free => regVal[r] = want[r]
 
-\* At the call every register-passed word is in its ABI register.
+\* At the call every register-passed word is in its ABI register, and the
+\* hidden pointer is still in A0.
 ArgsInPlace ==
-    phase \in {"call", "done"} =>
-        \A i \in 1..N : ~OnStack(i) => \A k \in Ks(i) : regVal[Abi(i, k)] = Word(i, k)
+    phase = "call" =>
+        /\ \A i \in RegPassed : \A k \in Ks(i) : regVal[Dst(i, k)] = Want(i, k)
+        /\ HasHidden => regVal["A0"] = Hidden
 
 NotStuck == phase # "stuck"
 
-\* Reachability probes, expected to FAIL (run_call_marshal_tlc.sh asserts it):
-\* the correct spec takes pool and memory parks, so those tiers are exercised.
-NoPoolPark == \A w \in WordIds : parkOf[w] \notin (Pool \cup Range(ArgRegs)) \/
-                                 parkOf[w] = Abi(w.j, 0)
-NoMemPark  == \A w \in WordIds : parkOf[w] # Mem
+\* Probes, expected to FAIL.
+NoStash      == "stash" \notin used
+NoFloatStash == "fstash" \notin used
+NoPoolPark   == "pool" \notin used
+NoMemPark    == "mem" \notin used
 
 ====

@@ -73,6 +73,19 @@ when StressEnabled:
 else:
   const stressParkMemory* = false
 
+when StressEnabled:
+  let stressLateMoves* = getEnv("ARKHAM_STRESS_MOVES").strip == "late"
+    ## `ARKHAM_STRESS_MOVES=late`: no call-argument move that only MOVES goes
+    ## early. A leaf, an aggregate word, a 64-bit scalar's word stays where it
+    ## lives until phase 2, and the parallel-move resolver places all of them.
+    ## The early move is an optimization the resolver must never depend on, and
+    ## this is how the corpus holds it to that. A COMPUTED argument is still
+    ## evaluated into its own register when that is correct: that is where the
+    ## value core gets the register it needs under a starved pool, and parking
+    ## it instead tests the value core's spill tier, not the resolver.
+else:
+  const stressLateMoves* = false
+
 proc stressActive(): bool {.inline.} =
   when StressEnabled: stressKeep > 0
   else: false

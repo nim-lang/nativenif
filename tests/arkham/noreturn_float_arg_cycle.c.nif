@@ -1,0 +1,21 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :die2.0
+  (params (param :x.0 . (f 64)) (param :y.0 . (f 64)) (param :z.0 . (f 64))).
+  (pragmas (attr "noreturn") (noinline))
+  (stmts (call exit.0 (conv (i 32) (add (f 64) (add (f 64) (mul (f 64) x.0 100.0) (mul (f 64) y.0 10.0)) z.0)))))
+ (proc :check.0
+  (params (param :a.0 . (f 64)) (param :b.0 . (f 64)) (param :c.0 . (f 64))).
+  (pragmas (noinline))
+  (stmts
+   (if (elif (lt a.0 c.0)
+    (stmts (call die2.0 b.0 c.0 a.0))))
+   (call exit.0 1)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (call check.0 1.0 2.0 3.0)
+   (call exit.0 2))))
