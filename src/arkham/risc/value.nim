@@ -3145,6 +3145,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
   # window per call and not a stack of them.
   assert g.md.divRemReg == NoReg and g.md.shiftCountReg == NoReg,
          "arkham risc: a fixed-role argument register needs the x64 park (`takeParked`)"
+  var sealedArgs: set[Reg] = {}
   var sealedFArgs: set[FReg] = {}
   var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
   var tailGp = plan.gpUsed                 # the registers the tail would have taken
@@ -3200,6 +3201,13 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           g.ab.sym paramName(j)
           if word >= 0: g.ab.intLit word.int64
         g.emReg dst
+      # A loaded argument is referenced RAW, so nothing in `rb` says it is live —
+      # and a LATER argument still runs: a stack-passed scalar evaluates through
+      # `needsReg`, whose temp draw would hand this register straight back out
+      # (`deps.buildGraph`: `ldrb w5, …; str x5, [sp]` over the payload word of
+      # `commandLineArgs` already in x5). `stagedArgs` alone does not stop it —
+      # only the Cortex-M last-resort draw reads it. The x64 twin seals the same way.
+      g.rb.sealAccum dst; sealedArgs.incl dst
     proc loadWord(g: var CodeGen; dst, p: Reg; idx, aggrSize: int) =
       let w = wordSize()
       if aggrSize - idx * w < w: g.loadAggrTail(dst, p, aggrSize, idx * w)
@@ -3412,6 +3420,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           var aD = regLoc(r, ScalarSlot)
           g.emitValue2(a, aD)
           g.unbindTemp(aD.r)
+          g.rb.sealAccum r; sealedArgs.incl r
           varTail.add (r, NoFReg, pl.byteOff)
           inc tailGp
       elif pl.onStack:
@@ -3584,6 +3593,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         g.ab.tree MovA64:
           g.emReg g.md.intRetReg
           g.ab.tree ResX: g.ab.sym synth("ret.0")
+  g.rb.unsealAccums(sealedArgs)
   for f in sealedFArgs: g.rb.unsealF f
   if fnTargetName.len > 0:
     g.ab.tree KillA64: g.ab.sym fnTargetName
