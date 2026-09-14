@@ -56,7 +56,9 @@ proc exprReadsRegImpl(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
     let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
     inc n
-    return h.kind == InReg and h.r == reg
+    # A pair-homed aggregate (`InRegPair`) is read through BOTH of its words.
+    return (h.kind == InReg and h.r == reg) or
+           (h.kind == InRegPair and (h.r0 == reg or h.r1 == reg))
   elif n.kind == TagLit:
     n.into:
       while n.hasMore:

@@ -3732,16 +3732,36 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
           g.freeLvalTemps2(a)
           srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
         else:
-          # A by-reference pointer param homed in one of the registers: park
-          # the pointer, the words are read through it at load time.
           let tcur = g.getType(a)
-          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tcur.symId)
-          assert ptrReg != NoReg and home.len == 0 and not isTvar,
-                 "arkham x64n: an at-risk aggregate argument that is not a pointer"
-          let p = g.park(j, AddrSlot)
-          if p.kind == InReg: g.movReg(p.r, ptrReg)
-          else: g.emitStoreLoc(p, ptrReg)
-          srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+          let tn = tcur.symId
+          let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
+          let hl = (if home.len > 0 and a.kind == Symbol:
+                      g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
+                    else: noLoc)
+          if ptrReg != NoReg:
+            # A by-reference pointer param homed in one of the registers: park
+            # the pointer, the words are read through it at load time.
+            let p = g.park(j, AddrSlot)
+            if p.kind == InReg: g.movReg(p.r, ptrReg)
+            else: g.emitStoreLoc(p, ptrReg)
+            srcs[j] = ArgSrc(kind: asAggrAddr, loc: p, ptrReg: NoReg)
+          elif hl.kind == InRegPair:
+            # A pair-homed aggregate: its words ARE registers another argument
+            # loads. Copy them into a slot of their own now; phase 2 reads the
+            # slot like any other in-memory home.
+            let slot = synth("pairpark") & $cursorToPosition(g.buf[], a) & ".0"
+            g.emTypedStackVar(slot, tcur)
+            g.varType[slot] = tn
+            for k in 0 ..< aggrWordCount(g.prog, tn):
+              g.ab.tree MovX64: (g.emWordAtSlot(slot, k * 8); g.emReg pairWord(hl, k))
+            srcs[j] = ArgSrc(kind: asAggrHome, home: slot, ptrReg: NoReg)
+          else:
+            # A constructor, BUILT into its synthetic slot right here — before
+            # any argument register is loaded, so the registers it reads are
+            # still intact.
+            assert home.len > 0 and a.kind != Symbol,
+                   "arkham x64n: an at-risk aggregate argument in unexpected storage"
+            srcs[j] = ArgSrc(kind: asAggrHome, home: home, ptrReg: NoReg)
       else:
         var aD = g.park(j, ScalarSlot)
         let want = aD

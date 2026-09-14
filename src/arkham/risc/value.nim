@@ -3266,9 +3266,9 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         if g.exprReadsReg(a, r): atRisk = true
       if not atRisk: continue
       if pl.isAgg:
-        let p = g.takeTmp(addrSlot())
-        heldArgs.add p
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+          let p = g.takeTmp(addrSlot())
+          heldArgs.add p
           g.emitLvalue2(a)
           if p.kind == InReg:
             g.aggrAddrInto(a, p.r, addrSlot(), doBind = true)
@@ -3278,17 +3278,49 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
             g.storeReg2(p, b)
             g.dropBridge b
           g.freeLvalTemps2(a)
+          parkLoc[j] = p
+          srcs[j] = rsAggrAddr
         else:
-          let hh = g.plan.homeOfSym(symName(a))
-          assert a.kind == Symbol and hh.kind == InReg,
-                 "arkham risc: an at-risk aggregate argument that is not a pointer"
-          if p.kind == InReg:
-            g.bindTemp(p.r, addrSlot())
-            g.movReg(p.r, hh.r)
+          let hh = (if a.kind == Symbol: g.plan.homeOfSym(symName(a)) else: noLoc)
+          if hh.kind == InReg:
+            # A by-reference pointer param homed in one of the registers: park
+            # the pointer, the words are read through it at load time.
+            let p = g.takeTmp(addrSlot())
+            heldArgs.add p
+            if p.kind == InReg:
+              g.bindTemp(p.r, addrSlot())
+              g.movReg(p.r, hh.r)
+            else:
+              g.storeReg2(p, hh.r)
+            parkLoc[j] = p
+            srcs[j] = rsAggrAddr
+          elif hh.kind == InRegPair:
+            # A pair-homed aggregate: its words ARE registers another argument
+            # loads. Copy them into a slot of their own now; the loader reads the
+            # slot like any other in-memory home.
+            let tcur = g.getType(a)
+            let slot = synth("pairpark") & $g.posOf(a) & ".0"
+            g.emTypedStackVar(slot, tcur)
+            g.varType[slot] = tcur.symId
+            let bridge = g.takeBridge()
+            g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym slot)
+            for k in 0 ..< aggrWordCount(g.prog, tcur.symId):
+              g.ab.tree MovA64: (g.emWordThroughPtr(bridge, k); g.emReg pairWord(hh, k))
+            g.dropBridge bridge
+            aggrHome[j] = slot
+            srcs[j] = rsAggrMem
           else:
-            g.storeReg2(p, hh.r)
-        parkLoc[j] = p
-        srcs[j] = rsAggrAddr
+            # A constructor, BUILT into its synthetic slot right here — before
+            # any argument register is loaded, so the registers it reads are
+            # still intact.
+            assert a.kind == TagLit,
+                   "arkham risc: an at-risk aggregate argument in unexpected storage"
+            let tcur = g.getType(a)
+            aggrHome[j] = synth("aggtmp") & $g.posOf(a) & ".0"
+            g.emTypedStackVar(aggrHome[j], tcur)
+            g.varType[aggrHome[j]] = tcur.symId
+            g.genStore2(a, namedStackLoc(aggrHome[j], callArgSlots[j]))
+            srcs[j] = rsAggrMem
       else:
         var aD = g.takeTmp(ScalarSlot)
         heldArgs.add aD
