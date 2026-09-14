@@ -47,19 +47,38 @@ proc fpSymReg(ctx: GenContext; n: Cursor): Symbol =
       return sym
   return nil
 
+proc fpCallRefA64(n: Cursor; ctx: GenContext): TagEnum =
+  ## The fp register tag an `(arg name)` / `(res name)` inside a prepare block
+  ## resolves to, or `InvalidTagId` when `n` is not such a reference or the
+  ## parameter / result is not float (a GPR one is `parseOperandA64`'s).
+  result = InvalidTagId
+  if n.kind != TagLit or not ctx.inCall or ctx.callContext.typ == nil: return
+  if n.tag notin {ArgTagId, ResTagId}: return
+  var m = n; inc m
+  if m.kind != Symbol: return
+  let p = (if n.tag == ArgTagId: findParam(ctx.callContext.typ, getSymId(m))
+           else: findResult(ctx.callContext.typ, getSymId(m)))
+  if p != nil and p.reg != InvalidTagId and isA64FpRegTag(p.reg) and
+     not p.typ.isOnStack:
+    result = p.reg
+
 proc isA64FpOperand*(n: Cursor; ctx: GenContext): bool =
-  ## True if `n` denotes an fp register operand — a raw `(dN)`/`(sN)` tag or a `Symbol`
-  ## naming a float local bound to a v-register. The float handlers dispatch on this
-  ## (reg-vs-mem / fmov direction) so a bound float local emitted as its name is
-  ## recognized as a register operand.
-  isA64FpRegOperand(n) or fpSymReg(ctx, n) != nil
+  ## True if `n` denotes an fp register operand — a raw `(dN)`/`(sN)` tag, a `Symbol`
+  ## naming a float local bound to a v-register, or a prepare block's `(arg name)` /
+  ## `(res name)` whose parameter / result is passed in a v-register. The float
+  ## handlers dispatch on this (reg-vs-mem / fmov direction) so a bound float local
+  ## emitted as its name is recognized as a register operand.
+  isA64FpRegOperand(n) or fpSymReg(ctx, n) != nil or fpCallRefA64(n, ctx) != InvalidTagId
 
 proc isA64FpSingle*(n: Cursor; ctx: GenContext): bool =
   ## Single-precision (`s` view)? For a raw tag, the `(sN)` form; for a bound float
-  ## symbol, the recorded type is `(f 32)`. nifasm reads the operand's precision here
-  ## to choose single- vs double-precision encodings — so a *named* float operand must
-  ## recover it from the binding rather than the (absent) tag.
+  ## symbol, the recorded type is `(f 32)`; for a call reference, the `(sN)` location
+  ## the signature declared. nifasm reads the operand's precision here to choose
+  ## single- vs double-precision encodings — so a *named* float operand must recover
+  ## it from the binding rather than the (absent) tag.
   if isA64FpRegOperand(n): return isA64SingleRegTag(n.tag)
+  let cr = fpCallRefA64(n, ctx)
+  if cr != InvalidTagId: return isA64SingleRegTag(cr)
   let sym = fpSymReg(ctx, n)
   result = sym != nil and sym.typ.kind == FloatT and sym.typ.bits == 32
 
@@ -82,6 +101,31 @@ proc parseFloatOperandA64*(n: var Cursor; ctx: var GenContext): arm64.FloatRegis
       error("Expected float register variable, got: " & getSym(n), n)
     result = tagToFloatRegA64(sym.reg)
     inc n
+  elif fpCallRefA64(n, ctx) != InvalidTagId:
+    # `(arg name)` — a float argument's v-register, assigned exactly once before
+    # the `(call)`; `(res name)` — a float result's, bound exactly once after it.
+    # The same bookkeeping `parseOperandA64` / `parseDestA64` keep for the GPR
+    # forms.
+    let refTok = n
+    let isArg = n.tag == ArgTagId
+    result = tagToFloatRegA64(fpCallRefA64(n, ctx))
+    var name = SymId(0)
+    into n:
+      name = getSymId(n)
+      inc n
+      if n.hasMore and n.kind == IntLit:
+        if getInt(n) != 0: error("a float argument has one register", refTok)
+        inc n
+    if isArg:
+      if name in ctx.callContext.argsSet:
+        error("Argument already set: " & ctx.nameOf(name), refTok)
+      ctx.callContext.argsSet.incl name
+    else:
+      if not ctx.callContext.callEmitted:
+        error("(res ...) can only be used after (call) or (extcall)", refTok)
+      if name in ctx.callContext.resultsSet:
+        error("Result already bound: " & ctx.nameOf(name), refTok)
+      ctx.callContext.resultsSet.incl name
   else:
     error("Expected fp register (dN/sN) or float variable", n)
 

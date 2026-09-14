@@ -345,3 +345,17 @@ proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSl
       skip q
     while q.hasMore: skip q
   result = slots
+
+proc isLeafArg*(a: Cursor): bool =
+  ## A scalar call argument that can be loaded into its ABI register from where
+  ## it lives, at any point of the marshalling: a literal or a symbol (a home,
+  ## a global, a thread-local, a proc) under any `cast`/`conv`/`suf`/`par`
+  ## wrappers (`leafCore`). Loading it writes that register alone and pins no
+  ## other — a sign/zero extension or a reinterpretation happens in place. What
+  ## it READS is the other question, `exprReadsReg`'s. Everything else is
+  ## computed in phase 1.
+  let c = leafCore(a)
+  case c.kind
+  of IntLit, UIntLit, CharLit, StrLit, Symbol: true
+  of TagLit: c.exprKind in {NilC, TrueC, FalseC}
+  else: false

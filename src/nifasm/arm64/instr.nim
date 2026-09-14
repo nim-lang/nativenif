@@ -76,7 +76,13 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     ctx.callContext.typ = sym.typ
     ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
+    # A dynamic import, reached through `(extcall)`. When the decl carried a
+    # signature (`parseExtprocSig`) — every Darwin extern arkham emits does — the
+    # arguments and the result are checked against it exactly as for an internal
+    # call; a bare extern has nothing to check against and only the marker is
+    # verified below.
     ctx.callContext.state = CallContextState.ExternalCall
+    ctx.callContext.typ = sym.typ
     for i, ext in ctx.extProcs:
       if ext.name == name:
         ctx.callContext.extProcIdx = i
@@ -84,8 +90,12 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   else:
     error("Expected proc symbol, got " & $sym.kind, hdr)
 
-  # Compute stack argument size (only for internal procs)
-  if ctx.callContext.state == CallContextState.NormalCall:
+  # Whether the call is checked against a signature — every internal call, plus an
+  # extern whose decl declared one.
+  let typed = ctx.callContext.typ != nil
+
+  # Compute stack argument size
+  if typed:
     ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
     # Fixed-frame soundness (AArch64): this call's outgoing stack args occupy
     # `[sp, sp+stackArgSize)`, the region `scanStackArgArea` reserved at the frame bottom.
@@ -104,10 +114,11 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     while n.hasMore:
       genInstA64(n, ctx)
 
-  # Verify call was emitted and all bindings are done
-  if ctx.callContext.state == CallContextState.NormalCall:
+  # Verify all bindings are done
+  if typed:
     for param in ctx.callContext.typ.params:
-      if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
+      if not param.typ.isOnStack and param.regs.len > 0 and
+         param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
     if not ctx.callContext.isTailcall:
@@ -117,10 +128,11 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
         if res.name notin ctx.callContext.resultsSet:
           error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
-    if not ctx.callContext.callEmitted:
+  # Verify call was emitted
+  if not ctx.callContext.callEmitted:
+    if ctx.callContext.state == CallContextState.NormalCall:
       error("Missing (call), (tailcall) or (extcall) in prepare block", hdr)
-  else:
-    if not ctx.callContext.callEmitted:
+    else:
       error("Missing (extcall) in prepare block", hdr)
 
   # Resume the enclosing call, if this prepare was nested inside one. arkham emits that
@@ -1416,7 +1428,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       let single = isA64FpSingle(n, ctx)
       let rd = parseFloatOperandA64(n, ctx)
       if isA64FpOperand(n, ctx):
-        arm64.emitFmov(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
+        # A same-register copy is elided, as `mov`'s is: `(fmov (arg pN) (dN))`
+        # and `(fmov (d0) (res ret.0))` are the declarative-call markers
+        # resolving to the register the value already sits in.
+        let rs = parseFloatOperandA64(n, ctx)
+        if rd != rs: arm64.emitFmov(ctx.buf.data, rd, rs, single)
       else:
         arm64.emitFmovFromGpr(ctx.buf.data, rd, parseGprA64(n, ctx), single)
     else:

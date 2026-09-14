@@ -27,7 +27,7 @@
 ## plan reproduces whatever the site states, so such quirks stay site-local and
 ## visible instead of being silently re-derived differently in six places.)
 
-import nifcore
+import nifcore, nifcdecl
 import asmslots, machinedesc, programs
 
 type
@@ -136,6 +136,10 @@ proc paramSlots*(prog: var Program; paramsSlot: Cursor): seq[AsmSlot] =
   ## The `AsmSlot` of every declared parameter, in order — the callee-side input
   ## to `planCall`. `paramsSlot` is the `(params (param :name pragmas T)…)` node
   ## (a DotToken for an empty signature → `@[]`).
+  ##
+  ## A `{.varargs.}` proc's trailing `(varargs …)` marker param is not a
+  ## parameter — it says where the variadic tail begins (`fixedParamCount`) and
+  ## has no slot; it is left out.
   result = @[]
   if paramsSlot.kind != TagLit: return
   var pc = paramsSlot
@@ -143,7 +147,8 @@ proc paramSlots*(prog: var Program; paramsSlot: Cursor): seq[AsmSlot] =
     while pc.hasMore:
       pc.into:                          # (param :name pragmas type)
         inc pc; skip pc                 # name, pragmas
-        result.add slotOf(prog, pc)
+        if not (pc.kind == TagLit and pc.typeKind == VarargsT):
+          result.add slotOf(prog, pc)
         while pc.hasMore: skip pc
 
 proc isWideScalar*(pl: ParamPlace): bool {.inline.} =

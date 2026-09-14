@@ -183,7 +183,11 @@ const arkhamOsxOnly: seq[string] =
   # `ulock_wake` calls `__ulock_wake`, the real libSystem symbol `syslocks` uses on
   # macOS. It links only against libSystem, so it's skipped on Linux (native x64 and
   # the linux_arm64 qemu path), where the symbol doesn't exist.
-  @["ulock_wake"]
+  @["ulock_wake",
+    # A `{.varargs.}` libSystem call (`snprintf`): the fixed parameters go through
+    # the extern's signature, the variadic tail down Apple's stack-passed path.
+    # Linux assembles it (`arkhamDarwinAssembleTests`); only macOS can run it.
+    "darwin_varargs"]
 
 const arkhamRejections: seq[(string, string)] = @[
   # Arkham owns the `{.assembler.}` rules outright — nimony's sem only forwards
@@ -487,6 +491,7 @@ const ithaquaUnsupported: seq[string] = @[
   # 3. `ulock_wake` is a Darwin syscall fixture: the syscall has no host import
   #    to map onto, so the proc has no definition to emit.
   "ulock_wake",
+  "darwin_varargs",     # a libSystem `{.varargs.}` extern: Darwin-only, see arkhamOsxOnly
   # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
   #    Each one aborts loudly today; none of them miscompiles.
   "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
@@ -937,6 +942,10 @@ exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
 exec "nim c -r src/nifasm/nifasm tests/packed_sse.nif"
+# A float parameter `(xmm0)`, a float result `(xmm0)` and a zero-register `(regs)`
+# parameter in a typed signature: `(movsd (arg p0.0) …)` assigns the argument,
+# `(movsd (xmm0) (res ret.0))` binds the result (elided: same register).
+exec "nim c -r src/nifasm/nifasm tests/x64_float_sig.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
@@ -996,6 +1005,7 @@ when defined(linux) and defined(amd64):
   # loads+stores, mulpd/addpd on 2 f64 lanes, mulps/addps on 4 f32 lanes,
   # punpcklqdq f64 broadcast and shufps f32 broadcast; checks both lane sums.
   execRun "tests/packed_sse"
+  execRun "tests/x64_float_sig"
   execRun "tests/pointer_field_at"
   execRun "tests/pointer_roundtrip"
   execExpectOutput("tests/string_pointer_field", "Hello\n")
@@ -1019,6 +1029,8 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "U
 # float variable (via `rebind`/`withreg`) must be rejected — the SIMD twin of the
 # GPR `(reg)` bound-use guard, closing the float silent-clobber hole.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
+# A float parameter is checked for assignment like a GPR one.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_float_sig_missing.nif", "Missing argument: p0.0")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.
@@ -1041,6 +1053,11 @@ exec "nim c -r src/nifasm/nifasm tests/a64_noreturn_clobber.nif"
 # register. It targets `linux_arm64`, so unlike the Darwin a64 fixtures it produces an
 # ELF this host can run under qemu (see the guarded `execRun` further down).
 exec "nim c -r src/nifasm/nifasm tests/a64_slot_base_free.nif"
+# The AArch64 twin of `x64_float_sig`: a float parameter `(d0)`, a float result
+# `(d0)` and an empty `(regs)` parameter in a typed signature, assigned with
+# `(fmov (arg p0.0) …)` and bound with `(fmov (d0) (res ret.0))`. Run under qemu below.
+exec "nim c -r src/nifasm/nifasm tests/a64_float_sig.nif"
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_float_sig_missing.nif", "Missing argument: p0.0")
 # The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
 # Reading a local homed in one of them afterwards must be rejected here — otherwise the
 # only symptom is a silently wrong value at run time.
@@ -1374,7 +1391,11 @@ proc rv32AsmTests() =
     return
   let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
   const fixtures = ["riscv32_alu", "riscv32_call", "riscv32_stackargs",
-                    "riscv32_global", "riscv32_branch", "riscv32_float"]
+                    "riscv32_global", "riscv32_branch", "riscv32_float",
+                    # a float param `(s10)`, a float result `(s10)` and an empty
+                    # `(regs)` param in a typed signature: `(fmov (arg p0.0) …)`
+                    # assigns, `(fmov (s10) (res ret.0))` binds (3+3+36 = 42)
+                    "riscv32_float_sig"]
   var passed = 0
   for name in fixtures:
     let src = "tests" / (name & ".nif")
@@ -1749,7 +1770,9 @@ proc cortexMAsmTests() =
                     ("cortex_m_call", 42, ""),
                     ("cortex_m_stackargs", 42, ""),
                     ("cortex_m_global", 42, ""),
-                    ("cortex_m_aggr", 42, "")]
+                    ("cortex_m_aggr", 42, ""),
+                    # the Cortex-M twin of `riscv32_float_sig` (FPv4-SP: `(s0)`)
+                    ("cortex_m_float_sig", 42, "")]
   var passed = 0
   for (stem, wantCode, wantOut) in fixtures:
     let src = "tests" / (stem & ".nif")
@@ -2184,7 +2207,7 @@ const cortexMUnsupported: seq[string] = @[
   # slot, which is a decision about the board and not about the ISA — a Cortex-M
   # part with four cores has four threads and is refused by name until the
   # SP-masked thread-local base exists.
-  "mmap_anon", "futex_wake", "ulock_wake", "naked_stacktrace_x64",
+  "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
@@ -2451,6 +2474,54 @@ when defined(linux):
 when defined(linux) and defined(amd64):
   arkhamQemuTests()
 
+# The DARWIN arm64 variant of the same corpus, assembled to a Mach-O image and not
+# run: no host here can execute it, but the Darwin-only code — every `importc` is
+# a libSystem extern with a signature, thread-locals go through TLV descriptors —
+# has to keep emitting and assembling. A stem in the known list is x86-64-pinned;
+# anything else failing is new breakage. (The foreign-module fixtures resolve
+# because the earlier passes left the `mod_*` modules in the same nimcache.)
+const arkhamDarwinAssembleKnown: seq[string] = @[
+  "assembler_x64", "intrinsics_x64", "naked_stacktrace_x64",   # x86-64-pinned
+]
+proc arkhamDarwinAssembleTests() =
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  var total, passed, expectedFail = 0
+  var newFailures: seq[string] = @[]
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let base = extractFilename(file)
+    if base.startsWith("mod_") or base.startsWith("err_"): continue
+    let name = base[0 ..< base.len - ".c.nif".len]
+    inc total
+    let asmNif = workDir / (name & ".darwin.nif")
+    let img = workDir / (name & ".darwin.out")
+    var failed = ""
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:arm64 -o:" &
+                             quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0:
+      failed = "codegen: " & ao.splitLines[^2 .. ^1].join(" ").strip
+    else:
+      let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(img) &
+                               " " & quoteShell(asmNif))
+      if nc != 0: failed = "assemble: " & no.splitLines[^1].strip
+    if failed.len == 0:
+      if name in arkhamDarwinAssembleKnown:
+        echo "NOTE: ", name, " now assembles for Darwin — remove it from arkhamDarwinAssembleKnown"
+      inc passed
+    elif name in arkhamDarwinAssembleKnown:
+      inc expectedFail
+    else:
+      newFailures.add name & " — " & failed
+  echo passed, " / ", total - expectedFail, " arkham darwin arm64 assemble tests successful (",
+       expectedFail, " known)"
+  if newFailures.len > 0:
+    quit "FAILURE arkham darwin arm64 assemble found NEW breakage:\n  " &
+         newFailures.join("\n  ")
+when defined(linux) and defined(amd64):
+  arkhamDarwinAssembleTests()
+
 # On an AArch64 Linux host (a Raspberry Pi is the common one) the `linux_arm64`
 # binaries are NATIVE: the same corpus runs without an emulator, and it is the only
 # arkham coverage such a host gets — the x64 pass above needs an x86-64 CPU and the
@@ -2489,6 +2560,10 @@ when defined(linux):
     if sbfCode != 0:
       quit "FAILURE a64_slot_base_free: exit " & $sbfCode & "\n" & sbfOut
     echo "1 / 1 a64 base-free slot addressing tests successful"
+    let (fsOut, fsCode) = runProgram(findExe("qemu-aarch64"), ["tests" / "a64_float_sig"])
+    if fsCode != 0:
+      quit "FAILURE a64_float_sig: exit " & $fsCode & "\n" & fsOut
+    echo "1 / 1 a64 float-signature tests successful"
   else:
     echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 

@@ -125,10 +125,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     # A dynamic import: the invocation is an indirect `(extcall)` through the IAT/GOT
-    # slot rather than a `call rel32`. If the decl carried a signature (the Windows
-    # form — see `parseExtprocSig`) it is checked and laid out exactly like any other
-    # call; a bare Darwin extern has no signature to check against, so its call site
-    # marshals into raw ABI registers and only the marker is verified below.
+    # slot rather than a `call rel32`. If the decl carried a signature (see
+    # `parseExtprocSig`) it is checked and laid out exactly like any other call; a
+    # bare extern has no signature to check against, so only the marker is verified.
     ctx.callContext.state = CallContextState.ExternalCall
     ctx.callContext.typ = sym.typ
     for i, ext in ctx.extProcs:
@@ -166,7 +165,8 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   # Verify all bindings are done
   if typed:
     for param in ctx.callContext.typ.params:
-      if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
+      if not param.typ.isOnStack and param.regs.len > 0 and
+         param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
     if not ctx.callContext.isTailcall:
@@ -2046,8 +2046,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let d = parseXmmOperand(n, ctx)
       if isXmmOperand(n, ctx):
         let s = parseXmmOperand(n, ctx)
-        if isD: x86.emitMovsd(ctx.buf.data, d, s)
-        else:   x86.emitMovss(ctx.buf.data, d, s)
+        # A same-register move is elided, as `mov`'s is: `(movsd (arg pN) (xmmN))`
+        # and `(movsd (xmm0) (res ret.0))` are the declarative-call markers
+        # resolving to the register the value already sits in.
+        if d != s:
+          if isD: x86.emitMovsd(ctx.buf.data, d, s)
+          else:   x86.emitMovss(ctx.buf.data, d, s)
       else:
         let s = parseOperand(n, ctx)
         if s.kind != okMem: error("movsd/movss source must be xmm or memory", n)

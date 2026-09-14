@@ -542,8 +542,7 @@ proc recordSymTypes2*(g: var CodeGen; c: Cursor) =
         g.recordSymTypes2(cc)
         skip cc
 
-proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
-                   frameHasCall: bool) =
+proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   ## Body-buffer model (the x64 stage-2 twin): the BODY is emitted into a side
   ## buffer first; the prologue — whose shape (callee-saved pairs, the `(s)`
   ## region `sub`) is only final once the body is known — is written after it,
@@ -598,7 +597,7 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.computeFrame(frameHasCall or g.helperCalls)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
-    g.emitSignature(info.decl, declarative)
+    g.emitSignature(info.decl)
     g.ab.tree StmtsA64:
       # Before anything else, including the prologue: the frame may already save
       # a callee-saved FPv4-SP register, and that store is itself a floating-point

@@ -1,0 +1,22 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :snprintf.0
+  (params
+   (param :buf.0 . (ptr (c 8)))
+   (param :n.0 . (u 64))
+   (param :fmt.0 . (ptr (c 8)))
+   (param :va.0 . (varargs)))
+  (i 32)
+  (pragmas (importc "snprintf"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :buf.1 . (array (c 8) 32))
+   (var :k.0 . (i 64) 7)
+   (var :r.0 . (i 32)
+    (call snprintf.0 (addr buf.1) (suf 32u "u64") "%lld %g %s" k.0 2.5 "x"))
+   (call exit.0 (sub (i 32) r.0 7)))))   # "7 2.5 x" is 7 chars: exit 0 iff the tail arrived

@@ -511,10 +511,6 @@ proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
   g.plan = Plan()
   if info.isEntry:
     lengError info.decl, "the program entry point cannot be an `.assembler` proc", g.asmInfo
-  if not isDeclarativeAbi(g.prog, info.decl):
-    lengError info.decl, "an `.assembler` proc's parameters and result must be " &
-              "integers or pointers (float and small-aggregate boundaries are not " &
-              "modelled in the typed signature yet)", g.asmInfo
   # Parameters: bind each ABI register to the signature's `pN.0` (as the allocated
   # path does) and map the param's own Leng name onto the same register, so the
   # body may spell it either way and `emReg` renders the one nifasm knows.

@@ -1,0 +1,33 @@
+(.nif27)
+(stmts
+ (arch linux_arm64)
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (prepare twice.0
+    (call)
+    (fmov
+     (d0)
+     (res ret.0)))
+   (mov
+    (x0)0)
+   (mov
+    (x8)93)
+   (svc 0)))
+ (proc :twice.0
+  (params
+   (param :p0.0
+    (d0)
+    (f 64)))
+  (result :ret.0
+   (d0)
+   (f 64))
+  (clobber
+   (x1))
+  (stmts
+   (fadd
+    (d0)
+    (d0))
+   (ret))))

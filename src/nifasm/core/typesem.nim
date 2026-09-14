@@ -677,7 +677,10 @@ proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] 
         onStack = true
       elif locTag == RegsTagId:
         # An aggregate param (≤16B by-value spread over several registers, or a >16B
-        # by-ref pointer in one) consumed RAW by the code generator — ABI-only, not bound.
+        # by-ref pointer in one) consumed RAW by the code generator — ABI-only, not
+        # bound. An EMPTY `(regs)` is a parameter passed in no register at all: a
+        # zero-size aggregate (an empty object). It occupies nothing, so a call site
+        # has nothing to assign for it and the completeness check skips it.
         viaRegs = true
         var rc = loc
         into rc:
@@ -687,8 +690,7 @@ proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] 
               error("expected register in (regs …)", rc)
             regs.add rawTag(rc)
             skip rc
-        if regs.len == 0: error("empty (regs …)", loc)
-        reg = regs[0]
+        if regs.len > 0: reg = regs[0]
       else:
         error("Expected location", loc)
     else:
@@ -734,9 +736,9 @@ proc parseExtprocSig*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   ## binds `(arg pN)`/`(res ret.0)` and is type-checked against it, and the frame pre-scan
   ## can size the call's outgoing stack-argument area — neither of which a bare extern
   ## permits, because there is nothing to check against and no way to know how many
-  ## arguments spill. The Windows backend declares one for every import (`emitWinExtproc`);
-  ## the Darwin one declares none and marshals into raw ABI registers at the call site,
-  ## which is why both forms have to keep working.
+  ## arguments spill. arkham declares one for every import on Windows (`emitWinExtproc`)
+  ## and on Darwin (the fixed parameters of a `{.varargs.}` one; the variadic tail is laid
+  ## out raw by the call site). A bare extern is still accepted for hand-written input.
   let sig = takeSig(n)
   if not (sig.hasParams or sig.hasResult or sig.hasClobber): return nil
   result = Type(kind: ProcT, params: @[], results: @[], clobbers: {})

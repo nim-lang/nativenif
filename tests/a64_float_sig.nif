@@ -1,0 +1,62 @@
+(.nif27)
+(stmts
+ (arch linux_arm64)
+ (type :Empty.0
+  (object))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (mov
+    (x1)4613937818241073152)
+   (fmov
+    (d3)
+    (x1))
+   (prepare twice.0
+    (fmov
+     (arg p0.0)
+     (d3))
+    (mov
+     (arg p2.0)7)
+    (call)
+    (fmov
+     (d0)
+     (res ret.0)))
+   (fcvtzs
+    (x0)
+    (d0))
+   (sub
+    (x0)13)
+   (mov
+    (x8)93)
+   (svc 0)))
+ (proc :twice.0
+  (params
+   (param :p0.0
+    (d0)
+    (f 64))
+   (param :p1.0
+    (regs)Empty.0)
+   (param :p2.0
+    (x0)
+    (i 64)))
+  (result :ret.0
+   (d0)
+   (f 64))
+  (clobber
+   (x1)
+   (x2)
+   (x9)
+   (x10))
+  (stmts
+   (fadd
+    (d0)
+    (d0))
+   (scvtf
+    (d1)
+    (x0))
+   (fadd
+    (d0)
+    (d1))
+   (ret))))

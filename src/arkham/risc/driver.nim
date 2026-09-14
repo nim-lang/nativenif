@@ -107,7 +107,6 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   # (The frame itself is finalized INSIDE emitProcBody2, after the body —
   # body-buffer model.)
-  let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
@@ -126,7 +125,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     dbgPeakHeldAtRecursion = 0
     tightCompositions = 0
     lastResortTakes = 0
-  g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
+  g.emitProcBody2(info, frameHasCall = an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE peak=" & $dbgPeakBridges & " heldAtRecursion=" &
                      $dbgPeakHeldAtRecursion & " tight=" & $tightCompositions &
@@ -487,10 +486,16 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # to `svc` syscalls — the static ELF needs no imports.)
       if g.prog.needsLibSystem or g.tvars.len > 0:
         g.ab.tree ImpD: g.ab.str DarwinLibSystem
+      # Each extern carries its FULL AAPCS64 signature, so a call to it goes
+      # through the declarative `(arg pN)`/`(res ret.0)` path like any other call
+      # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
+      # only; the variadic tail is Apple's stack-passed one, which the call site
+      # lays out itself (see `emitCall2Inner`).
       for ex in g.prog.externOrder:
         g.ab.tree ExtprocD:
           g.ab.symDef ex.asmName
           g.ab.str ex.extName
+          g.emitSignature(ex.decl)
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:

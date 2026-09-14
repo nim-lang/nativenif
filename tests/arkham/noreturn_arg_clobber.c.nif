@@ -1,0 +1,23 @@
+(.nif27)
+(stmts
+ (type :Pair.0 . (object . (fld :pa.0 . (i 64)) (fld :pb.0 . (i 64))))
+ (proc :exit.0 (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :die.0
+  (params (param :s.0 . Pair.0) (param :code.0 . (i 64))).
+  (pragmas (attr "noreturn") (noinline))
+  (stmts (call exit.0 (conv (i 32) code.0))))
+ (proc :check.0
+  (params (param :n.0 . (ptr (i 64))) (param :j.0 . (i 64))).
+  (pragmas (noinline))
+  (stmts
+   (if (elif (lt 100 j.0)
+    (stmts (call die.0 (oconstr Pair.0 (kv pa.0 1) (kv pb.0 2)) j.0))))
+   (asgn (deref n.0) j.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :x.0 . (i 64) 0)
+   (call check.0 (addr x.0) 150)
+   (call exit.0 1))))

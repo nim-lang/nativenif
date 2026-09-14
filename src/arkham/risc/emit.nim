@@ -841,16 +841,11 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
   ## pointer is still 8 bytes (nifasm sizes `ProcT` as a pointer); the signature is
   ## metadata for call sites.
   ##
-  ## The signature mirrors `emitSignature`'s declarative split. A DECLARATIVE proctype
-  ## (all single-GPR scalar params + scalar/void result) states the positional
-  ## `pN.0`/`ret.0` ABI so an indirect `(prepare …)` is cross-checked via `(arg pN)`/
-  ## `(res ret.0)`. A NON-declarative one (a float/aggregate param or an aggregate
-  ## return — e.g. a CPS continuation `proc(c): Continuation`) emits EMPTY `(params)`/
-  ## `(result)`, exactly as a non-declarative concrete proc does, so nifasm requires no
-  ## per-param bindings and the call site marshals args into raw ABI registers itself.
-  let declarative = isDeclarativeAbi(g.prog, c)
+  ## The signature mirrors `emitSignature` exactly: the positional `pN.0`/`ret.0`
+  ## ABI, floats and aggregates included, so an indirect `(prepare …)` is
+  ## cross-checked via `(arg pN)`/`(res ret.0)` like a direct call.
   g.ab.proctypeType:
-    if declarative:
+    block:
       c.into:
         skip c                                  # the Empty slot (a proc has its name here)
         # A >16B by-ref aggregate result travels via x8 (handled raw at the call site),
@@ -874,7 +869,15 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                 c.into:                         # (param :name pragmas type)
                   inc c                         # name → positional pN.0
                   skip c                        # pragmas
-                  if pl.isAgg or pl.isWideScalar:
+                  if pl.isFloat:
+                    g.ab.tree ParamD:           # a v-register location, see `emitSignature`
+                      g.ab.symDef paramName(pl.ord)
+                      if not pl.onStack:
+                        g.ab.freg(g.md.floatArgRegs[pl.fpIndex],
+                                  floatBitsFor(slotOf(g.prog, c).size))
+                      else: g.ab.keyword SO
+                      g.genPointee(c)
+                  elif pl.isAgg or pl.isWideScalar:
                     # Aggregate param: >16B by-ref pointer in one x-reg, ≤16B by-value
                     # over `pl.words` consecutive x-regs (`(arg pN k)` selects word k).
                     # A scalar too wide for one register (`(i 64)` on Cortex-M) takes
@@ -907,15 +910,15 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             # ≤16B by-value aggregate result → x0:x1 raw, EMPTY result slot (see
             # emitSignature): the caller reads the return registers directly.
             skip c
+          elif slotOf(g.prog, c).kind == AFloat:
+            g.ab.symDef synth("ret.0")
+            g.ab.freg(g.md.floatRetReg, floatBitsFor(slotOf(g.prog, c).size))
+            g.genPointee(c)
           else:
             g.ab.symDef synth("ret.0")
             g.ab.rawReg g.md.intRetReg                     # raw reg *location* of the result
             g.genPointee(c)                     # return type BY REFERENCE (named → sym)
         while c.hasMore: skip c                  # pragmas
-    else:
-      g.ab.keyword ParamsD
-      g.ab.keyword ResultD
-      skip c                                     # advance past the whole proctype node
     g.ab.tree ClobberD:
       g.emConvClobbers()
 

@@ -907,17 +907,11 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   g.enterScope()
   if g.retIndirect:
     # The hidden result pointer arrives in rdi. Save it into the callee-saved
-    # `indirectReg` for the duration of the body. In the DECLARATIVE path the
-    # signature binds rdi to `paramName(0)`, so it must be read by name (a raw
-    # `(reg rdi)` use of a bound register is rejected) and the binding killed. But a
-    # NON-declarative proc (float/≤16B-aggregate-result param forces an empty
-    # signature) never emits that binding, so there `p0.0` is undefined — read the
-    # raw arg register instead, mirroring how non-declarative params are moved.
-    if isDeclarativeAbi(g.prog, info.decl):
-      g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
-      g.ab.tree KillX64: g.ab.sym paramName(0)
-    else:
-      g.movReg(g.indirectReg, g.md.intArgRegs[0])
+    # `indirectReg` for the duration of the body. The signature binds rdi to
+    # `paramName(0)`, so it is read by name (a raw `(reg rdi)` use of a bound
+    # register is rejected) and the binding killed.
+    g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
+    g.ab.tree KillX64: g.ab.sym paramName(0)
     # Name it, for the same reason the relocated parameters above are named: unnamed,
     # it was the last big block of raw register operands (564 of the 742 left after
     # `emitParamMoves` was fixed) — every `(mov (mem (at (cast (aptr (u 64)) (rbx))k))

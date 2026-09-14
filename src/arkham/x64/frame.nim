@@ -309,26 +309,18 @@ proc checkWin64EntryAbi*(g: var CodeGen; decl: Cursor) =
                 "not model — this callback must return a scalar or nothing", g.asmInfo
 
 proc emitSignature*(g: var CodeGen; decl: Cursor) =
-  ## Emit `(params …) (result …)? (clobber …)`. A FULL-signature proc (scalar /
-  ## aggregate params, void / scalar / >16B by-ref result) states the complete SysV
-  ## register ABI — positional `p.i` params in rdi/rsi/…, a hidden result pointer in
-  ## rdi for a >16B return, an rax result — so nifasm knows the full layout (incl.
-  ## stack-passed args) and cross-checks every call site. A proc whose boundary is NOT
-  ## yet modelled in the typed signature (float params/results, ≤16B by-value aggregate
-  ## results) emits an EMPTY `(params)/(result)`; its caller marshals arguments into
-  ## raw ABI registers manually.
-  if isDeclarativeAbi(g.prog, decl):
-    var c = decl
-    c.into:
-      inc c                                 # name → params slot
-      # `g.entryMd`: arkham's own convention for everything arkham generates — both
-      # sides of every call to it are its own (see `generateX64`) — and WINDOWS'
-      # for a `stdcall` definition, which the OS enters (see `isWin64AbiProc`).
-      discard g.emitParamsAndResult(c, byRef = false, g.entryMd)  # types inline (concrete proc)
-      while c.hasMore: skip c               # pragmas, body
-  else:
-    g.ab.keyword ParamsD
-    g.ab.keyword ResultD
+  ## Emit `(params …) (result …)? (clobber …)`: the complete SysV register ABI —
+  ## positional `p.i` params in rdi/rsi/… or xmm0…, a hidden result pointer in rdi
+  ## for a >16B return, an rax or xmm0 result — so nifasm knows the full layout
+  ## (incl. stack-passed args) and cross-checks every call site.
+  var c = decl
+  c.into:
+    inc c                                   # name → params slot
+    # `g.entryMd`: arkham's own convention for everything arkham generates — both
+    # sides of every call to it are its own (see `generateX64`) — and WINDOWS'
+    # for a `stdcall` definition, which the OS enters (see `isWin64AbiProc`).
+    discard g.emitParamsAndResult(c, byRef = false, g.entryMd)  # types inline (concrete proc)
+    while c.hasMore: skip c                 # pragmas, body
   if declIsNoReturn(decl):
     # A diverging callee (`panic`, `raiseAssert`, the bound-check failure path) returns
     # to nobody, so NO caller can observe what it destroyed. The clobber list exists to
@@ -345,14 +337,10 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
     g.emitAbiClobber(g.numIncomingArgRegs(decl), g.entryMd)
 
 proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
-  ## Settle each register-passed parameter into its allocated home. A param the
-  ## allocator left in its incoming arg register becomes the named local `p.i`
-  ## (x64 refers to a bound register by name); one the allocator relocated to a
-  ## callee-saved register (because it lives across a call) is `mov`'d there as a
-  ## *raw* register — never a named local, so the epilogue can `pop` that
-  ## callee-saved reg without a "kill it first" binding conflict. Stack-passed
-  ## params (7th+) are handled by `emitStackParamLoadsX64`.
-  let declarative = isDeclarativeAbi(g.prog, decl)  # full signature ⇒ params bound as `pN.0`
+  ## Settle each register-passed parameter into its allocated home. The signature
+  ## binds every GPR param as `pN.0`, so it is read by that name and the binding
+  ## killed once the value has moved; a float param's xmm is ABI-only (unbound) and
+  ## read raw. Stack-passed params (7th+) are handled by `emitStackParamLoadsX64`.
   var c = decl
   inc c                                       # proc head → name
   inc c                                       # name → params slot
@@ -383,11 +371,10 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # the `spilledByRefPtr` predicate: two answers to one question.
         g.varType[nm] = tn
         g.emByRefPtrStackVar(nm, tn)
-        let argReg = g.entryMd.gprAt(pl)
         g.ab.tree MovX64:
           g.emStackMem(nm)
-          if declarative: g.ab.sym paramName(pl.ord) else: g.ab.rawReg argReg
-        if declarative: g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
+          g.ab.sym paramName(pl.ord)
+        g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
       elif tn != NoTypeSym and loc.kind == NamedStack and not pl.onStack:
         # A register-passed ≤16B by-value aggregate in a `(s)` home: the slot IS the
         # struct, filled from its GPR word(s).
@@ -455,34 +442,25 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
       elif not pl.onStack:                      # register-passed scalar parameter
         let argReg = g.entryMd.gprAt(pl)
         if loc.kind == InReg and loc.r == argReg:
-          if declarative:
-            g.rb.bindParam(argReg, paramName(pl.ord)) # the signature binds it as `pN.0`
-            # Record the type so `restoreBindings` can re-establish this name after a
-            # DIVERGING call. Without it the param is nameless from the first panic
-            # onward and every later read of it emits a raw `(reg)` — `inc.0.nifisob2`
-            # reading its `(ptr Cursor)` out of a bare rdi is the canonical case.
-            g.nameBindTyp[paramName(pl.ord)] =
-              NameBindTyp(isPtr: isPtrType(resolveType(g.prog, typeCur)), typ: typeCur)
-          else:
-            # no signature binding (empty params) → bind the param's own name to its
-            # arg register so the body can refer to it by name.
-            g.emRegLocalVar(nm, argReg, typeCur)
+          g.rb.bindParam(argReg, paramName(pl.ord)) # the signature binds it as `pN.0`
+          # Record the type so `restoreBindings` can re-establish this name after a
+          # DIVERGING call. Without it the param is nameless from the first panic
+          # onward and every later read of it emits a raw `(reg)` — `inc.0.nifisob2`
+          # reading its `(ptr Cursor)` out of a bare rdi is the canonical case.
+          g.nameBindTyp[paramName(pl.ord)] =
+            NameBindTyp(isPtr: isPtrType(resolveType(g.prog, typeCur)), typ: typeCur)
           # An ArgResident param (kept in its arg reg though the proc has calls) is dead
           # after the first call clobbers the reg; record it so `flushArgResidentParams`
           # kills the binding then. In a LEAF proc no call fires, so it never flushes and
           # the binding persists for the whole body — the existing leaf behavior.
           g.argResidentParams.add (argReg, g.rb.boundName(argReg))
         elif loc.kind == InReg:
-          # Relocated to a callee-saved or caller-save volatile home. In the declarative
-          # path the signature binds argReg to `pN.0`, so the relocation move must
-          # *read* it by name (a raw `(reg)` use of a bound register is rejected); the
-          # binding is then killed so the now-dead arg register is free. The empty-
-          # signature path has no binding, so it moves the raw register.
-          if declarative:
-            g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(pl.ord))
-            g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
-          else:
-            g.movReg(loc.r, argReg)
+          # Relocated to a callee-saved or caller-save volatile home. The signature
+          # binds argReg to `pN.0`, so the relocation move must *read* it by name (a
+          # raw `(reg)` use of a bound register is rejected); the binding is then
+          # killed so the now-dead arg register is free.
+          g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(pl.ord))
+          g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
           # Then DECLARE the home under the param's own name — after the move, never
           # before it (a binding created ahead of its value is the stillborn shape).
           #
@@ -498,14 +476,13 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           # an address-taken / spilled scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. Type the slot
           # with the param's real type (e.g. a pointer) — a generic `(i 64)` slot would
-          # reject the typed store and forbid a later deref. In the declarative path the
-          # arg reg is bound to `pN.0`, so reference it by that name (and kill it); the
-          # empty-signature path uses the raw register.
+          # reject the typed store and forbid a later deref. The arg reg is bound to
+          # `pN.0`, so reference it by that name, then kill it.
           g.emTypedStackVar(nm, typeCur)        # (var :nm (s) <param type>)
           g.ab.tree MovX64:
             g.emStackMem(nm)
-            if declarative: g.ab.sym paramName(pl.ord) else: g.ab.rawReg argReg
-          if declarative: g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
+            g.ab.sym paramName(pl.ord)
+          g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
         else:
           raiseAssert "arkham x64 v0: spilled / float parameter: " & nm
       # else: stack-passed (7th+) — loaded by emitStackParamLoadsX64.

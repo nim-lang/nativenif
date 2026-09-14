@@ -142,6 +142,22 @@ The four sections are positional and all four are present even when empty:
 body, which is a `(stmts ...)` block. A result that is returned in more than one register
 uses `(regs (rax) (rdx))` in place of the single register.
 
+A parameter passed in several registers (a small aggregate, one register per word)
+uses `(regs (rdi) (rsi))` as its location; `(arg name k)` at a call site selects the
+k-th of them. Such a parameter is ABI-only: it is not bound to its name in the body,
+so the body reads its registers raw. An empty `(regs)` is a parameter passed in no
+register at all — a zero-size aggregate — and a call site assigns nothing for it.
+
+A float parameter is passed in an SSE register, `(param :x.0 (xmm0) (f 64))`, and a
+float result is declared the same way, `(result :ret.0 (xmm0) (f 64))`. Like a
+`(regs …)` parameter it is ABI-only in the body. At a call site the argument is
+assigned with `(movsd (arg x.0) <xmm or float variable>)` (`movss` for an `(f 32)`)
+and the result bound with `(movsd <xmm or float variable> (res ret.0))`; both are
+checked for exactly-once assignment like their GPR counterparts, and a same-register
+move is elided. On AArch64 the locations are `(dN)` / `(sN)` and the moves are
+`(fmov (arg x.0) …)` and `(fmov … (res ret.0))`; RV32 (`(sN)`/`(dN)` naming
+fa0–fa7) and Cortex-M (`(sN)`, single precision only) spell them the same way.
+
 ### Stack parameters
 
 Parameters can also be passed on the stack instead of in registers. Use `(s)` or `(s N)` instead of a register name to indicate a stack-passed parameter:
@@ -222,7 +238,10 @@ For example:
 ```
 
 A call to a proc imported from a dynamic library (declared with `(extproc :name.0 "_name")`)
-uses `(extcall)` in place of `(call)`; a tail call uses `(tailcall)`.
+uses `(extcall)` in place of `(call)`; a tail call uses `(tailcall)`. An `(extproc …)`
+may carry `(params …) (result …) (clobber …)` after the external name, and then its
+call sites bind `(arg name)` / `(res name)` and are checked exactly like calls to a
+proc in the image.
 
 ### Stack arguments with `(csize)`
 

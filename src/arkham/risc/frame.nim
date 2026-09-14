@@ -17,7 +17,7 @@
 ## in `g.md`.
 
 import std / [assertions, tables]
-import nifcore
+import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, regbind, abi]
@@ -740,14 +740,14 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.movReg(loc.r, g.md.gprAt(pl))
         else: raiseAssert "arkham v1: stack-resident parameter: " & nm
 
-proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
-  ## Emit the proc's `(params)/(result)/(clobber)`. When `declarative`, the ABI
-  ## is stated explicitly — positional `p{i}` register params and an `x0` result
-  ## — so nifasm cross-checks every call site; otherwise both stay empty and
-  ## arkham marshals by hand (floats/aggregates/by-ref/>8/named types). The
-  ## clobber set is always the convention's, derived here (never per-proc
-  ## precomputed), which is reliable across modules.
-  if declarative:
+proc emitSignature*(g: var CodeGen; decl: Cursor) =
+  ## Emit the proc's `(params)/(result)/(clobber)`: the ABI stated explicitly —
+  ## positional `p{i}` register params (v-registers for floats, `(regs …)` for
+  ## aggregates and wide scalars, `(s)` past the register file) and an `x0` /
+  ## `d0` result — so nifasm cross-checks every call site. The clobber set is
+  ## always the convention's, derived here (never per-proc precomputed), which
+  ## is reliable across modules.
+  block:
     var c = decl
     c.into:
       inc c                                   # name → params slot
@@ -769,14 +769,32 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
           var pIdx = 0
           c.into:
             while c.hasMore:
+              block:                          # a `{.varargs.}` marker is not a param
+                var tc = c
+                var isMarker = false
+                tc.into:
+                  inc tc; skip tc
+                  isMarker = tc.kind == TagLit and tc.typeKind == VarargsT
+                  while tc.hasMore: skip tc
+                if isMarker:
+                  skip c
+                  continue
               let pl = plan.args[pIdx]
               inc pIdx
               c.into:                         # (param :name pragmas type)
                 inc c                         # name → use positional p{ord}
                 skip c                        # pragmas
                 if pl.isFloat:
-                  raiseAssert "arkham a64: float param in signature not yet supported"
-                if pl.isWideScalar:
+                  # A float param travels in a v-register: `(param :pN.0 (dK|sK) (f N))`.
+                  # nifasm binds no AArch64 param, so the body reads it raw
+                  # (`emitParamMoves`); a call site assigns it with `(fmov (arg pN) …)`.
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(pl.ord)
+                    if not pl.onStack:
+                      g.ab.freg(g.md.floatArgRegs[pl.fpIndex], floatBitsFor(slotOf(g.prog, c).size))
+                    else: g.ab.keyword SO       # 9th+ float: stack-passed
+                    g.genTypeBody(c)
+                elif pl.isWideScalar:
                   # A scalar too wide for one register (`(i 64)` on Cortex-M).
                   # `(regs …)` is the SAME location form a multi-word aggregate
                   # uses, and for the same reason: the halves have no Leng type
@@ -833,8 +851,13 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
         else:
           let rs = slotOf(g.prog, c)
           if rs.kind == AFloat:
-            raiseAssert "arkham a64: float result in signature not yet supported"
-          if g.isWideSlot(rs):
+            # `(result :ret.0 (d0|s0) (f N))`: the caller binds it with
+            # `(fmov (d0) (res ret.0))` right after the call, the twin of the x0
+            # announcement for a scalar.
+            g.ab.symDef synth("ret.0")
+            g.ab.freg(g.md.floatRetReg, floatBitsFor(rs.size))
+            g.genTypeBody(c)
+          elif g.isWideSlot(rs):
             # A 64-bit result travels in r0:r1 with an EMPTY result slot, exactly
             # as a two-word aggregate does: nifasm's `(ret …)` names ONE register,
             # and declaring only the low half is how a truncated return would look
@@ -851,9 +874,6 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
             g.ab.rawReg g.md.intRetReg                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
-  else:
-    g.ab.keyword ParamsD
-    g.ab.keyword ResultD
   g.ab.tree ClobberD:
     # A diverging callee returns to nobody, so no caller can observe what it
     # destroyed — declaring clobbers only forces every proc with a cold guard onto
