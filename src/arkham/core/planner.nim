@@ -39,7 +39,7 @@
 ## commutes — never as a placement; `stackArgBaseReg`'s callee-saved reservation in
 ## `allocateProc` and the `presealed` set are the two existing examples.
 ##
-## Phase B lives in codegen_x64/codegen_arm today, next to the pool it draws from
+## Phase B lives in the backends (`x64/`, `risc/`) today, next to the pool it draws from
 ## (`takeHeld`), and it already has a home of its own there: `emitLvalWalk` is a pure
 ## pick-and-record walk with no emission in it. Moving it here means a `planValue`
 ## twin to `planStmt` that recurses into the value positions this walk skips, calling
@@ -91,7 +91,7 @@ type
   ExprAux* = object
     ## Per-expression-position scratch memo (kept in `Plan.aux`, sparse).
     ## Written by the a64 fused lvalue walk (`emitLvalWalk`) for the `(at base
-    ## idx scratch)` non-scale stride register; read back by `emLvalAddr2` and
+    ## idx scratch)` non-scale stride register; read back by `emLvalAddr` and
     ## the lvalue release helpers.
     scratch*: seq[Reg]                ## extra GPRs reserved for this op (a
                                       ## non-pow2 stride temp, an address scratch…)
@@ -279,10 +279,10 @@ proc planAtEmitTime*(plan: var Plan; pos: int; loc: Location) {.inline.} =
   ##  1. a PLACEMENT — `getExpr` and `emitLvalWalk`'s global base decide where a value
   ##     will go before anything is emitted. Real phase B, in the wrong module; a
   ##     `planValue` pass subsumes exactly these.
-  ##  2. a WRITE-BACK of a resolution — `prematAddrVal2` and the intrinsic operand
-  ##     loops hand `emitValue2` a `NeedsReg`/`RegOrImm` and store the concrete answer
+  ##  2. a WRITE-BACK of a resolution — `prematAddrVal` and the intrinsic operand
+  ##     loops hand `emitValue` a `NeedsReg`/`RegOrImm` and store the concrete answer
   ##     back. The decision was already made; this only records how it came out.
-  ##  3. a scoped MATERIALIZATION — `reloadMemBase2`/`restoreMemBase2` lend a spilled
+  ##  3. a scoped MATERIALIZATION — `reloadMemBase`/`restoreMemBase` lend a spilled
   ##     home to a staging register for the length of one addressing mode and put it
   ##     back. A peephole, not an allocation. It stays at emit time whatever else moves.
   ##
@@ -850,7 +850,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   # only against `(instr …)` rows via `clobbersBridgeReg`), reasoning that it is the
   # one volatile with no ABI role — but the gate covered only the STATIC bridge
   # claims. The emitter also grabs the bridge REACTIVELY under register pressure
-  # (`produceIntoMem2`, the mem-base reload staging, the aggregate-copy transfer):
+  # (`produceIntoMem`, the mem-base reload staging, the aggregate-copy transfer):
   # those sites `releaseStaleName(R11)` and write it raw, because the bridge's whole
   # contract is "always free for the emitter" — a contract a rescued value homed
   # there silently violates. The corpus never had enough simultaneous pressure to
@@ -917,7 +917,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # `let c2 = cast[T](c1)` / `let c2 = c1`, where the relabel is SAME-WIDTH and `c1`
       # is a single-def register-homed local whose LAST touch is this initializer: `c2`
       # occupies `c1`'s register directly. The store then collapses to a zero-machine-code
-      # `(rebind)` (the emitter renames the register from c1 to c2 — see `genVarDecl2`),
+      # `(rebind)` (the emitter renames the register from c1 to c2 — see `genVarDecl`),
       # eliminating a reg→reg `mov`. Gated to x86 (the emitter's same-reg skip is wired
       # there) and to a source whose register CLASS already covers c2's lifetime: a
       # callee-saved home always does; a volatile home only for a call-free c2 (`AllRegs`).

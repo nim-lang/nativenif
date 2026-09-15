@@ -12,9 +12,9 @@
 ## `params`/`extproc`/… — all from nativenif's `model.nim`, generated from
 ## `doc/instructions.md`). Reusing them makes the assembler the single source
 ## of truth and compile-time-enforces that arkham only emits tags nifasm
-## accepts. Registers are arkham's arch-neutral `machine.Reg` slots, rendered
-## by the per-target `renderReg` shim (AArch64's `regName` unless a backend
-## overrides it — `codegen_x64` installs `x64RegName`).
+## accepts. Registers are arkham's arch-neutral `Reg` slots, rendered by the
+## per-target `renderReg` shim every driver hands to `newCodeGen` (the machine
+## model's `regName`, or `x64RegName`).
 ## Built as a `nifcore` `TokenBuf` (the flexible NIF API) and serialized with
 ## `toString`.
 
@@ -23,10 +23,7 @@ import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagpool]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
                              # and the seeded tag pool (with its escape tag)
-import ../risc/machine_a64 as machine
-                             # arkham: Reg, and the DEFAULT `renderReg` — AArch64's
-                             # `regName`. The x64 and Cortex-M backends install their
-                             # own, so this edge is only about the default argument.
+import machinedesc           # arkham: Reg
 import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, AvrInst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
 export RvInst  # the RV32-only mnemonics (`semihost`, `csrw`, `csrs`). Three, and
@@ -48,16 +45,17 @@ type
                                 ## peephole may splice (a body is target machine
                                 ## code; a fingerprint match alone must not do)
 
-proc initAsmBuf*(): AsmBuf =
-  ## Defaults the register shim to AArch64 spellings; the x86-64 backend
-  ## overrides `renderReg` after construction.
+proc initAsmBuf*(renderReg: proc (r: Reg): string {.nimcall.}): AsmBuf =
+  ## `renderReg` is the target's register spelling. There is no default: a
+  ## default would be SOME target's spelling, and a backend that forgot to
+  ## install its own would emit another ISA's registers rather than fail.
   ##
   ## The buffer takes nifasm's SEEDED tag pool rather than a fresh one: that
   ## pool is the one that nominates an escape tag, and asm-NIF's vocabulary
   ## overflows the 9-bit tag field (see `nifasm/tagpool`). With a fresh pool the
   ## overflowing spellings would have nowhere to go.
   AsmBuf(buf: createTokenBuf(256, sharedTags = createAsmTagPool()),
-         ids: initTable[string, TagId](), renderReg: regName)
+         ids: initTable[string, TagId](), renderReg: renderReg)
 
 proc openS(a: var AsmBuf; spelling: string) {.inline.} =
   a.buf.openTag a.ids.mgetOrPut(spelling, a.buf.tags.registerTag(spelling))

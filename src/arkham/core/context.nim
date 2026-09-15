@@ -22,8 +22,7 @@
 
 import std / [tables, sets]
 import nifcore
-import asmslots, machinedesc, planer, programs
-import "../risc/machine_m"                # the Cortex-M machine model
+import asmslots, machinedesc, planner, programs
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
 
@@ -33,7 +32,7 @@ import "../../nifasm/core/model"         # X64Inst: the fused-compare tag
 type
   StmtFlag* = enum
     ## What the code AROUND a statement does after it — the context a statement is
-    ## emitted in, handed DOWN to `genStmt2`/`asmStmt` as a `flags` parameter rather
+    ## emitted in, handed DOWN to `genStmt`/`asmStmt` as a `flags` parameter rather
     ## than parked in `CodeGen`. A statement's tail position is a property of where it
     ## sits, not of the proc being emitted, and the emitters nest: a field would have
     ## to be saved, cleared and restored around every recursive call, which is exactly
@@ -81,7 +80,7 @@ type
     ##
     ## x86-64 ONLY: `tag` is an `X64Inst` (the `jcc` that means "true"), and AArch64
     ## has its own condition handling. `scanCondFusions` and the emitter that reads
-    ## these both live in `codegen_x64`.
+    ## these both live in the x64 backend (`x64/stmt`).
     ##
     ## Two halves, with different lifetimes — which is why they are one object but
     ## not one table:
@@ -182,15 +181,15 @@ type
                                              ## EMIT even when constant-foldable, because the
                                              ## `(ovf)` test that follows reads the hardware
                                              ## flag that very instruction sets. -1 = none.
-                                             ## Set by genStmt2's KeepovfS around its store,
+                                             ## Set by genStmt's KeepovfS around its store,
                                              ## mirrored by the allocator's walk (same rule,
                                              ## same position). Checked wherever a fold would
                                              ## replace the op with an immediate.
     binNormSuppressPos*: int                 ## token pos of the ONE bin-arith node whose
                                              ## canonical sub-width `shl;sar` re-normalization is
                                              ## dead because its result feeds a truncating store of
-                                             ## width <= the bin's type (set by genStore2, read by
-                                             ## emitBin2). -1 = none. Never suppresses a result that
+                                             ## width <= the bin's type (set by genStore, read by
+                                             ## emitBin). -1 = none. Never suppresses a result that
                                              ## feeds `shr`/unsigned-cmp/div (those aren't stores).
     frameIsAddressable*: bool                ## some symbol of the current proc is homed on the
                                              ## STACK, so an address into this frame can exist and
@@ -341,7 +340,7 @@ type
     rvIrqCauses*: set[uint8]                 ## RV32: the trap causes this module declared
                                              ## a handler for. The reset path enables
                                              ## exactly these in `mie` — see
-                                             ## `runtime.emEnableInterruptsRv` for why
+                                             ## `rv32.emitEnableInterrupts` for why
                                              ## declaring the handler IS the enable.
     isInterrupt*: bool                       ## the proc being emitted is an
                                              ## `{.interrupt.}` handler. On RV32 that
@@ -397,15 +396,15 @@ type
                                              ## loaded into a transient staging reg for the lval
                                              ## emission; its original `NamedStack`/`Mem` home is
                                              ## parked here (keyed by value position) and restored
-                                             ## by `unbindLvalTemps2`.
+                                             ## by `unbindLvalTemps`.
     lvalStride*: Table[int, Reg]             ## x64: the non-SIB `(at/pat base idx scratch)` stride
                                              ## scratch is picked from the emit-time STAGING set
                                              ## (the always-free R11 bridge + free caller-saved),
                                              ## NOT reserved by the allocator from the local-
                                              ## competing temp pool — so it never starves under
                                              ## register pressure. Keyed by the at/pat position,
-                                             ## populated in `prematLval2`, consumed by
-                                             ## `emLvalAddr2`, released by `unbindLvalTemps2`.
+                                             ## populated in `prematLval`, consumed by
+                                             ## `emLvalAddr`, released by `unbindLvalTemps`.
     lvalStrideBorrowed*: HashSet[int]        ## x64: the `lvalStride` entries that BORROW the
                                              ## consuming instruction's destination register
                                              ## instead of taking a staging reg of their own.
@@ -416,8 +415,8 @@ type
                                              ## because the allocation walk found the temp pool AND
                                              ## the callee-saved file fully live (register-homed
                                              ## locals do not compete for a bridge). Recorded by
-                                             ## `emitLvalWalk`, honoured in `prematLval2`, released
-                                             ## with the rest of the scratch in `freeLvalTemps2`.
+                                             ## `emitLvalWalk`, honoured in `prematLval`, released
+                                             ## with the rest of the scratch in `freeLvalTemps`.
     lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
                                              ## aggregate base used in a transient LOAD (e.g. a
                                              ## float field read whose result is an xmm, so the
@@ -430,7 +429,7 @@ type
                                              ## signed op, `jb`/`jae` = CF for an unsigned op)
     ovfMode*: OvfMode                         ## a64: how the pending `(ovf)` test reads the
                                              ## overflow predicate (no flag-setting arithmetic in
-                                             ## the nifasm a64 vocabulary — see genStmt2 KeepovfS)
+                                             ## the nifasm a64 vocabulary — see genStmt KeepovfS)
     ovfReg*: Reg                              ## a64 OvfSign: the register holding the sign-bit
                                              ## predicate; OvfCmpLo: the cmp's LHS
     ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
@@ -443,12 +442,12 @@ type
                                               ## the lvalue premat it is about to run — offered to
                                               ## `lateGlobalBase` as a home for `&g` when neither a
                                               ## free volatile nor a staging bridge is left. Set
-                                              ## around one `prematLval2` call and cleared right
+                                              ## around one `prematLval` call and cleared right
                                               ## after; never read anywhere else.
     lateBaseBorrowedAt*: HashSet[int]         ## a64: lvalue positions whose global base went into
                                               ## `lateBaseSpare` rather than into scratch of its
                                               ## own. The register belongs to the CALLER, so the
-                                              ## matching `unbindLvalTemps2` must leave it bound.
+                                              ## matching `unbindLvalTemps` must leave it bound.
     # ── `.assembler` transliteration (doc/intrinsics.md §8) ──
     # In an `.assembler` proc there is no allocator: every value's home is DECLARED
     # (`.register`/`.stack` on the param or local), so the register IS the identity
@@ -492,13 +491,14 @@ proc resetPlan*(cf: var CondFusion) {.inline.} =
 type
   CallerSaveWindow* = object
     ## One open save window: what was stored, and the redirect table to put back when
-    ## it closes. Opened at `emitCall2` — or EARLIER by a caller that writes an ABI
+    ## it closes. Opened at `emitCall` — or EARLIER by a caller that writes an ABI
     ## register for the call itself (the hidden result pointer in rdi), which must
     ## happen after the save or it clobbers the value it was supposed to preserve.
     saved*: seq[tuple[reg: Reg, name: string]]
     prevActive*: Table[string, Location]
 
-proc newCodeGen*(buf: var TokenBuf; md: MachineDesc): CodeGen =
+proc newCodeGen*(buf: var TokenBuf; md: MachineDesc;
+                 renderReg: proc (r: Reg): string {.nimcall.}): CodeGen =
   ## The parts every target starts from. What differs — the machine model, the
   ## register renderer, whether immediates may address memory, which target the
   ## `BodyLib` splices are keyed on — is set by the caller, because it IS the
@@ -506,7 +506,7 @@ proc newCodeGen*(buf: var TokenBuf; md: MachineDesc): CodeGen =
   checkMachine(md)
   # `entryMd` starts as `md`: a proc is entered the way arkham calls it unless a
   # per-proc setup says otherwise, and every target but Windows/x64 always is.
-  CodeGen(ab: initAsmBuf(), buf: addr buf, md: md, entryMd: md)
+  CodeGen(ab: initAsmBuf(renderReg), buf: addr buf, md: md, entryMd: md)
 
 proc adoptProgram*(g: var CodeGen) =
   ## Read the loaded program model into the fields the emitter consults directly.

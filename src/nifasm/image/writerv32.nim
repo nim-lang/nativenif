@@ -23,7 +23,7 @@
 ## `(layout …)` board description — regions come from constants here.
 ##
 ## The `mtvec` trampoline table is NOT this writer's: arkham builds it in code
-## (`risc/driver.rv32InterruptTable`), so the `(interrupts …)` declaration that
+## (`risc/rv32.emitInterruptTable`), so the `(interrupts …)` declaration that
 ## `thumb/board` accepts for RV32 only keeps the handlers reachable — nothing
 ## here reads `ctx.interrupts`, unlike `writecortexm`.
 

@@ -936,7 +936,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # granting it to a bounds-checked `[]=` (whose panic is diverging) tripped the
       # allocator's own clobber check on rcx. That was the binding table, not the
       # machine: the panic's marshalling had to `(kill …)` the home, and every later
-      # read of the still-live local went raw. `restoreBindings` (codegen_x64) now
+      # read of the still-live local went raw. `restoreBindings` (x64/emit) now
       # re-establishes those names after the diverging call, so the strict test is no
       # longer needed — and rdx/rcx are 2 of the 4 GPRs arkham is short of against gcc.
       # `-d:arkhamStrictDivAcrossPanic` restores the old behaviour.

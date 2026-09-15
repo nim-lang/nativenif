@@ -34,7 +34,7 @@
 \* the seal, the steal's stack write, the staging free-check, or part of the
 \* StartEmit reset each makes TLC produce a counterexample.
 \*
-\* The abstracted code carries back-pointers: grep `MODEL:` in src/arkham/codegen_*.nim
+\* The abstracted code carries back-pointers: grep `MODEL:` in src/arkham/{core,x64,risc}/*.nim
 \* for the procs each action/invariant corresponds to (stealReg, pickStagingScratch,
 \* forceReg, genInto, genProc, evictFixedReg). Change one side, re-check the other.
 

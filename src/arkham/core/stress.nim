@@ -66,7 +66,7 @@ when StressEnabled:
     ## Shrinking the pools does not reach that tier on x86-64, and no fixture can:
     ## a park is needed only for an argument register a LATER argument is pinned
     ## to by the ISA — rcx for a shift count, rdx for a division — so at most two
-    ## words park per call, and the survivor the planer reserves for the emitter
+    ## words park per call, and the survivor the planner reserves for the emitter
     ## plus the first pool temp answer them. The memory tier is the one that has
     ## to hold when a real program arrives with both dry, so the tester drives it
     ## from here, against each fixture's own `.exitcode`.

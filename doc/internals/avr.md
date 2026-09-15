@@ -54,7 +54,7 @@ is the destination.
 
 ### Why M4 is not the Cortex-M arrangement
 
-`generateM` is the AArch64 emitter driven with a different machine model, not a
+`generateCortexM` is the AArch64 emitter driven with a different machine model, not a
 second code generator — Thumb-2 and AArch64 share the asm-NIF vocabulary at the
 instruction level, so a third target needed only a register file, a word size
 and honest refusals.
@@ -71,7 +71,7 @@ So AVR needs its own value core. That is the irreducible piece
 backend, and the piece whose register-binding protocol has a formal model behind
 it. It is M4c, and it is the largest single item left on this list.
 
-The register ALLOCATOR is reusable as it stands — `planer.allocateProc` is
+The register ALLOCATOR is reusable as it stands — `planner.allocateProc` is
 arch-neutral and takes a `MachineDesc` — so M4c is the emitter, not the
 allocator.
 

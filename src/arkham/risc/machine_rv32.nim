@@ -24,7 +24,7 @@
 ## Cortex-M. ilp32d gives eight integer argument registers and eight FP ones, and
 ## the temporaries `t0`–`t5` are DISJOINT from them — so the emitter's scratch
 ## pool cannot collide with a call's staged arguments, which is the collision
-## that forced `machine_m.IntTempRegs` to be empty. RV32 needs no such sacrifice.
+## that forced `machine_cortexm.IntTempRegs` to be empty. RV32 needs no such sacrifice.
 
 import ../core/[machinedesc]
 export machinedesc
@@ -191,7 +191,7 @@ const
       #   `ldrex`/`strex`, which need `dmb` on either side. The capability is a
       #   statement about the ISA and stays true; whether this BACKEND can emit an
       #   atomic is a separate question, answered by `atomicScratch` above, which
-      #   is empty. `emitAtomicInstr2` checks the reservation, not the capability,
+      #   is empty. `emitAtomicInstr` checks the reservation, not the capability,
       #   because a triple it does not hold is what actually stops it.
       # `TwoAddrForms`: the nifasm selector accepts the destructive `(op D S)`
       #   spelling and encodes it as `op rd, rd, rs`.
@@ -226,7 +226,7 @@ const
     intCallerSavedSet: {R1, R5, R6, R7, R10..R17, R28, R29, R30},
     convClobbersGpr: @ConvClobbersGpr)
 
-proc regNameRv*(r: Reg): string =
+proc regName*(r: Reg): string =
   ## The asm-NIF spelling of a GPR slot. RV32 reuses AArch64's tags outright —
   ## `(x0)`..`(x30)` and `(sp)` — so this is AArch64's `regName` verbatim, which
   ## is the whole reason the register half of this target cost nothing.
@@ -237,7 +237,7 @@ proc regNameRv*(r: Reg): string =
     if ord(r) <= ord(R30): "x" & $ord(r)
     else: "<unmapped:" & $ord(r) & ">"
 
-proc isAllocatableRv*(r: Reg): bool {.inline.} =
+proc isAllocatable*(r: Reg): bool {.inline.} =
   ## Whether arkham may place a value in `r`.
   r notin ReservedRegs
 
@@ -269,7 +269,7 @@ const
     ## standard causes stop; a platform-specific interrupt above 15 would extend
     ## it, and nothing here has one.
 
-proc interruptCauseRv*(name: string): int =
+proc interruptCause*(name: string): int =
   ## The trap cause `name` denotes, or -1 if this target has no such interrupt.
   ## Case-sensitive for the same reason Cortex-M's is: these are the spec's
   ## spellings, and accepting `machinetimer` invites a house style that differs

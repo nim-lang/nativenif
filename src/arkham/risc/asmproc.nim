@@ -1,12 +1,12 @@
 #
-#            Arkham — `.assembler` procs on the Arm targets (a64, Cortex-M)
+#            Arkham — `.assembler` procs on the load/store targets
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## INCLUDED by `codegen_arm.nim` — the Arm arm of `doc/intrinsics.md` §8, and the
-## twin of `codegen_x64.nim`'s `genAsmProc`.
+## The load/store half of `doc/intrinsics.md` §8, and the twin of
+## `x64/asmproc`'s `genAsmProc`.
 ##
 ## ## What this mode is
 ##
@@ -51,12 +51,15 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, asmcommon, 
                     mirrors, regbind, abi]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 import emit, value, frame
+from a64 import nil
+from cortexm import nil
+from rv32 import nil
 
 proc armFrameSaved(g: CodeGen): set[Reg] =
   ## The callee-saved registers this back end's prologue actually saves — the
@@ -101,71 +104,10 @@ proc asmPinReg*(g: var CodeGen; at: Cursor; name: string): Reg =
               g.md.gprRangeText, g.asmInfo
   if result == SP:
     lengError at, "`sp` is the stack pointer and cannot hold a value", g.asmInfo
-  if g.thumbM:
-    if result == g.md.linkReg:
-      lengError at, "`lr` holds the return address, which every `bl` overwrites " &
-                "and the epilogue reads back", g.asmInfo
-    if result == machine_m.IP:
-      lengError at, "`r12` is the assembler's own scratch: nifasm folds an " &
-                "out-of-range operand through it at sites this back end never " &
-                "sees, so a value left there dies to an instruction nobody emitted",
-                g.asmInfo
-    if result == g.md.produceBridge:
-      lengError at, "`r8` is arkham's produce bridge — the register it can " &
-                "always take when a value has to be staged", g.asmInfo
-    if result == g.md.indirectResultReg:
-      lengError at, "`r9` carries `&result` for a callee returning an aggregate " &
-                "too wide for registers", g.asmInfo
-    if result in {g.md.bridgeRegs[0], g.md.bridgeRegs[1]}:
-      lengError at, "`" & name & "` is one of arkham's two staging bridges " &
-                "(r10/r11): a folded memory operand has to be loaded somewhere, " &
-                "and this target has no spare volatile at all", g.asmInfo
-  elif g.md.arch == Rv32:
-    # RV32's own arm. It used to fall into the AArch64 `else` below, which answers
-    # about a different register file: `x16`/`x17` are IP0/IP1 there and the
-    # ARGUMENT registers a6/a7 here, `x18` is the platform register there and the
-    # callee-saved home `s2` here, and the link-register message names `x30` in
-    # prose while `md.linkReg` is `x1`. Every one of those is a confident sentence
-    # about the wrong register.
-    if result == g.md.linkReg:
-      lengError at, "`x1` is the link register (`ra`): every `jal` overwrites it " &
-                "and the epilogue reads it back", g.asmInfo
-    if result == R0:
-      lengError at, "`x0` reads as zero and discards every write — a value put " &
-                "there is not stored, it is deleted", g.asmInfo
-    if result in {R3, R4}:
-      lengError at, "`" & name & "` is reserved by the RISC-V ABI (`gp`/`tp`); " &
-                "nothing here establishes one, but a proc that clobbered it " &
-                "would break any object linked in that does", g.asmInfo
-    if result == g.md.indirectResultReg:
-      lengError at, "`x9` carries `&result` for a callee returning an aggregate " &
-                "too wide for registers", g.asmInfo
-    if result == R8:
-      lengError at, "`x8` is the ABI's frame pointer (`s0`), kept off the file " &
-                "so a debugger's frame walk and a hand-written body have a fixed " &
-                "place to stand", g.asmInfo
-    if result in {g.md.bridgeRegs[0], g.md.bridgeRegs[1]}:
-      lengError at, "`" & name & "` is one of arkham's two staging bridges " &
-                "(x29/x30): a folded memory operand has to be loaded somewhere, " &
-                "and this target reserves exactly as many as one emitter step " &
-                "may hold at once", g.asmInfo
-  else:
-    if result == g.md.linkReg:
-      lengError at, "`x30` is the link register: every `bl` overwrites it and " &
-                "the epilogue reads it back", g.asmInfo
-    if result == g.md.framePtrReg:
-      lengError at, "`x29` is the frame pointer, which addresses the caller's " &
-                "stack arguments for the whole body", g.asmInfo
-    if result == g.md.indirectResultReg:
-      lengError at, "`x8` carries `&result` for a callee returning an aggregate " &
-                "too wide for registers", g.asmInfo
-    if result in {R16, R17}:
-      lengError at, "`" & name & "` is an assembler veneer register (IP0/IP1); " &
-                "the linker writes it in branch thunks this back end never sees",
-                g.asmInfo
-    if result == R18:
-      lengError at, "`x18` is the platform register and belongs to the OS, not " &
-                "to this program", g.asmInfo
+  case g.md.arch
+  of ThumbM: cortexm.rejectReservedPin(g, at, name, result)
+  of Rv32: rv32.rejectReservedPin(g, at, name, result)
+  else: a64.rejectReservedPin(g, at, name, result)
   # Anything still standing must be a register the proc can ACCOUNT for: one the
   # ABI lets a callee destroy, or one the prologue saves. A callee-saved register
   # outside that second set is the quiet failure this whole check exists for —
@@ -349,7 +291,7 @@ proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   if argCurs.len != row.arity:
     lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
               g.asmInfo
-  let tag = armInoutTag(op)
+  let tag = inoutInst(op)
   if tag == NopA64:
     lengError c, "`" & IntrinsicNames[op] & "` has no " &
               g.md.targetName & " two-address form",
@@ -495,7 +437,7 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
 proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   ## `(instr SYM X*)` in an `.assembler` body: the operands are already where the
   ## user put them, so this is the row's opcode over `dst` and the operand
-  ## registers — no placement, no freeing, none of `emitInstr2`'s machinery.
+  ## registers — no placement, no freeing, none of `emitInstr`'s machinery.
   var fsym = ""
   var argCurs: seq[Cursor] = @[]
   var fc = c
@@ -689,7 +631,7 @@ proc asmIf(g: var CodeGen; c: Cursor) =
 proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
   g.asmNoteInfo(c)
-  # Tail position, tracked exactly as `genStmt2` does: only the LAST statement of
+  # Tail position, tracked exactly as `genStmt` does: only the LAST statement of
   # a straight-line `stmts`/`scope` inherits it. A `ret` there falls through to
   # the epilogue instead of branching to it — in a mode whose premise is
   # one-to-one, a `b` to the very next label is an instruction nobody wrote.
@@ -881,7 +823,7 @@ proc asmCheckAbi(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
         while pc.hasMore: skip pc
       inc ord
 
-proc genAsmProc2*(g: var CodeGen; info: ProcInfo) =
+proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
   ## Emit an `.assembler` proc: no allocator, no analyser, no value core. The
   ## signature is the ordinary declarative one (that is what lets ordinary Nimony
   ## call it), and the `.register` annotations on the parameters are checked

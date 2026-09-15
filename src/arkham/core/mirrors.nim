@@ -17,8 +17,7 @@
 import std / [tables, sets, os]
 
 import nifcore
-import asmslots, machinedesc, planer
-import "../risc/machine_m"
+import asmslots, machinedesc, planner
 import asmbuf, regbind, context
 
 
@@ -193,7 +192,7 @@ proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: string): bool =
   ## The caller owes the same proof `mirrorStored` gets for free from the store:
   ## that `r` still holds what it says. That is why this is NOT called from the
   ## address materialization but from the release of an lvalue whose address
-  ## registers were provably only READ (see `freeLvalTemps2`'s `addrIntact`): the
+  ## registers were provably only READ (see `freeLvalTemps`'s `addrIntact`): the
   ## load form `mov base, [base]` reuses the base register as its destination,
   ## and a mirror created there would name the loaded value.
   if forwardingOff or asmName.len == 0: return false

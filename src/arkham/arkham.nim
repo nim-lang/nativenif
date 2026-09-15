@@ -119,7 +119,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
-               generateM(buf, input, tags, board)
+               generateCortexM(buf, input, tags, board)
              of "avr": generateAvr(buf, input, tags)
              of "riscv32", "rv32":
                generateRv32(buf, input, tags, board)

@@ -10,14 +10,14 @@
 ## stores that go through one.
 ##
 ## x86 reaches memory from almost every instruction, so this is where most of
-## the target's leverage is — and most of its risk: `emLvalAddr2` walks a whole
+## the target's leverage is — and most of its risk: `emLvalAddr` walks a whole
 ## lvalue tree emitting base + index*scale + disp, and every scratch register it
 ## materialises on the way has to be released again in the same order
-## (`unbindLvalTemps2`), or the pool leaks across statements.
+## (`unbindLvalTemps`), or the pool leaks across statements.
 
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, exprpred, typenav, regbind]
 import "../../nifasm/image/tracetable"
@@ -120,7 +120,7 @@ proc movImm*(g: var CodeGen; d: Reg; v: int64) =
   ## The a64 twin has done this since 075b051 (`risc/mem.placeImmTyped`); this
   ## side never got one, so the same source compiled on one target and was
   ## rejected on the other. It lives here rather than in a typed wrapper because
-  ## `emitValue2`'s literal arm reaches `movImm` directly — a wrapper only the
+  ## `emitValue`'s literal arm reaches `movImm` directly — a wrapper only the
   ## callers that remembered it would use.
   ##
   ## `0` is left alone: it is a legal pointer value under the rule above, and
@@ -139,10 +139,10 @@ proc movReg*(g: var CodeGen; d, s: Reg) =
   ## checks the names' declared types, not the machine move — which moves the whole
   ## register whatever the two sides call it. Where they disagree the move is a
   ## reinterpretation, so say so with a `(cast …)` rather than emit something that
-  ## reads as a narrowing move; `genStore2` already answers a pointer field that way.
+  ## reads as a narrowing move; `genStore` already answers a pointer field that way.
   ## The destination's type is not ours to change here: it is a named local's, and
   ## it is right. (A retype that is genuinely wrong is a bug at the PRODUCER — see
-  ## `emitCast2`'s pre-retype and `restoreBindings` — and this does not paper over
+  ## `emitCast`'s pre-retype and `restoreBindings` — and this does not paper over
   ## those: they decide what the binding says, this only spells the move honestly.)
   if d == s: return
   let dt = g.bindTypeOf(d)
@@ -163,14 +163,14 @@ proc binImm*(g: var CodeGen; op: X64Inst; d: Reg; v: int64) =  # d op= imm
   ## `imul r, 2^k` is a shift: hexer lowers `p + i*sizeof(T)` to a runtime
   ## multiply even after `sizeof` folds to 4/8, and GCC turns that into
   ## `shl` / a SIB scale. Catching it here covers both the canonical and
-  ## swapped emitBin2 paths (and every other immediate-mul).
+  ## swapped emitBin paths (and every other immediate-mul).
   ##
   ## NOT under `keepovf`: the two agree on the low 64 bits and DISAGREE on the
   ## flags. `imul` sets OF/CF exactly when the product overflows, which is what
   ## the mandatory `(ovf)` right after reads via `jo`/`jb`; `shl` leaves OF
   ## UNDEFINED for counts > 1 and puts the last bit shifted out in CF, so `x * 8`
   ## would read a garbage overflow answer. `noFoldPos >= 0` marks exactly that
-  ## emission window (genStmt2's KeepovfS sets it around its store).
+  ## emission window (genStmt's KeepovfS sets it around its store).
   ## The a64 twin needs no such gate: its `KeepovfS` builds the `mul` + `smulh`/
   ## `umulh` sequence itself via `binReg`, never through this immediate fold.
   if op == ImulX64 and v >= 2 and (v and (v - 1)) == 0 and g.noFoldPos < 0:
@@ -270,7 +270,7 @@ proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
     # the ELF arm below keeps for free (two instructions, no retype), and the one
     # every caller is written against: the register handed in is already typed for
     # the value it will HOLD, by the allocator or by the caller's own `bindTemp`.
-    # `prematLval2` says so out loud ("already bound by the caller").
+    # `prematLval` says so out loud ("already bound by the caller").
     #
     # Leaving the staging type on it instead named the register `(i 64)` while it
     # carried a pointer, and nifasm — which type-checks operands, not registers —
@@ -326,7 +326,7 @@ proc emSymAddrByName*(g: var CodeGen; dest: Reg; name: string) =
 
 proc binMem*(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location) =
   ## `dest op= [rsp+slot]` — x86 folds a `NamedStack` memory source into the ALU op.
-  ## (A `Mem` access chain folds through `binMemLval2` instead.)
+  ## (A `Mem` access chain folds through `binMemLval` instead.)
   assert loc.kind == NamedStack, "arkham x64: binMem on location kind " & $loc.kind
   g.ab.tree op:
     g.emReg dest
@@ -674,7 +674,7 @@ proc genAtomicLoopRmw*(g: var CodeGen; dst, pReg, work: Reg; val: Location;
 proc emitIntrinsicOps*(g: var CodeGen; op: IntrinsicOp; argBits: int;
                       dst, src0: Reg; rotCount: int64) =
   ## Emit one intrinsic row's instruction(s) on ALREADY-PLACED operands. Shared by
-  ## the allocator-driven path (`emitInstr2`, which reads the placement out of
+  ## the allocator-driven path (`emitInstr`, which reads the placement out of
   ## `plan.locs`) and the `.assembler` path (`genAsmProc`, where the placement is
   ## the user's `.register` annotation) — they differ only in how `dst`/`src0`
   ## were chosen, never in what gets emitted. For an in-place row the caller has
@@ -733,13 +733,13 @@ proc emitIntrinsicOps*(g: var CodeGen; op: IntrinsicOp; argBits: int;
   else:
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 
-proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+proc emitInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                      argCurs: seq[Cursor]) =
   ## `add(d, s)` in an ordinary proc: `(add <d's home> <s>)`. The destination is
   ## `(haddr d)`, and d's home is whatever the allocator gave it — a register, or
   ## an `(s)` slot, both of which x86 accepts as a destination directly.
   let row = IntrinsicRows[op]
-  let tag = x64InoutTag(op)
+  let tag = inoutInst(op)
   if tag == NopX64:
     lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
               lengInfo(c)
@@ -763,7 +763,7 @@ proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   if row.arity == 1:
     g.ab.tree tag: g.emitDest(argCurs[0])
   else:
-    # The source was already emitted and memo'd by the fused emitInstr2.
+    # The source was already emitted and memo'd by the fused emitInstr.
     let src = g.plan.planned(cursorToPosition(g.buf[], argCurs[1]))
     g.ab.tree tag:
       g.emitDest(argCurs[0])
@@ -775,7 +775,7 @@ proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
         lengError argCurs[1], "unsupported source operand for `" &
                   IntrinsicNames[op] & "`", lengInfo(c)
 
-proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
+proc emLvalAddr*(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (the operand of a `(mem …)` /
   ## `(lea …)`), reading any embedded value register from its pre-allocated `locs`.
   ## v1 slice: a stack-var base (`(rsp) name`), a `dot` field over such a base or a
@@ -786,7 +786,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
     let loc = g.plan.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind == NoLoc:
       # a module-level global aggregate base: its address is in the pre-assigned base
-      # register (materialized by prematLval2) — either the allocator's `locs[pos]` reg
+      # register (materialized by prematLval) — either the allocator's `locs[pos]` reg
       # or, for a transient load, the emit-time staging reg parked in `lvalGlobBase`.
       # Type it `(cast (ptr globalType) reg)` so the enclosing dot/at can compute the offset.
       let pos = cursorToPosition(g.buf[], c)
@@ -829,7 +829,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
       g.ab.tree DotX:
         var cc = c
         cc.into:
-          g.emLvalAddr2(cc); skip cc                    # base (stack var or deref)
+          g.emLvalAddr(cc); skip cc                     # base (stack var or deref)
           g.ab.sym symName(cc); skip cc                 # field name
           while cc.hasMore: skip cc
     of AtC:
@@ -837,7 +837,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
       g.ab.tree AtX:
         var cc = c
         cc.into:
-          g.emLvalAddr2(cc); skip cc                    # base (stack array)
+          g.emLvalAddr(cc); skip cc                     # base (stack array)
           case cc.kind                                  # index (nifasm scales it)
           of IntLit: g.ab.intLit intVal(cc)
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
@@ -899,15 +899,15 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
               g.emReg pReg.r
             while dc.hasMore: skip dc
         else:
-          g.emLvalAddr2(cc)                               # transparent (inherited fields flatten)
+          g.emLvalAddr(cc)                                # transparent (inherited fields flatten)
         while cc.hasMore: skip cc
     of AconstrC, OconstrC:
-      # A constructor base materialized into `aggtmp<pos>` by `prematLval2`: address it as
+      # A constructor base materialized into `aggtmp<pos>` by `prematLval`: address it as
       # an ordinary stack-var base.
       let pos = cursorToPosition(g.buf[], c)
       g.ab.sym (synth("aggtmp") & $pos & ".0")
-    else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
-  else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
+    else: raiseAssert "arkham x64n: emLvalAddr expr " & $c.exprKind
+  else: raiseAssert "arkham x64n: emLvalAddr kind " & $c.kind
 
 proc takeLvalStride*(g: var CodeGen; c: Cursor; atPos: int; asBase = false;
                     hint = NoReg) =
@@ -958,7 +958,7 @@ proc takeLvalStride*(g: var CodeGen; c: Cursor; atPos: int; asBase = false;
   g.bindTemp(s, AsmSlot(cls: AInt, size: 8, align: 8))
   g.lvalStride[atPos] = s
 
-proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
+proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
   ## Release any scratch temp an lvalue's embedded value was loaded into (e.g. a
   ## stack-homed pointer reloaded for a `deref`/`pat`), AFTER the consuming
   ## (mem …)/(lea …) instruction. A reg-homed base sits in its own home (not a temp)
@@ -976,13 +976,13 @@ proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
     of DotC:
       var cc = c
       cc.into:
-        g.unbindLvalTemps2(cc)                          # base
+        g.unbindLvalTemps(cc)                           # base
         while cc.hasMore: skip cc
     of AtC:
       let atPos = cursorToPosition(g.buf[], c)
       var cc = c
       cc.into:
-        g.unbindLvalTemps2(cc); skip cc                 # base
+        g.unbindLvalTemps(cc); skip cc                  # base
         if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
       g.dropLvalStride(atPos)                            # the non-SIB stride scratch
@@ -1004,18 +1004,18 @@ proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         skip cc; skip cc                               # base type, depth
-        g.unbindLvalTemps2(cc)                         # the inner lvalue
+        g.unbindLvalTemps(cc)                          # the inner lvalue
         while cc.hasMore: skip cc
     else: discard
 
-proc emMemLval2*(g: var CodeGen; c: Cursor) =
+proc emMemLval*(g: var CodeGen; c: Cursor) =
   ## `(mem <address> [disp])` — the ONE place a folded constant displacement is
   ## emitted, so it can only ever appear where nifasm reads it as one: as the second
-  ## child of a `mem` node. `emLvalAddr2` stays displacement-free, which is what keeps
+  ## child of a `mem` node. `emLvalAddr` stays displacement-free, which is what keeps
   ## a nested `deref` under a `(dot …)`/`(at …)`/`(lea …)` correct by construction.
-  ## Pair with `prematLval2(c, foldDisp = true)`.
+  ## Pair with `prematLval(c, foldDisp = true)`.
   g.ab.tree MemX:
-    g.emLvalAddr2(c)
+    g.emLvalAddr(c)
     let (_, disp, folded) = g.derefDispSplit(c)
     if folded: g.ab.intLit disp.int64
 
@@ -1152,24 +1152,24 @@ proc marshalAggrFromAddr*(g: var CodeGen; addrReg: Reg; typeSym: SymId;
 proc emLvalFieldMem*(g: var CodeGen; lhs: Cursor; field: string) =
   ## `(mem (dot <lvalue address> field))` — a field within the aggregate addressed by
   ## the lvalue `lhs` (a `dot`/`at`/`deref` chain). The lvalue's embedded value
-  ## registers must already be materialized (`prematLval2`).
+  ## registers must already be materialized (`prematLval`).
   g.ab.tree MemX:
     g.ab.tree DotX:
-      g.emLvalAddr2(lhs)
+      g.emLvalAddr(lhs)
       g.ab.sym field
 
 proc bindLvalGlobalBases*(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   ## Bind the pre-assigned address register of every global base in lvalue `c`, so
-  ## `prematLval2` leas `&global` into a BOUND register before the `(mem …)` tree
+  ## `prematLval` leas `&global` into a BOUND register before the `(mem …)` tree
   ## opens (emReg rejects an unbound scratch-pool reg). The scalar load reuses its
-  ## result temp for this (see emitMemLoad2's "bind first"); an aggregate copy has
+  ## result temp for this (see emitMemLoad's "bind first"); an aggregate copy has
   ## no result reg, so it binds the base regs explicitly. Recurses only into the
   ## BASE (first child) of a dot/at/deref — not the index/field.
   if c.kind == Symbol:
     let loc = g.plan.planned(cursorToPosition(g.buf[], c))
     if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
        g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
-      # only an UNBOUND base reg (else the caller already bound it — e.g. `emitAddr2`
+      # only an UNBOUND base reg (else the caller already bound it — e.g. `emitAddr`
       # reuses its bound result reg for the global base; rebinding would clobber it).
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
@@ -1181,10 +1181,10 @@ proc bindLvalGlobalBases*(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
 
 proc emLvalElemMem*(g: var CodeGen; lhs: Cursor; idx: int) =
   ## `(mem (at <lvalue address> idx))` — element `idx` of the array addressed by `lhs`.
-  ## The lvalue's embedded value registers must already be materialized (`prematLval2`).
+  ## The lvalue's embedded value registers must already be materialized (`prematLval`).
   g.ab.tree MemX:
     g.ab.tree AtX:
-      g.emLvalAddr2(lhs)
+      g.emLvalAddr(lhs)
       g.ab.intLit idx
 
 proc fcvtU2F*(g: var CodeGen; d: FReg; s: Reg; bits: int) =
@@ -1225,7 +1225,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
                   heldBase = false) =
   ## FUSED port of the allocator's `allocLvalue2`: walk an lvalue subtree,
   ## deciding its embedded values' locations into the `plan.locs` memo — the
-  ## registers `prematLval2` materializes into and `emLvalAddr2` reads. Pure
+  ## registers `prematLval` materializes into and `emLvalAddr` reads. Pure
   ## pick-and-record: NO emission here. Advances `n` past the whole lvalue.
   ##
   ## `heldBase` says an enclosing `(at …)`/`(pat …)` has an INDEX that CALLS (a
@@ -1240,7 +1240,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
       if globBase.kind == InReg:
         g.plan.planAtEmitTime(pos, globBase)
       elif not isStore and not heldBase:
-        # transient global base for a LOAD: `prematLval2` sources the address
+        # transient global base for a LOAD: `prematLval` sources the address
         # from emit-time staging (the R11 bridge) — leave the position
         # unresolved as the marker.
         g.plan.planAtEmitTime(pos, dontCare)
@@ -1284,15 +1284,15 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         while n.hasMore: skip n
     of AconstrC, OconstrC:
       # A constructor used as an lvalue base (`[a,b][i]`): nothing to decide
-      # here — `prematLval2` builds it into its `aggtmp<pos>` slot via the
-      # (fused) `genStore2`, whose single-use temps are decided there.
+      # here — `prematLval` builds it into its `aggtmp<pos>` slot via the
+      # (fused) `genStore`, whose single-use temps are decided there.
       skip n
     else:
       raiseAssert "arkham x64n: computed lvalue base not supported: " & $n.exprKind
   else:
     inc n
 
-proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
-  g.bridgeStep("`emitLvalue2`")
+proc emitLvalue*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
+  g.bridgeStep("`emitLvalue`")
   var n = c
   g.emitLvalWalk(n, globBase, isStore)

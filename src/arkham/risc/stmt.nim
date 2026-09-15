@@ -14,15 +14,17 @@
 
 import std / [assertions, tables, strformat]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, constdata, exprpred,
                     mirrors, select]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 import emit, mem, aggr, value, frame
 import runtime
+from cortexm import nil
+from rv32 import nil
 
-proc genVarDecl2*(g: var CodeGen; c: Cursor) =
+proc genVarDecl*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let declPos = g.posOf(cc)
@@ -50,10 +52,10 @@ proc genVarDecl2*(g: var CodeGen; c: Cursor) =
       if loc.typ.kind == AMem and typeCur.kind == Symbol:
         g.varType[nm] = typeCur.symId                     # aggregate field layout
     else: raiseAssert "arkham a64n: var home " & $loc.kind
-    if hasVal: g.genStore2(cc, loc)
+    if hasVal: g.genStore(cc, loc)
     while cc.hasMore: skip cc
 
-proc cmpImm2(g: var CodeGen; selReg: Reg; v: int64) =
+proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
   if v >= 0 and v <= 0xFFFF:
     g.ab.tree CmpA64: (g.emReg selReg; g.ab.intLit v)
   else:
@@ -61,18 +63,18 @@ proc cmpImm2(g: var CodeGen; selReg: Reg; v: int64) =
     g.ab.tree CmpA64: (g.emReg selReg; g.emReg b)
     g.dropBridge b
 
-proc emitCaseTest2*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
+proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
   if c.kind == TagLit and c.substructureKind == RangeU:
     c.into:
       let lo = branchImm(c)
       let hi = branchImm(c)
       let lSkip = g.freshLabel()
-      g.cmpImm2(selReg, lo); g.emBr(if signed: BltA64 else: BloA64, lSkip)
-      g.cmpImm2(selReg, hi); g.emBr(if signed: BgtA64 else: BhiA64, lSkip)
+      g.cmpImm(selReg, lo); g.emBr(if signed: BltA64 else: BloA64, lSkip)
+      g.cmpImm(selReg, hi); g.emBr(if signed: BgtA64 else: BhiA64, lSkip)
       g.emBr(BA64, lBody)
       g.emLab(lSkip)
   else:
-    g.cmpImm2(selReg, branchImm(c)); g.emBr(BeqA64, lBody)
+    g.cmpImm(selReg, branchImm(c)); g.emBr(BeqA64, lBody)
 
 proc cselTagFor(branchTag: RiscInst): RiscInst =
   ## The `csel<cc>` whose condition matches branch tag `branchTag` (which fires
@@ -103,8 +105,8 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   # the flags survive to the csel.
   let ct = cselTagFor(g.emitScalarCmp(sd.a, sd.b, sd.ek, whenTrue = true))
   let rT = g.takeBridge(g.selectStagingSlot(sd))
-  g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ))
-  g.genStore2(sd.elseRhs, sd.dst)
+  g.genStore(sd.thenRhs, regLoc(rT, sd.dst.typ))
+  g.genStore(sd.elseRhs, sd.dst)
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT; g.emReg sd.dst.r)
   g.dropBridge rT
   return true
@@ -137,7 +139,7 @@ proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## branch it would skip is dead either way.
   if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
 
-proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
+proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
   # Tail position, as the x64 twin tracks it. `TailStmt` is "falls THROUGH to the
   # epilogue" and travels only to the last child of a straight-line `stmts`/`scope`;
@@ -149,7 +151,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     cc.into:
       while cc.hasMore:
         var nx = cc; skip nx
-        g.genStmt2(cc, listFlags(flags, nx)); skip cc
+        g.genStmt(cc, listFlags(flags, nx)); skip cc
   of ScopeS:
     # Leng's scope forwarded as a nifasm `(scope …)` — a reclaimable slot arena,
     # so sibling scopes share frame bytes and the prologue reserves the peak.
@@ -160,22 +162,22 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       cc.into:
         while cc.hasMore:
           var nx = cc; skip nx
-          g.genStmt2(cc, listFlags(flags, nx)); skip cc
+          g.genStmt(cc, listFlags(flags, nx)); skip cc
       g.exitScope()
-  of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
+  of VarS, GvarS, TvarS, ConstS: g.genVarDecl(c)
   of CallS:
     var d = dontCare                   # a statement call: result unused
     # A bare call at the END of a void proc is a tail call, and it is the shape the
     # `(ret (call …))` encoding cannot reach: a void proc has no `ret` for shoggoth's
     # fold to splice the call into. See the x64 twin for the census that found it and
     # for why `frameIsAddressable` has to gate it.
-    g.emitCall2(c, d, tail = TailPos in flags and g.retIsVoid and
-                             not g.frameIsAddressable and
-                             TailCall in g.md.caps)
+    g.emitCall(c, d, tail = TailPos in flags and g.retIsVoid and
+                            not g.frameIsAddressable and
+                            TailCall in g.md.caps)
     g.freeVal(d)
   of InstrS:
     var d = dontCare
-    g.emitInstr2(c, d)
+    g.emitInstr(c, d)
     g.freeVal(d)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham a64n: `break` outside a loop"
@@ -194,11 +196,11 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           # By-ref aggregate param, pointer register-homed: the destination is the
           # POINTEE — reclassify to the `Mem` lvalue form (see the x64 twin).
           dst = memLoc(lhsCur, g.exprSlot(lhsCur))
-        g.genStore2(cc, dst)
+        g.genStore(cc, dst)
       else:
         let lhsCur = cc
         var rhsCur = cc; skip rhsCur
-        g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot))
+        g.genStore(rhsCur, memLoc(lhsCur, ScalarSlot))
       while cc.hasMore: skip cc
   of WhileS:
     let lEnd = g.freshLabel()
@@ -208,7 +210,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       cc.into:
         let condC = cc; skip cc
         g.emitCond(condC, lEnd, whenTrue = false)     # forward exit when cond is false
-        while cc.hasMore: (g.genStmt2(cc); skip cc)     # body
+        while cc.hasMore: (g.genStmt(cc); skip cc)      # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
@@ -232,7 +234,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
                 var nb = bc; skip nb
                 # The arm's LAST statement inherits the `if`'s own tail position — see
                 # `armFlags` for which half of it travels here.
-                g.genStmt2(bc, armFlags(flags, nb)); skip bc
+                g.genStmt(bc, armFlags(flags, nb)); skip bc
               # When the `if` ITSELF is in tail position, `lEnd` is the epilogue —
               # nothing between them emits an instruction — so the arm can RETURN
               # instead of branching to a branch.
@@ -243,7 +245,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             bc.into:
               while bc.hasMore:
                 var nb = bc; skip nb
-                g.genStmt2(bc, armFlags(flags, nb)); skip bc
+                g.genStmt(bc, armFlags(flags, nb)); skip bc
           else: discard
           skip cc
       g.emLab(lEnd)
@@ -259,8 +261,8 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           g.wideArgTruncated(g.wideValueIntoTemp(cc), g.md.intRetReg)
         elif hasVal:
           var d = needsReg(g.valueSlot(cc))
-          g.emitValue2(cc, d)
-          g.place2(d, g.md.intRetReg)                            # exit code → x0 / r0
+          g.emitValue(cc, d)
+          g.place(d, g.md.intRetReg)                             # exit code → x0 / r0
           g.freeVal(d)
         else: g.movImm(g.md.intRetReg, 0)
         if Freestanding in g.md.caps:
@@ -272,9 +274,9 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         var tailed = false
         # An aggregate result travels by hidden pointer or in x0:x1; neither is a
         # shape the tail path marshals yet, so it keeps the ordinary route.
-        # A target without `TailCall` never gets here through `emitCall2`, so
+        # A target without `TailCall` never gets here through `emitCall`, so
         # taking the branch below would only cost it the `wideRet` path: a 64-bit
-        # result there is r0:r1 read raw, not a `NeedsReg` location `place2` can
+        # result there is r0:r1 read raw, not a `NeedsReg` location `place` can
         # settle.
         let canTail = g.retAggrSym == NoTypeSym and TailCall in g.md.caps
         if g.retAggrSym != NoTypeSym:
@@ -292,9 +294,9 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             else: tcur = g.getType(cc)
             g.emTypedStackVar(srcName, tcur)
             g.varType[srcName] = g.retAggrSym
-            g.genStore2(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)))
+            g.genStore(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)))
           if g.retIndirect:
-            g.copyStructThroughPtr2(srcName, g.retAggrSym, g.indirectReg)
+            g.copyStructThroughPtr(srcName, g.retAggrSym, g.indirectReg)
             g.movReg(g.md.intRetReg, g.indirectReg)
           else:
             g.structToRegs(srcName, g.retAggrSym, 0)
@@ -303,27 +305,27 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           # `(ret (call …))` — the tail-call encoding. Leng binds every call and
           # forbids nesting them, so a call sitting directly under a `ret` is not
           # an expression that happens to be there: it is the producer saying
-          # "tail-call this". Hand it to `emitCall2`, which marshals the arguments
+          # "tail-call this". Hand it to `emitCall`, which marshals the arguments
           # exactly as for an ordinary call and then pops the frame and branches.
           #
           # It may still decline — an external target, an outgoing stack argument,
           # a by-reference result — in which case it emitted an ordinary call and
           # left the value in `d`, and we return through the epilogue as usual.
           var d = needsReg(g.valueSlot(cc))
-          g.emitCall2(cc, d, tail = true)
+          g.emitCall(cc, d, tail = true)
           if not g.tailCallEmitted:
-            g.place2(d, g.md.intRetReg)
+            g.place(d, g.md.intRetReg)
             g.freeVal(d)
           tailed = g.tailCallEmitted
         elif hasVal:
           let retPos = g.posOf(cc)
           if g.retIsFloat:
             let fb = g.retFloatBits
-            g.genStore2(cc, fregLoc(g.md.floatRetReg, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
+            g.genStore(cc, fregLoc(g.md.floatRetReg, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
           elif g.isWideExpr(cc):
             g.wideRet(cc)                    # 64-bit result: r0:r1, read raw
           else:
-            g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot))
+            g.genStore(cc, regLoc(g.md.intRetReg, ScalarSlot))
         # A tail call has left the proc for good: no branch to the epilogue, and
         # nothing after it is reachable. A TAIL `ret` falls straight through the
         # (zero-instruction) scope kills into the epilogue and needs neither a branch
@@ -339,14 +341,14 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       let selC = cc
       let signed = not g.cmpOperandUnsigned(selC)
       var selLoc = needsReg(g.valueSlot(selC))           # held across ALL range tests
-      g.emitValue2(cc, selLoc); skip cc
+      g.emitValue(cc, selLoc); skip cc
       # Pool-dry etmp slot → a bridge for the (call-free) test chain; x15 stays
-      # free for cmpImm2's large-literal materialization.
+      # free for cmpImm's large-literal materialization.
       var selReg: Reg
       var selBridge = NoReg
       if selLoc.kind == InReg: selReg = selLoc.r
       else:
-        selBridge = g.takeBridge(selLoc.typ); g.place2(selLoc, selBridge); selReg = selBridge
+        selBridge = g.takeBridge(selLoc.typ); g.place(selLoc, selBridge); selReg = selBridge
       var bodies: seq[(string, Cursor)] = @[]
       var elseBody = cc
       var hasElse = false
@@ -358,7 +360,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           skip cc
           branch.into:
             branch.into:
-              while branch.hasMore: g.emitCaseTest2(selReg, branch, lBody, signed)
+              while branch.hasMore: g.emitCaseTest(selReg, branch, lBody, signed)
             bodies.add (lBody, branch)
             skip branch
         of ElseU:
@@ -373,7 +375,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       g.emBr(BA64, lElse)
       for (lBody, bc) in bodies:
         g.emLab(lBody)
-        g.genStmt2(bc, flags * {TailPos})                 # the arm inherits the case's own
+        g.genStmt(bc, flags * {TailPos})                  # the arm inherits the case's own
         if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
       if hasElse:
         g.emLab(lElse)
@@ -381,7 +383,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         e.into:
           while e.hasMore:
             var ne = e; skip ne
-            g.genStmt2(e, armFlags(flags, ne)); skip e
+            g.genStmt(e, armFlags(flags, ne)); skip e
     g.emLab(lEnd)
   of LabS:
     var cc = c
@@ -445,7 +447,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       if dst.kind == InReg:
         rD = dst.r
       else:
-        rD = g.pickStagingA64()
+        rD = g.pickUnboundReg()
         if rD == NoReg:
           raiseAssert "arkham a64n: no register for the keepovf destination in proc " &
                       g.curProcName
@@ -456,13 +458,13 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       # staging bridges — the op below may overwrite either operand's register (the
       # allocator dest-passes into `rD`, which can alias an operand home or temp).
       var aLoc = dontCare
-      g.emitValue2(aC, aLoc)
+      g.emitValue(aC, aLoc)
       var bLoc = dontCare
-      g.emitValue2(bC, bLoc)
+      g.emitValue(bC, bLoc)
       let rA = g.takeBridge()
-      g.place2(aLoc, rA)
+      g.place(aLoc, rA)
       let rB = g.takeBridge()
-      g.place2(bLoc, rB)
+      g.place(bLoc, rB)
       if aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
       if bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
       if ek == MulC:
@@ -515,12 +517,12 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         # After the predicate — which reads `rD` — and before the `(ovf)` test,
         # which may read it too (`OvfCmpLo`'s carry form compares `d <u a`). The
         # store does not touch `rD`, and the test's `ovfBridges` release frees it.
-        g.storeReg2(spillDst, rD)
+        g.storeReg(spillDst, rD)
         g.ovfBridges.add rD
       while cc.hasMore: skip cc
-  else: raiseAssert "arkham a64n: genStmt2 " & $c.stmtKind
+  else: raiseAssert "arkham a64n: genStmt " & $c.stmtKind
 
-proc recordVarType2*(g: var CodeGen; c: Cursor) =
+proc recordVarType*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     if cc.kind == SymbolDef:
@@ -530,19 +532,19 @@ proc recordVarType2*(g: var CodeGen; c: Cursor) =
       g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
     while cc.hasMore: skip cc
 
-proc recordSymTypes2*(g: var CodeGen; c: Cursor) =
+proc recordSymTypes*(g: var CodeGen; c: Cursor) =
   if c.kind != TagLit: return
   case c.stmtKind
-  of VarS, GvarS, TvarS, ConstS: g.recordVarType2(c)
+  of VarS, GvarS, TvarS, ConstS: g.recordVarType(c)
   of ProcS, TypeS: discard
   else:
     var cc = c
     cc.into:
       while cc.hasMore:
-        g.recordSymTypes2(cc)
+        g.recordSymTypes(cc)
         skip cc
 
-proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
+proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   ## Body-buffer model (the x64 stage-2 twin): the BODY is emitted into a side
   ## buffer first; the prologue — whose shape (callee-saved pairs, the `(s)`
   ## region `sub`) is only final once the body is known — is written after it,
@@ -579,7 +581,7 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
           var nx = c; skip nx
           # Only the LAST statement inherits it — `listFlags` off the body's own flags,
           # not off a running one, or the first statement's `{}` sticks for the walk.
-          g.genStmt2(c, listFlags(bodyFlags, nx)); skip c
+          g.genStmt(c, listFlags(bodyFlags, nx)); skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)
   if info.isEntry and g.entryExits:              # the entry EXITS (no epilogue)
@@ -619,9 +621,9 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
         # RV32 goes first with `sp` and the FPU, because unlike Cortex-M it is
         # handed neither, and the copy loop below is itself a stack-free but
         # register-using sequence that wants a valid `sp` for anything after it.
-        if g.md.arch == Rv32: g.emResetPathRv(g.rvStackTop)
-        g.emStartupInitM()
-        if g.md.arch == ThumbM: g.emEnableFpuM()
+        if g.md.arch == Rv32: rv32.emitResetPath(g, g.rvStackTop)
+        g.emStartupInit()
+        if g.md.arch == ThumbM: cortexm.emitEnableFpu(g)
       if g.hasFrame: framePush(g)
       if g.plan.hasStackVars:
         g.ab.tree SubA64: g.ab.rawReg SP; g.ab.keyword SsizeX
@@ -629,7 +631,7 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       # wide `etmp` of a 32-bit target. They belong here and not where they are
       # decided: a save slot must not sit inside the decl's scope, because arkham
       # emits by a textual walk and a sibling branch saves through the same slot
-      # (see `planer.addSpillTemp`). The value core's own `etmp`/`eftmp`/`held` are
+      # (see `planner.addSpillTemp`). The value core's own `etmp`/`eftmp`/`held` are
       # NOT in this list: those are declared where they are minted, which is a
       # statement position in every case.
       for st in g.plan.spillTemps:

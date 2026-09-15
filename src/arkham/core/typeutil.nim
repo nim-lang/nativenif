@@ -18,8 +18,7 @@
 import std / [assertions, strutils]
 
 import nifcore, nifcdecl
-import asmslots, machinedesc, planer, programs
-import "../risc/machine_m"
+import asmslots, machinedesc, planner, programs
 import asmbuf, typenav, context
 import diag
 
@@ -85,7 +84,7 @@ proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
     # `intTypeWidth` answers 64 for anything that is not a literal `(i|u|c N)`, so
     # every ENUM looks the same width as every other. nifasm types an enum binding
     # by its BASE, and `(u 16)` vs `(u 8)` is exactly the mismatch that reached it:
-    # `(cast NimonyType e)` out of a `TagEnum` skipped the pre-retype in `emitCast2`
+    # `(cast NimonyType e)` out of a `TagEnum` skipped the pre-retype in `emitCast`
     # and emitted a bare narrowing move. The SLOT does carry the base width.
     var ac = a
     var bc = b
@@ -234,7 +233,7 @@ proc valueSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   ##   full-register-width and expresses narrowness with explicit extends, so an
   ##   integer value temp is canonically `ScalarSlot`. Binding it at the value's own
   ##   narrow width makes the very move that brings a 64-bit value in a NARROWING
-  ##   move, which nifasm rejects — see `emitCast2`'s canonical-width rule, which
+  ##   move, which nifasm rejects — see `emitCast`'s canonical-width rule, which
   ##   exists for exactly that reason.
   ## * A pointer's POINTER-NESS is not a width, and it must survive. Losing it is what
   ##   turns `cmp tmp, (nil)` and `mov (mem &ptrGlobal), tmp` into type errors, and it

@@ -186,7 +186,7 @@ const
                                      # R5] here would name rbx/rsp/rbp.
     caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
            PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
-                                     # `codegen_x64` does not consult this set
+                                     # the x64 backend does not consult this set
                                      # yet — it predates the seam — so these say
                                      # what is true of the x86-64 vocabulary
                                      # rather than what any branch reads. No

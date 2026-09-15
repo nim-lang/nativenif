@@ -366,7 +366,7 @@ stdout and stderr are the same stream.
     EXC_RETURN value in lr unstacks them. So no `{.interrupt.}` prologue exists;
     the proc arkham already emits is correct, which is why this milestone is a
     table and not a calling convention.
-  * **The name means a slot.** `machine_m.interruptSlot` is the ARMv7-M table:
+  * **The name means a slot.** `machine_cortexm.interruptSlot` is the ARMv7-M table:
     `NMI`=2 … `SysTick`=15, `IRQ<n>`=16+n. Those numbers are architectural, so
     the table is the same on every Cortex-M part and the names are CMSIS's.
     External interrupts are spelled by NUMBER because `TIM2_IRQn` is a number
@@ -427,7 +427,7 @@ stdout and stderr are the same stream.
   7` has to become a 7 in RAM by some instruction that actually runs. So the
   initializer image travels in flash, appended after the code, and the entry
   proc's first act is to copy it into SRAM and zero the rest of the region
-  (`emStartupInitM`).
+  (`emStartupInit`).
 
   The four numbers this needs — where the image landed in flash, where the region
   sits in SRAM, and the size of each part — are `(dataload)`, `(datavma)`,
@@ -574,7 +574,7 @@ stdout and stderr are the same stream.
   to do with the console, both reachable for the first time now that the build
   gets past `system`'s thread-locals: the atomic rows have no Cortex-M lowering
   (ARC's refcount `AtomicAddFetch`), and `findSuitableBlock` in the allocator
-  exhausts the register file (`reloadMemBase2` finds no register to reload a
+  exhausts the register file (`reloadMemBase` finds no register to reload a
   spilled memory base — r8 is the candidate, being in no pool, but whether the
   produce bridge is free across an address chain needs checking rather than
   assuming). arkham compiles a module WHOLE, so every proc `system` defines has
@@ -630,7 +630,7 @@ stdout and stderr are the same stream.
   them by the rule above, and there is nothing else. That is the shape
   `atomic_ptr_cell` and `atomic_cas_operand_home` are parked under, and it is a
   property of the register file rather than of this lowering: the narrower fix is
-  the one `machine_m.IntTempRegs` already names — teach the scratch picker which
+  the one `machine_cortexm.IntTempRegs` already names — teach the scratch picker which
   argument registers are currently staged, so r0–r3 can serve where no call is in
   flight.
 

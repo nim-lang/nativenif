@@ -6,32 +6,38 @@
 #
 
 
-## `generateA64` and `generateM` — a Leng module in, Arm asm-NIF out.
+## `generateA64`, `generateCortexM` and `generateRv32` — a Leng module in,
+## load/store asm-NIF out.
 ##
-## One emitter, three targets. What `generateM` does differently is not a
-## different instruction selector: it is a different machine model, a 4-byte
-## word, a synthesized reset path, and an honest refusal by name for the
-## features Cortex-M does not have (`rejectForThumbM`). A second emitter would
-## have had to reimplement the register-binding protocol, which is the part with
-## a formal model behind it (`proofs/arkham_bindings.tla`).
+## One emitter, four targets (AArch64 on Darwin and Linux, Cortex-M, RV32). What
+## the 32-bit targets do differently is not a different instruction selector: it
+## is a different machine model, a 4-byte word, a synthesized reset path, and an
+## honest refusal by name for the features a target does not have
+## (`cortexm.rejectUnsupported`). What genuinely belongs to one CPU lives in its
+## helper module — `a64`, `cortexm`, `rv32` — and is called qualified. A second
+## emitter would have had to reimplement the register-binding protocol, which is
+## the part with a formal model behind it (`proofs/arkham_bindings.tla`).
 
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind, 
                     layout, stress]
-import "../risc/machine_a64" as machine
-from "../risc/machine_m" as machine_m import nil
-import "../risc/machine_rv32" as machine_rv32
+import machine_a64 as machine
+from machine_cortexm import nil
+from machine_rv32 import nil
 import emit, value, frame, stmt, asmproc
 import runtime
+from a64 import nil
+from cortexm import nil
+from rv32 import nil
 
-proc genProc2(g: var CodeGen; info: ProcInfo) =
+proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
-    stderr.writeLine "arkham genProc2: " & info.asmName
+    stderr.writeLine "arkham genProc: " & info.asmName
   if info.isAsm:
-    g.genAsmProc2(info)
+    g.genAsmProc(info)
     return
   if info.isNaked:
     # An allocated body assumes a frame everywhere: a spill goes to an `(s)` slot,
@@ -83,9 +89,9 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
       if pc.kind == TagLit:
         var p = pc
         p.into:
-          while p.hasMore: (g.recordVarType2(p); skip p)
+          while p.hasMore: (g.recordVarType(p); skip p)
       skip pc; skip pc; skip pc
-      if pc.stmtKind == StmtsS: g.recordSymTypes2(pc)
+      if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
       while pc.hasMore: skip pc
   # The pre-pass allocates HOMES only (decl walk); every expression decision is
   # made inline by the fused emitters at the point of emission. The `(at base
@@ -105,8 +111,11 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # fp/lr only when a `bl` exists. An atomic is an
   # instruction now, not a call, so a CAS loop no longer drags a frame onto an
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
-  # (The frame itself is finalized INSIDE emitProcBody2, after the body —
+  # (The frame itself is finalized INSIDE emitProcBody, after the body —
   # body-buffer model.)
+  # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. Every per-proc
+  # table (regLocal/boundTemps + the ra.locs snapshot) must be reset here or
+  # RegisterBindingsMatchLoc breaks.
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
@@ -125,7 +134,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     dbgPeakHeldAtRecursion = 0
     tightCompositions = 0
     lastResortTakes = 0
-  g.emitProcBody2(info, frameHasCall = an.hasCall)
+  g.emitProcBody(info, frameHasCall = an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE peak=" & $dbgPeakBridges & " heldAtRecursion=" &
                      $dbgPeakHeldAtRecursion & " tight=" & $tightCompositions &
@@ -230,30 +239,8 @@ proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
     g.ab.close()
     while c.hasMore: skip c
 
-proc rejectForThumbM(g: var CodeGen) =
-  ## Everything the Cortex-M target does NOT have, refused by name at the module
-  ## level before a single instruction is emitted. Each of these would otherwise
-  ## reach an AArch64-shaped emitter and produce something plausible and wrong.
-  if g.prog.tvars.len > 0 and not g.oneThread:
-    # A board with more than one stack slot has more than one thread, and each
-    # needs its own copy. The mechanism the layout was designed around is in
-    # place on the nifasm side — `(stacks (slots N) (bytes S) (tvar (bytes T)))`
-    # reserves T bytes at the top of every slot, and `S` is a power of two
-    # precisely so a thread reaches its own by masking SP — but arkham does not
-    # yet emit that masked base at a reference, and nifasm does not yet allocate
-    # offsets within the reservation. Refusing here is the honest report; what is
-    # missing is the addressing, not the target's ability to have threads.
-    quit "arkham cortex-m: this board declares " & $g.board.slotCount &
-         " stack slots, so a thread-local needs one copy per thread — and the " &
-         "SP-masked thread-local base that would reach it is not implemented " &
-         "yet. Declare `(stacks (slots 1) …)` for a single-core image, where a " &
-         "thread-local IS a global."
-  if g.prog.externOrder.len > 0:
-    quit "arkham cortex-m: `importc` of \"" & g.prog.externOrder[0].extName &
-         "\" cannot be satisfied — a firmware image has nothing to link against."
-
-proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                board = layout.Layout()): string =
+proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                      board = layout.Layout()): string =
   ## Compile a parsed Leng module to Cortex-M (ARMv7E-M) asm-NIF, which nifasm's
   ## `cortex_m` target assembles into a bare-metal firmware image.
   ##
@@ -265,7 +252,8 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## value core would mean reimplementing its register-binding protocol, which is
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
-  var g = newCodeGen(buf, stressed(machine_m.cortexMMachine))
+  var g = newCodeGen(buf, stressed(machine_cortexm.cortexMMachine),
+                     machine_cortexm.regName)   # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.thumbM = true
   g.entryExits = true
   g.board = board
@@ -273,10 +261,9 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   # board file at all, which declares no stacks and therefore no second thread for
   # anything to run on.
   g.oneThread = not board.given or board.slotCount <= 1
-  g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
-  g.rejectForThumbM()
+  cortexm.rejectUnsupported(g)
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident "cortex_m"
@@ -325,33 +312,9 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           g.ab.tree NifasmDecl.NoinitD:
             g.ab.tree BytesX: g.ab.intLit int64(g.board.noinitSize)
         g.ab.tree NifasmDecl.CoreD: g.ab.intLit int64(g.board.core)
-    # The interrupt table, as slots rather than names: WHICH slot a name denotes
-    # is the machine model's answer (`machine_m.interruptSlot`), and nifasm's job
-    # is to place an address in a word — so the name is resolved here and never
-    # leaves. Emitted before the bodies only so it reads first; it is a
-    # declaration and its position in the module carries no meaning.
-    var handlers: seq[(int, string)] = @[]
+    cortexm.emitInterruptTable(g)       # before the bodies only so it reads first
     for info in g.prog.procs:
-      if info.irqName.len == 0: continue
-      let slot = machine_m.interruptSlot(info.irqName)
-      if slot < 0:
-        quit "arkham cortex-m: `" & info.irqName & "` is not an interrupt of " &
-             "this target. Expected one of NMI, HardFault, MemManage, BusFault, " &
-             "UsageFault, SVCall, DebugMon, PendSV, SysTick, or IRQ<n>."
-      for (s, other) in handlers:
-        if s == slot:
-          quit "arkham cortex-m: interrupt `" & info.irqName & "` is claimed by " &
-               "both " & other & " and " & info.asmName &
-               " — a table word holds one address."
-      handlers.add (slot, info.asmName)
-    if handlers.len > 0:
-      g.ab.tree NifasmDecl.InterruptsD:
-        for (slot, nm) in handlers:
-          g.ab.tree NifasmDecl.IrqD:
-            g.ab.intLit int64(slot)
-            g.ab.sym nm
-    for info in g.prog.procs:
-      genProc2(g, info)
+      genProc(g, info)
     # AFTER the bodies: whether anything divides is only known once they are
     # emitted. A firmware image has no `libgcc` to borrow `__aeabi_ldivmod`
     # from, so it carries its own — once, and only if used.
@@ -362,45 +325,6 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         g.ab.symDef nm
         g.ab.str bytes
   result = g.ab.render("." & g.prog.thisModuleSuffix)
-
-proc rv32InterruptTable(g: var CodeGen) =
-  ## `(interrupts (irq <cause> <handler>)*)` for RV32 — the same declaration
-  ## Cortex-M emits, carrying a different number.
-  ##
-  ## The slot is a trap CAUSE here, not a word index into a table of addresses:
-  ## `mtvec` in vectored mode sends cause `c` to `base + 4*c`, and a word there
-  ## has to be an INSTRUCTION. Which name denotes which cause stays a machine
-  ## model question (`machine_rv32.interruptCauseRv`), exactly as it is on
-  ## Cortex-M, so the name is resolved here and never reaches nifasm.
-  var handlers: seq[(int, string)] = @[]
-  for info in g.prog.procs:
-    if info.irqName.len == 0: continue
-    let cause = machine_rv32.interruptCauseRv(info.irqName)
-    if cause < 0:
-      quit "arkham rv32: `" & info.irqName & "` is not an interrupt of this " &
-           "target. Expected one of MachineSoftware, MachineTimer or " &
-           "MachineExternal — the three M-mode interrupts of the privileged " &
-           "spec. Supervisor and user modes do not exist in an image that never " &
-           "leaves M-mode, and an EXCEPTION (a misaligned load, an illegal " &
-           "instruction) is reached through mtvec's other mode, not this table."
-    for (c, other) in handlers:
-      if c == cause:
-        quit "arkham rv32: interrupt `" & info.irqName & "` is claimed by both " &
-             other & " and " & info.asmName &
-             " — a table word holds one jump."
-    handlers.add (cause, info.asmName)
-  if handlers.len > 0:
-    # The declaration is what makes nifasm mark each handler USED: nothing CALLS
-    # one, so the reachability walk would otherwise drop it and leave the table
-    # jumping at a proc that was never emitted. Its Cortex-M meaning — build a
-    # table of addresses — does not apply here and `writeRv32Image` ignores it.
-    g.ab.tree NifasmDecl.InterruptsD:
-      for (cause, nm) in handlers:
-        g.ab.tree NifasmDecl.IrqD:
-          g.ab.intLit int64(cause)
-          g.ab.sym nm
-    g.emTrapTableRv(handlers)
-    for (cause, _) in handlers: g.rvIrqCauses.incl uint8(cause)
 
 proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    board = layout.Layout()): string =
@@ -413,7 +337,8 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## genuinely disagree about is a `TargetFeature` this model answers rather than
   ## a branch on which target is being emitted.
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
-  var g = newCodeGen(buf, stressed(machine_rv32.rv32Machine))
+  var g = newCodeGen(buf, stressed(machine_rv32.rv32Machine),
+                     machine_rv32.regName)      # `(x0)`..`(x30)`/`(sp)`
   g.entryExits = true              # bare metal: the entry cannot RETURN, because
                                    # `ra` at reset holds no valid address
   g.board = board
@@ -423,11 +348,10 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   # lays out against. The two MUST agree — a stack pointer above the region the
   # image declares is not a diagnosable error, it is a store into nothing.
   g.rvStackTop = if board.given: int64(board.sramStart) + int64(board.sramSize)
-                 else: Rv32DefaultStackTop
-  g.ab.renderReg = machine_rv32.regNameRv     # `(x0)`..`(x30)`/`(sp)`
+                 else: rv32.DefaultStackTop
   g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
-  # No `rejectForRv32` twin of Cortex-M's declaration-time refusals: RV32IMAFD
+  # No `rv32.rejectUnsupported` twin of `cortexm.rejectUnsupported`: RV32IMAFD
   # has both float precisions, hardware divide and self-ordering atomics, so what
   # it lacks is refused per intrinsic (`BitScanOps`, narrow atomics) instead.
   g.adoptProgram()
@@ -451,9 +375,9 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.close()
     for sp in g.prog.syscalls:            # semihosting shims, called like any proc
       g.emitSemihostRuntime(sp)
-    g.rv32InterruptTable()                # before the bodies only so it reads first
+    rv32.emitInterruptTable(g)            # before the bodies only so it reads first
     for info in g.prog.procs:
-      genProc2(g, info)
+      genProc(g, info)
     if g.needsUDiv64: g.emitUDivMod64()
     if g.needsSDiv64: g.emitSDivMod64()
     for (nm, bytes) in g.rodata:
@@ -470,7 +394,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
   setTargetWord Word64             # AArch64: 8-byte pointers, 8-byte platform int
-  var g = newCodeGen(buf, aarch64MachineA)
+  var g = newCodeGen(buf, aarch64MachineA, machine.regName)
   g.a64Linux = linux
   g.entryExits = linux
   g.oneThread = linux
@@ -490,7 +414,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # through the declarative `(arg pN)`/`(res ret.0)` path like any other call
       # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
       # only; the variadic tail is Apple's stack-passed one, which the call site
-      # lays out itself (see `emitCall2Inner`).
+      # lays out itself (see `emitCallInner`).
       for ex in g.prog.externOrder:
         g.ab.tree ExtprocD:
           g.ab.symDef ex.asmName
@@ -503,9 +427,9 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     for name, decl in g.prog.tvars:
       g.genTvar(name, decl)
     for sp in g.prog.syscalls:                  # one `(syproc …)` per used syscall
-      g.emitSyprocA64(sp)
+      a64.emitSyproc(g, sp)
     for info in g.prog.procs:
-      genProc2(g, info)
+      genProc(g, info)
     # NOTE: foreign types are NOT emitted here. arkham loads other modules only to
     # resolve their layout for *its own* codegen (sizing, field offsets, ABI). The
     # actual cross-module linking is nifasm's job: a module-suffixed symbol like

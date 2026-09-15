@@ -166,7 +166,7 @@ type
                  ## its stack parameters in the prologue and not at the top of
                  ## the body.
     PushFrame    ## the `call` instruction pushed the return address; one
-                 ## `push`/`pop` per saved register. `codegen_x64` builds its own
+                 ## `push`/`pop` per saved register. the x64 backend builds its own
                  ## prologue and does not consult this yet.
     AvrFrame     ## `push`/`pop` per saved register like `PushFrame`, but WITH a
                  ## frame pointer — and not as a convenience. AVR's SP lives in
@@ -244,7 +244,7 @@ type
     # ── register ROLES ────────────────────────────────────────────────────────
     # Registers the EMITTER needs BY NAME rather than by drawing them from a
     # pool. They used to be per-target `const`s reached through
-    # `if g.thumbM: machine_m.X else: X`, and that shape is what let a slot which
+    # `if g.thumbM: machine_cortexm.X else: X`, and that shape is what let a slot which
     # is not even MAPPED on the target (`R16` on Cortex-M) reach the output. A
     # role a target does not have is `NoReg`/`NoFReg`/`@[]`, never a plausible
     # substitute — every one of these is read unconditionally by code that has
@@ -259,7 +259,7 @@ type
     indirectResultReg*: Reg          ## where a caller leaves `&result` for an
                                      ## aggregate return too wide for registers
                                      ## (x8; r9 on Cortex-M — see
-                                     ## `machine_m.IndirectResultReg` for why a
+                                     ## `machine_cortexm.IndirectResultReg` for why a
                                      ## register is taken off the file instead of
                                      ## shifting the arguments). `NoReg` where it
                                      ## IS a hidden first argument (x86-64).
@@ -288,7 +288,7 @@ type
                                      ##
                                      ## `NoReg`s mean the target reserves no triple
                                      ## and therefore has no LL/SC lowering;
-                                     ## `emitAtomicInstr2` refuses by name.
+                                     ## `emitAtomicInstr` refuses by name.
     bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
                                      ## pools so the emitter can ALWAYS draw a
                                      ## transient — a folded memory operand a
@@ -406,7 +406,7 @@ type
                    ## other destination — and a nested aggregate field recurses
                    ## (a `(dot base field)` re-resolved to a `Field` whose base
                    ## is the field's address). This is what lets the one
-                   ## `genStore2`/`allocStore` path build an `oconstr`
+                   ## `genStore`/`allocStore` path build an `oconstr`
                    ## field-by-field with no per-field special-casing.
     Glob           ## a module-level global addressed by `name` (RIP-relative)
     Tvar           ## a thread-local addressed by `name` (FS/TLV)
@@ -446,7 +446,7 @@ type
                       ## produce-into marker for `NamedStack`.
     spillTemp*: bool  ## `NamedStack` ONLY: a synthesized `etmp`/`eftmp`/`held` spill
                       ## slot the emitter must PRODUCE the value into through a
-                      ## staging register (`produceIntoMem2`), as opposed to a
+                      ## staging register (`produceIntoMem`), as opposed to a
                       ## symbol's stack home left in place for operand folding.
                       ## (Formerly overloaded onto `isTemp`, which silently meant
                       ## two unrelated things depending on the kind.)
@@ -516,7 +516,7 @@ proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.i
   ## `spillTemp` marks a *spill-temp* slot (an `etmp`/`eftmp` synthesized when the
   ## register pool was exhausted) — a value position the emitter must PRODUCE into
   ## (via a staging register), as opposed to a symbol's stack home left in place for
-  ## folding. The emitter (`produceIntoMem2`) keys on it.
+  ## folding. The emitter (`produceIntoMem`) keys on it.
   Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
 proc stackPtrLoc*(name: string; pointeeType: SymId; typ: AsmSlot): Location {.inline.} =
   ## An 8-byte `(s)` slot holding `&aggregate` — the aggregate itself is elsewhere.
@@ -535,7 +535,7 @@ proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
 proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
 proc fieldLoc*(aggrType: SymId; field, baseName: string; typ: AsmSlot): Location {.inline.} =
-  ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
+  ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr base).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
 proc fieldLocReg*(aggrType: SymId; field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
@@ -556,7 +556,7 @@ proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
   Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
 proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
-  ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
+  ## genConstrIntoLval base — its embedded temps must be pre-materialized).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbLval, lval: baseLval), typ: typ)
 proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
@@ -641,7 +641,7 @@ type BridgeDemand* = enum
     ## in memory. Measured, this is one class with several faces: an ADDRESS held
     ## while a word passes through (`marshalStackAggrArg`, `genAggrCopyStore`, the
     ## aggregate tail loads), a spilled RESULT staged in one bridge while a spilled
-    ## operand is loaded into another (`emitBin2`, `emitMod2`), a `cmp` whose both
+    ## operand is loaded into another (`emitBin`, `emitMod`), a `cmp` whose both
     ## operands spilled (this ISA has no memory-operand compare), an `(at …)`
     ## stride scratch live across the index it multiplies, and a demoted memory
     ## base being reloaded. Every one of them is "no memory operand on this side
@@ -650,7 +650,7 @@ type BridgeDemand* = enum
   # There is deliberately NO member with ordinal 3. The only shape that ever held
   # three was an aggregate copy between two COMPUTED ends — a destination address
   # and a source address live together while a word passed between them — and
-  # `AggrEnd` removed it: `flatCopyToPtr2`'s source is a NAMED slot, addressed as
+  # `AggrEnd` removed it: `flatCopyToPtr`'s source is a NAMED slot, addressed as
   # `(mem name off)` with the offset folded into the slot's own frame displacement,
   # which costs no register at all. Adding a `= 3` member back would raise
   # `EmitterBridgeDemand` and make `checkMachine` demand a third bridge of every
@@ -663,7 +663,7 @@ const EmitterBridgeDemand* = ord(high(BridgeDemand))
   ##
   ## TWO. It was three until `AggrEnd` tiering reached the RISC emitter: the only
   ## step that ever held three was an aggregate copy between two COMPUTED ends, and
-  ## `flatCopyToPtr2`'s source is a NAMED slot, so addressing it as `(mem name off)`
+  ## `flatCopyToPtr`'s source is a NAMED slot, so addressing it as `(mem name off)`
   ## costs no register — and one instruction fewer than the `lea` it replaced.
   ##
   ## What makes this a bound and not an average: a bridge is withheld from every

@@ -167,7 +167,7 @@ over the 495-file `tests/arkham` corpus and 3,325 `.c.nif` files from every nimo
 
 ## 3. `call_marshal` — call-argument marshalling: two phases and a parallel move
 
-The call emitters of both backends (x86-64 `emitCall2Inner`, RISC `emitCall2`)
+The call emitters of both backends (x86-64 `emitCallInner`, RISC `emitCall`)
 in chibicc's shape (codegen.c `push_args` / `ND_FUNCALL`), with registers.
 Phase 1 runs EVERY argument expression and reduces each register-passed word to a
 **move**: a source that is no longer computed — a register, a memory place, an
@@ -204,7 +204,7 @@ for a float), any of which the emitter may take:
 
 | tier | code | what makes it sound |
 |---|---|---|
-| survivor | `pickHeldReg` | callee-saved; the planer reserves one for the emitter |
+| survivor | `pickHeldReg` | callee-saved; the planner reserves one for the emitter |
 | pool | `pickTempReg(avoid)` | r10 and the argument registers themselves, nothing bound, nothing in `avoid` — the call's **claims** (its argument registers and the hidden result pointer) plus the later arguments' clobbers. The float pool holds no argument register on any target |
 | memory | spill slot | read back through staging in phase 2 |
 

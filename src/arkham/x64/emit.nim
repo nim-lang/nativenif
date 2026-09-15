@@ -23,7 +23,7 @@
 
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     stress, context, typeutil, 
                     mirrors, temps, exprpred, regbind, abi, bridges]
 import machine as machine_x64
@@ -55,7 +55,7 @@ const StagingCandidates* = [R11, RAX, RDI, RSI, RDX, RCX, R8, R9]
 
 const FloatStagingBridge* = F15
   ## The reserved float staging bridge — kept out of `floatTempRegs` so it is always
-  ## free for `pickFStaging` to hand out, making `produceIntoFMem2` total (the SIMD
+  ## free for `pickFStaging` to hand out, making `produceIntoFMem` total (the SIMD
   ## twin of R11 in `StagingCandidates`).
 
 const x64RetRegs* = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rdx (word 1)
@@ -273,7 +273,7 @@ proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
   ## a caller-saved register to another value only when nothing live occupies it, and it
   ## homes a local in one only under `AllRegs` — the analyser's proof that the local's
   ## live range crosses NO call. This IS a call. So the value being built cannot read the
-  ## bound name either, which is what makes killing it before `emitValue2` safe. Skipped
+  ## bound name either, which is what makes killing it before `emitValue` safe. Skipped
   ## when the value IS that symbol, which legitimately reads through the name.
   let bound = g.rb.boundName(r)
   if bound.len == 0 or bound == valueSym: return
@@ -500,8 +500,8 @@ proc emStackMem*(g: var CodeGen; name: string) =       # (mem name)
 proc emFieldMem*(g: var CodeGen; base, field: string) =   # (mem (dot base field))
   # A sub-word field (e.g. a `cint`) is fine: nifasm sizes the `(mem (dot …))` access
   # from the field's declared type (a 4-byte mov for a 32-bit field, sign/zero-extended
-  # on load). A field-by-field aggregate copy (copyStructThroughPtr2 / genConstr2)
-  # therefore handles packed structs; the word-by-word path (genAggrCopy2) keeps its
+  # on load). A field-by-field aggregate copy (copyStructThroughPtr / genConstr)
+  # therefore handles packed structs; the word-by-word path (genAggrCopy) keeps its
   # own `fieldAtOffset` guard for genuinely word-misaligned packing.
   g.ab.tree MemX:
     g.ab.tree DotX:
@@ -770,7 +770,7 @@ proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
   ## `FloatStagingBridge` (xmm15) is tried FIRST and is the RESERVED float bridge:
   ## it is kept out of the allocator's float temp pool (`floatTempRegs`), so it is
   ## never a live float local/temp home — always pickable. That guarantees
-  ## `pickFStaging` never fails, making `produceIntoFMem2` total (every spilled float
+  ## `pickFStaging` never fails, making `produceIntoFMem` total (every spilled float
   ## value position has a staging xmm). The arg registers follow for nested staging.
   if FloatStagingBridge != avoid and not g.rb.isSealedF(FloatStagingBridge):
     return FloatStagingBridge
@@ -846,7 +846,7 @@ proc takeParked*(g: var CodeGen; avoid: set[Reg]; slot = ScalarSlot): Location =
   ##
   ## A register park is BOUND on hand-out with `slot`'s type, whoever fills it
   ## (an address is `lea`'d into it raw; R10/R11 refuse to be named raw by
-  ## `emReg`). A scalar producer (`emitValue2`) leaves an already-bound temp
+  ## `emReg`). A scalar producer (`emitValue`) leaves an already-bound temp
   ## alone. `freeVal` releases it after the call.
   ##
   ## MODEL: proofs/call_marshal.tla — `ParkRegs` / `ParkLocs`; `EvalStuck` is
@@ -875,7 +875,7 @@ proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
   ## A register that has become a MIRROR was already released — by the store that
   ## made it one — and its binding is now the map's, not this value's. Killing it
   ## here would undo the forwarding at the very moment it becomes useful (the
-  ## caller of `storeScalar2` frees the value it just stored).
+  ## caller of `storeScalar` frees the value it just stored).
   if loc.kind == InReg and loc.isTemp:
     g.pickedRegs.excl loc.r
     if not g.rb.isMirror(loc.r): g.unbindTemp(loc.r)
@@ -932,7 +932,7 @@ proc bindTypeOf*(g: var CodeGen; r: Reg): Cursor =
   ## The Leng type `r`'s CURRENT nifasm binding declares, or a nil cursor when it
   ## declares none: a raw register, an aggregate-pointer binding (whose type is a
   ## name, not a cursor), or a dont-care temp. This is what an operand ARRIVES as,
-  ## which is not always what its expression's static type says — see `emitCast2`.
+  ## which is not always what its expression's static type says — see `emitCast`.
   result = default(Cursor)
   if g.rb.isBoundTemp(r):
     if g.tmpBindTyp.hasKey(r): result = g.tmpBindTyp[r].typ
@@ -1431,7 +1431,7 @@ proc atomicPointee*(g: var CodeGen; ptrArg: Cursor): Cursor =
 
 proc atomicRegClaims*(op: IntrinsicOp): set[Reg] =
   ## The registers an atomic row's lowering takes FOR ITSELF, and which therefore
-  ## must not host one of its operands (`emitInstr2` seals these across the operand
+  ## must not host one of its operands (`emitInstr` seals these across the operand
   ## picks). Per-row rather than per-class, which is what keeps the exclusion
   ## affordable: a compare-exchange has three register operands plus a result, so
   ## reserving a register it never touches would exhaust the pools under pressure.
@@ -1483,7 +1483,7 @@ proc emitNullaryIntrinsicX64*(g: var CodeGen; op: IntrinsicOp) =
     raiseAssert "arkham x64n: no lowering for the nullary intrinsic `" &
                 IntrinsicNames[op] & "`"
 
-proc x64InoutTag*(op: IntrinsicOp): X64Inst =
+proc inoutInst*(op: IntrinsicOp): X64Inst =
   ## The nifasm tag a two-address row emits. Name-for-name throughout — the row's
   ## name IS the assembler's mnemonic — so this crosses the two ENUMS and nothing
   ## else; a row that reaches here without a tag is one the table gained and this
@@ -1552,7 +1552,7 @@ proc lvalHasComputedPart*(c: Cursor): bool =
   ## deref'd pointer or an index that is a computed expression rather than a
   ## symbol's home or a literal?
   ##
-  ## This is the question `emitMemLoad2`'s `late` mode is the answer to: `late`
+  ## This is the question `emitMemLoad`'s `late` mode is the answer to: `late`
   ## keeps the transfer register out of the address recursion (one register per
   ## nesting level saved), and pays for it with the global-base fusion — the
   ## `lea &g` that would otherwise land straight in the result register. With no
@@ -1599,8 +1599,8 @@ proc fbinOps*(ek: LengExpr): (X64Inst, X64Inst) =
   of DivC: (DivssX64, DivsdX64)
   else: raiseAssert "arkham x64n: fbinOps " & $ek
 
-proc restoreMemBase2*(g: var CodeGen; pos: int) =
-  ## Undo `reloadMemBase2`: release the staging reg and restore the local's stack home.
+proc restoreMemBase*(g: var CodeGen; pos: int) =
+  ## Undo `reloadMemBase`: release the staging reg and restore the local's stack home.
   if g.savedHomes.hasKey(pos):
     g.giveBack g.plan.planned(pos).r
     g.plan.planAtEmitTime(pos, g.savedHomes[pos])
@@ -1648,7 +1648,7 @@ proc lvalUsesReg*(g: var CodeGen; c: Cursor; r: Reg): bool =
   else: result = false
 
 proc lvalGlobBaseReg*(g: var CodeGen; c: Cursor): Reg =
-  ## The emit-time staging register `prematLval2` parked for a TRANSIENT global
+  ## The emit-time staging register `prematLval` parked for a TRANSIENT global
   ## base (`lea s, &global`), or `NoReg` when this lvalue has no such base. The
   ## address it holds is dead once the consuming `mov` has read it, so `s` can
   ## double as that `mov`'s destination when nothing else is free. Only a base
@@ -1687,8 +1687,8 @@ proc derefDispSplit*(g: var CodeGen; c: Cursor): (Cursor, int32, bool) =
   ## `mov r,base; add r,K; mov x,[r]` becomes `mov x,[base+K]`, two instructions and
   ## one register temp lighter.
   ##
-  ## A PURE function of the subtree, deliberately: `prematLval2` consults it to decide
-  ## what to materialize and `emMemLval2` consults it to decide whether to emit the
+  ## A PURE function of the subtree, deliberately: `prematLval` consults it to decide
+  ## what to materialize and `emMemLval` consults it to decide whether to emit the
   ## displacement. Being one function, they cannot disagree — the same discipline
   ## `constFold` is under. Both are gated on the caller's `foldDisp`, so a `deref`
   ## nested under a `(dot …)`/`(at …)`/`(lea …)` (where a trailing IntLit would be read
@@ -1762,12 +1762,12 @@ proc freeExpr*(g: var CodeGen; c: Cursor) =
   ## `freeSym` takes a NAME because a local may have been demoted out from under its
   ## register between acquire and release. Nothing can demote an expression home — it
   ## is minted and released inside one lvalue emission — so this one can be strict:
-  ## look the position up and release exactly what is there. `restoreMemBase2` first,
+  ## look the position up and release exactly what is there. `restoreMemBase` first,
   ## because a memory-homed base is on loan to a staging register at this point and the
   ## loan has to be unwound before the home is read back. A home that is not a temp
   ## (the common case: the value sat in its own register) releases nothing.
   let pos = cursorToPosition(g.buf[], c)
-  g.restoreMemBase2(pos)                             # demoted (stolen) base/index reload
+  g.restoreMemBase(pos)                              # demoted (stolen) base/index reload
   let l = g.plan.planned(pos)
   if l.kind == InReg and l.isTemp: g.unbindTemp(l.r)
 
@@ -1908,9 +1908,9 @@ proc takeInstrReg*(g: var CodeGen; slot: AsmSlot): Location =
     g.pickedRegs.incl r
     return regLoc(r, slot, isTemp = true)
   # What this draw must NOT return — the registers the row's own lowering claims —
-  # is a SEAL held by `emitInstr2` (`atomicRegClaims`) rather than an `avoid`
+  # is a SEAL held by `emitInstr` (`atomicRegClaims`) rather than an `avoid`
   # argument: there can be two of them, and the seal also covers the nested
-  # `pickStaging` calls inside `emitValue2`, which an `avoid` here would not reach.
+  # `pickStaging` calls inside `emitValue`, which an `avoid` here would not reach.
   let s = g.pickStagingScratch()
   if s == NoReg:
     raiseAssert "arkham x64n: out of registers for an intrinsic operand in proc " &
@@ -1953,7 +1953,7 @@ proc atomicValueMayBeImm*(op: IntrinsicOp; i: int): bool {.inline.} =
 
 proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED: decide (only) where an lvalue-embedded VALUE — a deref'd pointer, a
-  ## computed index — will live; `prematLval2` materializes it into the decided
+  ## computed index — will live; `prematLval` materializes it into the decided
   ## location right before the consuming `(mem …)` opens. A symbol resolves to
   ## its home, a literal to an immediate, a computed subtree to a reserved temp
   ## (its own computation emits at premat time, dest-threaded).
@@ -1965,13 +1965,13 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
          g.tempPoolDry():
       # A stack-homed symbol IS its own natural location. Honouring `NeedsReg`
       # with the temp pool dry mints an `etmpN.0` SLOT — which cannot satisfy
-      # "needs a register" in the first place. `prematAddrVal2` then copies one
+      # "needs a register" in the first place. `prematAddrVal` then copies one
       # stack slot into the other through the staging bridge, and
-      # `reloadMemBase2` loads it straight back out:
+      # `reloadMemBase` loads it straight back out:
       #     mov R, [home] ; mov [etmp], R ; mov R, [etmp]
       # Three instructions, a wasted frame slot, and staging taken TWICE, to end
       # up exactly where the first instruction already was. Every consumer of an
-      # lvalue-embedded value goes through `reloadMemBase2`, whose whole job is
+      # lvalue-embedded value goes through `reloadMemBase`, whose whole job is
       # bringing a memory home into a staging register — and it does that just as
       # well from the symbol's OWN slot, in one load and one staging pick. So
       # record the home and reserve nothing.
@@ -2005,7 +2005,7 @@ proc getExpr*(g: var CodeGen; n: var Cursor; held: bool; what: string) =
   ## rather than a volatile that call would clobber; `what` names it for the
   ## out-of-registers message.
   ##
-  ## This lives in the backend rather than in `planer` only because the phase-B pool
+  ## This lives in the backend rather than in `planner` only because the phase-B pool
   ## (`takeHeld`) still does. It is a relocation away, not a redesign: the door already
   ## speaks positions, and `emitLvalWalk` — which calls it — is already a pure
   ## pick-and-record pass with no emission in it.
@@ -2015,18 +2015,18 @@ proc getExpr*(g: var CodeGen; n: var Cursor; held: bool; what: string) =
   g.plan.planAtEmitTime(pos, d)
   skip n
 
-proc freeLvalTemps2*(g: var CodeGen; c: Cursor) =
+proc freeLvalTemps*(g: var CodeGen; c: Cursor) =
   ## FUSED port of `releaseLvalTemps`: release the reserved scratch of an
   ## lvalue's address computation — a computed index (`at`/`pat`), a computed
   ## pointer (`deref`/`pat`) — dead once the consuming access used the address.
   ## `freeVal` is a no-op on a symbol's home (non-temp). The stride scratch /
-  ## global-base staging are released by `unbindLvalTemps2` (staging-managed).
+  ## global-base staging are released by `unbindLvalTemps` (staging-managed).
   if c.kind != TagLit: return
   case c.exprKind
   of DotC:
     var cc = c
     cc.into:
-      g.freeLvalTemps2(cc)                           # base
+      g.freeLvalTemps(cc)                            # base
       while cc.hasMore: skip cc
   of DerefC:
     var cc = c
@@ -2036,7 +2036,7 @@ proc freeLvalTemps2*(g: var CodeGen; c: Cursor) =
   of AtC:
     var cc = c
     cc.into:
-      g.freeLvalTemps2(cc)                           # base (by-value: does not advance)
+      g.freeLvalTemps(cc)                            # base (by-value: does not advance)
       skip cc                                        # → the index operand
       if cc.kind notin {IntLit, UIntLit}:
         g.freeVal(g.plan.planned(cursorToPosition(g.buf[], cc))) # the computed index
@@ -2053,6 +2053,6 @@ proc freeLvalTemps2*(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       skip cc; skip cc                               # base type, depth
-      g.freeLvalTemps2(cc)                           # the inner lvalue
+      g.freeLvalTemps(cc)                            # the inner lvalue
       while cc.hasMore: skip cc
   else: discard

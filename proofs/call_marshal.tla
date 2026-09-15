@@ -1,6 +1,6 @@
 ---- MODULE call_marshal ----
 \* TLA+ model of arkham's CALL-ARGUMENT MARSHALLING: chibicc's two phases with
-\* a parallel-move resolver (x64 `emitCall2Inner`, RISC `emitCall2`; grep MODEL:).
+\* a parallel-move resolver (x64 `emitCallInner`, RISC `emitCall`; grep MODEL:).
 \*
 \* Phase 1 runs EVERY argument expression and reduces each register-passed word
 \* to a MOVE — a source that is no longer computed (a register, a memory place,

@@ -50,9 +50,9 @@ constant, independent of the expression's size — which is exactly what frees t
 rest of the register file for locals.
 
 A right-nested chain (`b + (c + (d + …))`) would naively need one register per
-level; arkham's value core applies a **Sethi–Ullman swap** in `emitBin2`
+level; arkham's value core applies a **Sethi–Ullman swap** in `emitBin`
 (evaluate the computed operand first, straight into the accumulator, then fold
-the leaf operand), collapsing it back to O(1) live registers. `emitBin2` follows
+the leaf operand), collapsing it back to O(1) live registers. `emitBin` follows
 vmgen's order in general — operands become locations first, the result register
 is chosen once both exist — so a leaf is never materialized early and no
 half-built value sits unprotected in a home register across a sibling.
@@ -60,7 +60,7 @@ half-built value sits unprotected in a home register across a sibling.
 ## What the codegen actually does
 
 The pre-pass (`allocateProc`) assigns every value position a `Location` and
-every local a home; the pure-emit core (`genProc2`/`emitProcBody2`) then walks
+every local a home; the pure-emit core (`genProc`/`emitProcBody`) then walks
 the tree and emits bytes with no further allocation. Each backend partitions its
 register file into the same four roles:
 
@@ -139,7 +139,7 @@ it; reserving THREE where these shapes occur, and nothing elsewhere, is what let
 the reservation go — and with it the register the spill census wants back.
 
 Depth does not enter. A chain of spilled pointer loads — `p->a->b->c->…` — costs two
-registers at depth 4 and two at depth 10, because `emitMemLoad2`'s `late` mode takes
+registers at depth 4 and two at depth 10, because `emitMemLoad`'s `late` mode takes
 the transfer register *after* the address is materialized, so it is not held across
 the recursion, and each level's address registers die with its `(mem …)` tree.
 `late` is not free, though: it gives up the global-base fusion that leas `&g`
@@ -192,8 +192,8 @@ loops so the progress check knows the backstop exists — counting only
 `ARKHAM_STRESS=2` when a take there would have succeeded.
 
 Landing the budget on x86-64 immediately found six under-declared steps that no
-RISC target has (`copyNestedAggrTemp`, `fcvtU2F`, `emitCall2Inner`,
-`genAggrCopyStore`, `produceIntoMem2`, `aggrSrcEnd`), all now declared. And at
+RISC target has (`copyNestedAggrTemp`, `fcvtU2F`, `emitCallInner`,
+`genAggrCopyStore`, `produceIntoMem`, `aggrSrcEnd`), all now declared. And at
 `arkhamStressLevel` — k=2, the level the x86-64 stress pass actually runs — the
 check flags exactly one fixture, `addr_chain_depth`, which is already in
 `arkhamStressKnown`. It agrees with the existing list and names the composition
@@ -287,8 +287,8 @@ out.** `bridgeScopePush` in `core/bridges.nim`, reached through `bridgeStep` /
 `withBridges` in each emitter, asserting that `need` reserved bridges are still
 free, at two kinds of site:
 
- * `need = 1` at every recursive emit entry — `emitValue2`, `genStore2`,
-   `emitLvalue2`. A step entered with every bridge already held cannot make
+ * `need = 1` at every recursive emit entry — `emitValue`, `genStore`,
+   `emitLvalue`. A step entered with every bridge already held cannot make
    progress whatever it turns out to be, so this is the weakest condition that
    still guarantees one.
  * `need = <the step's own demand>` at any step that takes more than one, above
@@ -302,20 +302,20 @@ pool-dry pass — and nowhere it would cost a three-register walk per recursive 
 for a property that pass has already established over the whole corpus.
 
 **The first statement of I1 here was "no bridge is held across a recursive emit
-call", and implementing it is what showed that to be wrong.** `produceIntoMem2`
-holds the produce bridge across `emitValue2` of a whole node BY CONTRACT — the
+call", and implementing it is what showed that to be wrong.** `produceIntoMem`
+holds the produce bridge across `emitValue` of a whole node BY CONTRACT — the
 bridge IS the destination the value is produced into — so "zero held" would delete
 the mechanism rather than fix it. What can be enforced is not that nothing is
 held, but that what is held always leaves the next step enough.
 
-**And the earlier count was optimistic.** `produceIntoMem2` threads its bridge
+**And the earlier count was optimistic.** `produceIntoMem` threads its bridge
 into the recursion deliberately UNBOUND (a leaf may produce raw into it, and only
 then is it bound for the store), holding it with `pickedRegs` alone — so a count
 that asks `isBoundTemp` misses precisely the site whose invariant this is.
 `liveBridges` counts reserved-or-bound, and on that honest count the peak held
 across a recursion is **2**, not 1, reached at `ARKHAM_STRESS=1` on all three RISC
 targets by one composition: an `(at …)` stride scratch that fell back to a staging
-bridge, live across the index premat, while `produceIntoMem2` holds the produce
+bridge, live across the index premat, while `produceIntoMem` holds the produce
 bridge for a nested node. Two held out of three reserved leaves the step entered
 there exactly ONE — and several enumerated steps want two.
 
@@ -358,8 +358,8 @@ and never would be: the register stays bound and the next step silently runs wit
 one fewer, until something far away asserts. `bridgeScopePop` is the only place
 that difference is visible — though it must stay quiet while an exception is
 already unwinding, or it replaces the real diagnostic with a derived one. It did
-exactly that on first use, reporting an under-declared `genAconstr2` as a leak in
-`genStore2` three frames out.
+exactly that on first use, reporting an under-declared `genAconstr` as a leak in
+`genStore` three frames out.
 
 Two things the declarations had to get right, and both are lessons about *where* a
 demand lives rather than what it is:
@@ -372,7 +372,7 @@ demand lives rather than what it is:
    rather than opening a scope of its own. Whether an lvalue address chain needs a
    second bridge depends on whether its base or index turned out to be SPILLED,
    which the walk that planned the lvalue could not say; and the registers are
-   taken by `prematLval2` but released by the consumer's `freeLvalTemps2`, a
+   taken by `prematLval` but released by the consumer's `freeLvalTemps`, a
    lifetime that deliberately spans several procs. A scope cannot bracket that. The
    enclosing step's declaration can grow to cover it, and reverts when that step
    ends.
@@ -406,7 +406,7 @@ on entry. It started at four, in one proc, and it is now **zero** — over both
 corpora × 4 target configs × `ARKHAM_STRESS` unstressed and 1..8. Two changes got
 it there, and neither is the spill-to-a-frame-slot this section used to propose.
 
-**The three-bridge step no longer exists.** `flatCopyToPtr2`'s source is a NAMED
+**The three-bridge step no longer exists.** `flatCopyToPtr`'s source is a NAMED
 stack slot, and it was being `lea`'d into the produce bridge before every copy —
 which is what made the destination address, the source address and the transfer
 word live together, and therefore the only reason the reservation had to be three.
@@ -424,7 +424,7 @@ better than the two-register copy loop sketched earlier: no extra load per word,
 minted slot, strictly less code. The earlier sketch assumed both ends were computed
 addresses. One of them never was.
 
-**The lvalue address chain stopped over-declaring.** `prematLval2` raised every
+**The lvalue address chain stopped over-declaring.** `prematLval` raised every
 enclosing step to two, but an `(at …)`/`(pat …)` chain needs a second bridge only
 when a computed index meets a base that must be reloaded into one. A LATE base
 costs no bridge here at all — by the time it is materialised,
@@ -460,14 +460,14 @@ which is what makes this a spend rather than a gamble.
 Two things had to be true first, and both were worth finding:
 
  * **A scratch with alternatives must not take a bridge first.** `bindStrideScratch`
-   asked `tryTakeBridge` before `pickStagingA64`, which was free while a third bridge
+   asked `tryTakeBridge` before `pickUnboundReg`, which was free while a third bridge
    sat idle and stopped being free the moment it did not: the `(at …)` stride scratch
-   would hold a bridge for the whole `(mem …)` while `produceIntoMem2` held the other.
+   would hold a bridge for the whole `(mem …)` while `produceIntoMem` held the other.
    Pool first, bridge only if there is none — the preference `emLvalGlobalBase`'s
    late-base cascade already states. Three Cortex-M fixtures moved a stride scratch
    from `r10` to `r0`/`r1`/`r7`; nothing else in the corpus changed.
 
- * **The atomic triple is NOT the bridges.** `emitAtomicRmw2` and the compare-exchange
+ * **The atomic triple is NOT the bridges.** `emitAtomicRmw` and the compare-exchange
    read `bridgeRegs[0..2]` — an LL/SC loop holds `old`, `new` and the store STATUS
    across instructions no allocator sees. That coincided with the bridges only while
    every RISC target reserved exactly three, and a two-element `bridgeRegs` makes it
@@ -475,7 +475,7 @@ Two things had to be true first, and both were worth finding:
    `checkMachine` (all three or none; none of them allocatable) — which is the rule
    this document already states after the `cmpxchg`/rax bug: *a register an emitter
    claims must be excluded where the claim is made, not inferred from a pool it
-   happens to be in.* A target without a triple has `emitAtomicInstr2` refuse by
+   happens to be in.* A target without a triple has `emitAtomicInstr` refuse by
    name; RV32's triple is the two bridges plus `x8` (see below).
    The split moved no register on any target — emitted asm-NIF byte-identical.
 
@@ -500,7 +500,7 @@ part can be answered: give atomics a register that is reserved but idle. RV32's
 `atomicScratch` is the two bridges plus `x8`, the ABI frame pointer this backend
 never establishes, so its triple cost no allocatable register at all. Cortex-M has
 no such register: `r9` carries `&result` and is live across argument evaluation
-(the caller stages it BEFORE `emitCall2`, so `f(atomicLoad(p))` would destroy it),
+(the caller stages it BEFORE `emitCall`, so `f(atomicLoad(p))` would destroy it),
 `r12` is nifasm's own scratch, and `r13`–`r15` are architectural.
 
 But two independent measurements say not to bother even if one were found:
@@ -513,7 +513,7 @@ But two independent measurements say not to bother even if one were found:
    is why the same move pays there and not here.
  * **`intTempRegs` is EMPTY on Cortex-M.** The deeper one. Everywhere else a
    transient that cannot get a bridge falls back to a volatile
-   (`pickStagingA64`) — RV32 has four — and here there are none, so a bridge is the
+   (`pickUnboundReg`) — RV32 has four — and here there are none, so a bridge is the
    only answer and compositions run three deep. Reserving two breaks
    `addr_chain_depth` immediately: two bridges held by an enclosing step and a
    third genuinely needed.
@@ -570,7 +570,7 @@ expression evaluator:
   the emit-time staging pool dry once optimization filled the volatiles with call-free
   locals. The tier is picked by `aggrSrcEnd`/`aggrDstEnd` and carried in `AggrEnd`.
 
-  **`codegen_arm` does not do this yet.** Its `copyAggr` takes two `Reg`s, so a named
+  **The `risc/` backend does not do this yet.** Its `copyAggr` takes two `Reg`s, so a named
   slot end is always lea'd into a bridge first — the untiered shape x86-64 used to
   have. nifasm accepts `(mem name off)` on both Arm targets now, so what is missing is
   the arkham half: port `AggrEnd`/`slotEnd`/`regEnd` across. Unlike the x86-64 spelling
@@ -703,7 +703,7 @@ free when the walk's pick lands on the register that already holds it. It has no
 counterpart on x86-64, where the address is a single RIP-relative `lea`. Its
 create site is narrower than a value mirror's, and for a reason worth keeping:
 the address is only known to survive where the consuming instruction merely READ
-it — a store through the address (`freeLvalTemps2`'s `addrIntact`), never a load,
+it — a store through the address (`freeLvalTemps`'s `addrIntact`), never a load,
 whose `mov base, [base]` reuses the base register as its destination.
 
 Measured on the fixture corpus: about 0.9 % fewer emitted instructions on both
@@ -754,7 +754,7 @@ position, and the query is now asked that way too.
 
 ## What belongs in the machine description
 
-The allocator has always been arch-neutral: `planer`, `regbind`, `analyser` and
+The allocator has always been arch-neutral: `planner`, `regbind`, `analyser` and
 `programs` contain no target test at all, and the whole planner asks `md.arch`
 seven times, every one of them x86-vs-RISC. The seam is real. What leaked past it
 is the EMITTER, and one flag — `CodeGen.thumbM` — was carrying facts of five
@@ -765,7 +765,7 @@ The first three are not target questions and are gone:
  * **Register roles.** Which register carries `&result` for a wide aggregate
    return, which one the emitter stages a value through, which is the link
    register, which set a call clobbers, which registers are withheld from every
-   pool. These read `if g.thumbM: machine_m.X else: X`, which is how slot `R16`
+   pool. These read `if g.thumbM: machine_cortexm.X else: X`, which is how slot `R16`
    — not even MAPPED on Cortex-M — once reached the output. They are
    `MachineDesc` fields now, and a role a target lacks is `NoReg`, stated rather
    than defaulted: `Reg`'s zero value is `R0`, so an omitted role would silently
