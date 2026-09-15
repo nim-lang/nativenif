@@ -480,7 +480,7 @@ const ithaquaUnsupported: seq[string] = @[
   # 1. Target-pinned `(instr …)` rows. wasm has no flags, no register ties and
   #    no named machine instructions, so these cannot lower — and ithaqua says
   #    so by name rather than emitting something plausible.
-  "a64_vec_instr", "assembler_a64", "assembler_x64", "atomic2", "cpurelax",
+  "a64_vec_instr", "assembler_a64", "assembler_x64", "atomic2",
   "err_flag_outside_asm", "err_flag_value", "err_inout_dest", "err_inout_value",
   "err_nonflag_cond", "intrinsics", "intrinsics_x64", "naked_stacktrace_x64",
   "volatile_access",
