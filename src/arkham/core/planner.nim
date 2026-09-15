@@ -1153,11 +1153,12 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           else:
             b.recordSym(pos, name, namedStackLoc(name, slot))
             b.plan.hasStackVars = true
-        elif aggrStack and b.md.arch == X86:
+        elif aggrStack and b.md.arch in {X86, Avr}:
           # (No early `continue`/`return`: that skips the `into` epilogue.) These home the
           # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
           # A stack-passed by-value aggregate keeps a slot home ONLY on x86-64, where
-          # `emitStackParamLoadsX64` COPIES the incoming stack bytes into it. On AArch64
+          # `emitStackParamLoadsX64` COPIES the incoming stack bytes into it (and on AVR,
+          # where `genProcAvr` copies them out of the caller's argument block). On AArch64
           # a stack-passed by-value aggregate instead gets a POINTER home in a register
           # (below, like a by-ref aggregate): `emitStackParamLoads` computes `&incoming`
           # with `Lea` and the body reads fields through it — no copy.
@@ -1465,7 +1466,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
         if rtSlot.kind == AMem:
           b.retAggr = true
           b.retAggrSlot = rtSlot
-          if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+          if b.entryMd.passesByRef(rtSlot.size): b.retIndirect = true
     # If any parameter is stack-passed, the emitter needs a callee-saved register for the
     # incoming-args base (`stackArgBaseReg`) that survives the frame `sub`s. It is picked
     # at emit time from the callee-saved regs the body did NOT use — so reserve one here,

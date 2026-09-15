@@ -1,0 +1,10 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :bump.0 (params (param :q.0 . (ptr (f 32)))) (void) . (stmts (asgn (deref q.0) (add (f 32) (deref q.0) (suf 50.0 "f32"))) (ret .)))
+ (proc :take.0 (params (param :p0.0 . (f 32)) (param :p1.0 . (f 32)) (param :p2.0 . (f 32)) (param :p3.0 . (f 32)) (param :p4.0 . (f 32)) (param :p5.0 . (f 32)) (param :p6.0 . (f 32)) (param :p7.0 . (f 32)) (param :p8.0 . (f 32)) (param :p9.0 . (f 32))) (i 32) . (stmts (call bump.0 (addr p0.0)) (call bump.0 (addr p9.0))
+  (ret (conv (i 32) (sub (f 32) (add (f 32) p0.0 p9.0) p5.0)))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (call exit.0 (call take.0 (suf 0.0 "f32") (suf 1.0 "f32") (suf 2.0 "f32") (suf 3.0 "f32") (suf 4.0 "f32") (suf 5.0 "f32") (suf 6.0 "f32") (suf 7.0 "f32") (suf 8.0 "f32") (suf 9.0 "f32")))
+))
+)

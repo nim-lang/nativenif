@@ -62,8 +62,10 @@ const
   # ── calling convention ───────────────────────────────────────────────────
   IntArgRegs* = [P24, P22, P20, P18]
     ## AVR-GCC's, which allocates DOWNWARD from r25: a first word argument in
-    ## r25:r24, a second in r23:r22, and so on. Four pairs, then the stack —
-    ## which this backend refuses by name for now (M5).
+    ## r25:r24, a second in r23:r22, and so on. Four pairs; a call with more
+    ## arguments than that passes the rest in a block in the caller's frame and its
+    ## address in the last pair (`MachineDesc.argBlock`), since both ends of every
+    ## call on a bare-metal image are arkham's.
   IntRet* = P24
 
   IntCalleeSaved* = [P2, P4, P6, P8, P10, P12, P14]
@@ -148,7 +150,8 @@ const
     floatCalleeSaved: @[],
     intCalleeSavedSet: {P2, P4, P6, P8, P10, P12, P14},
     floatCalleeSavedSet: {},
-    aggrByRefThreshold: 4,      # TWO words, matching `slots.classifyArg`'s `2*w`
+    aggrByRefThreshold: 4,
+    argBlock: true,      # TWO words, matching `slots.classifyArg`'s `2*w`
                                 # at w = 2. The two decide the same thing and
                                 # MUST agree: `planCall` reads the threshold
                                 # while the classifier reads `2*w`, so a

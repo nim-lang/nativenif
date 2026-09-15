@@ -187,7 +187,9 @@ const arkhamOsxOnly: seq[string] =
     # A `{.varargs.}` libSystem call (`snprintf`): the fixed parameters go through
     # the extern's signature, the variadic tail down Apple's stack-passed path.
     # Linux assembles it (`arkhamDarwinAssembleTests`); only macOS can run it.
-    "darwin_varargs"]
+    # `darwin_varargs_many` is the same with a tail past every argument register:
+    # doubles, integers, a ≤16B struct by value and a larger one by reference.
+    "darwin_varargs", "darwin_varargs_many"]
 
 const arkhamRejections: seq[(string, string)] = @[
   # Arkham owns the `{.assembler.}` rules outright — nimony's sem only forwards
@@ -396,6 +398,60 @@ proc arkhamWinTlsTests() =
          " (want 7 = threadA | threadB | main survived)"
   echo "1 / 1 arkham win64 thread-local tests successful"
 
+proc arkhamWinAbiTests() =
+  ## The Win64 argument and result boundary, in both directions, against code
+  ## arkham did not write.
+  ##
+  ##   `win_extern_abi`  — msvcrt's `pow` and `div`, ucrtbase's `lldiv`: double
+  ##                       arguments and result, an 8-byte struct in rax and a
+  ##                       16-byte one through the hidden pointer in rcx (want 31).
+  ##   `win_stdcall_abi` — `stdcall` definitions called through `stdcall` pointers:
+  ##                       positional floats, structs by value / by reference / at
+  ##                       odd sizes, stack parameters, float and struct results
+  ##                       (want 15). Both ends are arkham's here; the next two
+  ##                       are what makes it a statement about Windows.
+  ##   `win_c_abi`       — the same signatures against gcc (`win_abitest.c`): arkham
+  ##                       calling C (bits 0–3), C calling arkham's callbacks (bits
+  ##                       4–7), and xmm6/xmm11/xmm15 surviving a callback, which
+  ##                       Win64 makes callee-saved and SysV does not (want 255).
+  ##   `win_va`          — a variadic C function reading doubles and integers with
+  ##                       `va_arg`, a double in a register position included (27).
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 ABI tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  # A crashed image would otherwise wait in winedbg until the timeout.
+  putEnv("WINEDLLOVERRIDES", "winedbg.exe=d")
+  var total, passed = 0
+  proc run(name: string; want: int; total, passed: var int) =
+    inc total
+    let asmNif = workDir / (name & ".asm.nif")
+    let exe = workDir / (name & ".exe")
+    exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / (name & ".c.nif"))
+    exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+    let (_, code) = runProgram(findExe("wine"), [exe])
+    if code != want:
+      quit "FAILURE arkham win64 ABI " & name & ": exit code " & $code & " (want " &
+           $want & " — see `arkhamWinAbiTests` for what each bit is)"
+    inc passed
+  run("win_extern_abi", 31, total, passed)
+  run("win_stdcall_abi", 15, total, passed)
+  let mingw = findExe("x86_64-w64-mingw32-gcc")
+  if mingw.len == 0:
+    echo "x86_64-w64-mingw32-gcc not found - skipping the win64 C cross-check " &
+         "(install: sudo apt-get install gcc-mingw-w64-x86-64)"
+  else:
+    exec quoteShell(mingw) & " -O1 -shared -o " & quoteShell(workDir / "win_abitest.dll") &
+         " " & quoteShell("tests" / "win_abitest.c")
+    run("win_c_abi", 255, total, passed)
+    run("win_va", 27, total, passed)
+  delEnv("WINEDLLOVERRIDES")
+  echo passed, " / ", total, " arkham win64 ABI tests successful"
+
 proc arkhamWinTvarFieldTests() =
   ## Reading a FIELD of a thread-local aggregate on win_x64 — the half of `{.threadvar.}`
   ## `win_tls` does not reach, and it scores 7 whether or not this works.
@@ -492,6 +548,7 @@ const ithaquaUnsupported: seq[string] = @[
   #    to map onto, so the proc has no definition to emit.
   "ulock_wake",
   "darwin_varargs",     # a libSystem `{.varargs.}` extern: Darwin-only, see arkhamOsxOnly
+  "darwin_varargs_many",
   # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
   #    Each one aborts loudly today; none of them miscompiles.
   "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
@@ -2200,6 +2257,10 @@ const cortexMUnsupported: seq[string] = @[
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
   "store_forward", "uint_literal_to_float",
+  # The stack-passed-float fixtures are double precision; `tests/arkham_m/p32_*`
+  # are their single-precision, 32-bit-int twins, and run here.
+  "float_stack_args", "float_stack_forward", "float_stack_indirect",
+  "float_stack_mixed", "float_stack_param_addr", "stack_aggr_odd",
 
   # ── float <-> 64-bit integer ────────────────────────────────────────────────
   # FPv4-SP converts to and from a THIRTY-TWO bit integer. `int64(f)` past 2^31
@@ -2207,6 +2268,7 @@ const cortexMUnsupported: seq[string] = @[
   # quietly wrong exactly there — so it is refused. `int32(f)` and `float32(i32)`
   # are what this core has, and they work.
   "div_floatparam", "float_const_conv", "fp32", "fpconv", "fpconv2",
+  "float32_stack_args",
 
   # ── no such hardware, no such OS ────────────────────────────────────────────
   # `mmap`/`futex`/`___ulock_wake` (no kernel to ask) and the x86-64-pinned
@@ -2215,7 +2277,8 @@ const cortexMUnsupported: seq[string] = @[
   # slot, which is a decision about the board and not about the ISA — a Cortex-M
   # part with four cores has four threads and is refused by name until the
   # SP-masked thread-local base exists.
-  "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "naked_stacktrace_x64",
+  "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "darwin_varargs_many",
+  "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
@@ -2481,6 +2544,7 @@ when defined(linux):
   arkhamWinStdcallTests()
   arkhamWinTlsTests()
   arkhamWinTvarFieldTests()
+  arkhamWinAbiTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

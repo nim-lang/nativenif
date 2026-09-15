@@ -169,6 +169,7 @@ const
     intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
     aggrByRefThreshold: 8,
+    positionalArgs: true,
     # ── roles ── x86-64 has none of these: the `call` pushes the return address
     # (no link register), arkham establishes no rbp frame, an indirect result is
     # a hidden FIRST argument rather than a register off the file, and the
@@ -211,13 +212,23 @@ proc win64EntryOf*(md: MachineDesc): MachineDesc =
   ## exactly as it would be on Linux, and only the boundary changes. That is what
   ## keeps this a two-line ABI difference instead of a second code generator.
   ##
-  ## The rest of the Win64 boundary is not modelled here and is refused outright
-  ## (`checkWin64EntryAbi`): a float or aggregate parameter, and a 5th parameter —
-  ## which Windows reads from above the 32-byte shadow space, an offset arkham's
-  ## incoming-stack-argument addressing does not carry.
+  ## The rest of the Win64 boundary follows from `positionalArgs` (where a float or
+  ## aggregate arrives, and which aggregates come by reference), from the shadow
+  ## space `emitStackParamLoadsX64` adds to the incoming-argument base, and from the
+  ## saves a Win64 callee owes and SysV does not (`Win64EntrySaved`,
+  ## `Win64EntrySavedXmm`).
   result = md
   result.intArgRegs = win64Machine.intArgRegs
   result.floatArgRegs = win64Machine.floatArgRegs
+  result.positionalArgs = true
+  result.aggrByRefThreshold = win64Machine.aggrByRefThreshold
+
+const Win64EntrySavedXmm* = [F6, F7, F8, F9, F10, F11, F12, F13, F14, F15]
+  ## The SIMD registers Win64 makes callee-saved — all 128 bits of each — and SysV,
+  ## under which a `stdcall` proc's body is generated, treats as scratch (xmm8–14
+  ## are its float temp pool, xmm15 the float staging bridge, xmm6/7 argument and
+  ## staging registers). Saved to and restored from `(s)` slots, since there is no
+  ## `push` for them.
 
 const Win64EntrySaved* = [RDI, RSI]
   ## The registers a `stdcall` proc definition must give back that arkham's own

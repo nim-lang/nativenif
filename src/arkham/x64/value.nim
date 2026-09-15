@@ -1751,7 +1751,9 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       g.genAconstr(rhs, dst)                              # build array element-by-element
     elif rhs.kind == TagLit and rhs.exprKind == CallC:   # call-returned aggregate
-      if g.aggrByRef(tn):                                # >16B: pass &dst as the hidden result ptr
+      let cc = g.callConvOf(rhs)                         # the CALLEE's result convention
+      let hidden = cc.intArgRegs[0]
+      if cc.passesByRef(aggrByteSize(g.prog, tn)):       # pass &dst as the hidden result ptr
         # The window opens BEFORE `&dst` is written into rdi. rdi is an ABI argument
         # register and may be a caller-saved local's home; writing it here — outside
         # `emitCall`, which is where the save would otherwise happen — destroys that
@@ -1759,13 +1761,13 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
         # binding, so the write comes out as `(lea <thatlocal> …)` and the corruption
         # is invisible to any scan for raw register operands.)
         let w = g.emCallerSaveOpen()
-        g.dropStaleBinding(RDI)
+        g.dropStaleBinding(hidden)
         if dst.kind == StackPtr:
-          g.ab.tree MovX64: (g.emReg RDI; g.emStackMem(dst.ptrName))  # slot holds &aggregate
+          g.ab.tree MovX64: (g.emReg hidden; g.emStackMem(dst.ptrName))  # slot holds &aggregate
         else:
-          g.emStackAddr(RDI, dstVar)
+          g.emStackAddr(hidden, dstVar)
         var d = dontCare
-        g.emitCall(rhs, d, hiddenPtr = true)             # the callee writes through rdi
+        g.emitCall(rhs, d, hiddenPtr = true)             # the callee writes through it
         g.emCallerSaveClose(w, d)
       else:
         var d = dontCare
@@ -1807,10 +1809,11 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     # RHS kind; global-vs-threadvar lives entirely in `emSymAddr`. The address temp
     # is a callee-saved survivor picked at emission (`takeHeld`).
     if rhs.kind == TagLit and rhs.exprKind == CallC and
-       dst.typ.size > g.md.aggrByRefThreshold:
-      let w = g.emCallerSaveOpen()                       # rdi first: see the sibling site
-      g.dropStaleBinding(RDI)
-      g.emSymAddr(RDI, dst)                              # >16B: &dst is the hidden result ptr
+       g.callConvOf(rhs).passesByRef(dst.typ.size):
+      let hidden = g.callConvOf(rhs).intArgRegs[0]
+      let w = g.emCallerSaveOpen()                       # the pointer first: see the sibling site
+      g.dropStaleBinding(hidden)
+      g.emSymAddr(hidden, dst)                           # &dst is the hidden result ptr
       var d = dontCare
       g.emitCall(rhs, d, hiddenPtr = true)               # callee writes through rdi
       g.emCallerSaveClose(w, d)
@@ -3307,6 +3310,8 @@ type
     msHomeAddr     ## `&name`, a stack home (a `StackPtr` home: the pointer it holds)
     msGlobalAddr   ## `&name`, a module-level global
     msTvarAddr     ## `&name`, a thread-local
+    msFloatBits    ## the bit pattern of the double in the float park `loc` (a Win64
+                   ## variadic double in a register position, `ParamPlace.floatBits`)
   ArgMove = object
     dst: Reg                     ## the ABI register — or, for a float, `fdst`
     fdst: FReg
@@ -3345,7 +3350,13 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   ## is emitted. nifasm has assembled the prologue by the time it reaches the
   ## marker and can simply reverse it.
   g.bridgeStep("a call", bdTwoInRegs)
-  discard hiddenPtr
+  # The CALLEE's argument convention. It is arkham's own (SysV) for everything arkham
+  # generates, and the OS's for the one foreign boundary: a call out to an `importc`'d
+  # Windows API or through a `stdcall` proctype. Only the argument REGISTERS and the
+  # result convention differ — the temp / callee-saved pools stay `g.md`'s, because
+  # those describe this caller's own register file.
+  let amd = g.callConvOf(c)
+  let foreignCall = amd.positionalArgs
   var argCurs: seq[Cursor] = @[]
   var fsym = ""
   var targetCur: Cursor
@@ -3379,7 +3390,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       # chain like `m.context.hook` stages its intermediate pointer through
       # whichever volatile is free, rdi included. Seal it now; the seal is
       # lifted with the argument seals after the call.
-      g.rb.sealAccum g.md.intArgRegs[0]
+      g.rb.sealAccum amd.intArgRegs[0]
     fnptrLoc = needsReg(ScalarSlot)
     g.emitValue(targetCur, fnptrLoc)               # fn-ptr target → a held register
     if fnptrLoc.kind == InReg:
@@ -3403,21 +3414,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       fnTargetName = nm
       tgt = CallTarget(asmName: nm, retType: retType, foreignAbi: foreignAbi)
   else:
-    if not g.callTarget.hasKey(fsym):
-      let si = g.lookupSym(fsym)
-      if si.cat in {scGlobal, scTvar}:
-        var d = si.decl
-        var proctype: Cursor
-        d.into:
-          inc d; skip d
-          proctype = resolveType(g.prog, d)
-          while d.hasMore: skip d
-        g.callTarget[fsym] = CallTarget(
-          indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl),
-          foreignAbi: isForeignAbiProctype(g.prog, proctype))
-      else:
-        g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
-    tgt = g.callTarget[fsym]
+    tgt = g.directCallTarget(fsym)
     if tgt.memIntrin.len > 0:                      # C mem* intrinsic → inline loop
       g.emitMemIntrin(argCurs, tgt.memIntrin)      # (fused arg emission inside)
       g.settleResultReg(dest, RAX)
@@ -3430,16 +3427,16 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   let hasResult = not retIsVoid(tgt.retType)
   let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
   let resultIsFloat = hasResult and resSlot.kind == AFloat
-  let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > g.md.aggrByRefThreshold
+  let resultByRef = hasResult and resSlot.kind == AMem and amd.passesByRef(resSlot.size)
   var callArgSlots: seq[AsmSlot] = @[]
   for a in argCurs: callArgSlots.add g.exprSlot(a)
-  # The CALLEE's argument convention. It is arkham's own (SysV) for everything arkham
-  # generates, and the OS's for the one foreign boundary: a call out to an `importc`'d
-  # Windows API. Only the argument REGISTERS differ — the temp / callee-saved pools
-  # below stay `g.md`'s, because those describe this caller's own register file.
-  let foreignCall = tgt.foreignAbi or (tgt.extern and g.prog.windows)
-  let amd = if foreignCall: win64Machine else: g.md
-  let plan = planCall(amd, callArgSlots, resultByRef)
+  # A `{.varargs.}` Windows extern: the call goes through a declaration of its own
+  # SHAPE (`winVariadicTarget`), so every variadic argument has a parameter to be
+  # marshalled into; a double in a register position travels as its bits.
+  let variadicFrom = if foreignCall and tgt.isVarargs: tgt.fixedParams else: -1
+  if variadicFrom >= 0:
+    tgt.asmName = g.winVariadicTarget(tgt.asmName, callArgSlots, variadicFrom)
+  let plan = planCall(amd, callArgSlots, resultByRef, variadicFrom)
   if foreignCall:
     # A Win64 call ALWAYS has an outgoing stack-argument area — the 32-byte shadow
     # space — even with no stack-passed argument, so the frame must carry the
@@ -3460,7 +3457,8 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   # bit-builtin paths above return early, and a stale `true` from an earlier call
   # would make `RetS` skip the epilogue jump.)
   var doTail = tail and not indirect and not tgt.extern and not tgt.syscall and
-               not tgt.indirect and not resultByRef and not foreignCall
+               not tgt.indirect and not resultByRef and not foreignCall and
+               not g.win64Entry   # `(popframe)` would skip the xmm6–15 restore
   # An aggregate LARGER than `aggrByRefThreshold` is passed indirectly on both x64
   # ABIs (SysV 16, Win64 8): the caller allocates the copy in its OWN frame and hands
   # the callee a pointer to it. `(popframe)` gives that frame back before the `jmp`,
@@ -3631,6 +3629,13 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       of msHomeAddr: g.emAggrHomeAddr(dst, m.name)
       of msGlobalAddr: g.emGlobalAddr(dst, m.name)
       of msTvarAddr: g.emTvarAddr(dst, m.name)
+      of msFloatBits:
+        var f = m.loc.f
+        if m.loc.kind != InFReg:
+          f = g.pickFStagingSealed("a variadic double's bits")
+          g.emFloatScalarLoad(f, m.loc.name, 64)
+        g.ab.tree MovfqX64: (g.emReg dst; g.emFReg f)
+        if m.loc.kind != InFReg: g.rb.unsealF f
     proc emitMove(g: var CodeGen; m: ArgMove) =
       if m.fdst != NoFReg:
         let bits = m.bytes * 8
@@ -3879,7 +3884,28 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
           pending.add ms
         if staged != NoReg: g.giveBack staged
       elif pl.onStack and g.isFloatExpr(a):
-        raiseAssert "arkham x64: >8 float arguments (stack TODO)"
+        # A float past the SIMD argument registers (the 9th+): evaluated into a
+        # float temp — or its spill slot, when the pool is dry — and stored into its
+        # outgoing slot at once, exactly as a 7th+ scalar is. The slot IS its park:
+        # nothing later in the call can disturb it. The width is the argument's own,
+        # for the reason the register arm below gives.
+        g.plan.hasStackVars = true             # outgoing stack-arg area ⇒ frame sub
+        let bytes = (if g.exprSlot(a).kind == AFloat: g.exprSlot(a).size else: 8)
+        let op = if bytes == 4: MovssX64 else: MovsdX64
+        let p = g.takeFTmp(AsmSlot(cls: AFloat, size: bytes, align: bytes))
+        if p.kind == InFReg: g.bindFTmp(p.f)
+        var fD = p
+        g.emitFValue(a, fD)
+        assert fD.kind == p.kind and (fD.kind != InFReg or fD.f == p.f),
+               "arkham x64n: a stack-passed float argument moved under its producer"
+        if p.kind == InFReg:
+          g.ab.tree op: (outgoingSlot(nameIdx, 0, false); g.emFReg p.f)
+        else:
+          let s = g.pickFStagingSealed("a spilled stack-passed float argument")
+          g.emFloatScalarLoad(s, p.name, bytes * 8)
+          g.ab.tree op: (outgoingSlot(nameIdx, 0, false); g.emFReg s)
+          g.rb.unsealF s
+        g.freeVal(p)
       elif pl.onStack:
         # 7th+ scalar: any register, stored into its outgoing slot, released.
         g.plan.hasStackVars = true             # outgoing stack-arg area ⇒ frame sub
@@ -3896,6 +3922,15 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
           ownSrc = true
         g.ab.tree MovX64: (outgoingSlot(nameIdx, 0, false); g.emReg srcReg)
         if ownSrc: g.giveBack srcReg else: g.freeVal(aD)
+      elif pl.floatBits:
+        # A Win64 variadic double in a register position: evaluated into a float
+        # park now, its bits moved into the GPR with the other moves.
+        let p = g.fpark(8)
+        var fD = p
+        g.emitFValue(a, fD)
+        var ms = @[ArgMove(dst: amd.gprAt(pl), fdst: NoFReg, f: NoFReg, r: NoReg,
+                           nameIdx: nameIdx, word: -1, kind: msFloatBits, loc: p)]
+        if placeNow(j, ms[0]): g.resolve(ms) else: pending.add ms
       else:
         # A scalar, integer or float: one move into its register.
         let isF = g.isFloatExpr(a)
@@ -3968,7 +4003,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
           g.ab.tree ResX: g.ab.sym synth("ret.0")
   g.rb.unsealAccums(sealedArgs)
   for f in sealedFArgs: g.rb.unsealF f
-  if hiddenPtr: g.rb.unsealAccums {g.md.intArgRegs[0]}    # the early seal (indirect target)
+  if hiddenPtr: g.rb.unsealAccums {amd.intArgRegs[0]}     # the early seal (indirect target)
   if fnTargetName.len > 0:
     g.ab.tree KillX64: g.ab.sym fnTargetName
     discard g.rb.takeBinding(fnptrReg)

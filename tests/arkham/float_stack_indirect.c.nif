@@ -1,0 +1,10 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :tgt.0 (params (param :p0.0 . (f 64)) (param :p1.0 . (f 64)) (param :p2.0 . (f 64)) (param :p3.0 . (f 64)) (param :p4.0 . (f 64)) (param :p5.0 . (f 64)) (param :p6.0 . (f 64)) (param :p7.0 . (f 64)) (param :p8.0 . (f 64)) (param :p9.0 . (f 64))) (i 64) . (stmts (ret (conv (i 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (mul (f 64) p0.0 1.0) (mul (f 64) p1.0 2.0)) (mul (f 64) p2.0 3.0)) (mul (f 64) p3.0 4.0)) (mul (f 64) p4.0 5.0)) (mul (f 64) p5.0 6.0)) (mul (f 64) p6.0 7.0)) (mul (f 64) p7.0 8.0)) (mul (f 64) p8.0 9.0)) (mul (f 64) p9.0 10.0))))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (var :fp.0 . (proctype . (params (param :q0.0 . (f 64)) (param :q1.0 . (f 64)) (param :q2.0 . (f 64)) (param :q3.0 . (f 64)) (param :q4.0 . (f 64)) (param :q5.0 . (f 64)) (param :q6.0 . (f 64)) (param :q7.0 . (f 64)) (param :q8.0 . (f 64)) (param :q9.0 . (f 64))) (i 64) (pragmas (nimcall))) tgt.0)
+  (call exit.0 (call fp.0 10.0 9.0 8.0 7.0 6.0 5.0 4.0 3.0 2.0 1.0))
+))
+)(.index)

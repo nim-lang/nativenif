@@ -392,6 +392,14 @@ proc takeFScratch*(rb: var RegBind; f: FReg): string =
     rb.fregLocal.del f
     rb.boundFTmps.excl f
 
+proc takeFBinding*(rb: var RegBind; f: FReg): string =
+  ## The SIMD twin of `takeBinding`: remove WHATEVER binding `f` carries (a float
+  ## local or a temp), returning the name whose `(kill …)` the caller must emit.
+  result = rb.fregLocal.getOrDefault(f, "")
+  rb.dropFMirror f
+  rb.fregLocal.del f
+  rb.boundFTmps.excl f
+
 proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
   assert rb.scopeFLocals.len > 0, "arkham: bindFLocal outside any scope"
   rb.dropFMirror f

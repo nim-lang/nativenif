@@ -1,0 +1,39 @@
+(.nif27)
+(stmts
+ (type :Pt.0 . (object . (fld :x.0 . (i 16)) (fld :y.0 . (i 16))))
+ (proc :sum7.0
+  (params (param :a.0 . (i 16)) (param :b.0 . (u 8)) (param :c.0 . (i 16)) (param :d.0 . (i 16))
+          (param :e.0 . Pt.0) (param :f.0 . (i 16)) (param :g.0 . (u 8)))
+  (i 16) .
+  (stmts
+   (var :c2.0 . (i 16) (add (i 16) c.0 c.0))
+   (ret (add (i 16) (sub (i 16) a.0 (conv (i 16) b.0))
+          (add (i 16) c2.0
+            (add (i 16) (sub (i 16) d.0 (dot e.0 x.0 0))
+              (add (i 16) (dot e.0 y.0 0) (sub (i 16) f.0 (conv (i 16) g.0)))))))))
+ (proc :mk6.0
+  (params (param :a.0 . (i 16)) (param :b.0 . (i 16)) (param :c.0 . (i 16))
+          (param :d.0 . (i 16)) (param :e.0 . (i 16)))
+  Pt.0 .
+  (stmts
+   (var :r.0 . Pt.0 .)
+   (asgn (dot r.0 x.0 0) (add (i 16) a.0 (add (i 16) b.0 c.0)))
+   (asgn (dot r.0 y.0 0) (sub (i 16) d.0 e.0))
+   (ret r.0)))
+ (proc :fwd.0
+  (params (param :a.0 . (i 16)) (param :b.0 . (u 8)) (param :c.0 . (i 16)) (param :d.0 . (i 16))
+          (param :e.0 . Pt.0) (param :f.0 . (i 16)) (param :g.0 . (u 8)))
+  (i 16) .
+  (stmts
+   (var :r.0 . (i 16) (call sum7.0 f.0 g.0 d.0 c.0 e.0 a.0 b.0))
+   (ret r.0)))
+ (proc :callSum.0 (params (param :p.0 . Pt.0)) (i 16) .
+  (stmts (var :s.0 . (i 16) (call sum7.0 100 3 4 50 p.0 9 2)) (ret s.0)))
+ (proc :callFwd.0 (params (param :p.0 . Pt.0)) (i 16) .
+  (stmts (var :t.0 . (i 16) (call fwd.0 100 3 4 50 p.0 9 2)) (ret t.0)))
+ (proc :main.0 (params) (i 16) (pragmas (exportc "main"))
+  (stmts
+   (var :p.0 . Pt.0 (call mk6.0 1 2 3 30 5))
+   (var :s.0 . (i 16) (call callSum.0 p.0))
+   (var :t.0 . (i 16) (call callFwd.0 p.0))
+   (ret (sub (i 16) (add (i 16) s.0 t.0) 250)))))

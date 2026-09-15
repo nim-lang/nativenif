@@ -46,6 +46,10 @@ type
                          ## (registers = intArgRegs[gpFirst ..< gpFirst+words])
     fpIndex*: int        ## register-passed float: SIMD register index
     byteOff*: int        ## stack-passed: byte offset within the stack-argument area
+    floatBits*: bool     ## a Win64 VARIADIC double in a register position: it travels
+                         ## as its bit pattern in the GPR `gpFirst` (the callee's
+                         ## `va_arg` reads the integer register), so it is placed as an
+                         ## integer word and `isFloat` is false
 
   CallPlan* = object
     ## One signature's complete ABI assignment, computed ONCE by `planCall` and
@@ -75,9 +79,29 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
   var stackOff = 0
   var ord = if retByRef: 1 else: 0
   var idx = 0
+  if md.argBlock:
+    # AVR (see `MachineDesc.argBlock`): one register per argument while they last;
+    # past the file, the LAST register carries the address of the overflow block and
+    # every remaining argument is a word of it — `byteOff` is its offset there.
+    let overflow = slots.len + gp > md.intArgRegs.len
+    let regCount = if overflow: md.intArgRegs.len - 1 else: md.intArgRegs.len
+    for s in slots:
+      var pp = ParamPlace(ord: ord, words: 1)
+      pp.isAgg = s.kind == AMem
+      pp.byRef = pp.isAgg and md.passesByRef(s.size)
+      if gp < regCount:
+        pp.gpFirst = gp; inc gp
+      else:
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += w
+        result.hasStackArgs = true
+      result.args.add pp
+      inc ord
+    result.gpUsed = if overflow: md.intArgRegs.len else: gp
+    result.stackBytes = stackOff
+    return
   for s in slots:
     var pp = ParamPlace(ord: ord)
-    if variadicFrom >= 0 and idx >= variadicFrom:
+    if variadicFrom >= 0 and idx >= variadicFrom and not md.positionalArgs:
       # Darwin AArch64: every argument past a `{.varargs.}` proc's declared
       # parameters travels on the stack, 8-byte slotted, no matter how many
       # argument registers are still free. This is the one place Apple's ABI
@@ -87,7 +111,7 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
       # happened to hold: `open`'s mode came out as garbage permission bits.
       pp.isFloat = s.kind == AFloat
       pp.isAgg = s.kind == AMem
-      pp.byRef = pp.isAgg and s.size > md.aggrByRefThreshold
+      pp.byRef = pp.isAgg and md.passesByRef(s.size)
       pp.words = if pp.byRef or pp.isFloat: 1
                  else: max(1, (s.size + w - 1) div w)
       pp.onStack = true
@@ -99,9 +123,30 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
       inc idx
       continue
     inc idx
+    if md.positionalArgs:
+      # Win64: one POSITION per argument, whichever register file it uses. A
+      # float at position `i` takes xmm`i` and leaves the `i`-th GPR unused; an
+      # aggregate is one word, by value or as a pointer; every stack slot is 8
+      # bytes. `gp` counts positions, and it is what `gpFirst`/`fpIndex` read.
+      pp.isFloat = s.kind == AFloat
+      pp.isAgg = s.kind == AMem
+      pp.byRef = pp.isAgg and md.passesByRef(s.size)
+      pp.words = 1
+      if gp < md.intArgRegs.len:
+        if pp.isFloat and variadicFrom >= 0 and idx - 1 >= variadicFrom:
+          pp.isFloat = false; pp.floatBits = true; pp.gpFirst = gp
+        elif pp.isFloat: (pp.fpIndex = gp; fp = gp + 1)
+        else: pp.gpFirst = gp
+        inc gp
+      else:
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += w
+        result.hasStackArgs = true
+      result.args.add pp
+      inc ord
+      continue
     if s.kind == AMem:
       pp.isAgg = true
-      pp.byRef = s.size > md.aggrByRefThreshold
+      pp.byRef = md.passesByRef(s.size)
       pp.words = if pp.byRef: 1 else: (s.size + w - 1) div w
       if gp + pp.words <= md.intArgRegs.len:
         pp.gpFirst = gp; gp += pp.words
@@ -162,3 +207,13 @@ proc isWideScalar*(pl: ParamPlace): bool {.inline.} =
 proc gprAt*(md: MachineDesc; pl: ParamPlace; k = 0): Reg {.inline.} =
   ## The k-th integer argument register of a register-passed place.
   md.intArgRegs[pl.gpFirst + k]
+
+proc incomingGprs*(md: MachineDesc; plan: CallPlan): set[Reg] =
+  ## The integer argument registers `plan` puts a value in: the hidden result
+  ## pointer and every register-passed word. Not a prefix of `intArgRegs` under a
+  ## positional convention, where a float argument leaves its position's GPR unused
+  ## — which is why this is a set and not `gpUsed`.
+  if plan.retByRef: result.incl md.intArgRegs[0]
+  for pl in plan.args:
+    if not pl.isFloat and not pl.onStack:
+      for k in 0 ..< pl.words: result.incl md.gprAt(pl, k)

@@ -60,7 +60,6 @@ proc setEntryAbi(g: var CodeGen; decl: Cursor; isNaked: bool) =
   ## push rdi/rsi in the prologue of whatever proc followed a callback.
   let win64 = isWin64AbiProc(g.prog, decl)
   g.entryMd = if win64: win64EntryOf(x64MachineA) else: g.md
-  if win64: g.checkWin64EntryAbi(decl)
   # `{.naked.}` is a promise that this proc emits no prologue, and the rdi/rsi
   # saves ARE prologue. An `.assembler` body that declares itself naked owns every
   # register it touches — including these two — the same way it already owns rbx
@@ -109,7 +108,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.retIsVoid = rc.kind == DotToken            # `(proc :f (params …) . (pragmas …) …)`
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrSym = rc.symId
-      g.retIndirect = g.aggrByRef(g.retAggrSym)
+      g.retIndirect = g.entryMd.passesByRef(aggrByteSize(g.prog, g.retAggrSym))
     elif rc.kind == TagLit and rc.typeKind == FT:
       g.retIsFloat = true                       # float return → xmm0
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
@@ -299,12 +298,16 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
+    for (name, decl) in g.prog.mainTypeList:
+      g.genType(name, decl)
     if windows:
       # Every `importc` on Windows is a DLL import (there are no raw syscalls to
       # lower to — see `collect`), and every import names its OWN library via
       # the decl's `(dynlib …)` pragma; arkham hardcodes no library name. Externs
       # are emitted grouped per dll behind that dll's `(imp …)` — nifasm binds
-      # an `(extproc …)` against the last import library seen.
+      # an `(extproc …)` against the last import library seen. After the types:
+      # a signature names the aggregate types it passes, and nifasm resolves them
+      # as it reads the declaration.
       var dlls: seq[string] = @[]
       for ex in g.prog.externOrder:
         if ex.dll notin dlls: dlls.add ex.dll
@@ -312,8 +315,6 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         g.ab.tree ImpD: g.ab.str dll
         for ex in g.prog.externOrder:
           if ex.dll == dll: g.emitWinExtproc(ex)
-    for (name, decl) in g.prog.mainTypeList:
-      g.genType(name, decl)
     for name, decl in g.prog.globals:
       g.genGlobal(name, decl)
     # `arkham.tls.0` (the per-thread block FS points at) is owned and emitted by
@@ -325,6 +326,9 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.emitSyproc(sp)
     for info in g.prog.procs:
       genProc(g, info)
+    for v in g.variadicExterns:                 # the variadic call shapes the bodies used
+      g.ab.tree ImpD: g.ab.str v.dll
+      g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm
