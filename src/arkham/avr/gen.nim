@@ -815,13 +815,19 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
     refuse(c, "the result of `" & callee & "`, which is an aggregate, used " &
               "somewhere with no place to put it")
   let shift = if retsAggr: 1 else: 0
-  if args.len + shift > g.md.intArgRegs.len:
-    refuse(c, "a call with " & $args.len & " arguments plus a hidden result " &
-              "pointer — more than this target passes in registers (M5)")
+  # Past the argument pairs, the rest go in a block in THIS frame and its address
+  # in the last pair (see `MachineDesc.argBlock` and the callee side in `genProcAvr`).
+  let overflow = args.len + shift > g.md.intArgRegs.len
+  let regCount = if overflow: g.md.intArgRegs.len - 1 else: g.md.intArgRegs.len
 
-  var slots: seq[string] = @[]
+  # Every argument is PARKED before the first is written to its pair, because
+  # evaluating a later one may use the pairs. A register argument parks in a slot
+  # of its own; an overflow argument's park IS its word of the block, which is in
+  # this frame and nothing later touches.
+  var slots = newSeq[string](args.len)
+  var blockSlot = ""
+  if overflow: blockSlot = g.mintAggrSlot(2 * (args.len + shift - regCount))
   for i in 0 ..< args.len:
-    let sl = g.mintSlot(args[i])
     if g.exprSlot(args[i]).cls == AMem:
       # The callee gets a pointer to the CALLER's copy, so it may write through
       # it without the caller seeing that.
@@ -832,8 +838,17 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
       g.emLeaSlot(ValueBridge, tmp)
     else:
       g.emitValue(args[i], ValueBridge)
-    g.emStoreSlot(sl, ValueBridge)
-    slots.add sl
+    if i + shift < regCount:
+      slots[i] = g.mintSlot(args[i])
+      g.emStoreSlot(slots[i], ValueBridge)
+    else:
+      let off = 2 * (i + shift - regCount)
+      g.ab.tree StbAvr:
+        g.ab.tree MemX: (g.ab.sym blockSlot; g.ab.intLit off)
+        g.emLo ValueBridge
+      g.ab.tree StbAvr:
+        g.ab.tree MemX: (g.ab.sym blockSlot; g.ab.intLit(off + 1))
+        g.emHi ValueBridge
 
   # The declarative call ABI: arguments are written to `(arg pN.0)` by NAME and
   # the result read from `(res ret.0)`, so nifasm checks both against the
@@ -847,9 +862,15 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
       g.ab.tree ArgX: g.ab.sym paramName(0)
       g.emPair ValueBridge
   for i in 0 ..< args.len:
+    if i + shift >= regCount: continue
     g.emLoadSlot(ValueBridge, slots[i])
     g.ab.tree MovwAvr:
       g.ab.tree ArgX: g.ab.sym paramName(i + shift)
+      g.emPair ValueBridge
+  if overflow:
+    g.emLeaSlot(ValueBridge, blockSlot)
+    g.ab.tree MovwAvr:
+      g.ab.tree ArgX: g.ab.sym paramName(regCount)
       g.emPair ValueBridge
   g.ab.keyword CallAvr
   # The result is bound whether or not the caller wants it: nifasm checks that
@@ -1373,12 +1394,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   let retsAggr = hasResult and slotOf(g.prog, rtc0).cls == AMem
   gRetAggrSlot = ""
   let shift = if retsAggr: 1 else: 0
-  if params.len + shift > g.md.intArgRegs.len:
-    lengError info.decl,
-      "AVR: this proc takes " & $params.len & " parameters" &
-      (if retsAggr: " plus a hidden result pointer" else: "") &
-      "; the target passes " & $g.md.intArgRegs.len &
-      " pairs in registers and the rest on the stack (M5)", lengInfo(info.decl)
+  # More parameters than argument pairs: the last pair brings the address of the
+  # caller's overflow block, and parameter `i` past `regCount` is its word
+  # `i + shift - regCount` (see `MachineDesc.argBlock`).
+  let overflow = params.len + shift > g.md.intArgRegs.len
+  let regCount = if overflow: g.md.intArgRegs.len - 1 else: g.md.intArgRegs.len
+  let blockReg = g.md.intArgRegs[^1]
+  template inBlock(i: int): bool = overflow and i + shift >= regCount
 
   g.ab.open NifasmDecl.ProcD
   g.ab.symDef info.asmName
@@ -1391,6 +1413,7 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
         g.ab.rawReg g.md.intArgRegs[0]
         g.ab.ptrType: g.ab.voidType()
     for i in 0 ..< params.len:
+      if inBlock(i): continue
       g.ab.tree NifasmDecl.ParamD:
         g.ab.symDef paramName(i + shift)
         g.ab.rawReg g.md.intArgRegs[i + shift]
@@ -1404,6 +1427,11 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
         else:
           var tc = params[i].typ
           g.genTypeBodyAvr(tc)
+    if overflow:
+      g.ab.tree NifasmDecl.ParamD:              # the address of the caller's block
+        g.ab.symDef paramName(regCount)
+        g.ab.rawReg blockReg
+        g.ab.ptrType: g.ab.voidType()
   if hasResult and not retsAggr:
     g.checkWidth(rt, "the result of `" & info.asmName & "`")
     g.ab.tree NifasmDecl.ResultD:
@@ -1424,7 +1452,18 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
 
   if retsAggr: g.rb.bindParam(g.md.intArgRegs[0], paramName(0))
   for i in 0 ..< params.len:
-    g.rb.bindParam(g.md.intArgRegs[i + shift], paramName(i + shift))
+    if not inBlock(i):
+      g.rb.bindParam(g.md.intArgRegs[i + shift], paramName(i + shift))
+  var blockSlot = ""
+  if overflow:
+    # The block's address is needed once per overflow parameter and its pair is
+    # an ordinary volatile, so it is parked like the hidden result pointer.
+    g.rb.bindParam(blockReg, paramName(regCount))
+    blockSlot = SynthMark & "argblk.0"
+    g.emPtrSlot blockSlot
+    g.emStoreSlot(blockSlot, blockReg)
+    g.ab.tree KillAvr: g.ab.sym paramName(regCount)
+    discard g.rb.takeBinding(blockReg)
   if retsAggr:
     # Park the hidden pointer for the proc's lifetime: it is needed at every
     # `ret`, and the first argument pair is caller-saved and also the first
@@ -1438,7 +1477,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
     let nm = params[i].name
     var ptc = params[i].typ
     let home = g.plan.homeOfSym(nm)
-    let src = g.md.intArgRegs[i + shift]
+    let src = if inBlock(i): ValueBridge else: g.md.intArgRegs[i + shift]
+    if inBlock(i):
+      # The word out of the caller's block, into the value bridge — from there on
+      # it is handled exactly as if it had arrived in a pair: a scalar moves to its
+      # home, an aggregate's word is the pointer to the caller's copy.
+      g.emLoadSlot(ValueBridge, blockSlot)
+      g.emLoadPtr(ValueBridge, ValueBridge, 2 * (i + shift - regCount), 2)
     if slotOf(g.prog, ptc).cls == AMem and home.kind == NamedStack:
       # An aggregate arrives as a POINTER to the caller's copy and is copied into
       # this proc's own slot. That is what makes it call-by-value: the callee may

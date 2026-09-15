@@ -25,8 +25,9 @@ import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     stress, context, typeutil, 
-                    mirrors, temps, exprpred, regbind, abi, bridges]
+                    mirrors, temps, exprpred, regbind, abi, bridges, typenav]
 import machine as machine_x64
+from symparser import derivedName
 
 const FloatRet* = F0    # xmm0: SysV scalar-float return + first float argument
 
@@ -1106,11 +1107,12 @@ proc genPointee*(g: var CodeGen; c: var Cursor) =
     g.genTypeBody(c)
 
 proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
-                         amd: MachineDesc): int =
+                         amd: MachineDesc; tail: openArray[AsmSlot] = []): set[Reg] =
   ## Emit the `(params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax) T))?` of a
-  ## signature under the calling convention `amd` describes, consuming the params slot
-  ## and the return type at `c`, and returning the count of integer arg registers
-  ## consumed (for the clobber set). `byRef` selects how a *named* type is emitted: by
+  ## signature under the calling convention `amd` describes (plus a variadic call
+  ## shape's `tail`, see `VariadicExtern`), consuming the params slot
+  ## and the return type at `c`, and returning the integer arg registers that carry
+  ## a value (for the clobber set). `byRef` selects how a *named* type is emitted: by
   ## reference (`genPointee`, so a self-referential proctype can't recurse forever) or
   ## inline (`genTypeBody`). Shared by `genProctypeSig` and `emitSignature`.
   ##
@@ -1127,11 +1129,13 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
   var retByRef = false
   if not retIsVoid(retC):
     let rs = slotOf(g.prog, retC)
-    retByRef = rs.kind == AMem and rs.size > amd.aggrByRefThreshold
+    retByRef = rs.kind == AMem and amd.passesByRef(rs.size)
   # THE plan (see abi.nim): register indices and name ordinals below read it —
   # a param's NAME ordinal advances by exactly 1 per param, decoupled from the
   # GPR index (a stack/float param consumes 0 GPRs, an aggregate several).
-  let plan = planCall(amd, paramSlots(g.prog, c), retByRef)
+  let fixedSlots = paramSlots(g.prog, c)
+  let plan = planCall(amd, fixedSlots & @tail, retByRef,
+                      variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
   var pIdx = 0
   g.ab.tree ParamsD:
     if retByRef:                                # synthetic hidden result pointer in rdi
@@ -1144,6 +1148,16 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
     if c.kind == TagLit:                        # (params (param …) …)
       c.into:
         while c.hasMore:
+          block:                                # a `{.varargs.}` marker is not a param
+            var tc = c
+            var isMarker = false
+            tc.into:
+              inc tc; skip tc
+              isMarker = tc.kind == TagLit and tc.typeKind == VarargsT
+              while tc.hasMore: skip tc
+            if isMarker:
+              skip c
+              continue
           let pl = plan.args[pIdx]
           inc pIdx
           c.into:                               # (param :name pragmas type)
@@ -1186,6 +1200,22 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
                 else: g.ab.keyword SO           # past the arg registers → stack-passed
                 if byRef: g.genPointee(c) else: g.genTypeBody(c)
             while c.hasMore: skip c
+      for k in 0 ..< tail.len:
+        # A variadic call shape's tail: word-sized parameters placed where the
+        # convention puts them. Their types are the ABI's words, not the arguments'
+        # Leng types — an aggregate is its one word (or the pointer to its copy).
+        let pl = plan.args[fixedSlots.len + k]
+        g.ab.tree ParamD:
+          g.ab.symDef paramName(pl.ord)
+          if pl.onStack: g.ab.keyword SO
+          elif pl.isFloat: g.ab.xmmReg amd.floatArgRegs[pl.fpIndex]
+          elif pl.isAgg:
+            g.ab.tree RegsD: g.ab.rawReg amd.gprAt(pl)
+          else: g.ab.rawReg amd.gprAt(pl)
+          if pl.isFloat: g.ab.floatType(64)
+          elif pl.isAgg and not pl.byRef:
+            g.ab.arrayType: (g.ab.uintType(64); g.ab.intLit 1)
+          else: g.ab.uintType(64)
     else:
       skip c                                    # no params slot
   g.ab.tree ResultD:                            # c now at the return type
@@ -1209,16 +1239,13 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
         g.ab.symDef synth("ret.0")
         g.ab.rawReg RAX
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
-  result = plan.gpUsed
+  result = incomingGprs(amd, plan)
 
-proc emitAbiClobber*(g: var CodeGen; numArgRegs: int;
-                    amd: MachineDesc = x64Machine) =
-  ## `(clobber …)` listing the volatile GPRs EXCEPT the first `numArgRegs` integer
-  ## arg registers of `amd`'s convention — they hold live params on entry, and nifasm
-  ## treats a declared clobber as clobbered there, so listing them would stop the
-  ## body/callee reading its own params.
-  var paramRegs: set[Reg] = {}
-  for i in 0 ..< min(numArgRegs, amd.intArgRegs.len): paramRegs.incl amd.intArgRegs[i]
+proc emitAbiClobber*(g: var CodeGen; paramRegs: set[Reg]) =
+  ## `(clobber …)` listing the volatile GPRs EXCEPT `paramRegs`, the integer argument
+  ## registers that hold live params on entry: nifasm treats a declared clobber as
+  ## clobbered there, so listing one would stop the body/callee reading its own
+  ## params (see `incomingGprs`).
   g.ab.tree ClobberD:
     for r in x64ClobbersGpr:
       if r notin paramRegs: g.ab.rawReg r
@@ -1242,9 +1269,9 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
   g.ab.proctypeType:
     c.into:
       skip c                                    # the Empty slot (a proc has its name here)
-      let numParams = g.emitParamsAndResult(c, byRef = true, amd)
+      let paramRegs = g.emitParamsAndResult(c, byRef = true, amd)
       while c.hasMore: skip c                    # pragmas
-      g.emitAbiClobber(numParams, amd)          # mirrors `emitSignature`
+      g.emitAbiClobber(paramRegs)               # mirrors `emitSignature`
 
 proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
   ## Translate a Leng type at `c` into asm-NIF, advancing past it. Named types
@@ -1517,6 +1544,63 @@ proc proctypeOfTarget*(g: var CodeGen; targetCur: Cursor): Cursor =
     result = resolveType(g.prog, inner)
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham x64n: indirect call target is not a proctype"
+
+proc directCallTarget*(g: var CodeGen; fsym: string): CallTarget =
+  ## What a DIRECT call to `fsym` reaches — an arkham proc, an extern, a syscall, a
+  ## mem intrinsic, or a proc-typed global/threadvar called through — memoized in
+  ## `g.callTarget`.
+  if not g.callTarget.hasKey(fsym):
+    let si = g.lookupSym(fsym)
+    if si.cat in {scGlobal, scTvar}:
+      var d = si.decl
+      var proctype: Cursor
+      d.into:
+        inc d; skip d
+        proctype = resolveType(g.prog, d)
+        while d.hasMore: skip d
+      g.callTarget[fsym] = CallTarget(
+        indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl),
+        foreignAbi: isForeignAbiProctype(g.prog, proctype))
+    else:
+      g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+  g.callTarget[fsym]
+
+proc winVariadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
+                        fixed: int): string =
+  ## The symbol a Win64 call to the `{.varargs.}` extern `asmName` goes through: a
+  ## declaration of this call's SHAPE (see `VariadicExtern`), registered for the
+  ## driver to emit. The tail's positions follow the convention, so the shape is
+  ## what each slot IS: a double, an integer word, an aggregate by value, or one
+  ## passed by reference.
+  var key = ""
+  for s in slots.toOpenArray(fixed, slots.len - 1):
+    case s.kind
+    of AFloat: key.add 'f'
+    of AMem: key.add(if win64Machine.passesByRef(s.size): 'r' else: 'a')
+    else: key.add 'i'
+  var ex: Extern
+  for e in g.prog.externOrder:
+    if e.asmName == asmName: ex = e
+  assert ex.asmName.len > 0, "arkham win_x64: a variadic call to an unknown extern " & asmName
+  result = derivedName(cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
+           thisModuleSuffix(g.prog)
+  for v in g.variadicExterns:
+    if v.asmName == result: return
+  g.variadicExterns.add VariadicExtern(asmName: result, extName: ex.extName, dll: ex.dll,
+                                       decl: ex.decl,
+                                       tail: @(slots.toOpenArray(fixed, slots.len - 1)))
+
+proc callConvOf*(g: var CodeGen; call: Cursor): MachineDesc =
+  ## The convention the callee of `(call target …)` is ENTERED under, which decides
+  ## where its arguments go and how its result comes back: Windows' for an importc'd
+  ## Windows API or a `stdcall` proctype, arkham's own (`g.md`) for everything else.
+  var target = call
+  inc target                                        # `(call` → the target
+  if isIndirectCallTarget(g.typeCtx, target):
+    if isForeignAbiProctype(g.prog, g.proctypeOfTarget(target)): win64Machine else: g.md
+  else:
+    let tgt = g.directCallTarget(symName(target))
+    if tgt.foreignAbi or (tgt.extern and g.prog.windows): win64Machine else: g.md
 
 proc transparentCastInner*(g: var CodeGen; c: Cursor; home: Location): tuple[hit: bool, inner: Cursor] =
   ## A conv/cast is a NO-OP when the allocator dest-threaded the SAME stack home onto

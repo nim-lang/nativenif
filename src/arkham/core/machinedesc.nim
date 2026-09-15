@@ -240,6 +240,18 @@ type
     intCalleeSavedSet*: set[Reg]     ## membership form of `intCalleeSaved`
     floatCalleeSavedSet*: set[FReg]  ## membership form of `floatCalleeSaved`
     aggrByRefThreshold*: int         ## aggregates larger than this go by reference
+    argBlock*: bool                  ## AVR: one argument register per argument (an
+                                     ## aggregate as a pointer to the caller's copy), and
+                                     ## a call with more arguments than registers passes
+                                     ## the rest in a block in the CALLER's frame, whose
+                                     ## address takes the last argument register — both
+                                     ## ends are arkham's (a bare-metal image links against
+                                     ## nothing), so no stack-argument frame is needed
+    positionalArgs*: bool            ## Win64: argument `i` takes POSITION `i` in both
+                                     ## register files — the `i`-th GPR or the `i`-th
+                                     ## SIMD register, the other left unused — and an
+                                     ## aggregate goes by value only at exactly 1, 2, 4
+                                     ## or 8 bytes (see `passesByRef`)
 
     # ── register ROLES ────────────────────────────────────────────────────────
     # Registers the EMITTER needs BY NAME rather than by drawing them from a
@@ -682,6 +694,14 @@ const EmitterBridgeDemand* = ord(high(BridgeDemand))
   ## See design.md, "Making the reservation a bound instead of a measurement" and
   ## "Spending the third bridge" for why the spend transfers to RV32 and not to
   ## either Arm target.
+
+proc passesByRef*(md: MachineDesc; size: int): bool =
+  ## Does an aggregate of `size` bytes travel as a pointer to a copy under `md`'s
+  ## convention — as an argument, and as a result through a hidden pointer? SysV and
+  ## AAPCS: above `aggrByRefThreshold`. Win64: unless it is exactly the width of a
+  ## register a single load can fill (1, 2, 4 or 8 bytes).
+  if md.positionalArgs: size notin {1, 2, 4, 8}
+  else: size > md.aggrByRefThreshold
 
 proc checkMachine*(md: MachineDesc) =
   ## Consistency of a machine model against what the shared emitter assumes.

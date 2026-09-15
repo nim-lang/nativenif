@@ -47,6 +47,7 @@ export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
 export regbind   # the emitter's register-binding state (`g.rb`) — the single
                  # owner of reg<->name bindings, see regbind.nim
 import emit, mem, aggr
+from a64 import nil
 
 # When the backend targets Linux (`g.a64Linux`), an `importc`'d libc function
 # recognised as a syscall (see `programs.collect` / `LinuxSyscalls`) is emitted as
@@ -942,9 +943,9 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
   ## a trailing PARTIAL eightbyte through `loadAggrTail` — exact bytes, no over-read).
   ##
   ## Both staging bridges are live here (the source address and the word carrier), so
-  ## the one tail shape that needs a third scratch — a 3/5/6/7-byte aggregate, which has
-  ## neither a single covering load nor a full word to borrow from — is refused rather
-  ## than silently mis-marshalled. It takes a call with 8+ integer arguments to reach.
+  ## the one tail shape that would need a third scratch — a 3/5/6/7-byte aggregate,
+  ## which has neither a single covering load nor a full word to borrow from — spends
+  ## the source address instead, after its last read.
   g.bridgeStep("a stack-passed aggregate argument", bdTwoInRegs)
   let tcur = g.getType(a)
   if tcur.kind != Symbol:
@@ -965,9 +966,10 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
       if sz - i * mw >= mw:
         g.ab.tree MovA64: (g.emReg w; g.emWordThroughPtr(src, i))
       else:
-        if i == 0 and sz notin {1, 2, 4}:
-          raiseAssert "arkham arm: " & $sz & "-byte aggregate stack-arg ABI unsupported"
-        g.loadAggrTail(w, src, sz, i * mw)
+        # The source address is not read again after the last word, so the tail may
+        # consume it — which is what lets a 3/5/6/7-byte aggregate load with the two
+        # bridges this step holds (see `loadAggrTail`).
+        g.loadAggrTail(w, src, sz, i * mw, baseDies = true)
       g.ab.tree MovA64:
         g.ab.tree MemX:
           g.emReg SP
@@ -3053,10 +3055,13 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   # AAPCS64, and libc is compiled to that rule. `open(path, flags, 0o666)` put the
   # mode in x2, so every file arkham created got whatever the stack happened to
   # hold as its permission bits. Linux/AAPCS64 keeps filling registers, so this is
-  # Darwin-only. The signature names the fixed params only; the tail is produced
-  # into the argument registers it WOULD have taken (caller-saved, and this callee
-  # never reads them), then moved down into an area carved just before the call.
-  let variadicFrom = if tgt.isVarargs and not g.a64Linux: tgt.fixedParams else: -1
+  # Darwin-only. The call goes through a declaration of its own SHAPE whose tail
+  # is `(s)` parameters (`a64.variadicTarget`), so the tail is marshalled exactly
+  # like any other stack argument — no count limit, floats and aggregates alike.
+  let variadicFrom = if tgt.isVarargs and g.md.arch == Arm64 and not g.a64Linux: tgt.fixedParams
+                     else: -1
+  if variadicFrom >= 0:
+    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, variadicFrom)
   let plan = planCall(g.md, callArgSlots, retByRef = false, variadicFrom)
   if doTail:
     for pa in plan.args:
@@ -3100,9 +3105,6 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
          "arkham risc: a fixed-role argument register needs the x64 park (`takeParked`)"
   var sealedArgs: set[Reg] = {}
   var sealedFArgs: set[FReg] = {}
-  var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
-  var tailGp = plan.gpUsed                 # the registers the tail would have taken
-  var tailFp = plan.fpUsed
   var pending: seq[ArgMove] = @[]
   var claims: set[Reg] = {}
   for pl in plan.args:
@@ -3110,7 +3112,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       for k in 0 ..< max(pl.words, 1): claims.incl g.md.gprAt(pl, k)
   var fclaims: set[FReg] = {}
   for j, pl in plan.args:
-    if pl.isFloat and not pl.onStack and not (variadicFrom >= 0 and j >= variadicFrom):
+    if pl.isFloat and not pl.onStack:
       fclaims.incl g.md.floatArgRegs[pl.fpIndex]
   var reads = newSeq[set[Reg]](argCurs.len)      # among the claimed registers
   var freads = newSeq[set[FReg]](argCurs.len)
@@ -3347,39 +3349,33 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       let a = argCurs[j]
       let pl = plan.args[j]
       let aSym = if a.kind == Symbol: symName(a) else: ""
-      if variadicFrom >= 0 and j >= variadicFrom:
-        # Darwin's variadic tail: into the register it would have taken, claimed
-        # so nothing later draws it; stored to the stack after phase 2.
-        if g.exprSlot(a).kind == AMem:
-          # C's default argument promotions never produce one, and guessing the
-          # HFA/indirect split would miscompile silently.
-          raiseAssert "arkham a64: aggregate in the variadic tail of " & tgt.asmName
-        elif pl.isFloat:
-          if tailFp >= g.md.floatArgRegs.len:
-            raiseAssert "arkham a64: too many float arguments in the variadic tail of " &
-                        tgt.asmName
-          var fD = fregLoc(g.md.floatArgRegs[tailFp], defaultFloatSlot())
-          g.emitFValue(a, fD)                  # promoted to double by the front end
-          g.rb.sealF fD.f; sealedFArgs.incl fD.f
-          varTail.add (NoReg, fD.f, pl.byteOff)
-          inc tailFp
-        else:
-          if tailGp >= g.md.intArgRegs.len:
-            raiseAssert "arkham a64: too many arguments in the variadic tail of " &
-                        tgt.asmName
-          let r = g.md.intArgRegs[tailGp]
-          g.releaseArgDest(r, aSym)
-          g.stagedArgs.incl r
-          var aD = regLoc(r, ScalarSlot)
-          g.emitValue(a, aD)
-          g.unbindTemp(aD.r)
-          g.rb.sealAccum r; sealedArgs.incl r
-          varTail.add (r, NoFReg, pl.byteOff)
-          inc tailGp
-      elif pl.onStack:
+      if pl.onStack:
         # The outgoing slot IS the park: stored now, from wherever the value is.
         if g.exprSlot(a).kind == AMem:
           g.marshalStackAggrArg(a, paramName(j))
+        elif pl.isFloat:
+          # A float past the SIMD argument registers: into a float temp (or its
+          # spill slot, pool dry) and `fstr`d to its outgoing slot. The width is the
+          # argument's own, for the reason the register arm below gives.
+          let fSlot = g.exprSlot(a)
+          let bytes = if fSlot.kind == AFloat: fSlot.size else: defaultFloatSlot().size
+          let bits = bytes * 8
+          let p = g.takeFTmp(AsmSlot(cls: AFloat, size: bytes, align: bytes))
+          if p.kind == InFReg: g.bindFTmp(p.f, bits)
+          var fD = p
+          g.emitFValue(a, fD)
+          var src = NoFReg
+          if fD.kind == InFReg: src = fD.f
+          else:
+            src = g.takeFBridge(bits)
+            g.emFloatScalarLoad(src, fD.name, bits)
+          g.ab.tree FstrA64:
+            g.ab.tree MemX:
+              g.emReg SP
+              g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emFReg(src, bits)
+          if fD.kind != InFReg: g.dropFBridge()
+          g.freeVal(fD)
         elif g.isWideExpr(a):
           g.wideArgToStack(wideArgSlots[j], paramName(j))
         else:
@@ -3490,27 +3486,6 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
         g.scalarArg(j, m)
     # ── phase 2: one parallel move ───────────────────────────────────────────
     g.resolve(pending)
-    # Drop the variadic tail into a freshly carved outgoing area at [sp+0…]. The
-    # frame nifasm sizes has no room for it (that reservation follows the callee's
-    # DECLARED signature, which names the fixed params only), so carve it here and
-    # give it back straight after the call — 16-aligned, as the ABI requires SP to
-    # be. Carved AFTER phase 2: a fixed argument may have been loaded out of an
-    # `(s)` slot, and those are SP-relative.
-    var varArea = 0
-    if varTail.len > 0:
-      assert plan.stackBytes == varTail.len * 8,
-             "arkham a64: a variadic callee with stack-passed fixed parameters"
-      varArea = (varTail.len * 8 + 15) and not 15
-      g.ab.tree SubA64: (g.ab.rawReg SP; g.ab.intLit varArea)
-      for it in varTail:
-        if it.r != NoReg:
-          g.ab.tree MovA64:
-            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
-            g.emReg it.r
-        else:
-          g.ab.tree FstrA64:
-            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
-            g.emFReg(it.f, 64)
     # Every argument is in place; the call itself clobbers all four, so from the
     # marker on nobody's claim survives.
     g.stagedArgs = {}
@@ -3518,8 +3493,6 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       g.ab.tree SvcA64: g.ab.intLit 0
     elif tgt.extern:
       g.ab.keyword ExtcallA64                # a dynamic import: through its stub
-      if varArea > 0:
-        g.ab.tree AddA64: (g.ab.rawReg SP; g.ab.intLit varArea)
     elif doTail:
       # The arguments are in their ABI registers; from here nothing of ours is
       # live, so undo the prologue and branch. `(popframe)` is inside the

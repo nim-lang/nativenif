@@ -62,15 +62,30 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   else:
     inc n
 
-proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int) =
+proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int;
+                     locals: var Table[SymId, Type]) =
   ## Pre-scan a proc body for the largest outgoing stack-argument area any `(prepare …)`
   ## needs (AArch64 fixed-frame model). The result seeds the slot allocator so the area is
   ## reserved ONCE at the frame bottom: local `(s)` slots then sit ABOVE it and `(ssize)`
   ## includes it, so the caller writes `(mem (sp) (arg pN))` with no per-call `sub sp` and
-  ## SP stays constant between prologue and epilogue. A target that doesn't resolve here
-  ## (an indirect call through a not-yet-declared local fn-ptr) contributes 0; `genPrepareA64`
-  ## guards against an under-reservation at emit time.
+  ## SP stays constant between prologue and epilogue.
+  ##
+  ## An indirect call names a LOCAL — a `(var :fp …)` or a `(rebind :fntmp …)` of a
+  ## `(proctype …)` — which the scope does not know yet: the body's declarations are
+  ## entered as pass 2 walks it, after this scan. So the scan records every proc-typed
+  ## local it passes in `locals`, and a `(prepare)` that does not resolve in the scope
+  ## is looked up there. (It used to contribute 0 instead, and `genPrepare*` then
+  ## refused the call: no indirect call could pass anything on the stack.)
   if n.kind == TagLit:
+    if n.tag in {VarTagId, RebindTagId}:
+      var d = n
+      inc d                                      # the tag → the defined name
+      if d.kind == SymbolDef:
+        let name = getSymId(d)
+        inc d
+        if n.tag == VarTagId: skip d             # `(var :name <loc> <type>)`
+        if d.kind == TagLit and d.tag == ProctypeTagId:
+          locals[name] = parseType(d, scope, ctx)
     if n.tag == PrepareTagId:
       # A Win64 call owns the 32-byte shadow space at the bottom of the area whatever
       # its signature says — reserved even for a call with no stack argument at all,
@@ -80,11 +95,15 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
       acc = max(acc, base)
       var t = n; inc t                           # the call target symbol
       if t.kind == Symbol:
-        let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
-        if s != nil and s.typ != nil and s.typ.kind == ProcT:
-          acc = max(acc, base + computeStackArgSize(s.typ))
+        let id = getSymId(t)
+        if id in locals:
+          acc = max(acc, base + computeStackArgSize(locals[id]))
+        else:
+          let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
+          if s != nil and s.typ != nil and s.typ.kind == ProcT:
+            acc = max(acc, base + computeStackArgSize(s.typ))
     loopInto n:
-      scanStackArgArea(n, ctx, scope, acc)
+      scanStackArgArea(n, ctx, scope, acc, locals)
   else:
     inc n
 
@@ -229,8 +248,9 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     block:
       var scanArgs = n
       var maxArgs = 0
+      var procTypedLocals = initTable[SymId, Type]()
       while scanArgs.hasMore:
-        scanStackArgArea(scanArgs, ctx, ctx.scope, maxArgs)
+        scanStackArgArea(scanArgs, ctx, ctx.scope, maxArgs, procTypedLocals)
       ctx.reservedArgArea = maxArgs
       ctx.slots.stackSize = max(ctx.slots.stackSize, maxArgs)
 

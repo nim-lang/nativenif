@@ -105,6 +105,21 @@ type
                                              ## register either
     tag*: Table[string, X64Inst]             ## bool symbol → the `jcc` that means "true"
 
+  VariadicExtern* = object
+    ## One CALL SHAPE of a `{.varargs.}` extern, declared as an `(extproc …)` of its
+    ## own: the fixed parameters of `decl`, then one parameter per slot of `tail`.
+    ## A declaration names every argument, which is what lets a variadic call go
+    ## through the ordinary declarative `(arg pN)` path — any number of arguments,
+    ## floats and aggregates included — with nifasm reserving the outgoing area.
+    ## Darwin/AArch64 spells the tail as `(s)` stack parameters (Apple passes it on
+    ## the stack); Win64 places it positionally, a double in a register position as
+    ## its bits in the GPR (`ParamPlace.floatBits`).
+    asmName*: string                         ## the shape's own symbol
+    extName*: string                         ## the C symbol all shapes import
+    dll*: string                             ## Windows: the import library ("" on Darwin)
+    decl*: Cursor                            ## the importc decl (fixed parameters)
+    tail*: seq[AsmSlot]                      ## the variadic arguments' ABI slots
+
   CodeGen* = object
     ab*: AsmBuf
     plan*: Plan
@@ -212,6 +227,8 @@ type
                                              ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
+    variadicExterns*: seq[VariadicExtern]    ## Darwin: every variadic call shape used,
+                                             ## declared after the procs (see `a64.variadicTarget`)
     helperCalls*: bool                       ## Cortex-M: the proc being emitted calls a
                                              ## runtime helper (the 64-bit divider) with a
                                              ## bare `bl`. `bl` overwrites lr, and nothing

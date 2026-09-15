@@ -17,6 +17,7 @@ import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, mirrors, regbind]
 import machine_a64 as machine
 import emit
+from symparser import derivedName
 
 proc emLdar(g: var CodeGen; rt, rn: Reg; bits = 64) =   # rt ← acquire [rn] (sized)
   g.ab.tree LdarA64:
@@ -180,3 +181,32 @@ proc rejectReservedPin*(g: var CodeGen; at: Cursor; name: string; r: Reg) =
   if r == R18:
     lengError at, "`x18` is the platform register and belongs to the OS, not " &
               "to this program", g.asmInfo
+
+proc variadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
+                     fixed: int): string =
+  ## The symbol a Darwin call to the `{.varargs.}` extern `asmName` goes through:
+  ## the extern's own name with the variadic tail's SHAPE folded in, registered in
+  ## `g.variadicExterns` so the driver declares it. Two calls with the same shape
+  ## share one declaration; the slots are 8-byte words on Apple's stack (a double,
+  ## an integer or pointer, a ≤16B aggregate's words, a larger one's pointer), so
+  ## that is all the shape records.
+  var key = ""
+  for s in slots.toOpenArray(fixed, slots.len - 1):
+    case s.kind
+    of AFloat: key.add 'f'
+    of AMem:
+      if s.size > g.md.aggrByRefThreshold: key.add 'r'
+      else: key.add 'a' & $((s.size + 7) div 8)
+    else: key.add 'i'
+  let ex = block:
+    var found = -1
+    for i, e in g.prog.externOrder:
+      if e.asmName == asmName: found = i
+    assert found >= 0, "arkham a64: a variadic call to an unknown extern " & asmName
+    g.prog.externOrder[found]
+  result = derivedName(cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
+           thisModuleSuffix(g.prog)
+  for v in g.variadicExterns:
+    if v.asmName == result: return
+  g.variadicExterns.add VariadicExtern(asmName: result, extName: ex.extName, decl: ex.decl,
+                                       tail: @(slots.toOpenArray(fixed, slots.len - 1)))

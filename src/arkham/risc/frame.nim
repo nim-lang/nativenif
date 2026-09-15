@@ -401,8 +401,13 @@ proc bridgeStackParam(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSl
     return
   let s = g.pickUnboundReg()
   if s == NoReg:
-    raiseAssert "arkham a64: no register to bridge stack parameter " & slotName &
-                " in proc " & g.curProcName
+    # Every register is some home. The bridges are in no pool, and this runs before
+    # the first body statement, so none of them is holding anything yet.
+    let v = g.takeBridge(typ)
+    g.emLoadIncomingArg(v, byteOff)
+    g.emScalarStore(slotName, v)
+    g.dropBridge v
+    return
   g.pickedRegs.incl s
   g.bindTemp(s, typ)
   g.emLoadIncomingArg(s, byteOff)
@@ -454,12 +459,30 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = c.symId
         while c.hasMore: skip c               # type (+ anything else)
       if not pl.onStack: continue
-      if pl.isFloat:
-        # `emitParamMoves` skips every stack-passed parameter, so if this one is
-        # skipped here too it is silently never loaded. Say so instead.
-        lengError decl, "arkham: a stack-passed FLOAT parameter (`" & nm &
-                  "`) is not supported yet", lengInfo(decl)
       let loc = g.plan.homeOfSym(nm)
+      if pl.isFloat:
+        # A float past the SIMD argument registers: its bytes into its home through
+        # the float bridge — `fldr` from the incoming area, then into a SIMD home or
+        # the `(s)` slot the allocator spilled it to.
+        let bits = slotOf(g.prog, typeCur).size * 8
+        let f = g.takeFBridge(bits)
+        if g.md.frameStyle == BlockFrame:
+          let b = g.takeBridge()
+          g.emIncomingArgBase(b)
+          g.ab.tree FldrA64: (g.emFReg(f, bits); g.emIncomingArgMem(b, pl.byteOff))
+          g.dropBridge b
+        else:
+          g.ab.tree FldrA64: (g.emFReg(f, bits); g.emIncomingArgMem(NoReg, pl.byteOff))
+        case loc.kind
+        of InFReg: g.fmovF(loc.f, f, bits)
+        of NamedStack:
+          g.emFloatStackVar(nm, bits)
+          g.emFloatScalarStore(nm, f, bits)
+        else:
+          raiseAssert "arkham risc: stack-passed float parameter home " & $loc.kind &
+                      ": " & nm
+        g.dropFBridge()
+        continue
       if g.isWideType(typeCur):
         # A stack-passed 64-bit parameter: eight bytes of the incoming area into
         # the slot the allocator gave it (a scalar wider than a register never
@@ -669,18 +692,12 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.wideParamToHome(nm, pl.gpFirst)
       elif loc.kind == InFReg:
         # Float parameter: in a leaf proc it stays in its incoming v{fpIndex}; if
-        # the allocator gave it a callee-saved home, move it there. A STACK-passed
-        # float has no `v{fpIndex}` to read — `FloatArgRegs[pl.fpIndex]` would name
-        # another parameter's register and silently move the wrong value, so say so
-        # instead. (>8 float params; the integer side is handled above.)
-        assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
-          " in " & g.curProcName
+        # the allocator gave it a callee-saved home, move it there. (A stack-passed
+        # one never reaches here — see the `pl.onStack` arm above.)
         g.fmovF(loc.f, g.md.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming SIMD arg register into it so `addr`/loads/stores work.
-        assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
-          " in " & g.curProcName
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
         g.emFloatScalarStore(nm, g.md.floatArgRegs[pl.fpIndex], bits)
@@ -697,13 +714,16 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.movReg(loc.r, g.md.gprAt(pl))
         else: raiseAssert "arkham v1: stack-resident parameter: " & nm
 
-proc emitSignature*(g: var CodeGen; decl: Cursor) =
+proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = []) =
   ## Emit the proc's `(params)/(result)/(clobber)`: the ABI stated explicitly —
   ## positional `p{i}` register params (v-registers for floats, `(regs …)` for
   ## aggregates and wide scalars, `(s)` past the register file) and an `x0` /
   ## `d0` result — so nifasm cross-checks every call site. The clobber set is
   ## always the convention's, derived here (never per-proc precomputed), which
   ## is reliable across modules.
+  ##
+  ## `tail` is a Darwin variadic call shape's tail (see `VariadicExtern`): one `(s)`
+  ## word-slotted parameter per slot, after the declared ones.
   block:
     var c = decl
     c.into:
@@ -722,7 +742,9 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
         if c.kind == TagLit:                  # (params (param …) …)
           # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
           # argument file, so the plan is never shifted (retByRef=false).
-          let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+          let fixedSlots = paramSlots(g.prog, c)
+          let plan = planCall(g.md, fixedSlots & @tail, retByRef = false,
+                              variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
           var pIdx = 0
           c.into:
             while c.hasMore:
@@ -800,6 +822,17 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
                       g.ab.keyword SO           # 9th+ → stack-passed `(s)`
                     g.genTypeBody(c)            # the param type (consumes it)
                 while c.hasMore: skip c
+          for k in 0 ..< tail.len:
+            # Apple's variadic slots: a double, an integer/pointer word, a ≤16B
+            # aggregate's words, a larger aggregate's pointer — all 8-byte slotted.
+            let pl = plan.args[fixedSlots.len + k]
+            g.ab.tree ParamD:
+              g.ab.symDef paramName(pl.ord)
+              g.ab.keyword SO
+              if pl.isFloat: g.ab.floatType(64)
+              elif pl.isAgg and not pl.byRef:
+                g.ab.arrayType: (g.ab.uintType(64); g.ab.intLit int64(pl.words))
+              else: g.ab.uintType(64)
         else:
           skip c                              # no params slot → consume it
       g.ab.tree ResultD:                      # c now at the return type

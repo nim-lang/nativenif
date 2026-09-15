@@ -1,0 +1,13 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :leaf.0 (params (param :p0.0 . (f 64)) (param :p1.0 . (f 64)) (param :p2.0 . (f 64)) (param :p3.0 . (f 64)) (param :p4.0 . (f 64)) (param :p5.0 . (f 64)) (param :p6.0 . (f 64)) (param :p7.0 . (f 64)) (param :p8.0 . (f 64)) (param :p9.0 . (f 64)) (param :k0.0 . (i 64)) (param :k1.0 . (i 64)) (param :k2.0 . (i 64)) (param :k3.0 . (i 64)) (param :k4.0 . (i 64)) (param :k5.0 . (i 64)) (param :k6.0 . (i 64)) (param :k7.0 . (i 64))) (i 64) . (stmts (ret (add (i 64) (add (i 64) (add (i 64) (add (i 64) (add (i 64) (add (i 64) (add (i 64) (add (i 64) (mul (i 64) k0.0 1) (mul (i 64) k1.0 2)) (mul (i 64) k2.0 3)) (mul (i 64) k3.0 4)) (mul (i 64) k4.0 5)) (mul (i 64) k5.0 6)) (mul (i 64) k6.0 7)) (mul (i 64) k7.0 8)) (conv (i 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (mul (f 64) p0.0 1.0) (mul (f 64) p1.0 2.0)) (mul (f 64) p2.0 3.0)) (mul (f 64) p3.0 4.0)) (mul (f 64) p4.0 5.0)) (mul (f 64) p5.0 6.0)) (mul (f 64) p6.0 7.0)) (mul (f 64) p7.0 8.0)) (mul (f 64) p8.0 9.0)) (mul (f 64) p9.0 10.0)))))))
+ (proc :fwd.0 (params (param :p0.0 . (f 64)) (param :p1.0 . (f 64)) (param :p2.0 . (f 64)) (param :p3.0 . (f 64)) (param :p4.0 . (f 64)) (param :p5.0 . (f 64)) (param :p6.0 . (f 64)) (param :p7.0 . (f 64)) (param :p8.0 . (f 64)) (param :p9.0 . (f 64)) (param :k0.0 . (i 64)) (param :k1.0 . (i 64)) (param :k2.0 . (i 64)) (param :k3.0 . (i 64)) (param :k4.0 . (i 64)) (param :k5.0 . (i 64)) (param :k6.0 . (i 64)) (param :k7.0 . (i 64))) (i 64) . (stmts (var :r.0 . (i 64) (call leaf.0 p9.0 p8.0 p7.0 p6.0 p5.0 p4.0 p3.0 p2.0 p1.0 p0.0 k7.0 k6.0 k5.0 k4.0 k3.0 k2.0 k1.0 k0.0)) (ret r.0)))
+ (proc :fwdtail.0 (params (param :p0.0 . (f 64)) (param :p1.0 . (f 64)) (param :p2.0 . (f 64)) (param :p3.0 . (f 64)) (param :p4.0 . (f 64)) (param :p5.0 . (f 64)) (param :p6.0 . (f 64)) (param :p7.0 . (f 64)) (param :p8.0 . (f 64)) (param :p9.0 . (f 64)) (param :k0.0 . (i 64)) (param :k1.0 . (i 64)) (param :k2.0 . (i 64)) (param :k3.0 . (i 64)) (param :k4.0 . (i 64)) (param :k5.0 . (i 64)) (param :k6.0 . (i 64)) (param :k7.0 . (i 64))) (i 64) . (stmts (ret (call leaf.0 p9.0 p8.0 p7.0 p6.0 p5.0 p4.0 p3.0 p2.0 p1.0 p0.0 k7.0 k6.0 k5.0 k4.0 k3.0 k2.0 k1.0 k0.0))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (var :u.0 . (i 64) (call fwd.0 0.0 1.0 2.0 3.0 4.0 0.0 1.0 2.0 3.0 4.0 0 1 2 3 4 5 6 7))
+  (var :w.0 . (i 64) (call fwdtail.0 0.0 1.0 2.0 3.0 4.0 0.0 1.0 2.0 3.0 4.0 0 1 2 3 4 5 6 7))
+  (call exit.0 (sub (i 64) u.0 (sub (i 64) w.0 1)))
+))
+)(.index)

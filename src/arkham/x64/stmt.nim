@@ -974,6 +974,7 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
           g.ab.rawReg g.stackArgBaseReg
           g.ab.intLit g.framePushBytesX64().int64
       g.emitFrameSub()
+      g.saveWin64EntryXmm()
       # The PLANNER's spill slots — the `csave` cells of caller-saved homes. They
       # belong here and not where they are decided: a save slot must not sit inside
       # the decl's scope, because arkham emits by a textual walk and a sibling branch

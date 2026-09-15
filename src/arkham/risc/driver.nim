@@ -430,6 +430,11 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       a64.emitSyproc(g, sp)
     for info in g.prog.procs:
       genProc(g, info)
+    for v in g.variadicExterns:                 # the variadic call shapes the bodies used
+      g.ab.tree ExtprocD:
+        g.ab.symDef v.asmName
+        g.ab.str v.extName
+        g.emitSignature(v.decl, v.tail)
     # NOTE: foreign types are NOT emitted here. arkham loads other modules only to
     # resolve their layout for *its own* codegen (sizing, field offsets, ABI). The
     # actual cross-module linking is nifasm's job: a module-suffixed symbol like

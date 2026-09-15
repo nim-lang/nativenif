@@ -17,7 +17,8 @@ Status: **M0–M4d complete.**
 | M5a scalar globals | done — SRAM storage, values stored at entry |
 | M5b constructors as values, nested aggregates | done |
 | M5c `case`, short-circuit `and`/`or`, enums | done — 20 Leng fixtures |
-| M5 wide scalars, stack arguments, divide | not started |
+| M5 arguments past the four pairs | done — an overflow block in the caller's frame, its address in r19:r18 (`MachineDesc.argBlock`) |
+| M5 wide scalars, divide | not started |
 | M6 aggregate globals, flash constants, interrupts | not started |
 
 ### What M4c has

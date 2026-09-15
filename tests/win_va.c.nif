@@ -1,0 +1,10 @@
+(.nif27)
+(stmts
+ (proc :c_va.0 (params (param :fmt.0 . (ptr (c 8))) (param :va.0 . (varargs))) (i 32)
+   (pragmas (importc "c_va") (dynlib "win_abitest")) (stmts .))
+ (proc :ExitProcess.0 (params (param :code.0 . (u 32))) .
+  (pragmas (importc "ExitProcess") (dynlib "kernel32")) (stmts .))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (var :x.0 . (f 64) 2.5)
+  (var :r.0 . (i 32) (call c_va.0 "didiid" 1.5 2 x.0 3 4 0.5))
+  (call ExitProcess.0 (conv (u 32) r.0)))))

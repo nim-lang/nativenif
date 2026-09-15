@@ -23,10 +23,17 @@ import machine_a64 as machine
 from machine_cortexm import nil
 import emit, mem
 
-proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
+proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int;
+                   baseDies = false) =
   ## `dst ←` the aggregate's trailing `aggrSize - byteOff` bytes at `[base + byteOff]`,
   ## right-justified in `dst` (the by-value ABI leaves the word's padding bits
   ## unspecified, so the high bytes are free).
+  ##
+  ## `baseDies` says the caller does not read `base` afterwards. The 3/5/6/7-byte
+  ## case then needs no third register: two in-bounds loads of 2 or 4 bytes cover
+  ## it — the low one at the start, the high one ending at the last byte — and they
+  ## overlap by at most one byte, whose value both carry, so OR joins them exactly.
+  ## The low load goes into `base` itself.
   ##
   ## MODEL: proofs/aggr_marshal.tla, `Algo = "a64tail"`.
   ## Reads NOTHING outside the aggregate. The word a small value ends in may be the
@@ -42,6 +49,12 @@ proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
     g.binImm(LsrA64, dst, int64((w - n) * 8))
   elif n in {1, 2, 4} and n <= w:
     g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff, n))
+  elif baseDies:
+    let part = if n > 4: 4 else: 2                   # 2·part >= n > part
+    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff + n - part, part))
+    g.binImm(LslA64, dst, int64((n - part) * 8))
+    g.ab.tree MovA64: (g.emReg base; g.emScalarAtOff(base, byteOff, part))
+    g.binReg(OrrA64, dst, base)
   else:
     # A 3/5/6/7-byte aggregate: no single load covers it and there is no full word to
     # borrow from, so assemble it from the top byte down.
