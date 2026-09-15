@@ -16,11 +16,11 @@
 
 import std / [assertions]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, temps, typenav, regbind]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 import emit, mem
 
 proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
@@ -138,7 +138,7 @@ proc takeProduceBridge*(g: var CodeGen; typ = ScalarSlot): Reg =
   ##
   ## Its call sites are written against "the produce bridge is free on entry", and
   ## for four of the five that is a local fact: they take it, emit two or three
-  ## instructions, and release it. The fifth (`produceIntoMem2`) holds it across
+  ## instructions, and release it. The fifth (`produceIntoMem`) holds it across
   ## the evaluation of a whole node, which is where the claim stops being local —
   ## a combining node re-enters and would scribble on the partial. Going through
   ## the protocol makes the claim a CHECK: a register that is still bound is not
@@ -169,7 +169,7 @@ proc takeInstrReg*(g: var CodeGen; slot: AsmSlot; atomic: bool): Location =
     g.pickedRegs.incl r
     return regLoc(r, slot, isTemp = true)
   if atomic:
-    let s = g.pickStagingA64()
+    let s = g.pickUnboundReg()
     if s == NoReg:
       result = g.takeHeld("an atomic intrinsic operand")  # fails loudly
       result.typ = slot                        # keep the precise type for the binding
@@ -184,7 +184,7 @@ proc takeInstrReg*(g: var CodeGen; slot: AsmSlot; atomic: bool): Location =
   g.pickedRegs.incl b
   result = regLoc(b, slot, isTemp = true)
 
-proc flatCopyToPtr2*(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
+proc flatCopyToPtr*(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]` through the
   ## (already bound) word scratch `tmp` — the a64 twin of x64's `flatCopyToPtr`. A flat
   ## word copy is byte-accurate whatever the field layout; a PER-FIELD copy would
@@ -229,7 +229,7 @@ proc marshalAggrFromAddr*(g: var CodeGen; addrReg: Reg; typeSym: SymId; firstArg
     else:
       g.loadAggrTail(g.md.intArgRegs[firstArg + i], addrReg, byteSize, i * mw)
 
-proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+proc emitInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                      argCurs: seq[Cursor]) =
   ## `add(d, s)` in an ORDINARY proc: `(add <d's home> <s>)`. The destination is
   ## `(haddr d)` and d's home is whatever the allocator gave it.
@@ -244,7 +244,7 @@ proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   ## possible shape for a diagnostic: the same source compiles or does not
   ## depending on how many locals surround it.
   let row = IntrinsicRows[op]
-  let tag = armInoutTag(op)
+  let tag = inoutInst(op)
   if tag == NopA64:
     lengError c, "`" & IntrinsicNames[op] & "` has no " &
               g.md.targetName & " two-address form",
@@ -259,7 +259,7 @@ proc emitInoutInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     lengError argCurs[0], "the destination of `" & IntrinsicNames[op] & "` must " &
               "be a `var` argument naming a local", lengInfo(c)
   let home = g.plan.locationOfSym(symName(destSym), g.posOf(destSym))
-  # The source was already emitted and memo'd by the fused `emitInstr2`.
+  # The source was already emitted and memo'd by the fused `emitInstr`.
   var src = Location(kind: Undef)
   if row.arity > 1: src = g.plan.planned(g.posOf(argCurs[1]))
   proc emitSrc(g: var CodeGen; src: Location; at: Cursor) =

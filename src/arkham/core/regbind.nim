@@ -94,7 +94,7 @@ type
                                       ## local; released by `takeScratch`
     regBindPtr: set[Reg]              ## regs whose current binding is POINTER-typed:
                                       ## a `(nil)` value only fits such a binding
-                                      ## (x64 `emitValue2` NilC consults this)
+                                      ## (x64 `emitValue` NilC consults this)
     fregLocal: Table[FReg, string]    ## the SIMD twin of `regLocal`
     boundFTmps: set[FReg]             ## the SIMD twin of `boundTemps`
     tmpBindCount: int                 ## per-proc fresh-name counter for `tmpN.0`

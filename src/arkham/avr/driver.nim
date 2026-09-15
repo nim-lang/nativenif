@@ -7,7 +7,7 @@
 
 ## Leng in, AVR asm-NIF out.
 ##
-## **Why this is a new emitter and not the Cortex-M arrangement.** `generateM`
+## **Why this is a new emitter and not the Cortex-M arrangement.** `generateCortexM`
 ## is the AArch64 emitter driven with a different machine model, and that works
 ## because Thumb-2 and AArch64 share the asm-NIF vocabulary at the instruction
 ## level: `add3`, `cmp`, `beq`, `ldr` mean the same thing on both, so a third
@@ -55,8 +55,8 @@ proc generateAvr*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## Compile a parsed Leng module to AVR asm-NIF, which nifasm's `avr` target
   ## assembles into a bare-metal firmware image.
   setTargetWord Word16             # 2-byte pointers, 2-byte platform int
-  var g = newCodeGen(buf, avrMachine)
-  g.ab.renderReg = machine.regName # render a slot as the PAIR it is: `(rpN)`
+  var g = newCodeGen(buf, avrMachine, machine.regName)
+                                   # render a slot as the PAIR it is: `(rpN)`
   g.ab.arch = "avr"                # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags)
   g.rejectForAvr()

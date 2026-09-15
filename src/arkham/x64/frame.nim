@@ -16,7 +16,7 @@
 
 import std / [assertions, tables, sets]
 import nifcore
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil,
                     mirrors, regbind, abi]
 import machine as machine_x64
@@ -50,7 +50,7 @@ proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   # buys a real check: a wide value landing in a narrow local without the extend
   # that converts it is now an error rather than an invisible truncation. Widening
   # reads out of it stay legal; the narrowing write is the `movzx`/`movsx` itself,
-  # which `emitCast2` retypes around (see the pre-retype there).
+  # which `emitCast` retypes around (see the pre-retype there).
   #
   # This used to declare every non-pointer as a flat `(i 64)`, which made the width
   # and signedness of every register-homed local invisible to nifasm.
@@ -730,7 +730,7 @@ proc emProcessExit*(g: var CodeGen; code: Location) =
   ## is not special-cased there at all. (nimony's synthesized `main` never
   ## reaches either path: it terminates through a declared call to `cExit`.)
   assert not g.prog.windows, "arkham x64: emProcessExit on a win_x64 target"
-  g.place2(code, RDI)
+  g.place(code, RDI)
   g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
 
 proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
@@ -738,7 +738,7 @@ proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   ## `loc`. Normally the allocator fixed the producing operand's dest to the result
   ## register, so `loc` IS `resF` and this is a no-op; but when `resF` is a produce-into
   ## staging register (a spilled bin RESULT) the allocator placed the operand in its own
-  ## location — move/load it in (the float analogue of the integer `place2`).
+  ## location — move/load it in (the float analogue of the integer `place`).
   case loc.kind
   of InFReg:
     if loc.f != resF:
@@ -763,7 +763,7 @@ proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
   of InReg: g.movReg(dest, home.r)
   else: g.emSymAddrByName(dest, name)
 
-proc copyStructThroughPtr2*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
+proc copyStructThroughPtr*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
   ## pointer return). This runs at the `ret` and crosses NO call, so its scratch comes
   ## from the transient staging pool, never a callee-saved survivor (a survivor would

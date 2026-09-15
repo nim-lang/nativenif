@@ -134,7 +134,7 @@ than a name, so the temp filter needs to know about it specifically.
 **analyser** — pass 1. Counts definitions and uses per local, and records what
 would disqualify it from a given register class.
 
-**plan** / **planer** — pass 2. Gives every local a home. Keyed by token
+**plan** / **planner** — pass 2. Gives every local a home. Keyed by token
 *position*, not by name; a name is an alias for the position of its
 declaration.
 

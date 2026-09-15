@@ -15,7 +15,7 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind]
 import machine as machine_x64
@@ -150,7 +150,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamCallerSaveDbg):
     # The ALLOCATOR's side of the caller-save audit: for every value it gave a
     # caller-saved home, the live interval it made that decision on, plus every call
-    # position inside it. `emitCall2` prints where it actually saved (`CSCALL`);
+    # position inside it. `emitCall` prints where it actually saved (`CSCALL`);
     # `scratchpad/csdiff.py` joins the two. The emitted asm alone cannot answer this —
     # a value that is live but UNBOUND at a call looks correct to an asm-level audit
     # (nothing to save) and is fatal at run time.
@@ -194,9 +194,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.indirectReg = RBX
     g.plan.usedCallee.incl RBX                   # saved/restored like any callee reg
   # Pure-emit path: the allocator already assigned every value position; emit once.
-  # (The frame is finalized INSIDE emitProcBody2, after the body — body-buffer model.
+  # (The frame is finalized INSIDE emitProcBody, after the body — body-buffer model.
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — keep rsp 16-aligned for that call.)
+  # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. Every per-proc
+  # table (regLocal/boundTemps + the ra.locs snapshot) must be reset here or
+  # RegisterBindingsMatchLoc breaks.
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.postDivergeBinds.setLen 0; g.nameBindTyp.clear()
@@ -211,7 +214,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamBridgeDbg):
     tightCompositions = 0
     lastResortTakes = 0
-  g.emitProcBody2(info, an.hasCall)
+  g.emitProcBody(info, an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE tight=" & $tightCompositions & " lastResort=" &
                      $lastResortTakes & " " & info.asmName
@@ -289,8 +292,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## The foreign edge keeps the unshrunk `win64Machine` — that is an ABI, not an
   ## allocation choice (see `stress.nim`).
   setTargetWord Word64             # x86-64: 8-byte pointers, 8-byte platform int
-  var g = newCodeGen(buf, x64MachineA)
-  g.ab.renderReg = x64RegName                 # render register slots as x86 names
+  var g = newCodeGen(buf, x64MachineA, x64RegName)   # register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows)

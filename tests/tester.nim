@@ -1,7 +1,7 @@
 import std/[os, osproc, streams, strutils]
 # The SHARED intrinsic table arkham itself compiles against — imported for
 # `declared(intrinsics.FldrqOp)` alone, to stage the vector fixtures (see
-# `arkhamStagedVec`) in lock-step with codegen_arm's staged AdvSIMD block.
+# `arkhamStagedVec`) in lock-step with the risc backend's staged AdvSIMD block.
 from "../../nimony/src/lib/intrinsics" import nil
 # The AArch64 encoders, for the byte-level checks below. Importing the module is
 # what lets a test assert an ENCODING rather than a program's output — the only
@@ -104,7 +104,7 @@ const arkhamKnownUnsupported: seq[string] =
   @[]
 
 const arkhamStagedVec: seq[string] =
-  # Staged exactly like codegen_arm's AdvSIMD block (`when declared(FldrqOp)`):
+  # Staged exactly like the risc backend's AdvSIMD block (`when declared(FldrqOp)`):
   # these fixtures declare `{.instruction: "fldrq".}`-family rows, which resolve
   # through the shared `nimony/src/lib/intrinsics` table. Against a nimony
   # checkout whose table lacks the vector rows (CI pins nimony's default
@@ -137,16 +137,16 @@ const arkhamA64Unsupported: seq[string] = @[
   "naked_stacktrace_x64",
   # Six by-ref array params exhaust x86-64's FIVE callee-saved registers, so the
   # sixth pointer spills to a `StackPtr` slot — the shape this fixture exists to
-  # pin (`genAconstr2` must store through that pointer, not over the slot).
+  # pin (`genAconstr` must store through that pointer, not over the slot).
   # AAPCS64 has TEN, so every pointer stays `InReg` and the same source reaches a
-  # DIFFERENT, still-open a64 gap: `genStore2` serves an aggregate destination only
+  # DIFFERENT, still-open a64 gap: `genStore` serves an aggregate destination only
   # for `NamedStack`/`StackPtr`/`Glob`/`Tvar`, and an `InReg` by-ref pointer's home
-  # carries an 8-byte pointer slot (`effSlot`, planer) rather than
+  # carries an 8-byte pointer slot (`effSlot`, planner) rather than
   # `AMem` — so the location cannot say "this register addresses an aggregate" and
-  # the aconstr falls through to `emitValue2`'s scalar arm. Closing it means giving
+  # the aconstr falls through to `emitValue`'s scalar arm. Closing it means giving
   # that home its pointee type, as `StackPtr` already does, NOT re-deriving the fact
   # from `varType` at the use site (the "two answers to one question" shape the
-  # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr2` StackPtr arm
+  # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr` StackPtr arm
   # is in place and mirrors x86-64; it is what this gap currently keeps unreachable.
   "aconstr_byref_spilled",
 ]
@@ -661,7 +661,7 @@ const arkhamStressKnown: seq[string] = @[
   # callee-saved register and under `k=2` stress there was nothing left to go to.
   # Widening it to the idle volatiles fixed them outright.
   # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
-  # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the
+  # (71 -> 95)": `produceIntoMem` hands the produce bridge to the WHOLE node on the
   # claim that it is "not held across the recursion" — true for a leaf or a load,
   # false for a binop, whose left partial sits in the bridge while the other side is
   # Verified 2026-08-09 across k=2..5: the fixture either returns the correct 71
@@ -693,7 +693,7 @@ const arkhamStressA64Known: seq[string] = @[
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
   # (`a64_vec_instr` lived here — six 128-bit vector locals live at once
   # overran the stress-starved SIMD pool into the designed loud
-  # out-of-registers error. The planer's early-free now covers `InFReg`
+  # out-of-registers error. The planner's early-free now covers `InFReg`
   # homes too, so the dead vector temps hand their registers back in time
   # and the fixture passes even stressed.)
   # (`atomic_cas_regpressure` and `atomic_cas_operand_home` lived here for the
@@ -711,8 +711,8 @@ const arkhamStressA64Known: seq[string] = @[
   # class — a spilled `(u 8)` whose slot arkham declared `(i 64)`. Slots now carry
   # their own type, so the class is gone and the fixture passes.)
   # NOT listed, but known: `addr_chain_depth` is the x16 twin of the x86-64
-  # `addr_chain_depth` entry above — `produceIntoMem2` re-enters the produce
-  # bridge while an enclosing `emitBin2`'s partial is still live in it — and
+  # `addr_chain_depth` entry above — `produceIntoMem` re-enters the produce
+  # bridge while an enclosing `emitBin`'s partial is still live in it — and
   # silently returns 221 instead of 71 at k<=2 (22 instead of 64 at chain depth
   # 10). It passes at this list's own k=3, so listing it would only report
   # "now passes". Lowering `arkhamStressA64Level` needs that fix first.
@@ -815,7 +815,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
   # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
   # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary
-  # has no flag-setting `adds`/`subs`. See codegen_arm's KeepovfS.)
+  # has no flag-setting `adds`/`subs`. See risc/stmt's KeepovfS.)
   #
   # The a64 backend otherwise reaches x86-64 parity on every arkham test, including
   # the value-core aggregate paths: object/array constructors as a var-init, a call
@@ -825,7 +825,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # `(at (dot h arr) i)`) computed the wrong address; now folded like the x64 parser.
 ]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
-  # addressing: codegen_arm now uses the same premat-before-tree two-pass
+  # addressing: the risc backend now uses the same premat-before-tree two-pass
   # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
   # index, and a non-scale stride's scratch into registers *before* the operand tree
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
@@ -1611,7 +1611,7 @@ const rv32StressLevel = 2
   ## — which leaves ONE temp — then describes a machine below what the emitter is
   ## written against: `array2d` reaches an `(at …)` whose stride scratch finds no
   ## pool register, takes a bridge, and leaves an enclosed step with none while
-  ## `produceIntoMem2` holds the other.
+  ## `produceIntoMem` holds the other.
   ##
   ## That is a demand statement, not a finding, which is exactly what `StagingFloor`
   ## says about `k=1` on x86-64. `k=2` is the real floor: the pools must be able to
@@ -2230,7 +2230,7 @@ const cortexMUnsupported: seq[string] = @[
   "mul_overflow", "mul_overflow_pow2",
 
   # ── register pressure ───────────────────────────────────────────────────────
-  # Four allocatable homes and an empty volatile pool (see machine_m.nim). Each
+  # Four allocatable homes and an empty volatile pool (see machine_cortexm.nim). Each
   # of these fails LOUDLY at the pick — never with a wrong answer.
   #
   # The list shrank again when the last-resort scratch draw learned which

@@ -18,7 +18,7 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, typeutil, regbind, diag]
 import machine
 

@@ -22,11 +22,11 @@
 
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     stress, context, typeutil, bridges, 
                     mirrors, temps, typenav, regbind, abi]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
 from thumbimm import nil
 
@@ -90,28 +90,9 @@ const StackArgFpBias* = 16
 
 template posOf*(g: CodeGen; cur: Cursor): int = cursorToPosition(g.buf[], cur)
 
-const ThreeOpA64* = {AddA64, SubA64, MulA64, AndA64, OrrA64, EorA64,
-                    LslA64, LsrA64, AsrA64}
+const ThreeOpInsts* = {AddA64, SubA64, MulA64, AndA64, OrrA64, EorA64,
+                       LslA64, LsrA64, AsrA64}
   ## Ops with a native 3-operand `(op D A B)` nifasm encoding (see parseArith3A64).
-
-# Order in which a codegen-time steal looks for a victim register-local: prefer
-# the volatile temp pool (x9–x15 — call-free locals the allocator put there once
-# the callee-saved pool was full, the common case), then callee-saved (x19–x28).
-# Fixed order ⇒ the plan and emit passes pick the same victim deterministically.
-# `w32` selects the 32-bit W-form tag (`add`→`addw`, `add3`→`addw3`, …) for an
-# UNSIGNED 32-bit result: the W-form auto zero-extends into bits 32..63, so the
-# `normalizeBinWidth` shift-pair that would otherwise re-clear the top half is
-# elided (see emitBin2). Only add/sub/mul have W-forms; other ops pass w32 = false.
-# 3-operand forms `(op3 D A B)` → `D = A op B` (arm64 native, non-destructive). Used
-# when the left source `A` is a still-live local in a register distinct from the
-# result `D`, so the value is computed without a preceding `mov D, A`. The 2-operand
-# op tag is mapped to its distinct 3-operand tag (`add`→`add3`, …); nifasm dispatches
-# on the tag's fixed arity (see parse3OperandsA64).
-const
-  CpacrAddr* = 0xE000ED88'i64
-    ## The Coprocessor Access Control Register.
-  CpacrFullAccessCp10Cp11* = 0x00F00000'i64
-    ## Full access for CP10 and CP11 — the two coprocessor slots the FPU lives in.
 
 const
   UDivMod64Base* = "`udivmod64.0"
@@ -171,6 +152,22 @@ proc emReg*(g: var CodeGen; r: Reg) {.inline.} =
       "arkham: unbound scratch-pool register reached emReg: " & g.ab.renderReg(r)
     g.ab.rawReg r
 
+proc argReg*(g: CodeGen; i: int): Reg {.inline.} =
+  ## Argument register `i` of the target being emitted for.
+  ##
+  ## This file is HAND-WRITTEN asm-NIF, not allocator output, so it names its
+  ## registers directly — and naming them `R0`..`R3` was correct only while the
+  ## one target with a runtime happened to put its arguments there. Cortex-M's
+  ## `a0`–`a3` are `r0`–`r3`; RV32's are `x10`–`x13`. Reading them off the
+  ## machine description is what lets one runtime serve both, and is the same
+  ## move `MachineDesc`'s register ROLES already made for the emitter.
+  ##
+  ## `argReg(0)` is also the RESULT register on every target here — `intRetReg`
+  ## and `intArgRegs[0]` coincide — so a shim that computes into it needs no
+  ## separate spelling.
+  assert i < g.md.intArgRegs.len, "runtime: argument register out of range"
+  g.md.intArgRegs[i]
+
 proc emOp*(g: CodeGen; r: Reg): string =
   ## The asm-NIF operand spelling of register `r` for a `splice`d text fragment — the
   ## text-path counterpart of `emReg` (`emReg` can't be used because `splice` consumes
@@ -214,6 +211,10 @@ proc movReg*(g: var CodeGen; d, s: Reg) =
   if d == s: return
   g.ab.tree MovA64: g.emReg d; g.emReg s
 
+# `w32` selects the 32-bit W-form tag (`add`→`addw`, `add3`→`addw3`, …) for an
+# UNSIGNED 32-bit result: the W-form auto zero-extends into bits 32..63, so the
+# `normalizeBinWidth` shift-pair that would otherwise re-clear the top half is
+# elided (see emitBin). Only add/sub/mul have W-forms; other ops pass w32 = false.
 proc wForm(op: RiscInst): RiscInst =
   case op
   of AddA64: AddwA64
@@ -223,7 +224,7 @@ proc wForm(op: RiscInst): RiscInst =
 
 proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   ## The tag the SHARED intrinsic row table uses for the target being emitted.
-  ## `codegen_arm` serves both Arm profiles, and reading `tgA64` for both was a
+  ## This emitter serves both Arm profiles, and reading `tgA64` for both was a
   ## proxy that held only while no row distinguished them; the volatile rows do.
   case g.md.arch
   of X86: tgX64
@@ -275,6 +276,11 @@ proc emNeg*(g: var CodeGen; d: Reg) =
   else:
     g.ab.tree NegA64: (g.emReg d; g.emReg d)
 
+# 3-operand forms `(op3 D A B)` → `D = A op B` (arm64 native, non-destructive). Used
+# when the left source `A` is a still-live local in a register distinct from the
+# result `D`, so the value is computed without a preceding `mov D, A`. The 2-operand
+# op tag is mapped to its distinct 3-operand tag (`add`→`add3`, …); nifasm dispatches
+# on the tag's fixed arity (see parse3OperandsA64).
 proc threeOpTag(op: RiscInst; w32 = false): RiscInst =
   if w32:
     case op
@@ -302,22 +308,6 @@ proc binImm3*(g: var CodeGen; op: RiscInst; d, a: Reg; v: int64; w32 = false) =
 
 proc emAdr*(g: var CodeGen; d: Reg; sym: string) =
   g.ab.tree AdrA64: g.emReg d; g.ab.sym sym
-
-proc emLdaxr(g: var CodeGen; rt, rn: Reg) =        # rt ← exclusive-acquire [rn]
-  g.ab.tree LdaxrA64: g.emReg rt; g.emReg rn
-
-proc emStlxr(g: var CodeGen; rs, rt, rn: Reg) =    # store-release-exclusive rt→[rn]; rs←status
-  g.ab.tree StlxrA64: g.emReg rs; g.emReg rt; g.emReg rn
-
-proc emLdar*(g: var CodeGen; rt, rn: Reg; bits = 64) =   # rt ← acquire [rn] (sized)
-  g.ab.tree LdarA64:
-    g.emReg rt; g.emReg rn
-    if bits != 64: g.ab.intLit bits
-
-proc emStlr*(g: var CodeGen; rt, rn: Reg; bits = 64) =   # release store rt→[rn] (sized)
-  g.ab.tree StlrA64:
-    g.emReg rt; g.emReg rn
-    if bits != 64: g.ab.intLit bits
 
 proc emByteAt*(g: var CodeGen; base, idx: Reg) =
   ## `(mem (at (cast (aptr (u 8)) base) idx))` — the byte at `base[idx]`.
@@ -380,7 +370,7 @@ proc produceBridge*(g: CodeGen): Reg {.inline.} =
   ## The third always-free scratch, beyond the two staging bridges. AArch64
   ## borrows the assembler's x16 (IP0); Cortex-M cannot borrow nifasm's r12,
   ## because nifasm folds operands through it at sites this emitter never sees,
-  ## so it dedicates r8 instead (see `machine_m.ProduceBridge`).
+  ## so it dedicates r8 instead (see `machine_cortexm.ProduceBridge`).
   ##
   ## Read from the machine description rather than chosen here: slot R16 is not
   ## even MAPPED on Cortex-M, so the `if thumbM` this used to be could — and once
@@ -390,7 +380,7 @@ proc produceBridge*(g: CodeGen): Reg {.inline.} =
 proc indirectResultReg*(g: CodeGen): Reg {.inline.} =
   ## Where the caller leaves `&result` for an aggregate return too wide for
   ## registers. AArch64 has a dedicated x8 off the argument file; Cortex-M has no
-  ## such register and dedicates r9 (see `machine_m.IndirectResultReg`), which
+  ## such register and dedicates r9 (see `machine_cortexm.IndirectResultReg`), which
   ## keeps this emitter's one code shape working on both.
   g.md.indirectResultReg
 
@@ -454,6 +444,22 @@ proc fmovF*(g: var CodeGen; d, s: FReg; bits: int) =
   if d == s: return
   g.ab.tree FmovA64: g.emFReg(d, bits); g.emFReg(s, bits)
 
+# `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
+# to pick single- vs double-precision encodings.
+# The GPR side of an `fmov` bitcast is a VALUE, so it goes through `emReg` like
+# every other value operand — a bound register by its checked name, a raw tag
+# otherwise, and the unbound-scratch assertion in between.
+#
+# It used to be spelled by name on Cortex-M and RAW on AArch64, and the split was
+# not arkham's choice at all: nifasm's AArch64 handlers for `fmov`/`scvtf`/
+# `fcvtzs` read that operand with `parseRegisterA64`, which accepts a register
+# TAG and nothing else, while the Thumb-2 handlers have always gone through the
+# operand parser and taken either. So the emitter carried a branch to satisfy an
+# asymmetry one level down, and the value check had a hole on the target with the
+# larger register file. Both handlers now use `parseGprA64` — the resolving form,
+# which additionally rejects a raw use of a BOUND register — and the only
+# difference in the output is that such a register is named where it used to be
+# spelled raw, which nifasm resolves back to the same register.
 proc fmovFromGpr*(g: var CodeGen; d: FReg; s: Reg; bits: int) =   # fmov dD/sD, xS/wS (bits)
   g.ab.tree FmovA64:
     g.emFReg(d, bits)
@@ -720,6 +726,22 @@ when defined(arkhamBridgeDbg):
   ## the one that decides whether a fixed reservation composes; see design.md.
   var dbgPeakBridges*: int = 0
   var dbgPeakHeldAtRecursion*: int = 0
+proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
+  ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
+  ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
+  ## checker can't see. The binding is recorded as a transient temp; released by
+  ## `unbindTemp`.
+  let name = g.rb.freshTmpName()
+  g.ab.tree RebindA64:
+    g.ab.symDef name
+    g.emBindType(typ)
+    g.ab.rawReg r
+  g.rb.bindScratch(r, name, g.slotIsPointer(typ))
+  g.tmpBindTyp[r] = typ                 # what the register is TYPED as, for a later
+                                        # `(rebind …)` and for `mirrorStored`, which
+                                        # may only forward a value whose binding type
+                                        # is the slot's own (x64's `bindTemp` twin)
+
 proc unbindTemp*(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
   ## binding. A no-op when `r` carries no temp binding (so it is safe on every
@@ -1151,7 +1173,7 @@ proc cmpOperandUnsigned*(g: var CodeGen; c: Cursor): bool =
   of IntLit: result = false
   else: result = not isSignedType(resolveType(g.prog, g.getType(c)))
 
-proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false)
+proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false)
 
 type AggrEnd* = object
   ## One end (source or destination) of a whole-aggregate copy, in the form the
@@ -1189,14 +1211,14 @@ proc bridgeRegs*(g: CodeGen): seq[Reg] {.inline.} =
   ## between two computed ends really did hold three at once.
   ##
   ## The third is the produce bridge (x16 / r8), last in the order deliberately: its
-  ## own call sites (`produceIntoMem2` and friends, via `takeProduceBridge`) still
+  ## own call sites (`produceIntoMem` and friends, via `takeProduceBridge`) still
   ## get it first, and the staging draw reaches it only where it would otherwise
   ## have had nothing.
   g.md.bridgeRegs
 
 proc liveBridges*(g: CodeGen): int =
   ## How many DISTINCT reserved bridges are live right now. BOUND or merely
-  ## RESERVED: `produceIntoMem2` threads its bridge into `emitValue2` UNBOUND on
+  ## RESERVED: `produceIntoMem` threads its bridge into `emitValue` UNBOUND on
   ## purpose (a leaf may produce raw into it, and only then is it bound for the
   ## store), holding it with `pickedRegs` alone — so a bound-only count would miss
   ## precisely the site whose invariant this is. Counting bound-only reports a
@@ -1224,8 +1246,6 @@ export bridges
 # The scope machinery itself is arch-neutral and lives in `core/bridges`. What
 # stays here is the pair of numbers this target answers it with: `bridgeRegs` is
 # reserved outright, so its capacity and its guarantee are the same count.
-
-template bridgeStackHeld(g: CodeGen): untyped = g.heldBridgeNames()
 
 proc bridgeRaise*(g: var CodeGen; demand: BridgeDemand; what: string) {.inline.} =
   bridges.bridgeRaise(g, demand, what, g.distinctBridges())
@@ -1255,8 +1275,8 @@ template withBridges*(g: var CodeGen; demand: BridgeDemand; what: string;
     body
 
 template bridgeStep*(g: var CodeGen; what: string; demand = bdTransient) =
-  ## The implicit scope every RECURSIVE emit entry opens (`emitValue2`,
-  ## `genStore2`, `emitLvalue2`). Scoped to the rest of the enclosing proc via
+  ## The implicit scope every RECURSIVE emit entry opens (`emitValue`,
+  ## `genStore`, `emitLvalue`). Scoped to the rest of the enclosing proc via
   ## `defer`, because those procs return from many places.
   when BridgeCheck:
     bridgeScopePush(g, demand, what, g.liveBridges(), g.distinctBridges(),
@@ -1328,7 +1348,7 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
     g.pickedRegs.incl r
     return regLoc(r, ScalarSlot, isTemp = true)
   # Second chance, callee-saved only (the value must survive a call): judged by
-  # LIVE bindings instead of the `regHoldsHome` union — see `pickStagingA64` for
+  # LIVE bindings instead of the `regHoldsHome` union — see `pickUnboundReg` for
   # why the union is what runs out under `-d:release`.
   for cs in g.md.intCalleeSaved:
     if cs notin g.pickedRegs and cs notin g.rawHomeRegs and not g.plan.isSealed(cs) and
@@ -1356,7 +1376,7 @@ proc tryTakeHeld*(g: var CodeGen): Location =
   g.pickedRegs.incl r
   result = regLoc(r, ScalarSlot, isTemp = true)
 
-proc pickStagingA64*(g: var CodeGen): Reg =
+proc pickUnboundReg*(g: var CodeGen): Reg =
   ## Last-resort transient GPR for an operand that MUST be in a register and cannot
   ## use a bridge (an atomic's operands: its LL/SC sequence owns x14/x15/x16).
   ##
@@ -1391,7 +1411,7 @@ proc pickStagingA64*(g: var CodeGen): Reg =
     # registers. Cortex-M's pool is EMPTY by design — its only caller-saved
     # registers ARE r0–r3, so
     # letting the ALLOCATOR home a value there means handing out r1 as a temp while
-    # r1 holds staged argument word 1 (see `machine_m.IntTempRegs`, where that bug
+    # r1 holds staged argument word 1 (see `machine_cortexm.IntTempRegs`, where that bug
     # is written up). The pool stays empty for exactly that reason.
     #
     # What this adds is narrower than a pool: a TRANSIENT the emitter takes and
@@ -1418,7 +1438,7 @@ proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
   ## A register that has become a MIRROR was already released — by the store that
   ## made it one — and its binding is now the map's, not this value's. Killing it
   ## here would undo the forwarding at the very moment it becomes useful (the
-  ## caller of `storeScalar2` frees the value it just stored).
+  ## caller of `storeScalar` frees the value it just stored).
   if loc.kind == InReg and loc.isTemp:
     g.pickedRegs.excl loc.r
     if not g.rb.isMirror(loc.r): g.unbindTemp(loc.r)
@@ -1467,7 +1487,7 @@ proc globalAddrSlot*(g: var CodeGen; name: string): AsmSlot =
   ## way. The type comes from the DECLARATION, so there is no case with no answer.
   typeToSlot(g.prog.ptrTypeOf(g.globalDeclType(name)))
 
-proc restoreMemBase2*(g: var CodeGen; pos: int) =
+proc restoreMemBase*(g: var CodeGen; pos: int) =
   if g.savedHomes.hasKey(pos):
     g.dropBridge g.plan.planned(pos).r
     g.plan.planAtEmitTime(pos, g.savedHomes[pos])
@@ -1477,12 +1497,12 @@ proc inlineAggrHome*(g: var CodeGen; c: Cursor): string =
   ## The stack slot standing in for an aggregate CONSTRUCTOR used as an lvalue base —
   ## `[a, b][i]`, which hexer hands over as `(at (aconstr …) i)`. A constructor is a
   ## value, not a location, so there is nothing to address until one exists; this
-  ## names the slot that `prematLval2` builds it into and `emLvalAddr2` then reads.
+  ## names the slot that `prematLval` builds it into and `emLvalAddr` then reads.
   ## Keyed on the node's position, so both passes name the same slot without a side
   ## table.
   synth("lvaltmp") & $g.posOf(c) & ".0"
 
-proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
+proc emLvalAddr*(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (operand of a `(mem …)`/`(lea
   ## …)`), reading any embedded value register from its pre-allocated `locs`.
   case c.kind
@@ -1492,7 +1512,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
     if loc.kind == NoLoc:                                 # module-level global base
       let planned = g.plan.planned(g.posOf(c))
       # An allocated register, or — when the walk had none to give — the bridge
-      # `prematLval2` derived `&g` into late (see `lateGlobalBase`).
+      # `prematLval` derived `&g` into late (see `lateGlobalBase`).
       let baseReg = if planned.kind == InReg: planned.r
                     else: g.lvalGlobBase[g.posOf(c)]
       let si = g.lookupSym(nm)
@@ -1521,7 +1541,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
       g.ab.tree DotX:
         var cc = c
         cc.into:
-          g.emLvalAddr2(cc); skip cc                      # base
+          g.emLvalAddr(cc); skip cc                       # base
           g.ab.sym symName(cc); skip cc                   # field name
           while cc.hasMore: skip cc
     of AtC:
@@ -1529,7 +1549,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
       g.ab.tree AtX:
         var cc = c
         cc.into:
-          g.emLvalAddr2(cc); skip cc                      # base
+          g.emLvalAddr(cc); skip cc                       # base
           case cc.kind                                    # index (nifasm scales it)
           of IntLit: g.ab.intLit intVal(cc)
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
@@ -1588,12 +1608,12 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
               g.emReg pReg.r
             while dc.hasMore: skip dc
         else:
-          g.emLvalAddr2(cc)                               # transparent
+          g.emLvalAddr(cc)                                # transparent
         while cc.hasMore: skip cc
     of AconstrC, OconstrC:
-      g.ab.sym g.inlineAggrHome(c)                        # built by `prematLval2`
-    else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
-  else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
+      g.ab.sym g.inlineAggrHome(c)                        # built by `prematLval`
+    else: raiseAssert "arkham a64n: emLvalAddr expr " & $c.exprKind
+  else: raiseAssert "arkham a64n: emLvalAddr kind " & $c.kind
 
 proc lvalMaterializedRegs(g: CodeGen; c: Cursor; acc: var set[Reg]) =
   ## Every register the lvalue/value subtree `c` has materialized something into (a
@@ -1641,7 +1661,7 @@ proc lateGlobalBase*(g: var CodeGen; c: Cursor): bool =
   ##
   ## A global's address is RE-DERIVABLE: `adrp`+`add` of a link-time label, no inputs.
   ## So the step never actually needed a register that outlives a call; it only needed
-  ## one because `prematLval2` materializes the base BEFORE the index. Deriving it
+  ## one because `prematLval` materializes the base BEFORE the index. Deriving it
   ## after instead costs nothing at run time and removes the demand entirely — the
   ## same reasoning `fieldLocGlob` states on x64, and what design.md means by fixing
   ## it "in the demand of the step that asked" rather than in a bigger pool.
@@ -1658,7 +1678,7 @@ proc lateSpilledBase*(g: var CodeGen; c: Cursor): bool =
   ##
   ## That holding is the composition I3 exists to remove. Measured, it is the ONLY
   ## one left: an outer `p[i]` whose pointer spilled holds a bridge, a
-  ## `produceIntoMem2` inside the index holds the produce bridge, and the inner
+  ## `produceIntoMem` inside the index holds the produce bridge, and the inner
   ## address chain then declares two with one free. Deriving the base late drops the
   ## outer holder and with it the composition — at no run-time cost, because the
   ## `ldr` happens either way and only its POSITION changes.
@@ -1672,7 +1692,7 @@ proc lateSpilledBase*(g: var CodeGen; c: Cursor): bool =
   let loc = g.plan.planned(g.posOf(c))
   loc.kind == NamedStack and loc.spillTemp
 
-proc binA64Op*(g: var CodeGen; c: Cursor): RiscInst =
+proc binInst*(g: var CodeGen; c: Cursor): RiscInst =
   ## The a64 opcode for a binary-arith node; div/shift signedness from the result type.
   var rt: Cursor
   block:
@@ -1691,7 +1711,7 @@ proc binA64Op*(g: var CodeGen; c: Cursor): RiscInst =
   of BitandC: AndA64
   of BitorC: OrrA64
   of BitxorC: EorA64
-  else: raiseAssert "arkham a64n: binA64Op " & $c.exprKind
+  else: raiseAssert "arkham a64n: binInst " & $c.exprKind
 
 proc isLogicalImmA64(v: int64): bool =
   ## Is `v` an AArch64 "bitmask immediate" — the form `and`/`orr`/`eor` take
@@ -1728,7 +1748,7 @@ proc normalizeUnaryWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
 
 proc isUnsigned32*(resTypeC: Cursor): bool =
   ## True for a `(u 32)` result — the case where an add/sub/mul W-form gives the
-  ## fully-normalized (zero-extended) value for free, letting emitBin2 both emit the
+  ## fully-normalized (zero-extended) value for free, letting emitBin both emit the
   ## `addw`/`subw`/`mulw` tag and skip the `normalizeBinWidth` shift-pair.
   let slot = typeToSlot(resTypeC)
   slot.kind == AUInt and slot.size == 4
@@ -1747,13 +1767,13 @@ proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: RiscInst)
   if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
     g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
 
-proc fbinA64Op*(ek: LengExpr): RiscInst =
+proc fbinInst*(ek: LengExpr): RiscInst =
   case ek
   of AddC: FaddA64
   of SubC: FsubA64
   of MulC: FmulA64
   of DivC: FdivA64
-  else: raiseAssert "arkham a64n: fbinA64Op " & $ek
+  else: raiseAssert "arkham a64n: fbinInst " & $ek
 
 proc atomicBits*(g: var CodeGen; ptrArg: Cursor): int =
   ## Access width (bits) of an atomic = the size of the pointee of `ptrArg` (a `ptr T`).
@@ -1826,187 +1846,6 @@ proc releaseArgSpan*(g: var CodeGen; first, words: int; valueSym: string) =
   for k in 0 ..< words:
     if first + k < g.md.intArgRegs.len:
       g.releaseArgDest(g.md.intArgRegs[first + k], valueSym)
-
-proc emitAtomicRmw2*(g: var CodeGen; dst, p, v: Reg; opStr: string;
-                    isXchg, returnNew: bool; bits: int) =
-  ## `loop: ldaxr old,[p]; new = old op v (or v, for an exchange); stlxr st,new,[p];
-  ## cmp st,0; beq done` — a non-zero status means another agent won the line, so
-  ## the loop falls through to nifasm's internal back-edge and re-reads.
-  ##
-  ## `old`/`new`/`st` are the dedicated scratch (`AtomicScratchRegs`); `p` and `v`
-  ## are only ever read, which is what lets `dst` alias either of them.
-  let lDone = g.freshLabel()
-  let (pS, vS) = (g.emOp p, g.emOp v)
-  let old = g.emOp g.md.atomicScratch[0]
-  let neu = g.emOp g.md.atomicScratch[1]
-  let st = g.emOp g.md.atomicScratch[2]
-  let w = wsfx(bits)
-  let update = if isXchg: &"(mov {neu} {vS})" else: &"(mov {neu} {old}) ({opStr} {neu} {vS})"
-  # Structured `(loop …)`: nifasm emits the back-edge internally. The exclusive
-  # store SUCCEEDS when `st == 0` → the forward `(beq lDone)` leaves the loop.
-  g.ab.splice &"(loop (stmts (ldaxr {old} {pS}{w}) " & update & " " &
-              &"(stlxr {st} {neu} {pS}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
-  g.movReg(dst, g.md.atomicScratch[if returnNew: 1 else: 0])
-
-proc emitAtomicRmwRv*(g: var CodeGen; dst, p, v: Reg; opTag: RiscInst;
-                     isXchg, returnNew: bool) =
-  ## `loop: lr.w old,(p); new = old op v (or v); sc.w st,new,(p); cmp st,0;
-  ## beq done` — a non-zero status means the reservation was lost, so the loop
-  ## falls through to nifasm's internal back-edge and re-reads.
-  ##
-  ## Structurally the Cortex-M twin, and deliberately so: `ldrex`/`strex` and
-  ## `lr.w`/`sc.w` are the same instruction pair with different names, down to
-  ## the status register's sense (zero is success on both). What differs is the
-  ## ORDERING — RISC-V carries it in the `aq`/`rl` bits of the pair, which is what
-  ## `AcqRelExclusives` names, so no fence is emitted around the loop.
-  ##
-  ## Word-only. RV32's A extension has `lr.w`/`sc.w` and no byte or halfword form
-  ## at all, so a narrower atomic is refused by name before reaching here rather
-  ## than widened — a byte cell widened to a word is a read-modify-write of the
-  ## three neighbours it shares the word with.
-  let old = g.md.atomicScratch[0]
-  let neu = g.md.atomicScratch[1]
-  let st = g.md.atomicScratch[2]
-  let lDone = g.freshLabel()
-  g.emitLoop:
-    g.ab.tree LrwRv: (g.emReg old; g.emReg p)
-    if isXchg:
-      g.ab.tree MovA64: (g.emReg neu; g.emReg v)
-    else:
-      g.ab.tree MovA64: (g.emReg neu; g.emReg old)
-      g.ab.tree opTag: (g.emReg neu; g.emReg v)
-    g.ab.tree ScwRv: (g.emReg st; g.emReg neu; g.emReg p)
-    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
-    g.emBr(BeqA64, lDone)
-  g.emLab(lDone)
-  g.movReg(dst, if returnNew: neu else: old)
-
-proc emitAtomicCasRv*(g: var CodeGen; ret, p, ep, d: Reg) =
-  ## Compare-and-exchange. `ep` points at the EXPECTED value and the failure path
-  ## must publish what was actually there — that is the protocol, not a detail:
-  ## the caller retries against the value it now holds.
-  ##
-  ## No `clrex` on the failure path. AArch64 and ARMv7-M both have to abandon the
-  ## claim their exclusive load took; on RISC-V a reservation is broken implicitly
-  ## — by any `sc.w`, by a trap, and in the worst case by the next `lr.w` — so
-  ## there is no instruction to emit and nothing left holding a line.
-  let exp = g.md.atomicScratch[0]
-  let old = g.md.atomicScratch[1]
-  let st = g.md.atomicScratch[2]
-  let lSucc = g.freshLabel()
-  let lFail = g.freshLabel()
-  let lDone = g.freshLabel()
-  g.ab.tree MovA64:
-    g.emReg exp
-    g.ab.tree MemX: (g.emReg ep; g.ab.intLit 0)
-  g.emitLoop:
-    g.ab.tree LrwRv: (g.emReg old; g.emReg p)
-    g.ab.tree CmpA64: (g.emReg old; g.emReg exp)
-    g.emBr(BneA64, lFail)
-    g.ab.tree ScwRv: (g.emReg st; g.emReg d; g.emReg p)
-    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
-    g.emBr(BeqA64, lSucc)
-  g.emLab(lSucc)
-  g.movImm(ret, 1)
-  g.emBr(BA64, lDone)
-  g.emLab(lFail)
-  g.ab.tree MovA64:
-    g.ab.tree MemX: (g.emReg ep; g.ab.intLit 0)
-    g.emReg old
-  g.movImm(ret, 0)
-  g.emLab(lDone)
-
-proc emAtomicLoadM*(g: var CodeGen; dst, p: Reg; bits: int) =
-  ## `dst ← the bits-wide cell at [p]`, zero-extended. Not an exclusive load:
-  ## nothing is claimed, because nothing is going to be stored back.
-  # Each arm emits its own tree: `ldrb`/`ldrh` are `MInst` members and `ldr` is an
-  # `RiscInst` one (the shared spelling lives in the A64 enum), so there is no
-  # common variable to select into — the tag IDS are what nifasm reads, and those
-  # agree.
-  case bits
-  of 8:
-    g.ab.tree LdrbM:
-      g.emReg dst
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-  of 16:
-    g.ab.tree LdrhM:
-      g.emReg dst
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-  else:
-    g.ab.tree LdrA64:
-      g.emReg dst
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-
-proc emAtomicStoreM*(g: var CodeGen; p, src: Reg; bits: int) =
-  case bits
-  of 8:
-    g.ab.tree StrbM:
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-      g.emReg src
-  of 16:
-    g.ab.tree StrhM:
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-      g.emReg src
-  else:
-    g.ab.tree StrA64:
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-      g.emReg src
-
-proc emitAtomicRmwM*(g: var CodeGen; dst, p, v: Reg; opTag: RiscInst;
-                    isXchg, returnNew: bool; bits: int) =
-  ## `loop: ldrex old,[p]; new = old op v (or v); strex st,new,[p]; cmp st,0;
-  ## beq done` — a non-zero status means another agent won the line, so the loop
-  ## falls through to nifasm's internal back-edge and re-reads.
-  ##
-  ## `old`/`new`/`st` are the three reserved bridges; `p` and `v` are only ever
-  ## read, which is what lets `dst` alias either of them.
-  let old = g.md.atomicScratch[0]
-  let neu = g.md.atomicScratch[1]
-  let st = g.md.atomicScratch[2]
-  let lDone = g.freshLabel()
-  g.emitLoop:
-    g.ab.tree LdrexM: (g.emReg old; g.emReg p; g.ab.intLit bits)
-    if isXchg:
-      g.ab.tree MovA64: (g.emReg neu; g.emReg v)
-    else:
-      g.ab.tree MovA64: (g.emReg neu; g.emReg old)
-      g.ab.tree opTag: (g.emReg neu; g.emReg v)
-    g.ab.tree StrexM: (g.emReg st; g.emReg neu; g.emReg p; g.ab.intLit bits)
-    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
-    g.emBr(BeqA64, lDone)
-  g.emLab(lDone)
-  # A sub-word RMW computed on a zero-extended `old`, so the result needs no
-  # narrowing: `strex{b,h}` stores the low bits and the returned value is what
-  # the cell holds.
-  g.movReg(dst, if returnNew: neu else: old)
-
-proc emitAtomicCasM*(g: var CodeGen; ret, p, ep, d: Reg; bits: int) =
-  ## Compare-and-swap. The FAILURE path is the whole protocol: it publishes what
-  ## the cell actually held through `ep`, so the caller retries against the value
-  ## it now holds — and it must `clrex` first, because it leaves the pair without
-  ## the store and the monitor would otherwise stay armed on this address.
-  let exp = g.md.atomicScratch[0]
-  let old = g.md.atomicScratch[1]
-  let st = g.md.atomicScratch[2]
-  let lSucc = g.freshLabel()
-  let lFail = g.freshLabel()
-  let lDone = g.freshLabel()
-  g.emAtomicLoadM(exp, ep, bits)
-  g.emitLoop:
-    g.ab.tree LdrexM: (g.emReg old; g.emReg p; g.ab.intLit bits)
-    g.ab.tree CmpA64: (g.emReg old; g.emReg exp)
-    g.emBr(BneA64, lFail)
-    g.ab.tree StrexM: (g.emReg st; g.emReg d; g.emReg p; g.ab.intLit bits)
-    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
-    g.emBr(BeqA64, lSucc)
-  g.emLab(lSucc)
-  g.movImm(ret, 1)
-  g.emBr(BA64, lDone)
-  g.emLab(lFail)
-  g.ab.keyword ClrexM
-  g.emAtomicStoreM(ep, old, bits)
-  g.movImm(ret, 0)
-  g.emLab(lDone)
 
 proc proctypeOfTarget*(g: var CodeGen; targetCur: Cursor): Cursor =
   ## The resolved proctype body of an indirect call target, for ABI queries. The target
@@ -2142,7 +1981,7 @@ proc dstAggrInfo*(g: var CodeGen; dst: Location): (bool, int) =
 
 proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED: decide (only) where an lvalue-embedded VALUE — a deref'd pointer, a
-  ## computed index — will live; `prematLval2` materializes it later. A symbol
+  ## computed index — will live; `prematLval` materializes it later. A symbol
   ## resolves to its home, a literal to an immediate, a computed subtree to a
   ## reserved temp (its computation emits at premat time, dest-threaded).
   case c.kind
@@ -2172,23 +2011,23 @@ proc reserveStrideScratch*(g: var CodeGen; atPos: int) =
   ## so the `heldN.0` spill fallback `takeHeld` offers cannot serve it. Fall back to a
   ## staging bridge instead — never allocator-assigned, so it neither starves nor can
   ## alias the base/index nifasm requires it to differ from. The bridge is not free at
-  ## walk time (nothing is emitted yet), so record the intent and let `prematLval2`
+  ## walk time (nothing is emitted yet), so record the intent and let `prematLval`
   ## take it at emission, where a bridge's lifetime belongs.
   var t = g.takeTmp(ScalarSlot)
   if t.kind != InReg:
     let r = g.pickHeldReg()
     if r == NoReg:
       g.lvalStrideOnBridge.incl atPos
-      g.plan.aux[atPos] = ExprAux(scratch: @[NoReg])   # filled in by `prematLval2`
+      g.plan.aux[atPos] = ExprAux(scratch: @[NoReg])   # filled in by `prematLval`
       return
     g.pickedRegs.incl r
     t = regLoc(r, ScalarSlot, isTemp = true)
   g.plan.aux[atPos] = ExprAux(scratch: @[t.r])
 
-proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false) =
+proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false) =
   ## FUSED port of `releaseLvalTemps`: release the reserved picks of an
   ## lvalue's address computation — computed index/pointer temps, the a64
-  ## stride scratch, and a global-base temp. (`unbindLvalTemps2` already
+  ## stride scratch, and a global-base temp. (`unbindLvalTemps` already
   ## unbinds; this clears the pick flags and frees the pool.)
   ##
   ## `addrIntact` says the consuming instruction only READ this address — a
@@ -2212,7 +2051,7 @@ proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false) =
     of DotC:
       var cc = c
       cc.into:
-        g.freeLvalTemps2(cc, addrIntact)
+        g.freeLvalTemps(cc, addrIntact)
         while cc.hasMore: skip cc
     of DerefC:
       var cc = c
@@ -2223,7 +2062,7 @@ proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false) =
       let atPos = g.posOf(c)
       var cc = c
       cc.into:
-        g.freeLvalTemps2(cc, addrIntact)
+        g.freeLvalTemps(cc, addrIntact)
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
           g.freeVal(g.plan.planned(g.posOf(cc)))
@@ -2245,7 +2084,7 @@ proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false) =
       var cc = c
       cc.into:
         skip cc; skip cc
-        g.freeLvalTemps2(cc, addrIntact)
+        g.freeLvalTemps(cc, addrIntact)
         while cc.hasMore: skip cc
     else: discard
   else: discard
@@ -2297,7 +2136,7 @@ proc isCmpImmLeaf*(c: Cursor): bool =
   if cur.kind == TagLit and cur.exprKind in {SufC, ParC}: inc cur
   result = cur.kind in {IntLit, UIntLit, CharLit}
 
-proc armInoutTag*(op: IntrinsicOp): RiscInst =
+proc inoutInst*(op: IntrinsicOp): RiscInst =
   ## The two-address Arm form of a row that writes through operand 0. `(add D S)`
   ## is one tag for both Arm targets — nifasm dispatches on the arch — so only
   ## `not` differs: Thumb-2 spells it `mvn` and the AArch64 vocabulary has no

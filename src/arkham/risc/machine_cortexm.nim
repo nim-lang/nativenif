@@ -73,7 +73,7 @@ const
     ##    charges.
     ##  * **`IntTempRegs` is EMPTY here.** That is the deeper one. On every other
     ##    target a transient that cannot get a bridge falls back to a volatile
-    ##    (`pickStagingA64`), and RV32 has four; this target has none, so a bridge
+    ##    (`pickUnboundReg`), and RV32 has four; this target has none, so a bridge
     ##    is the ONLY answer and compositions run three deep. Reserving two and
     ##    moving `r8` to `atomicScratch` alone breaks `addr_chain_depth` at once —
     ##    two bridges held by an enclosing step and a third genuinely needed.
@@ -135,7 +135,7 @@ const
   ## ── FPv4-SP (M5) ──────────────────────────────────────────────────────────
   ## Cortex-M4F's FPU is SINGLE PRECISION ONLY: s0–s31, no `.f64` instruction at
   ## all. A `float64` is therefore refused BY NAME rather than lowered through a
-  ## softfloat library nobody asked for — see `rejectForThumbM`.
+  ## softfloat library nobody asked for — see `cortexm.rejectUnsupported`.
   ##
   ## Unlike the integer file this one is roomy, so the split follows AAPCS32's
   ## (s0–s15 caller-saved, s16–s31 callee-saved) and — crucially — keeps the
@@ -232,7 +232,7 @@ const
                                            # but it is nifasm's (see `IP`)
     convClobbersGpr: @ConvClobbersGpr)
 
-proc regNameM*(r: Reg): string =
+proc regName*(r: Reg): string =
   ## The asm-NIF spelling of a GPR slot. These are the tags nifasm's `MReg`
   ## enum accepts — `(r0)`..`(r12)`, `(sp)`, `(lr)` — which Cortex-M SHARES with
   ## the other targets rather than minting its own (see doc/instructions.md).
@@ -244,7 +244,7 @@ proc regNameM*(r: Reg): string =
     if ord(r) <= ord(R12): "r" & $ord(r)
     else: "<unmapped:" & $ord(r) & ">"
 
-proc isAllocatableM(r: Reg): bool {.inline.} =
+proc isAllocatable(r: Reg): bool {.inline.} =
   ## Whether arkham may place a value in `r`. Excludes nifasm's IP, the bridges'
   ## role is enforced by their absence from the pools rather than here.
   r notin ReservedRegs
