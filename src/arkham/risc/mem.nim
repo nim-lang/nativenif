@@ -16,32 +16,19 @@
 
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
                     exprpred, regbind]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 import emit
+from a64 import nil
+from cortexm import nil
+from rv32 import nil
 
 proc takeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg   # defined below
 
-proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
-  ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
-  ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
-  ## checker can't see. The binding is recorded as a transient temp; released by
-  ## `unbindTemp`.
-  let name = g.rb.freshTmpName()
-  g.ab.tree RebindA64:
-    g.ab.symDef name
-    g.emBindType(typ)
-    g.ab.rawReg r
-  g.rb.bindScratch(r, name, g.slotIsPointer(typ))
-  g.tmpBindTyp[r] = typ                 # what the register is TYPED as, for a later
-                                        # `(rebind …)` and for `mirrorStored`, which
-                                        # may only forward a value whose binding type
-                                        # is the slot's own (x64's `bindTemp` twin)
-
-proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false)
+proc emitLvalue*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false)
 
 proc tryTakeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg;
                    lastResort = false): Reg =
@@ -117,14 +104,14 @@ proc bindStrideScratch*(g: var CodeGen; atPos: int; recycle: Reg) =
   ## answers; a reloaded base or a spilled compare operand does not. Taking the
   ## bridge first was free while three were reserved and one was always idle, and it
   ## stopped being free the moment the third was spent: the stride scratch would sit
-  ## on a bridge for the whole `(mem …)`, and a `produceIntoMem2` inside the index
-  ## then left an enclosed step with none. `pickStagingA64` judges by what is BOUND
+  ## on a bridge for the whole `(mem …)`, and a `produceIntoMem` inside the index
+  ## then left an enclosed step with none. `pickUnboundReg` judges by what is BOUND
   ## right now rather than by the whole-proc home union `reserveStrideScratch`
   ## consulted, so it routinely finds a register that walk could not — this is the
   ## same preference `emLvalGlobalBase`'s late-base cascade already states, for the
   ## same reason.
   if atPos in g.lvalStrideOnBridge:
-    var r = g.pickStagingA64()
+    var r = g.pickUnboundReg()
     if r != NoReg:
       g.pickedRegs.incl r
       g.bindTemp(r, ScalarSlot)
@@ -153,16 +140,16 @@ proc freeExpr*(g: var CodeGen; c: Cursor) =
   ## `freeSym` takes a NAME because a local may have been demoted out from under its
   ## register between acquire and release. Nothing can demote an expression home — it
   ## is minted and released inside one lvalue emission — so this one can be strict:
-  ## look the position up and release exactly what is there. `restoreMemBase2` first,
+  ## look the position up and release exactly what is there. `restoreMemBase` first,
   ## because a memory-homed base is on loan to a staging register at this point and the
   ## loan has to be unwound before the home is read back. A home that is not a temp
   ## (the common case: the value sat in its own register) releases nothing.
   let pos = g.posOf(c)
-  g.restoreMemBase2(pos)                             # demoted (stolen) base/index reload
+  g.restoreMemBase(pos)                              # demoted (stolen) base/index reload
   let l = g.plan.planned(pos)
   if l.kind == InReg and l.isTemp: g.unbindTemp(l.r)
 
-proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
+proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
   ## Release scratch an lvalue's embedded value used (a reloaded base/index), AFTER
   ## the consuming `(mem …)`/`(lea …)` instruction.
   if c.kind == Symbol:
@@ -179,13 +166,13 @@ proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
     of DotC:
       var cc = c
       cc.into:
-        g.unbindLvalTemps2(cc)
+        g.unbindLvalTemps(cc)
         while cc.hasMore: skip cc
     of AtC:
       let atPos = g.posOf(c)
       var cc = c
       cc.into:
-        g.unbindLvalTemps2(cc); skip cc
+        g.unbindLvalTemps(cc); skip cc
         if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
@@ -209,14 +196,14 @@ proc unbindLvalTemps2*(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         skip cc; skip cc                                 # base type, depth
-        g.unbindLvalTemps2(cc)
+        g.unbindLvalTemps(cc)
         while cc.hasMore: skip cc
     else: discard
 
 proc bindLvalGlobalBases*(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
-  ## Bind every UNBOUND global-base address register in lvalue `c` so `prematLval2` leas
+  ## Bind every UNBOUND global-base address register in lvalue `c` so `prematLval` leas
   ## `&global` into a bound register (`emReg` rejects an unbound scratch). Skips an
-  ## already-bound base reg (a caller — e.g. `emitAddr2` — may reuse its bound result reg).
+  ## already-bound base reg (a caller — e.g. `emitAddr` — may reuse its bound result reg).
   if c.kind == Symbol:
     let loc = g.plan.planned(g.posOf(c))
     if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
@@ -229,7 +216,7 @@ proc bindLvalGlobalBases*(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
       g.bindLvalGlobalBases(cc, bound); skip cc          # the base only
       while cc.hasMore: skip cc
 
-proc ensureFAccum2*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
+proc ensureFAccum*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   ## Make `resF` hold the value just produced at `loc` (usually a no-op — the
   ## allocator dest-passed the operand into resF; otherwise move/load it in).
   case loc.kind
@@ -240,133 +227,12 @@ proc ensureFAccum2*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham a64n: float accumulator source " & $loc.kind
 
-proc emitAtomicInstrRv(g: var CodeGen; c: Cursor; op: IntrinsicOp;
-                       argCurs: seq[Cursor]; res: Location) =
-  ## RV32's atomics. `lr.w`/`sc.w` carry their own ordering in the `aq`/`rl` bits
-  ## — which is what `AcqRelExclusives` names — so unlike the Cortex-M twin there
-  ## is no `dmb` bracketing anything; the pair IS the ordering.
-  ##
-  ## A plain load and a plain store are the load/store cases, and each is a single
-  ## machine access, which is the only property an atomic load or store of a
-  ## naturally-aligned word has to have on this ISA.
-  case op
-  of AtomicThreadFenceOp:
-    g.ab.keyword DmbA64                    # `fence rw,rw`
-    return
-  of AtomicSignalFenceOp:
-    return                                 # a compiler barrier only; see the a64 twin
-  else: discard
-  let bits = g.atomicBits(argCurs[0])
-  if bits != 32:
-    lengError c, "a " & $bits & "-bit atomic has no RV32 lowering: the A " &
-              "extension has `lr.w`/`sc.w` and no byte, halfword or doubleword " &
-              "form at all. Widening a byte cell to the word it sits in would " &
-              "make the access a read-modify-write of its three neighbours, " &
-              "which is not the atom that was asked for", lengInfo(c)
-  let p = g.instrOperandReg(argCurs[0])
-  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
-    g.bindTemp(res.r, res.typ)
-  case op
-  of AtomicLoadOp:
-    g.ab.tree MovA64:
-      g.emReg res.r
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-  of AtomicStoreOp:
-    g.ab.tree MovA64:
-      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
-      g.emReg g.instrOperandReg(argCurs[1])
-  of AtomicExchangeOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), NopA64, true, false)
-  of AtomicFetchAddOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, false)
-  of AtomicFetchSubOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, false)
-  of AtomicFetchAndOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AndA64, false, false)
-  of AtomicFetchOrOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), OrrA64, false, false)
-  of AtomicFetchXorOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), EorA64, false, false)
-  of AtomicAddFetchOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, true)
-  of AtomicSubFetchOp:
-    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, true)
-  of AtomicCompareExchangeOp:
-    g.emitAtomicCasRv(res.r, p, g.instrOperandReg(argCurs[1]),
-                      g.instrOperandReg(argCurs[2]))
-  else:
-    lengError c, "`" & IntrinsicNames[op] & "` has no RV32 lowering — " &
-              "guard the call with a `when`", lengInfo(c)
-  # Release the operand temps' bindings, exactly as the other two arms do.
-  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
-    let a = g.plan.planned(g.posOf(argCurs[i]))
-    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
-      g.unbindTemp(a.r)
-
-proc emitAtomicInstrM(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+proc emitAtomicInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
-  ## The Cortex-M twin of `emitAtomicInstr2`. Every variant is bracketed by `dmb`
-  ## — the strongest ordering this profile can express, and the one every memory
-  ## order the row carries is satisfied by.
-  case op
-  of AtomicThreadFenceOp:
-    g.ab.keyword DmbM
-    return
-  of AtomicSignalFenceOp:
-    # A compiler barrier only: it orders nothing in hardware, and what it forbids
-    # — hoisting a memory access across it — arkham does not do to begin with.
-    return
-  else: discard
-  for r in g.bridgeRegs: g.releaseStaleName(r)
-  let bits = g.atomicBits(argCurs[0])
-  if bits notin {8, 16, 32}:
-    lengError c, "a " & $bits & "-bit atomic has no Cortex-M lowering: ARMv7-M " &
-              "has no `ldrexd`/`strexd`, and two exclusive pairs over the halves " &
-              "would be two claims rather than one atom", lengInfo(c)
-  let p = g.instrOperandReg(argCurs[0])
-  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
-    g.bindTemp(res.r, res.typ)
-  g.ab.keyword DmbM
-  case op
-  of AtomicLoadOp: g.emAtomicLoadM(res.r, p, bits)
-  of AtomicStoreOp: g.emAtomicStoreM(p, g.instrOperandReg(argCurs[1]), bits)
-  of AtomicExchangeOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), NopA64, true, false, bits)
-  of AtomicFetchAddOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, false, bits)
-  of AtomicFetchSubOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, false, bits)
-  of AtomicFetchAndOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), AndA64, false, false, bits)
-  of AtomicFetchOrOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), OrrA64, false, false, bits)
-  of AtomicFetchXorOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), EorA64, false, false, bits)
-  of AtomicAddFetchOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, true, bits)
-  of AtomicSubFetchOp:
-    g.emitAtomicRmwM(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, true, bits)
-  of AtomicCompareExchangeOp:
-    g.emitAtomicCasM(res.r, p, g.instrOperandReg(argCurs[1]),
-                     g.instrOperandReg(argCurs[2]), bits)
-  else:
-    # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
-    # empty, so this is the message that column promises.
-    lengError c, "`" & IntrinsicNames[op] & "` has no Cortex-M lowering — " &
-              "guard the call with a `when`"
-  g.ab.keyword DmbM
-  # Release the operand temps' nifasm bindings — see the AArch64 twin.
-  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
-    let a = g.plan.planned(g.posOf(argCurs[i]))
-    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
-      g.unbindTemp(a.r)
-
-proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
-                      argCurs: seq[Cursor]; res: Location) =
-  ## An atomic row's AArch64 sequence, on operands the ALLOCATOR placed. Every
-  ## variant is the strong acquire/release form, so the memory-order operands are
-  ## not evaluated at all (see `evaluatedOperands`) — whatever order was asked for,
-  ## this satisfies it.
+  ## An atomic row's instruction sequence, on operands the ALLOCATOR placed. The
+  ## sequence itself is the CPU's (`a64` / `cortexm` / `rv32`.`emitAtomic`); what
+  ## every CPU shares — the refusal for a target with no scratch triple, and
+  ## releasing the operand temps afterwards — is here.
   if g.md.atomicScratch[2] == NoReg:
     # No reserved triple, so there is no lowering to reach — and reaching one
     # anyway would emit another ISA's exclusives. Refused by NAME here rather than
@@ -375,77 +241,17 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
       " lowering — this target reserves no atomic scratch triple, so its " &
       "load-reserved/store-conditional loop cannot be built; guard the call " &
       "with a `when`"
-  if g.md.arch == Rv32:
-    g.emitAtomicInstrRv(c, op, argCurs, res)
-    return
-  if AcqRelExclusives notin g.md.caps:
-    # A different instruction set, not a different width: ARMv7-M has `ldrex`/
-    # `strex` and an explicit `dmb` where AArch64 has `ldaxr`/`stlxr`.
-    g.emitAtomicInstrM(c, op, argCurs, res)
-    return
-  # A fence has no cell operand, and its memory order is not evaluated, so it must
-  # be answered before anything reads `argCurs[0]`.
-  case op
-  of AtomicThreadFenceOp:
-    g.ab.keyword DmbA64
-    return
-  of AtomicSignalFenceOp:
-    # A compiler barrier only: it orders nothing in hardware, and what it forbids —
-    # hoisting a memory access across it — arkham does not do to begin with.
-    return
-  else: discard
-  for r in g.md.bridgeRegs: g.releaseStaleName(r)
-  let bits = g.atomicBits(argCurs[0])
-  let p = g.instrOperandReg(argCurs[0])
-  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
-    g.bindTemp(res.r, res.typ)
-  case op
-  of AtomicLoadOp: g.emLdar(res.r, p, bits)
-  of AtomicStoreOp: g.emStlr(g.instrOperandReg(argCurs[1]), p, bits)
-  of AtomicExchangeOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "", true, false, bits)
-  of AtomicFetchAddOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "add", false, false, bits)
-  of AtomicFetchSubOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "sub", false, false, bits)
-  of AtomicFetchAndOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "and", false, false, bits)
-  of AtomicFetchOrOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "orr", false, false, bits)
-  of AtomicFetchXorOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "eor", false, false, bits)
-  of AtomicAddFetchOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "add", false, true, bits)
-  of AtomicSubFetchOp:
-    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "sub", false, true, bits)
-  of AtomicCompareExchangeOp:
-    let lSucc = g.freshLabel()
-    let lFail = g.freshLabel()
-    let lDone = g.freshLabel()
-    let pp = g.emOp p
-    let ep = g.emOp g.instrOperandReg(argCurs[1])   # `expected`, a POINTER
-    let d = g.emOp g.instrOperandReg(argCurs[2])
-    let exp = g.emOp g.md.atomicScratch[0]
-    let old = g.emOp g.md.atomicScratch[1]
-    let st = g.emOp g.md.atomicScratch[2]
-    let ret = g.emOp res.r
-    let w = wsfx(bits)
-    # Two FORWARD exits from the loop body: `(bne lFail)` when the cell no longer
-    # holds `expected`, `(beq lSucc)` when the exclusive store succeeded. A non-zero
-    # `st` (another agent won the line) falls through to the internal back-edge and
-    # re-reads. The failure path MUST publish what was actually there — that is the
-    # whole protocol: the caller retries against the value it now holds.
-    g.ab.splice(
-      &"(ldar {exp} {ep}{w}) (loop (stmts (ldaxr {old} {pp}{w}) " &
-      &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}{w}) " &
-      &"(cmp {st} 0) (beq {lSucc}))) " &
-      &"(lab :{lSucc}) (mov {ret} 1) (b {lDone}) " &
-      &"(lab :{lFail}) (clrex) (stlr {old} {ep}{w}) (mov {ret} 0) (lab :{lDone})")
-  else:
-    # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
-    # empty, so this is the message that column promises.
-    lengError c, "`" & IntrinsicNames[op] & "` has no AArch64 lowering — " &
-              "guard the call with a `when`"
+  # A different instruction set per CPU, not a different width: ARMv7-M has
+  # `ldrex`/`strex` and an explicit `dmb` where AArch64 has `ldaxr`/`stlxr`, and
+  # RV32's `lr.w`/`sc.w` carry their ordering themselves.
+  case g.md.arch
+  of Arm64: a64.emitAtomic(g, c, op, argCurs, res)
+  of ThumbM: cortexm.emitAtomic(g, c, op, argCurs, res)
+  of Rv32: rv32.emitAtomic(g, c, op, argCurs, res)
+  of X86, Avr:
+    raiseAssert "arkham: " & g.md.targetName & " does not reach the load/store atomics"
+  if op in {AtomicThreadFenceOp, AtomicSignalFenceOp}:
+    return                 # a fence has no operands, so there is nothing to release
   # Release the operand temps' nifasm bindings. Ordinarily a volatile temp's binding
   # dies when the register is rebound for the next value, but an operand that had to
   # be escalated to a CALLEE-SAVED register (`reserveInstrReg`) may see no such rebind
@@ -459,19 +265,19 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
 proc emLvalFieldMem*(g: var CodeGen; lhs: Cursor; field: string) =
   g.ab.tree MemX:
     g.ab.tree DotX:
-      g.emLvalAddr2(lhs)
+      g.emLvalAddr(lhs)
       g.ab.sym field
 
 proc emLvalElemMem*(g: var CodeGen; lhs: Cursor; idx: int) =
   g.ab.tree MemX:
     g.ab.tree AtX:
-      g.emLvalAddr2(lhs)
+      g.emLvalAddr(lhs)
       g.ab.intLit idx
 
 proc emLvalElemAt*(g: var CodeGen; lhs: Cursor; idx: int) =
   ## Bare `(at <lvalue address> idx)` address tree — for `lea` of an lvalue element.
   g.ab.tree AtX:
-    g.emLvalAddr2(lhs)
+    g.emLvalAddr(lhs)
     g.ab.intLit idx
 
 proc emFieldOperand*(g: var CodeGen; dst: Location) =
@@ -499,7 +305,7 @@ proc emFieldDot(g: var CodeGen; dst: Location) =
     g.emAggrDot(dst.base.sym, dst.field)
   of FbLval:
     g.ab.tree DotX:
-      g.emLvalAddr2(dst.base.lval)
+      g.emLvalAddr(dst.base.lval)
       g.ab.sym dst.field
   of FbGlob, FbTvar:
     raiseAssert "arkham a64n: FbGlob/FbTvar field base must be pre-materialized"
@@ -519,7 +325,7 @@ proc getExpr*(g: var CodeGen; n: var Cursor; held: bool; what: string) =
   ## rather than a volatile that call would clobber; `what` names it for the
   ## out-of-registers message.
   ##
-  ## This lives in the backend rather than in `planer` only because the phase-B pool
+  ## This lives in the backend rather than in `planner` only because the phase-B pool
   ## (`takeHeld`) still does. It is a relocation away, not a redesign: the door already
   ## speaks positions, and `emitLvalWalk` — which calls it — is already a pure
   ## pick-and-record pass with no emission in it.
@@ -545,7 +351,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
       let pos = g.posOf(n)
       if globBase.kind == InReg:
         # The caller donated its result register; it owns (and frees) that pick —
-        # record it non-temp so freeLvalTemps2 won't unbind the live result.
+        # record it non-temp so freeLvalTemps won't unbind the live result.
         g.plan.planAtEmitTime(pos, regLoc(globBase.r, globBase.typ))
       else:
         # a64 always materializes &global into an allocator-visible register
@@ -553,7 +359,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         # for a store held across the rhs, else an ordinary temp.
         if isStore or heldBase:
           # A survivor if one is going spare; otherwise record NOTHING and let
-          # `prematLval2` derive `&g` into a bridge after the index (`lateGlobalBase`).
+          # `prematLval` derive `&g` into a bridge after the index (`lateGlobalBase`).
           # This step used to assert here, and it is the one place the assert was
           # avoidable rather than a real shortage: the address has no inputs, so
           # holding it across the call was a choice, not a requirement.
@@ -608,16 +414,16 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         g.emitLvalWalk(n, globBase, isStore, heldBase, asBase)
         while n.hasMore: skip n
     of AconstrC, OconstrC:
-      # A constructor base: `prematLval2`'s consumer builds it into its aggtmp
-      # via the (fused) genStore2 — nothing to decide here.
+      # A constructor base: `prematLval`'s consumer builds it into its aggtmp
+      # via the (fused) genStore — nothing to decide here.
       skip n
     else:
       raiseAssert "arkham a64n: computed lvalue base not supported: " & $n.exprKind
   else:
     inc n
 
-proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
-  g.bridgeStep("`emitLvalue2`")                         # I1 + I2
+proc emitLvalue*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
+  g.bridgeStep("`emitLvalue`")                          # I1 + I2
   var n = c
   g.emitLvalWalk(n, globBase, isStore)
 
@@ -644,14 +450,14 @@ proc retypeBinDest*(g: var CodeGen; rD: Reg; resTypeC: Cursor;
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
 
-proc reReprCast2*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor;
+proc reReprCast*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor;
                  isCast: bool; preRetyped: string) =
   ## Convert the INNER value now held in register `res.r` into the cast's TARGET
   ## representation, in place: the pointer-kind rebind, the `extendTo` shift pair
   ## that IS the widening/narrowing, and the binding retype that records the new
   ## type on the name.
   ##
-  ## Split out of `emitCast2` so the SPILLED result path can run it too, staged
+  ## Split out of `emitCast` so the SPILLED result path can run it too, staged
   ## through the produce bridge. That path used to `return` with the conversion
   ## never emitted — a silent miscompile, since the extend is the whole cast:
   ## `cast[uint32](zi)` in `formatfloat.toDecimal64` kept all 64 bits whenever the
@@ -706,7 +512,7 @@ proc takeWideRegs*(g: var CodeGen; n: int; what: string): seq[Reg] =
   ## handing out a register something else is holding.
   ## A wide lowering juggles PAIRS — the low and high halves of one 64-bit value
   ## live at once, by definition, on a target whose word is four bytes — so it
-  ## raises the enclosing step's declaration to two the way `prematLval2` does:
+  ## raises the enclosing step's declaration to two the way `prematLval` does:
   ## the demand is discovered here, the registers are released by the CALLER, and
   ## the scope that has to cover them is therefore the caller's.
   ##

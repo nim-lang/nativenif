@@ -94,7 +94,7 @@ type
                                       ## local; released by `takeScratch`
     regBindPtr: set[Reg]              ## regs whose current binding is POINTER-typed:
                                       ## a `(nil)` value only fits such a binding
-                                      ## (x64 `emitValue2` NilC consults this)
+                                      ## (x64 `emitValue` NilC consults this)
     fregLocal: Table[FReg, string]    ## the SIMD twin of `regLocal`
     boundFTmps: set[FReg]             ## the SIMD twin of `boundTemps`
     tmpBindCount: int                 ## per-proc fresh-name counter for `tmpN.0`
@@ -391,6 +391,14 @@ proc takeFScratch*(rb: var RegBind; f: FReg): string =
     rb.dropFMirror f
     rb.fregLocal.del f
     rb.boundFTmps.excl f
+
+proc takeFBinding*(rb: var RegBind; f: FReg): string =
+  ## The SIMD twin of `takeBinding`: remove WHATEVER binding `f` carries (a float
+  ## local or a temp), returning the name whose `(kill …)` the caller must emit.
+  result = rb.fregLocal.getOrDefault(f, "")
+  rb.dropFMirror f
+  rb.fregLocal.del f
+  rb.boundFTmps.excl f
 
 proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
   assert rb.scopeFLocals.len > 0, "arkham: bindFLocal outside any scope"

@@ -1,0 +1,9 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :s32.0 (params (param :s0.0 . (f 32)) (param :s1.0 . (f 32)) (param :s2.0 . (f 32)) (param :s3.0 . (f 32)) (param :s4.0 . (f 32)) (param :s5.0 . (f 32)) (param :s6.0 . (f 32)) (param :s7.0 . (f 32)) (param :s8.0 . (f 32)) (param :s9.0 . (f 32)) (param :s10.0 . (f 32)) (param :dd.0 . (f 64)) (param :ii.0 . (i 64))) (i 64) . (stmts (ret (add (i 64) ii.0 (conv (i 64) (add (f 64) dd.0 (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (add (f 64) (conv (f 64) (mul (f 32) s0.0 (suf 1.0 "f32"))) (conv (f 64) (mul (f 32) s1.0 (suf 2.0 "f32")))) (conv (f 64) (mul (f 32) s2.0 (suf 3.0 "f32")))) (conv (f 64) (mul (f 32) s3.0 (suf 4.0 "f32")))) (conv (f 64) (mul (f 32) s4.0 (suf 5.0 "f32")))) (conv (f 64) (mul (f 32) s5.0 (suf 6.0 "f32")))) (conv (f 64) (mul (f 32) s6.0 (suf 7.0 "f32")))) (conv (f 64) (mul (f 32) s7.0 (suf 8.0 "f32")))) (conv (f 64) (mul (f 32) s8.0 (suf 9.0 "f32")))) (conv (f 64) (mul (f 32) s9.0 (suf 10.0 "f32")))) (conv (f 64) (mul (f 32) s10.0 (suf 11.0 "f32"))))))))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (call exit.0 (call s32.0 (suf 0.5 "f32") (suf 1.5 "f32") (suf 2.5 "f32") (suf 3.5 "f32") (suf 0.5 "f32") (suf 1.5 "f32") (suf 2.5 "f32") (suf 3.5 "f32") (suf 0.5 "f32") (suf 1.5 "f32") (suf 2.5 "f32") 7.0 3))
+))
+)(.index)

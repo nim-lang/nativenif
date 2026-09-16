@@ -17,7 +17,8 @@ Status: **M0–M4d complete.**
 | M5a scalar globals | done — SRAM storage, values stored at entry |
 | M5b constructors as values, nested aggregates | done |
 | M5c `case`, short-circuit `and`/`or`, enums | done — 20 Leng fixtures |
-| M5 wide scalars, stack arguments, divide | not started |
+| M5 arguments past the four pairs | done — an overflow block in the caller's frame, its address in r19:r18 (`MachineDesc.argBlock`) |
+| M5 wide scalars, divide | not started |
 | M6 aggregate globals, flash constants, interrupts | not started |
 
 ### What M4c has
@@ -54,7 +55,7 @@ is the destination.
 
 ### Why M4 is not the Cortex-M arrangement
 
-`generateM` is the AArch64 emitter driven with a different machine model, not a
+`generateCortexM` is the AArch64 emitter driven with a different machine model, not a
 second code generator — Thumb-2 and AArch64 share the asm-NIF vocabulary at the
 instruction level, so a third target needed only a register file, a word size
 and honest refusals.
@@ -71,7 +72,7 @@ So AVR needs its own value core. That is the irreducible piece
 backend, and the piece whose register-binding protocol has a formal model behind
 it. It is M4c, and it is the largest single item left on this list.
 
-The register ALLOCATOR is reusable as it stands — `planer.allocateProc` is
+The register ALLOCATOR is reusable as it stands — `planner.allocateProc` is
 arch-neutral and takes a `MachineDesc` — so M4c is the emitter, not the
 allocator.
 

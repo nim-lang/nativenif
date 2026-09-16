@@ -6,55 +6,39 @@
 #
 
 
-## The code arkham SYNTHESIZES for a bare-metal Cortex-M image — the part of a
-## program nobody wrote.
+## The code arkham SYNTHESIZES for a bare-metal image (Cortex-M, RV32) — the
+## part of a program nobody wrote.
 ##
-##  * the reset path: enable the FPU, copy `.data` from its flash image, zero
-##    `.bss`, and only then call `main`;
+##  * the reset path's shared half: copy `.data` from its flash image and zero
+##    `.bss` before `main` (`emStartupInit`). What only one CPU needs before it
+##    — RV32's `sp`/`mstatus`/`mtvec`, Cortex-M's FPU enable — is in `rv32` and
+##    `cortexm`;
 ##  * semihosting: how a firmware image with no OS prints and exits, by
 ##    trapping to the debugger;
-##  * the 64-bit divide helpers, because ARMv7E-M has no `udiv`/`sdiv` wide
+##  * the 64-bit divide helpers, because a 32-bit core has no `udiv`/`sdiv` wide
 ##    enough and there is no libgcc to borrow one from.
 ##
-## All three are emitted only for the target that needs them.
+## All three are emitted only for the targets that need them.
 
 import std / [assertions]
 import nifcore
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, typeutil, 
                     mirrors, abi]
 import machine_a64 as machine
-import machine_rv32 as machine_rv32_m
-from machine_m as machine_m import nil
+from machine_rv32 import nil
+from machine_cortexm import nil
 import emit, value
 
 const
-  Rv32DefaultStackTop* = 0x8020_0000'i64
-    ## The top of QEMU `virt`'s SRAM region, used when no `--layout:` names one.
-    ## MUST agree with `nifasm/image/writerv32`'s `Rv32SramAddr + Rv32SramSize` —
-    ## a stack pointer above the region the image declares is not a diagnosable
-    ## error, it is a store into nothing.
-  CsrMstatus* = 0x300'i64
-  MstatusFsDirty* = 0x6000'i64
-    ## `mstatus.FS = Dirty`. Any non-zero FS enables the FP unit; `Dirty` is
-    ## chosen because it is the state the first FP instruction would move it to
-    ## anyway, so nothing has to reason about a later transition.
-
-proc argReg*(g: CodeGen; i: int): Reg {.inline.} =
-  ## Argument register `i` of the target being emitted for.
-  ##
-  ## This file is HAND-WRITTEN asm-NIF, not allocator output, so it names its
-  ## registers directly — and naming them `R0`..`R3` was correct only while the
-  ## one target with a runtime happened to put its arguments there. Cortex-M's
-  ## `a0`–`a3` are `r0`–`r3`; RV32's are `x10`–`x13`. Reading them off the
-  ## machine description is what lets one runtime serve both, and is the same
-  ## move `MachineDesc`'s register ROLES already made for the emitter.
-  ##
-  ## `argReg(0)` is also the RESULT register on every target here — `intRetReg`
-  ## and `intArgRegs[0]` coincide — so a shim that computes into it needs no
-  ## separate spelling.
-  assert i < g.md.intArgRegs.len, "runtime: argument register out of range"
-  g.md.intArgRegs[i]
+  SemiWrite* = 5           ## SYS_WRITE:  r1 = &{handle, buf, len}
+  SemiOpen* = 1            ## SYS_OPEN:   r1 = &{&name, mode, namelen}
+  SemiOpenModeW* = 4       ## the "w" mode; `:tt` opened with it is the console
+  SemiTtyBase* = "`shtty.0"    ## the `:tt` device name, in rodata
+  SemiTtyHandleBase* = "`shwh.0"   ## the cached console handle, one `.bss` word
+  SemiExitExtended* = 0x20 ## SYS_EXIT_EXTENDED: r1 = &{reason, status}
+  SemiBkpt* = 0xAB         ## the `bkpt` immediate that IS the semihosting call
+  AdpStoppedApplicationExit* = 0x20026
 
 proc emSemihostCall*(g: var CodeGen) =
   ## The semihosting escape: operation in `argReg(0)`, parameter block in
@@ -71,115 +55,8 @@ proc emSemihostCall*(g: var CodeGen) =
   else:
     quit "arkham " & g.md.targetName & ": no semihosting escape on this target"
 
-proc emEnableFpuM*(g: var CodeGen) =
-  ## Turn the FPU on, first thing in the entry proc.
-  ##
-  ## Cortex-M4F comes out of reset with the FPU DISABLED: CPACR grants no access
-  ## to CP10/CP11, and the first VFP instruction takes a UsageFault (NOCP) —
-  ## which, with no handler installed, is a lockup at the top of `main` with
-  ## nothing to say why. Every image gets this, because whether it uses a float
-  ## is not known when the entry proc is emitted, and twenty bytes once is not
-  ## worth being clever about.
-  ##
-  ## The DSB/ISB pair is not decoration: CPACR changes how LATER instructions
-  ## behave, so the write has to complete and the pipeline be re-fetched before
-  ## the first floating-point instruction. QEMU forgives its absence; silicon
-  ## does not.
-  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit CpacrAddr)
-  g.ab.tree LdrA64:
-    g.ab.rawReg g.argReg(1)
-    g.ab.tree MemX: (g.ab.rawReg g.argReg(0); g.ab.intLit 0)
-  g.ab.tree OrrA64: (g.ab.rawReg g.argReg(1); g.ab.intLit CpacrFullAccessCp10Cp11)
-  g.ab.tree StrA64:
-    g.ab.tree MemX: (g.ab.rawReg g.argReg(0); g.ab.intLit 0)
-    g.ab.rawReg g.argReg(1)
-  g.ab.keyword DsbM
-  g.ab.keyword IsbM
 
-const TrapTableName* = "`mtvec.0"
-  ## The trampoline table's symbol. Back-quoted like the other runtime shims so it
-  ## cannot collide with a Leng name.
-
-const MstatusMie* = 0x8'i64      ## `mstatus.MIE`: interrupts enabled in M-mode at all
-const CsrMie* = 0x304'i64        ## the per-cause enable register
-const CsrMtvec* = 0x305'i64      ## trap vector base + mode
-const MtvecVectored* = 1'i64     ## mode 1: cause `c` traps to base + 4*c
-
-proc emTrapTableRv*(g: var CodeGen; handlers: seq[(int, string)]) =
-  ## The `mtvec` trampoline table, emitted as ORDINARY CODE under a symbol.
-  ##
-  ## This is where RISC-V and Cortex-M stop resembling each other. An M-profile
-  ## core reads a table of ADDRESSES that the image writer bakes at the flash
-  ## base, and the reset vector is one of its words. A RISC-V core resets to a
-  ## fixed PC, and `mtvec` — written by the code that runs there — holds a base
-  ## plus a two-bit MODE. In vectored mode a trap with cause `c` jumps to
-  ## `base + 4*c`, so each entry is one WORD that has to be an INSTRUCTION.
-  ##
-  ## A table of jumps is therefore just code, which is why nothing in the image
-  ## writer knows about this: it is emitted like any other proc, and the reset
-  ## path takes its address with the same `(adr …)` any other symbol gets. The
-  ## alternative — a new image-layout number for the base — would have cost a
-  ## shared tag id on every target to describe something only this one has.
-  ##
-  ## Sixteen entries, one per standard cause, and every cause the module did not
-  ## claim jumps to a PARK loop rather than falling through. Falling through would
-  ## run the next cause's handler, which is the worst available answer: an
-  ## unexpected trap would be silently misrouted to a handler written for
-  ## something else, and only sometimes.
-  g.ab.tree NifasmDecl.ProcD:
-    g.ab.symDef TrapTableName
-    g.ab.tree NifasmDecl.ParamsD: discard
-    g.ab.tree StmtsA64:
-      let park = g.freshLabel()
-      for cause in 0 ..< machine_rv32_m.InterruptCauseCount:
-        var target = park
-        for (c, nm) in handlers:
-          if c == cause: target = nm
-        g.emBr(BA64, target)
-      g.emLab(park)
-      g.emBr(BA64, park)             # an unclaimed trap stops here, visibly
-
-proc emEnableInterruptsRv*(g: var CodeGen; causes: set[uint8]) =
-  ## Point `mtvec` at the table and enable exactly the causes the module declared.
-  ##
-  ## Enabling is done HERE, at reset, and not left to the program, because on this
-  ## target the two halves of "this handler runs" are a CSR write and a pragma,
-  ## and only one of them is visible in the source. Cortex-M's `{.interrupt.}` for
-  ## a core exception needs no enable at all — PendSV is pended and taken — so a
-  ## handler that never ran would be a difference between the targets with nothing
-  ## in the program to explain it. Declaring the handler IS the enable; a program
-  ## that wants finer control clears the bit itself.
-  g.ab.tree AdrA64: (g.ab.rawReg g.argReg(0); g.ab.sym TrapTableName)
-  g.ab.tree OrrA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MtvecVectored)
-  g.ab.tree CsrwRv: (g.ab.intLit CsrMtvec; g.ab.rawReg g.argReg(0))
-  var mie = 0'i64
-  for c in causes: mie = mie or (1'i64 shl int(c))
-  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit mie)
-  g.ab.tree CsrsRv: (g.ab.intLit CsrMie; g.ab.rawReg g.argReg(0))
-  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MstatusMie)
-  g.ab.tree CsrsRv: (g.ab.intLit CsrMstatus; g.ab.rawReg g.argReg(0))
-
-proc emResetPathRv*(g: var CodeGen; stackTop: int64) =
-  ## What a RISC-V core does NOT do for an image, in the order it must be done.
-  ##
-  ## An M-profile core reads its initial SP out of vector-table word 0 and enters
-  ## the reset handler with a usable stack. A RISC-V core does neither: `sp` holds
-  ## whatever reset left there, and `mstatus.FS` is clear, so the first stack
-  ## access is wild and the first floating-point instruction raises an
-  ## illegal-instruction exception into an `mtvec` that has not been set either.
-  ##
-  ## Both failures present as a HANG rather than a fault, which is what makes them
-  ## expensive: the image simply stops, at an instruction that is spelled and
-  ## encoded correctly. So both are established unconditionally, before anything
-  ## else, and neither is conditional on whether the program looks like it needs
-  ## one — that is not knowable when this is emitted.
-  g.ab.tree MovA64: (g.ab.rawReg SP; g.ab.intLit stackTop)
-  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MstatusFsDirty)
-  g.ab.tree CsrsRv: (g.ab.intLit CsrMstatus; g.ab.rawReg g.argReg(0))
-  if g.rvIrqCauses != {}: g.emEnableInterruptsRv(g.rvIrqCauses)
-
-
-proc emStartupInitM*(g: var CodeGen) =
+proc emStartupInit*(g: var CodeGen) =
   ## The reset handler's first duty: give SRAM the contents the program expects
   ## to find there.
   ##

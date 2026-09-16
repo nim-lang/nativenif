@@ -160,7 +160,7 @@ const
     intCallerSavedSet: IntCallerSaved,
     convClobbersGpr: @ConvClobbersGpr)
 
-  ## The machine description for the NEW pure-emit value core (`genProc2`): identical
+  ## The machine description for the NEW pure-emit value core (`genProc`): identical
   ## to `aarch64Machine` except the two integer bridges (x14/x15) and the float bridge
   ## (v31) are withheld from the allocator's temp pools, so the emitter can always draw
   ## a free transient (see `IntBridgeRegs`/`FloatBridgeReg`).

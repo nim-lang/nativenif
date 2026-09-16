@@ -16,7 +16,7 @@
 ## (`slots.setTargetWord`), and which features the target simply does not have,
 ## every one of which is refused BY NAME rather than mis-emitted.
 ##
-## That is why there is no separate `codegen_m`: a second emitter would have had
+## That is why there is no separate Cortex-M emitter: a second one would have had
 ## to reimplement the register-binding protocol, which is the part with a formal
 ## model behind it (`proofs/arkham_bindings.tla`).
 ##
@@ -32,13 +32,13 @@
 
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     mirrors, temps, exprpred, typenav, regbind, abi,
                     layout, stress]
 import machine_a64 as machine
-from machine_m as machine_m import nil
-  # Fully qualified: `machine_m` names its own `LR`/`IP`/`IntCalleeSaved` for the
+from machine_cortexm import nil
+  # Fully qualified: `machine_cortexm` names its own `LR`/`IP`/`IntCalleeSaved` for the
   # Cortex-M register file, every one of which would collide with `machine`'s
   # AArch64 spelling of the same idea. Which target a name refers to should be
   # visible at the use site, not decided by import order.
@@ -46,11 +46,8 @@ export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
                  # backends' `g.lookupSym(...).cat` keeps resolving
 export regbind   # the emitter's register-binding state (`g.rb`) — the single
                  # owner of reg<->name bindings, see regbind.nim
-                                 # nifasm: the bitmask-immediate predicate, so
-                                 # arkham folds exactly the constants it can encode
 import emit, mem, aggr
-                                 # `nifasm/thumb2` so the two cannot drift apart
-
+from a64 import nil
 
 # When the backend targets Linux (`g.a64Linux`), an `importc`'d libc function
 # recognised as a syscall (see `programs.collect` / `LinuxSyscalls`) is emitted as
@@ -59,39 +56,13 @@ import emit, mem, aggr
 # backend serves it without a dynamic linker. `LinuxA64ExitNr` and the table live
 # in `programs`; AArch64 uses the asm-generic unistd numbers (write=64 not 1).
 
-# The `CodeGen` state object and the Leng type/lvalue analysis live in
-# `codegen_common`; this module is the AArch64 instruction-selection backend.
-
-# ── low-level emit helpers ──────────────────────────────────────────────────
-
-# ── scratch register pool (volatile temps not held by a local) ──────────────
-
-# ── SIMD/FP scratch pool + emit helpers (double precision) ──────────────────
-
-# `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
-# to pick single- vs double-precision encodings.
-# The GPR side of an `fmov` bitcast is a VALUE, so it goes through `emReg` like
-# every other value operand — a bound register by its checked name, a raw tag
-# otherwise, and the unbound-scratch assertion in between.
-#
-# It used to be spelled by name on Cortex-M and RAW on AArch64, and the split was
-# not arkham's choice at all: nifasm's AArch64 handlers for `fmov`/`scvtf`/
-# `fcvtzs` read that operand with `parseRegisterA64`, which accepts a register
-# TAG and nothing else, while the Thumb-2 handlers have always gone through the
-# operand parser and taken either. So the emitter carried a branch to satisfy an
-# asymmetry one level down, and the value check had a hole on the target with the
-# larger register file. Both handlers now use `parseGprA64` — the resolving form,
-# which additionally rejects a raw use of a BOUND register — and the only
-# difference in the output is that such a register is named where it used to be
-# spelled raw, which nifasm resolves back to the same register.
-# ── expressions: target-into-register ───────────────────────────────────────
-
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
-# ── 64-bit scalars on Cortex-M (M4) ─────────────────────────────────────────
-# Defined in the INCLUDED `codegen_m64.nim` at the end of this file, because
-# they need the whole value core they dispatch out of. Every one of these is a
-# no-op on the 64-bit targets: `isWideSlot` is false there by construction, so
-# not one of the call sites below can fire.
+
+# ── 64-bit scalars on a 32-bit target (Cortex-M, RV32) ──────────────────────
+# Defined in the wide-integer section at the end of this module, because they
+# need the whole value core they dispatch out of. Every one of these is a no-op
+# on the 64-bit targets: `isWideSlot` is false there by construction, so not one
+# of the call sites below can fire.
 proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
 proc emitWideCmp(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
@@ -120,7 +91,7 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # passes split exactly that concern: `prematAccess` (pass 1) materializes every
 # embedded value into a register as a preceding statement; `emAccessAddr` (pass 2)
 # re-emits the address tree consuming those registers in the same traversal order.
-# Mirrors the x86-64 backend (codegen_x64); the nifasm A64 `(at)` parser folds the
+# Mirrors the x86-64 backend (`x64/`); the nifasm A64 `(at)` parser folds the
 # resulting `base + idx*scale` / `(at base idx scratch)` from the element type.
 
 # ── floating-point expressions (single + double precision) ──────────────────
@@ -131,10 +102,6 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # MODEL: the init-home seal in proofs/arkham_bindings.tla (`beginInit` seals the home;
 # ValueConsistency). The `sealHome` below protects a register-local home while its own
 # value is built — without it a steal evicts the home and the write lands in a stale reg.
-# ── calls ────────────────────────────────────────────────────────────────────
-
-# ── statements ──────────────────────────────────────────────────────────────
-
 # ── AAPCS64 small-aggregate (≤16B) marshalling ──────────────────────────────
 # A ≤16-byte aggregate travels in 1–2 consecutive GPRs. The transfer is purely
 # POSITIONAL — eightbyte i is the 8 bytes at offset 8·i — and never consults the
@@ -145,19 +112,16 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # by-reference / x8-indirect paths still `raiseAssert`. Layout/size live in
 # slots.nim so the register allocator shares them.
 
-# ── named register locals (typed nifasm vars; transient scratch stays `(xN)`) ─
-
-# ── control flow: labels + goto ─────────────────────────────────────────────
-
-# ── the atomic rows (`{.intrinsic: "AtomicX".}` → AArch64 LL/SC loops) ─────────
-# AArch64 has no lock prefix: every read-modify-write is a load-exclusive /
-# store-exclusive retry loop, and the acquire/release forms (`ldaxr`/`stlxr`)
-# carry the ordering. Memory ordering is always that strong form, so the
-# memory-order operands are not evaluated (see `evaluatedOperands`).
+# ── the atomic rows (`{.intrinsic: "AtomicX".}` → LL/SC loops) ──────────────
+# No load/store target has a lock prefix: every read-modify-write is a
+# load-exclusive / store-exclusive retry loop, spelled per CPU in `a64`,
+# `cortexm` and `rv32` (`mem.emitAtomicInstr` dispatches). Memory ordering is
+# always the strong form, so the memory-order operands are not evaluated (see
+# `evaluatedOperands`).
 #
 # An atomic arrives as `(instr …)`, so its operands are wherever the ALLOCATOR put
 # them and the sequence assumes no ABI; the three registers it takes for itself are
-# `AtomicScratchRegs`, which the allocator never hands out. See `emitAtomicInstr2`.
+# `AtomicScratchRegs`, which the allocator never hands out. See `emitAtomicInstr`.
 
 # ── mem* intrinsics: inline copies (no libc) ─────────────────────────────────
 # memcpy/memmove/memset/memcmp masquerade as importc calls (see programs.collect).
@@ -168,14 +132,8 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # Result lands in x0 (memcpy/memmove/memset return dest, memcmp the first byte
 # difference).
 
-# ── case statement ──────────────────────────────────────────────────────────
-
-# ── proc emission ────────────────────────────────────────────────────────────
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  Fused value core (`*2`) — the AArch64 twin of codegen_x64.nim's emit*2
-#  family. The destination is threaded as a parameter (constraint in, resolved
+#  The value core — the load/store twin of `x64/value`'s. The destination is threaded as a parameter (constraint in, resolved
 #  location out); every register decision is made inline at the point of
 #  emission (machine `aarch64MachineN`). Transient scratch the emitter needs
 #  (a folded memory operand a64 must load, a global address temp, a
@@ -184,38 +142,36 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 #  pools so one is always free.
 # ════════════════════════════════════════════════════════════════════════════
 
-proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location)
-proc prematLval2*(g: var CodeGen; c: Cursor)
-proc genConstr2*(g: var CodeGen; c: Cursor; dst: Location)
-proc genAconstr2*(g: var CodeGen; c: Cursor; dst: Location)
+proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location)
+proc prematLval*(g: var CodeGen; c: Cursor)
+proc genConstr*(g: var CodeGen; c: Cursor; dst: Location)
+proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
 # The destination is a threaded parameter (constraint in, resolved location
 # out) instead of the allocator's per-position plan — the a64 twin of the x64
-# fused core. Old locs-reading procs stay live until genProc2 flips.
-proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location)
+# fused core.
+proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitMod(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst
-proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+proc emitMemLoad*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
-proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc produceIntoMem2*(g: var CodeGen; c: Cursor; dst: Location)
-proc produceIntoFMem2*(g: var CodeGen; c: Cursor; dst: Location)
-proc storeReg2*(g: var CodeGen; dst: Location; src: Reg)
+proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
+proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location)
+proc produceIntoFMem*(g: var CodeGen; c: Cursor; dst: Location)
+proc storeReg*(g: var CodeGen; dst: Location; src: Reg)
 
 
-# ── staging bridges (always free; reserved out of the allocator pool) ────────
-
-# ── fused value core: emit-time destination protocol (step 3, a64 twin) ──────
+# ── fused value core: emit-time destination protocol (`emit.nim`) ───────────
 # Lazy-bind lifecycle identical to x64's: `takeTmp` RESERVES (pickedRegs flag
 # guards the reserve→bind gap; the consumer binds on materialization);
 # `freeVal` releases. Pool dry → mint an `etmp` slot (declared by the
@@ -224,10 +180,10 @@ proc storeReg2*(g: var CodeGen; dst: Location; src: Reg)
 
 # ── scalar Location → register / register → Location ─────────────────────────
 
-proc place2*(g: var CodeGen; src: Location; dest: Reg) =
+proc place*(g: var CodeGen; src: Location; dest: Reg) =
   ## `dest ← <scalar Location src>`. The pure-emit analogue of `emitLoad`: a
   ## global/threadvar address is formed straight into `dest` (no borrowed temp),
-  ## a complex lvalue routes through the `*2` address machinery.
+  ## a complex lvalue routes through the value core's address machinery.
   ##
   ## `dest` is about to be WRITTEN, so whatever it mirrored is stale — and a
   ## memory `src` may still be in a register, which turns the load into a move.
@@ -285,13 +241,13 @@ proc place2*(g: var CodeGen; src: Location; dest: Reg) =
     let spare = if g.exprReadsReg(src.cur, dest): NoReg else: dest
     let savedSpare = g.lateBaseSpare
     g.lateBaseSpare = spare
-    g.prematLval2(src.cur)
+    g.prematLval(src.cur)
     g.lateBaseSpare = savedSpare
-    g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emLvalAddr2(src.cur))
-    g.unbindLvalTemps2(src.cur)
-  else: raiseAssert "arkham a64n: place2 src " & $src.kind
+    g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emLvalAddr(src.cur))
+    g.unbindLvalTemps(src.cur)
+  else: raiseAssert "arkham a64n: place src " & $src.kind
 
-proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
+proc placeF(g: var CodeGen; src: Location; dest: FReg; bits: int) =
   ## `dest ← <float Location src>`.
   case src.kind
   of InFReg: g.fmovF(dest, src.f, bits)
@@ -300,12 +256,12 @@ proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
     let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(src.name))
     g.emFLoad(dest, b, bits); g.dropBridge b
   of Mem:
-    g.prematLval2(src.cur)
-    g.ab.tree FldrA64: (g.emFReg(dest, bits); g.ab.tree MemX: g.emLvalAddr2(src.cur))
-    g.unbindLvalTemps2(src.cur)
-  else: raiseAssert "arkham a64n: placeF2 src " & $src.kind
+    g.prematLval(src.cur)
+    g.ab.tree FldrA64: (g.emFReg(dest, bits); g.ab.tree MemX: g.emLvalAddr(src.cur))
+    g.unbindLvalTemps(src.cur)
+  else: raiseAssert "arkham a64n: placeF src " & $src.kind
 
-proc storeReg2*(g: var CodeGen; dst: Location; src: Reg) =
+proc storeReg*(g: var CodeGen; dst: Location; src: Reg) =
   ## `<scalar Location dst> ← src` (integer/pointer).
   case dst.kind
   of InReg: g.movReg(dst.r, src)
@@ -332,25 +288,25 @@ proc storeReg2*(g: var CodeGen; dst: Location; src: Reg) =
     if wr != NoReg:
       g.movReg(wr, src)
       return
-    g.prematLval2(dst.cur)
+    g.prematLval(dst.cur)
     g.ab.tree MovA64:
-      g.ab.tree MemX: g.emLvalAddr2(dst.cur)
+      g.ab.tree MemX: g.emLvalAddr(dst.cur)
       g.emReg src
-    g.unbindLvalTemps2(dst.cur)
-  else: raiseAssert "arkham a64n: storeReg2 dst " & $dst.kind
+    g.unbindLvalTemps(dst.cur)
+  else: raiseAssert "arkham a64n: storeReg dst " & $dst.kind
 
-# ── lvalue addressing (mirrors x64 emLvalAddr2/prematLval2/unbindLvalTemps2) ──
+# ── lvalue addressing (mirrors x64 emLvalAddr/prematLval/unbindLvalTemps) ───
 
-proc reloadMemBase2*(g: var CodeGen; pos: int) =
+proc reloadMemBase*(g: var CodeGen; pos: int) =
   ## A deref/at/pat base or register index the allocator spilled (NamedStack/Mem)
   ## must be in a register for `[reg]` addressing: load it into a bridge, repoint
-  ## its location, and park the home so `restoreMemBase2` puts it back. (A register-
+  ## its location, and park the home so `restoreMemBase` puts it back. (A register-
   ## homed base returns immediately — no steal can move it under us anymore.)
   let loc = g.plan.planned(pos)
   if loc.kind notin {NamedStack, Mem}: return
   # A bridge, but never the LAST one while there is another answer. Any register
   # with no live binding serves just as well — the reload dies with the operand —
-  # and `pickStagingA64` finds those the whole-proc home union hides. Taking the
+  # and `pickUnboundReg` finds those the whole-proc home union hides. Taking the
   # last bridge here is what leaves a step with no alternative holding nothing:
   # under a 64-bit lowering (which juggles pairs) this is reached with one already
   # gone, and on the `cortex-m 64` corpus it was the last over-budget take left.
@@ -358,7 +314,7 @@ proc reloadMemBase2*(g: var CodeGen; pos: int) =
   if g.liveBridges() + 1 < g.distinctBridges():
     s = g.tryTakeBridge(loc.typ)
   if s == NoReg:
-    s = g.pickStagingA64()
+    s = g.pickUnboundReg()
     if s != NoReg:
       g.pickedRegs.incl s
       g.bindTemp(s, loc.typ)
@@ -369,21 +325,21 @@ proc reloadMemBase2*(g: var CodeGen; pos: int) =
       if s == NoReg:
         raiseAssert "arkham a64n: no register to reload a spilled memory base in proc " &
                     g.curProcName
-  g.place2(loc, s)
+  g.place(loc, s)
   g.savedHomes[pos] = loc
   g.plan.planAtEmitTime(pos, regLoc(s, loc.typ))
 
-proc prematAddrVal2*(g: var CodeGen; c: Cursor) =
+proc prematAddrVal*(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue base/index value `c` into a register for the enclosing
   ## `(mem …)`. A register-homed base materializes in place; a genuinely spilled base
-  ## (`NamedStack`/`Mem`) is brought into a bridge by `reloadMemBase2`. Scoped to the
-  ## lvalue tree (NOT general `emitValue2`). The destination was decided by
-  ## `emitLvalue2` (`resolveLvalVal`) and parked in the memo; thread it.
+  ## (`NamedStack`/`Mem`) is brought into a bridge by `reloadMemBase`. Scoped to the
+  ## lvalue tree (NOT general `emitValue`). The destination was decided by
+  ## `emitLvalue` (`resolveLvalVal`) and parked in the memo; thread it.
   let pos = g.posOf(c)
   var d = g.plan.planned(pos)
-  g.emitValue2(c, d)
+  g.emitValue(c, d)
   g.plan.planAtEmitTime(pos, d)
-  g.reloadMemBase2(pos)
+  g.reloadMemBase(pos)
 
 proc raiseForIndexedBase*(g: var CodeGen; c: Cursor; lateBase: bool) =
   ## I2/I3: the honest bridge demand of an `(at …)` / `(pat …)` address chain.
@@ -391,7 +347,7 @@ proc raiseForIndexedBase*(g: var CodeGen; c: Cursor; lateBase: bool) =
   ## TWO only when both ends really need a bridge of their own — a computed index
   ## AND a base that must be reloaded into one. It is one otherwise, and saying two
   ## unconditionally is not merely pessimistic: this chain is reached with two
-  ## bridges already held (`foldRhs2`'s load destination plus `produceIntoMem2`'s
+  ## bridges already held (`foldRhs`'s load destination plus `produceIntoMem`'s
   ## produce bridge), so an unconditional two made every such composition look like
   ## it needed four of three.
   ##
@@ -409,11 +365,11 @@ proc raiseForIndexedBase*(g: var CodeGen; c: Cursor; lateBase: bool) =
   if idxComputed and not lateBase:
     g.bridgeRaise(bdTwoInRegs, "an indexed lvalue with a spilled base and a computed index")
 
-proc prematLval2*(g: var CodeGen; c: Cursor) =
+proc prematLval*(g: var CodeGen; c: Cursor) =
   # A `(mem …)` whose base AND index both spilled reloads each into a bridge
-  # (`reloadMemBase2`), and an `(at …)` stride scratch that found the pools dry
+  # (`reloadMemBase`), and an `(at …)` stride scratch that found the pools dry
   # takes one that lives until the operand is emitted (`bindStrideScratch`). Both
-  # outlive this proc — the consumer's `freeLvalTemps2` releases them — so the
+  # outlive this proc — the consumer's `freeLvalTemps` releases them — so the
   # demand is the enclosing STEP's, and this is where it becomes known.
   ## Materialize an lvalue's embedded values (a deref pointer, an index, a global
   ## base address) into their allocated registers BEFORE the consuming `(mem …)`/
@@ -441,9 +397,9 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
       # consuming `(mem …)` tree can clobber a volatile — any register with no live
       # binding will do, and taking one leaves both bridges for the operand reloads
       # that have no other answer. A bridge only if even that finds nothing.
-      # `freeLvalTemps2` drops it with the rest of the lvalue's temps either way
+      # `freeLvalTemps` drops it with the rest of the lvalue's temps either way
       # (`dropBridge` is `unbindTemp`, which also clears the reserve flag).
-      var s = g.pickStagingA64()
+      var s = g.pickUnboundReg()
       var borrowed = false
       if s != NoReg:
         g.pickedRegs.incl s
@@ -452,7 +408,7 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
         s = g.tryTakeBridge()
         if s == NoReg and g.lateBaseSpare != NoReg:
           # Nothing free and both bridges are staging. The caller named one register
-          # it is about to OVERWRITE anyway — `place2`'s load destination, which it
+          # it is about to OVERWRITE anyway — `place`'s load destination, which it
           # only offers after proving this address does not read it. `&g` goes there
           # and the load consuming it reads `[s + idx]` back into `s`. Without this
           # the shape `x op globalArray[i]` has no third register to stand in and the
@@ -460,7 +416,7 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
           # that shape, and inlining puts one inside an enclosing binary operator.
           #
           # BORROWED, not taken: the register stays the caller's, so the matching
-          # `unbindLvalTemps2` must not release it (it is still holding the loaded
+          # `unbindLvalTemps` must not release it (it is still holding the loaded
           # value the caller is about to consume).
           s = g.lateBaseSpare
           borrowed = true
@@ -482,12 +438,12 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
     of DotC:
       var cc = c
       cc.into:
-        g.prematLval2(cc)
+        g.prematLval(cc)
         while cc.hasMore: skip cc
     of DerefC:
       var cc = c
       cc.into:
-        g.prematAddrVal2(cc)                              # the pointer → its reg (follow steals)
+        g.prematAddrVal(cc)                               # the pointer → its reg (follow steals)
         while cc.hasMore: skip cc
     of AtC:
       let atPos = g.posOf(c)
@@ -500,12 +456,12 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
         # no survivor at all (`lateGlobalBase`).
         let late = g.lateGlobalBase(baseCur) or g.lateSpilledBase(baseCur)
         g.raiseForIndexedBase(cc, late)
-        if not late: g.prematLval2(cc)
+        if not late: g.prematLval(cc)
         skip cc                                           # base
         if cc.kind notin {IntLit, UIntLit}:
-          g.prematAddrVal2(cc)                            # follow steals
+          g.prematAddrVal(cc)                             # follow steals
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
-        if late: g.prematLval2(baseCur)
+        if late: g.prematLval(baseCur)
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
         g.bindStrideScratch(atPos, recycle)
@@ -522,12 +478,12 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
         # composition `tightCompositions` still counted.
         let late = g.lateSpilledBase(baseCur)
         g.raiseForIndexedBase(cc, late)
-        if not late: g.prematAddrVal2(cc)                 # the pointer → its reg
+        if not late: g.prematAddrVal(cc)                  # the pointer → its reg
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
-          g.prematAddrVal2(cc)                            # follow steals
+          g.prematAddrVal(cc)                             # follow steals
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
-        if late: g.prematAddrVal2(baseCur)
+        if late: g.prematAddrVal(baseCur)
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
         g.bindStrideScratch(patPos, recycle)
@@ -535,18 +491,18 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         skip cc; skip cc                                 # base type, depth
-        g.prematLval2(cc)
+        g.prematLval(cc)
         while cc.hasMore: skip cc
     of AconstrC, OconstrC:
       # An aggregate CONSTRUCTOR in lvalue position (`[a, b][i]`): build it into a
       # stack slot here, before the consuming `(mem …)` tree opens, and let
-      # `emLvalAddr2` address that slot. A constructor has no address of its own.
+      # `emLvalAddr` address that slot. A constructor has no address of its own.
       let home = g.inlineAggrHome(c)
       if not g.varType.hasKey(home):
         let t = g.getType(c)
         g.emTypedStackVar(home, t)
         if t.kind == Symbol: g.varType[home] = t.symId
-        g.genStore2(c, namedStackLoc(home, g.exprSlot(c)))
+        g.genStore(c, namedStackLoc(home, g.exprSlot(c)))
     else: discard
 
 # ── memory loads / address-of ────────────────────────────────────────────────
@@ -554,7 +510,7 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
 proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool) =
   ## THE address-of any lvalue into register `dest`: `&(deref p)`
   ## is `p`; a global/threadvar leas its absolute address; a `baseobj` is the inner
-  ## lvalue's address (base at offset 0); anything else leas the `emLvalAddr2` subtree.
+  ## lvalue's address (base at offset 0); anything else leas the `emLvalAddr` subtree.
   ## `doBind` names a fresh temp `dest`. Shared by `(addr …)` / aggregate marshalling /
   ## aggregate copy.
   if lv.kind == TagLit and lv.exprKind == DerefC:
@@ -565,12 +521,12 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
         p = dd; skip dd
         while dd.hasMore: skip dd
     var pLoc = g.plan.planned(g.posOf(p))    # the CALLER's walk decided p's spot
-    g.emitValue2(p, pLoc)
+    g.emitValue(p, pLoc)
     g.plan.planAtEmitTime(g.posOf(p), pLoc)
     if doBind:
       g.bindTemp(dest, AsmSlot(cls: AUInt, size: wordSize(), align: wordAlign(),
                               typ: g.getType(p)))
-    g.place2(pLoc, dest)
+    g.place(pLoc, dest)
     if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != dest: g.unbindTemp(pLoc.r)
   elif lv.kind == TagLit and lv.exprKind == BaseobjC:
     var inner: Cursor
@@ -588,16 +544,16 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
           p = dd; skip dd
           while dd.hasMore: skip dd
       var pLoc = g.plan.planned(g.posOf(p))  # the CALLER's walk decided p's spot
-      g.emitValue2(p, pLoc)
+      g.emitValue(p, pLoc)
       g.plan.planAtEmitTime(g.posOf(p), pLoc)
       if doBind: g.bindTemp(dest, aslot)
-      g.place2(pLoc, dest)
+      g.place(pLoc, dest)
       if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != dest: g.unbindTemp(pLoc.r)
     else:
       if doBind: g.bindTemp(dest, aslot)
-      g.prematLval2(inner)
-      g.ab.tree LeaA64: (g.emReg dest; g.emLvalAddr2(inner))
-      g.unbindLvalTemps2(inner)
+      g.prematLval(inner)
+      g.ab.tree LeaA64: (g.emReg dest; g.emLvalAddr(inner))
+      g.unbindLvalTemps(inner)
   elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat in {scGlobal, scTvar}:
     if doBind: g.bindTemp(dest, aslot)
     var lc = lv
@@ -622,23 +578,23 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
       raiseAssert "arkham a64n: aggrAddr of InRegPair local " & symName(lv)
     else: raiseAssert "arkham a64n: aggrAddr of local " & symName(lv) & " home " & $home.kind
   else:
-    # The lvalue's embedded picks come from the CALLER's `emitLvalue2` walk
-    # (and the caller frees them with `freeLvalTemps2`) — x64's contract.
+    # The lvalue's embedded picks come from the CALLER's `emitLvalue` walk
+    # (and the caller frees them with `freeLvalTemps`) — x64's contract.
     if doBind: g.bindTemp(dest, aslot)
     var bound: seq[Reg] = @[]
     g.bindLvalGlobalBases(lv, bound)                    # bind any UNBOUND global-base reg first
-    g.prematLval2(lv)
-    g.ab.tree LeaA64: (g.emReg dest; g.emLvalAddr2(lv))
-    g.unbindLvalTemps2(lv)
+    g.prematLval(lv)
+    g.ab.tree LeaA64: (g.emReg dest; g.emLvalAddr(lv))
+    g.unbindLvalTemps(lv)
     for r in bound: g.unbindTemp(r)
 
 # ── integer arithmetic ───────────────────────────────────────────────────────
 
-proc foldRhs2(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
-              w32 = false) =
+proc foldRhs(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
+             w32 = false) =
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
   ## large/non-add immediate goes through a bridge). `dest` already holds the lhs.
-  ## `w32` selects the 32-bit W-form tag for add/sub/mul (see wForm/emitBin2).
+  ## `w32` selects the 32-bit W-form tag for add/sub/mul (see wForm/emitBin).
   case rhsLoc.kind
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
@@ -664,17 +620,17 @@ proc foldRhs2(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: C
     g.binReg(op, dest, rhsLoc.r, w32)
   of NamedStack, Mem, Glob, Tvar:
     let b = g.takeBridge(avoid = dest)
-    g.place2(rhsLoc, b)
+    g.place(rhsLoc, b)
     g.binReg(op, dest, b, w32)
     g.dropBridge b
-  else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
+  else: raiseAssert "arkham a64n: foldRhs " & $rhsLoc.kind
 
 
 proc foldRhs3(g: var CodeGen; op: RiscInst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
-  ## `dest = rn op rhs` — the 3-operand twin of `foldRhs2`. `rn` holds the left
+  ## `dest = rn op rhs` — the 3-operand twin of `foldRhs`. `rn` holds the left
   ## source (a live local's register, distinct from `dest`); nothing is moved into
-  ## `dest` first. Materializes the rhs exactly as `foldRhs2` does.
+  ## `dest` first. Materializes the rhs exactly as `foldRhs` does.
   case rhsLoc.kind
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
@@ -697,19 +653,17 @@ proc foldRhs3(g: var CodeGen; op: RiscInst; dest, rn: Reg; rhsLoc: Location; rhs
     g.binReg3(op, dest, rn, rhsLoc.r, w32)
   of NamedStack, Mem, Glob, Tvar:
     let b = g.takeBridge(avoid = dest)
-    g.place2(rhsLoc, b)
+    g.place(rhsLoc, b)
     g.binReg3(op, dest, rn, b, w32)
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs3 " & $rhsLoc.kind
 
-# ── float arithmetic ─────────────────────────────────────────────────────────
-
 # ── calls ────────────────────────────────────────────────────────────────────
 
-proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
+proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## Inline `mem*` copy. The allocator placed the 3 args in x0/x1/x2 (a normal
   ## int-arg call); during this leaf intrinsic the free arg registers x3/x4/x5 are the
-  ## loop scratch (raw, caller-saved). Result → x0 (moved to its home by emitCall2).
+  ## loop scratch (raw, caller-saved). Result → x0 (moved to its home by emitCall).
   ## A compile-time memcpy of 0..64 bytes unrolls into sized loads/stores.
   var unroll = false
   var nUnroll = 0'i64
@@ -730,15 +684,15 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       g.wideLoad(g.md.intArgRegs[idx], g.wideValueSlot(argCurs[idx]), 0)
       continue
     var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
-    g.emitValue2(argCurs[idx], aD)                       # → x0 / x1 / x2 directly
+    g.emitValue(argCurs[idx], aD)                        # → x0 / x1 / x2 directly
     if aD.kind != InReg or aD.r != g.md.intArgRegs[idx]:
       # A fixed register is a REQUEST the value core may answer with the value's
       # home instead — a spilled local's stack slot, in particular a 64-bit count
       # on a 32-bit target (measured: Cortex-M on `memcpy_bulk`, where reading
       # `.r` off the NamedStack answer was a FieldDefect). The loop below reads the
-      # argument registers raw, so bring the value there the way `emitCall2` does
+      # argument registers raw, so bring the value there the way `emitCall` does
       # for a function-pointer target that came back off-register.
-      g.place2(aD, g.md.intArgRegs[idx])
+      g.place(aD, g.md.intArgRegs[idx])
     g.unbindTemp(g.md.intArgRegs[idx])                   # used raw below
   # The three ARGUMENT registers, read off the machine rather than written as
   # slot literals: `a0`/`a1`/`a2` are `x0`/`x1`/`x2` on Arm and `x10`/`x11`/`x12`
@@ -889,13 +843,13 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
 
 # ── stores ───────────────────────────────────────────────────────────────────
 
-proc storeScalar2*(g: var CodeGen; dst, v: Location) =
+proc storeScalar*(g: var CodeGen; dst, v: Location) =
   ## Move a just-computed scalar `v` into a scalar home `dst`, releasing `v` if a temp.
   case dst.kind
-  of InReg: g.place2(v, dst.r)
+  of InReg: g.place(v, dst.r)
   of InFReg:
     let bits = dst.typ.size * 8
-    if v.kind in {NamedStack, Mem, Glob}: g.placeF2(v, dst.f, bits)
+    if v.kind in {NamedStack, Mem, Glob}: g.placeF(v, dst.f, bits)
     elif v.kind == InFReg and v.f != dst.f:
       g.fmovF(dst.f, v.f, bits)
       if v.isTemp: g.unbindFTmp(v.f)
@@ -906,7 +860,7 @@ proc storeScalar2*(g: var CodeGen; dst, v: Location) =
     if dst.typ.isFloat:
       if need.fregs > 0:
         let fs = g.takeFBridge(bits)
-        g.placeF2(v, fs, bits)
+        g.placeF(v, fs, bits)
         g.emFloatScalarStore(dst.name, fs, bits)
         g.dropFBridge()
       elif v.kind == InFReg:
@@ -918,7 +872,7 @@ proc storeScalar2*(g: var CodeGen; dst, v: Location) =
     else:
       if need.gprs > 0:
         let b = g.takeBridge(need.slot)
-        if v.kind == Imm: g.placeImm(b, v) else: g.place2(v, b)
+        if v.kind == Imm: g.placeImm(b, v) else: g.place(v, b)
         g.emScalarStore(dst.name, b)
         g.dropBridge b
       elif v.kind == InReg:
@@ -977,7 +931,7 @@ proc aggrArgAddr*(g: var CodeGen; a: Cursor; dst: Reg) =
     let home = synth("aggtmp") & $pos & ".0"
     g.emTypedStackVar(home, g.getType(a))
     g.varType[home] = g.getType(a).symId
-    g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
+    g.genStore(a, namedStackLoc(home, g.exprSlot(a)))
     g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
 
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
@@ -989,9 +943,9 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
   ## a trailing PARTIAL eightbyte through `loadAggrTail` — exact bytes, no over-read).
   ##
   ## Both staging bridges are live here (the source address and the word carrier), so
-  ## the one tail shape that needs a third scratch — a 3/5/6/7-byte aggregate, which has
-  ## neither a single covering load nor a full word to borrow from — is refused rather
-  ## than silently mis-marshalled. It takes a call with 8+ integer arguments to reach.
+  ## the one tail shape that would need a third scratch — a 3/5/6/7-byte aggregate,
+  ## which has neither a single covering load nor a full word to borrow from — spends
+  ## the source address instead, after its last read.
   g.bridgeStep("a stack-passed aggregate argument", bdTwoInRegs)
   let tcur = g.getType(a)
   if tcur.kind != Symbol:
@@ -1012,9 +966,10 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
       if sz - i * mw >= mw:
         g.ab.tree MovA64: (g.emReg w; g.emWordThroughPtr(src, i))
       else:
-        if i == 0 and sz notin {1, 2, 4}:
-          raiseAssert "arkham arm: " & $sz & "-byte aggregate stack-arg ABI unsupported"
-        g.loadAggrTail(w, src, sz, i * mw)
+        # The source address is not read again after the last word, so the tail may
+        # consume it — which is what lets a 3/5/6/7-byte aggregate load with the two
+        # bridges this step holds (see `loadAggrTail`).
+        g.loadAggrTail(w, src, sz, i * mw, baseDies = true)
       g.ab.tree MovA64:
         g.ab.tree MemX:
           g.emReg SP
@@ -1026,7 +981,7 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
 proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
   ## Materialize an aggregate field value `valC` (a nested `oconstr`/`aconstr`, an
   ## aggregate symbol, …) of declared field type `fty` into the sub-aggregate at field
-  ## `dst`: build it into a synthetic temp through the general `genStore2` (which
+  ## `dst`: build it into a synthetic temp through the general `genStore` (which
   ## recurses for deeper nesting) WITHOUT holding a bridge, then copy that temp through
   ## the field address. Computing the field pointer AFTER the recursive build keeps only
   ## two bridges live at once (the field ptr + the word-transfer temp), so nesting is
@@ -1038,21 +993,21 @@ proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
   let tmpName = synth("nctmp") & $pos & ".0"
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
-  g.genStore2(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)))   # build (no bridge held)
+  g.genStore(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)))    # build (no bridge held)
   # The field pointer and the word temp are live together; the source inside
-  # `flatCopyToPtr2` is a NAMED slot and costs no register (`AggrEnd`), which is
+  # `flatCopyToPtr` is a NAMED slot and costs no register (`AggrEnd`), which is
   # what took this step from three bridges to two.
   g.withBridges(bdTwoInRegs, "a nested-aggregate field copy"):
     let fptr = g.takeBridge()
     g.emFieldAddr(dst, fptr)
     let tmp = g.takeBridge(avoid = fptr)
-    g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), fptr, tmp)
+    g.flatCopyToPtr(tmpName, aggrByteSize(g.prog, ntn), fptr, tmp)
     g.dropBridge tmp
     g.dropBridge fptr
 
-proc genFieldStore2*(g: var CodeGen; dst: Location; valC: Cursor) =
+proc genFieldStore*(g: var CodeGen; dst: Location; valC: Cursor) =
   ## Store value `valC` into the aggregate-field destination `dst` — the `Field` case of
-  ## `genStore2`, and the ONE per-field store behind `genConstr2`. A scalar/float/pointer
+  ## `genStore`, and the ONE per-field store behind `genConstr`. A scalar/float/pointer
   ## field emits its value into the field operand (a POINTER field reinterprets a scalar
   ## via `(cast (ptr …) reg)` for nifasm's strict typing); a nested aggregate field
   ## recurses through `genNestedAggrField`. No per-field special-casing at the call site.
@@ -1063,26 +1018,26 @@ proc genFieldStore2*(g: var CodeGen; dst: Location; valC: Cursor) =
     var v: Location
     if g.isFloatExpr(valC):
       # Seed the rhs target with the FIELD's slot rather than leaving it
-      # `dontCare` — the same lesson as the `Mem` destination in `genStore2`,
+      # `dontCare` — the same lesson as the `Mem` destination in `genStore`,
       # which this path had not learned. A float LITERAL picks its bit pattern
-      # from the destination slot (`emitFValue2`) and the `fstr` below takes its
+      # from the destination slot (`emitFValue`) and the `fstr` below takes its
       # width from `v.typ`; with neither known both default to 64, so a
       # `float32` field gets the DOUBLE pattern written EIGHT bytes wide, over
       # whatever field follows it. `dst.typ` is the field's own slot here (the
       # `AMem` case returned above), so the destination type is the authority.
       v = (if dst.typ.kind == AFloat: Location(kind: Undef, typ: dst.typ)
            else: dontCare)
-      g.emitFValue2(valC, v)
+      g.emitFValue(valC, v)
     else:
       v = needsReg(g.valueSlot(valC))                   # single-use (allocSingleUse's shape)
-      g.emitValue2(valC, v)
+      g.emitValue(valC, v)
     if v.kind == InFReg or v.typ.isFloat:               # float field
       let bits = if v.typ.size == 4: 32 else: 64
       var fr = NoFReg
       var fb = false
       if v.kind == InFReg: fr = v.f
       else:                                             # eftmp spill (pool-dry) → bridge
-        fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
+        fr = g.takeFBridge(bits); g.placeF(v, fr, bits); fb = true
       g.ab.tree FstrA64: (g.emFieldOperand(dst); g.emFReg(fr, bits))
       if fb: g.dropFBridge()
       elif v.isTemp: g.unbindFTmp(v.f)
@@ -1092,7 +1047,7 @@ proc genFieldStore2*(g: var CodeGen; dst: Location; valC: Cursor) =
       var vb = NoReg
       if v.kind == InReg: vr = v.r
       else:                                             # etmp spill (pool-dry) → bridge
-        vb = g.takeBridge(v.typ); g.place2(v, vb); vr = vb
+        vb = g.takeBridge(v.typ); g.place(v, vb); vr = vb
       g.ab.tree MovA64:
         g.emFieldOperand(dst)
         if isPtrType(fty):
@@ -1104,9 +1059,9 @@ proc genFieldStore2*(g: var CodeGen; dst: Location; valC: Cursor) =
       elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
 
 proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
-  ## The ONE field-store loop behind `genConstr2`/`genConstrIntoLval2`/nested fields:
+  ## The ONE field-store loop behind `genConstr`/`genConstrIntoLval`/nested fields:
   ## walk `(oconstr T child*)` and store each value into its field via the uniform
-  ## `genStore2`. `base` names the destination aggregate — a stack slot (`NamedStack`)
+  ## `genStore`. `base` names the destination aggregate — a stack slot (`NamedStack`)
   ## or an lvalue subtree (`Mem`, pre-materialized by the caller).
   ##
   ## A child is one of: a `(kv field value)`; a nested `(oconstr BaseT …)` (an
@@ -1164,7 +1119,7 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
         of InReg:      fieldLocReg(typeSym, field, base.r, fSlot)
         of Mem:        fieldLocLval(typeSym, field, base.cur, fSlot)
         else: raiseAssert "arkham a64n: bad oconstr base " & $base.kind
-      g.genStore2(valC, fdst)
+      g.genStore(valC, fdst)
     while cc.hasMore:
       if cc.kind == TagLit and cc.exprKind == OconstrC:
         g.constrFieldStores(cc, base)                  # nested inherited-base sub-object
@@ -1199,12 +1154,12 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           let tmpName = synth("nctmp") & $pos & ".0"
           g.emTypedStackVar(tmpName, elemTyRaw)
           g.varType[tmpName] = ntn
-          g.genStore2(valC, namedStackLoc(tmpName, elemSlot))  # build (no bridge held)
+          g.genStore(valC, namedStackLoc(tmpName, elemSlot))   # build (no bridge held)
           g.withBridges(bdTwoInRegs, "an `aconstr` aggregate element copy"):
             let eptr = g.takeBridge()
             g.ab.tree LeaA64: (g.emReg eptr; addrOp(i))   # &element[i]
             let tmp = g.takeBridge(avoid = eptr)
-            g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), eptr, tmp)
+            g.flatCopyToPtr(tmpName, aggrByteSize(g.prog, ntn), eptr, tmp)
             g.dropBridge tmp
             g.dropBridge eptr
           inc i
@@ -1232,17 +1187,17 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           # pattern and every element read back as 0.0.
           v = (if elemSlot.kind == AFloat: Location(kind: Undef, typ: elemSlot)
                else: dontCare)
-          g.emitFValue2(valC, v)
+          g.emitFValue(valC, v)
         else:
           v = needsReg(ScalarSlot)
-          g.emitValue2(valC, v)
+          g.emitValue(valC, v)
         if v.kind == InFReg or v.typ.isFloat:
           let bits = if v.typ.size == 4: 32 else: 64
           var fr = NoFReg
           var fb = false
           if v.kind == InFReg: fr = v.f
           else:                                         # eftmp spill (pool-dry) → bridge
-            fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
+            fr = g.takeFBridge(bits); g.placeF(v, fr, bits); fb = true
           g.ab.tree FstrA64: (destOp(i); g.emFReg(fr, bits))
           if fb: g.dropFBridge()
           elif v.isTemp: g.unbindFTmp(v.f)
@@ -1252,7 +1207,7 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           var vb = NoReg
           if v.kind == InReg: vr = v.r
           else:                                         # etmp spill (pool-dry) → bridge
-            vb = g.takeBridge(v.typ); g.place2(v, vb); vr = vb
+            vb = g.takeBridge(v.typ); g.place(v, vb); vr = vb
           g.ab.tree MovA64:
             destOp(i)
             if etIsPtr:
@@ -1265,16 +1220,16 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
         inc i
         skip cc
 
-proc genConstr2*(g: var CodeGen; c: Cursor; dst: Location) =
+proc genConstr*(g: var CodeGen; c: Cursor; dst: Location) =
   ## `dst` is the destination aggregate's own location — a `NamedStack` slot, or a
   ## `StackPtr` whose pointer `constrFieldStores` loads into a base register. (It used
   ## to take the NAME and rebuild a `NamedStack` from it, which erased the difference
   ## and left the pointer case to a predicate re-derived downstream.)
   g.constrFieldStores(c, dst)
 
-proc genAconstr2*(g: var CodeGen; c: Cursor; dst: Location) =
+proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location) =
   ## Emit `(aconstr ArrayT e0 e1 …)` into the aggregate destination `dst`. The array
-  ## twin of `genConstr2`, and it takes the same `Location` for the same reason: a
+  ## twin of `genConstr`, and it takes the same `Location` for the same reason: a
   ## `NamedStack` slot IS the array, while a `StackPtr` slot holds a POINTER to it (a
   ## by-ref aggregate param whose pointer the allocator could not keep in a register).
   ## Addressing `(at name idx)` in the second case would write the elements over the
@@ -1294,19 +1249,19 @@ proc genAconstr2*(g: var CodeGen; c: Cursor; dst: Location) =
     template elemAddrInSlot(i) = g.emAggrElemAt(dst.name, i)
     g.aconstrElemStores(c, destInSlot, elemAddrInSlot)
 
-proc genConstrIntoLval2*(g: var CodeGen; c: Cursor; lhs: Cursor) =
-  g.prematLval2(lhs)
+proc genConstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
+  g.prematLval(lhs)
   g.constrFieldStores(c, memLoc(lhs, ScalarSlot))            # base = the lvalue subtree
-  g.unbindLvalTemps2(lhs)
+  g.unbindLvalTemps(lhs)
 
-proc genAconstrIntoLval2*(g: var CodeGen; c: Cursor; lhs: Cursor) =
-  g.prematLval2(lhs)
+proc genAconstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
+  g.prematLval(lhs)
   template dest(i) = g.emLvalElemMem(lhs, i)
   template elemAddr(i) = g.emLvalElemAt(lhs, i)
   g.aconstrElemStores(c, dest, elemAddr)
-  g.unbindLvalTemps2(lhs)
+  g.unbindLvalTemps(lhs)
 
-proc genBaseobj2*(g: var CodeGen; c: Cursor; dst: Location) =
+proc genBaseobj*(g: var CodeGen; c: Cursor; dst: Location) =
   ## `(baseobj BaseType depth value)` — an object→base up-conversion (slicing). The base
   ## sub-object is laid out FIRST (offset 0), so the base view is the value's prefix: build
   ## the (derived) `value` into a synthetic temp, then copy the BaseType fields into the
@@ -1322,7 +1277,7 @@ proc genBaseobj2*(g: var CodeGen; c: Cursor; dst: Location) =
     let dtmp = synth("botmp") & $pos & ".0"
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = derivedTy.symId
-    g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)))  # build derived
+    g.genStore(valC, namedStackLoc(dtmp, g.exprSlot(valC)))   # build derived
     # The base view is the derived value's PREFIX (base fields first, offset 0), so a
     # flat copy of `sizeof(BaseType)` bytes is exact — and unlike a per-field copy it
     # stays correct when a base field is itself an aggregate.
@@ -1330,7 +1285,7 @@ proc genBaseobj2*(g: var CodeGen; c: Cursor; dst: Location) =
       let dptr = g.takeBridge()
       g.ab.tree LeaA64: (g.emReg dptr; g.ab.sym dst.name)
       let tmp = g.takeBridge(avoid = dptr)
-      g.flatCopyToPtr2(dtmp, aggrByteSize(g.prog, baseTy.symId), dptr, tmp)
+      g.flatCopyToPtr(dtmp, aggrByteSize(g.prog, baseTy.symId), dptr, tmp)
       g.dropBridge tmp
       g.dropBridge dptr
     while cc.hasMore: skip cc
@@ -1381,9 +1336,9 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
       if rhs.kind == Symbol:
         g.aggrAddrInto(rhs, addrR, addrSlot(), doBind = true)
       else:
-        g.emitLvalue2(rhs)
+        g.emitLvalue(rhs)
         g.aggrAddrInto(rhs, addrR, addrSlot(), doBind = true)
-        g.freeLvalTemps2(rhs)
+        g.freeLvalTemps(rhs)
       for i in 0 ..< nwords:
         g.ab.tree MovA64:
           g.emReg pairWord(dst, i)
@@ -1397,9 +1352,9 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
       # the general copy path below. Without it `aggrAddrLoc` re-emits the address tree
       # with nothing reserved, and a 16-byte element (`s[i] = e` on a `seq[HashEntry]`)
       # has no addressing scale to fold into: nifasm rejects the 2-operand `(at …)`.
-      if dst.kind == Mem: g.emitLvalue2(dst.cur)
+      if dst.kind == Mem: g.emitLvalue(dst.cur)
       g.aggrAddrLoc(dst, addrR)
-      if dst.kind == Mem: g.freeLvalTemps2(dst.cur)
+      if dst.kind == Mem: g.freeLvalTemps(dst.cur)
       for i in 0 ..< nwords:
         g.ab.tree MovA64:
           g.emWordThroughPtr(addrR, i)
@@ -1414,37 +1369,37 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   block:
     var r = g.pickTempReg()
     if r == NoReg: r = g.pickHeldReg()
-    # Before a bridge: any register with no LIVE binding (`pickStagingA64`). The copy
+    # Before a bridge: any register with no LIVE binding (`pickUnboundReg`). The copy
     # crosses no call, so a caller-saved one is as good as a survivor — and every
     # bridge left free here is one the two addresses' own materialization can use.
-    if r == NoReg: r = g.pickStagingA64()
+    if r == NoReg: r = g.pickUnboundReg()
     if r != NoReg:
       g.pickedRegs.incl r; h0 = regLoc(r, ScalarSlot, isTemp = true); a0 = r
     else:
       b0 = g.takeBridge(); a0 = b0
   if dst.kind == Mem:
-    g.emitLvalue2(dst.cur)                 # pick the dst lvalue's embedded values
+    g.emitLvalue(dst.cur)                  # pick the dst lvalue's embedded values
   g.bindTemp(a0, ScalarSlot); g.aggrAddrLoc(dst, a0)             # &dst
-  if dst.kind == Mem: g.freeLvalTemps2(dst.cur)
+  if dst.kind == Mem: g.freeLvalTemps(dst.cur)
   # The SOURCE register is reserved only NOW, after `&dst` is in `a0`. Reserving
   # both up front used to hand the two bridges out before either address was
   # materialized — and materializing a `Mem` destination whose base or index is
-  # itself spilled needs a bridge of its own (`reloadMemBase2`), which was then
+  # itself spilled needs a bridge of its own (`reloadMemBase`), which was then
   # gone. Deferring costs nothing: `a1` is not read until `&rhs` is emitted, and
   # any bridge the destination borrowed is back by then.
   block:
     var r = g.pickTempReg()
     if r == NoReg: r = g.pickHeldReg()
-    if r == NoReg: r = g.pickStagingA64()
+    if r == NoReg: r = g.pickUnboundReg()
     if r != NoReg:
       g.pickedRegs.incl r; h1 = regLoc(r, ScalarSlot, isTemp = true); a1 = r
     else:
       b1 = g.takeBridge(avoid = b0); a1 = b1
   g.bindTemp(a1, ScalarSlot)
   if rhs.kind == TagLit:
-    g.emitLvalue2(rhs)                     # pick the src lvalue's embedded values
+    g.emitLvalue(rhs)                      # pick the src lvalue's embedded values
   g.aggrAddrInto(rhs, a1, addrSlot(), doBind = false)  # &rhs
-  if rhs.kind == TagLit: g.freeLvalTemps2(rhs)
+  if rhs.kind == TagLit: g.freeLvalTemps(rhs)
   var tmp: Reg
   if b0 != NoReg and b1 != NoReg:
     tmp = g.takeProduceBridge(addrSlot())   # both staging bridges gone: r8/x16 serves
@@ -1455,11 +1410,11 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.unbindTemp(a1); g.unbindTemp(a0)
   g.freeVal(h1); g.freeVal(h0)
 
-proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
+proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An
   ## aggregate COPY goes through the ONE `genAggrCopyStore`; constructors/calls/baseobj
-  ## PRODUCE per-form; a scalar/float destination through `storeScalar2`.
-  g.bridgeStep("`genStore2`")                           # I1 + I2
+  ## PRODUCE per-form; a scalar/float destination through `storeScalar`.
+  g.bridgeStep("`genStore`")                            # I1 + I2
   # A `Mem` destination's `typ` is often the dont-care `ScalarSlot` (the lvalue
   # subtree is the authority, not the Location), so its width is read off the
   # subtree — otherwise a 64-bit `obj.field` store looks like a word one.
@@ -1488,16 +1443,16 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
     var inner = rhs
     inner.into:
       skip inner                                             # the target type
-      g.genStore2(inner, dst)                        # the operand → same dest
+      g.genStore(inner, dst)                         # the operand → same dest
       while inner.hasMore: skip inner
     return
   if dst.kind in {NamedStack, StackPtr} and dst.typ.kind == AMem:
     # `StackPtr` reaches its aggregate through the slot's pointer; `NamedStack` IS it.
     let dstVar = (if dst.kind == StackPtr: dst.ptrName else: dst.name)
     let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
-    if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr2(rhs, dst)
+    if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      g.genAconstr2(rhs, dst)
+      g.genAconstr(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == CallC:
       if aggrByteSize(g.prog, tn) > 2 * wordSize():   # the same rule as `retIndirect`
         if dst.kind == StackPtr:
@@ -1505,13 +1460,13 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
         else:
           g.ab.tree LeaA64: (g.emReg g.indirectResultReg; g.ab.sym dstVar)
         var d = dontCare
-        g.emitCall2(rhs, d, hiddenPtr = true)            # the callee writes through x8
+        g.emitCall(rhs, d, hiddenPtr = true)             # the callee writes through x8
       else:
         var d = dontCare
-        g.emitCall2(rhs, d)                              # ≤16B result in x0:x1
+        g.emitCall(rhs, d)                               # ≤16B result in x0:x1
         g.regsToStruct(dstVar, tn, 0)
     elif rhs.kind == TagLit and rhs.exprKind == BaseobjC:
-      g.genBaseobj2(rhs, dst)                              # object→base slice
+      g.genBaseobj(rhs, dst)                               # object→base slice
     else: raiseAssert "arkham a64n: aggregate store rhs " & $rhs.exprKind
   elif dst.kind in {Glob, Tvar} and dst.typ.kind == AMem:
     # Aggregate store into a GLOBAL or a THREADVAR: address it into a pointer scratch
@@ -1524,7 +1479,7 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
        dst.typ.size > g.md.aggrByRefThreshold:
       g.emAdr(g.indirectResultReg, dst.name)        # wide result: &g is the hidden ptr
       var d = dontCare
-      g.emitCall2(rhs, d, hiddenPtr = true)
+      g.emitCall(rhs, d, hiddenPtr = true)
     else:
       # The &g address scratch, held across the build: a callee-saved survivor
       # (a call rhs clobbers every volatile).
@@ -1545,7 +1500,7 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
         g.aconstrElemStores(rhs, dest, elemAddr)
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in x0:x1
         var d = dontCare
-        g.emitCall2(rhs, d)
+        g.emitCall(rhs, d)
         g.regsToStructThroughPtr(addrT, g.getType(rhs).symId, 0)
       else: raiseAssert "arkham a64n: aggregate global store rhs " & $rhs.exprKind
       g.unbindTemp(addrT)
@@ -1557,13 +1512,13 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
       # the double pattern and `emFStore` writes its low half — `gf = 3.5'f32`
       # on a `float32` global stored 0.0.
       var fv = Location(kind: Undef, typ: dst.typ)
-      g.emitFValue2(rhs, fv)
+      g.emitFValue(rhs, fv)
       let bits = if dst.typ.size == 4: 32 else: 64
       var fr = NoFReg
       var fb = false
       if fv.kind == InFReg: fr = fv.f
       else:                                              # eftmp spill (pool-dry) → bridge
-        fr = g.takeFBridge(bits); g.placeF2(fv, fr, bits); fb = true
+        fr = g.takeFBridge(bits); g.placeF(fv, fr, bits); fb = true
       let b = g.takeBridge()
       if dst.kind == Glob: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
       g.emFStore(fr, b, bits)
@@ -1572,23 +1527,23 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
       elif fv.kind == InFReg and fv.isTemp: g.unbindFTmp(fv.f)
     else:
       var v = needsReg(g.valueSlot(rhs))                 # single-use rhs (allocSingleUse's shape)
-      g.emitValue2(rhs, v)
+      g.emitValue(rhs, v)
       var vb = NoReg
       var vr: Reg
       if v.kind == InReg: vr = v.r
-      else: (vb = g.takeBridge(); g.place2(v, vb); vr = vb)
-      g.storeReg2(dst, vr)
+      else: (vb = g.takeBridge(); g.place(v, vb); vr = vb)
+      g.storeReg(dst, vr)
       if vb != NoReg: g.dropBridge vb
       elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
   elif dst.kind == Mem:                                      # store through complex lvalue
     let wr = g.pairFieldReg(dst.cur)
     if wr != NoReg:
       var v = regLoc(wr, if dst.typ.size > 0: dst.typ else: ScalarSlot)
-      g.emitValue2(rhs, v)
+      g.emitValue(rhs, v)
       return
     let lhs = dst.cur
     # A global aggregate base in the lvalue needs an address scratch, held across the
-    # rhs; bind it so prematLval2's `lea scratch, &g` emits a checked name. Only
+    # rhs; bind it so prematLval's `lea scratch, &g` emits a checked name. Only
     # a CONSTRUCTOR build holds `&g` across the rhs (a scalar store emits the rhs
     # FIRST, so its global base is a plain walk pick — no survivor needed).
     var globScratch = NoReg
@@ -1601,47 +1556,47 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
     let globBaseLoc = (if globScratch != NoReg: regLoc(globScratch, ScalarSlot)
                        else: dontCare)
     if rhs.kind == TagLit and rhs.exprKind == OconstrC:
-      g.emitLvalue2(lhs, globBaseLoc, isStore = true)
-      g.genConstrIntoLval2(rhs, lhs)
-      g.freeLvalTemps2(lhs)
+      g.emitLvalue(lhs, globBaseLoc, isStore = true)
+      g.genConstrIntoLval(rhs, lhs)
+      g.freeLvalTemps(lhs)
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      g.emitLvalue2(lhs, globBaseLoc, isStore = true)
-      g.genAconstrIntoLval2(rhs, lhs)
-      g.freeLvalTemps2(lhs)
+      g.emitLvalue(lhs, globBaseLoc, isStore = true)
+      g.genAconstrIntoLval(rhs, lhs)
+      g.freeLvalTemps(lhs)
     else:
       var v: Location
       if g.isFloatExpr(rhs):
         # Seed the rhs target with the DESTINATION's slot rather than leaving it
         # `dontCare`. Two things downstream read a width that `dontCare` does not
         # carry: a float LITERAL picks its bit pattern from the destination slot
-        # (`emitFValue2`), and the `fstr` below takes its width from `v.typ`. With
+        # (`emitFValue`), and the `fstr` below takes its width from `v.typ`. With
         # neither known both defaulted to 64, so `a[0] = 1.0'f32` on a
         # `float32` element wrote the DOUBLE pattern, eight bytes wide, over its
         # neighbour — and read back as 0.0 because the low half of `1.0` is zero.
         #
         # The destination type is the authority here, exactly as it is for a
         # conversion's target type (see the same lesson recorded in
-        # `codegen_x64.emitCast2`).
+        # `x64/value.emitCast`).
         let lhsSlot = g.exprSlot(lhs)
         v = (if lhsSlot.kind == AFloat: Location(kind: Undef, typ: lhsSlot)
              else: dontCare)
-        g.emitFValue2(rhs, v)                            # rhs value FIRST
+        g.emitFValue(rhs, v)                             # rhs value FIRST
       else:
         v = needsReg(ScalarSlot)
-        g.emitValue2(rhs, v)
+        g.emitValue(rhs, v)
       # lvalue picks AFTER the rhs: the live rhs value is a bound temp, so the
       # picks cannot land on it. `isStore=false`: the rhs is done, nothing must
       # survive it — the walk takes an ordinary temp for a global base.
-      g.emitLvalue2(lhs, globBaseLoc, isStore = false)
+      g.emitLvalue(lhs, globBaseLoc, isStore = false)
       let floatRhs = v.kind == InFReg or (v.kind in {NamedStack, Mem} and v.typ.isFloat)
-      g.prematLval2(lhs)
+      g.prematLval(lhs)
       if floatRhs:
         let bits = if v.typ.size == 4: 32 else: 64
         var fr = NoFReg
-        if v.kind != InFReg: (fr = g.takeFBridge(bits); g.placeF2(v, fr, bits))
+        if v.kind != InFReg: (fr = g.takeFBridge(bits); g.placeF(v, fr, bits))
         else: fr = v.f
         g.ab.tree FstrA64:
-          g.ab.tree MemX: g.emLvalAddr2(lhs)
+          g.ab.tree MemX: g.emLvalAddr(lhs)
           g.emFReg(fr, bits)
         if v.kind != InFReg: g.dropFBridge()
         elif v.isTemp: g.unbindFTmp(v.f)
@@ -1653,9 +1608,9 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
         if v.kind == Imm:
           discard
         elif v.kind == InReg: vr = v.r
-        else: (vBridge = g.takeBridge(v.typ); g.place2(v, vBridge); vr = vBridge)
+        else: (vBridge = g.takeBridge(v.typ); g.place(v, vBridge); vr = vBridge)
         g.ab.tree MovA64:
-          g.ab.tree MemX: g.emLvalAddr2(lhs)
+          g.ab.tree MemX: g.emLvalAddr(lhs)
           if v.kind == Imm: g.emImm(v)
           elif dstPtr:
             g.ab.tree CastX:
@@ -1664,36 +1619,36 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
           else: g.emReg vr
         if vBridge != NoReg: g.dropBridge vBridge
         elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
-      g.unbindLvalTemps2(lhs)
+      g.unbindLvalTemps(lhs)
       # A STORE: the `(mem …)` was the destination operand, so every register in
       # the address was only read and a global base still holds `&g` — keep it as
       # an address mirror for the next access to the same global.
-      g.freeLvalTemps2(lhs, addrIntact = true)
+      g.freeLvalTemps(lhs, addrIntact = true)
     if globScratch != NoReg: g.unbindTemp(globScratch)
     g.freeVal(globHeld)
   elif dst.kind == Field:                                    # a field within an aggregate
-    g.genFieldStore2(dst, rhs)
+    g.genFieldStore(dst, rhs)
   else:                                                      # scalar / float register or `(s)` slot
     # Dest threading: a register home receives the rhs DIRECTLY (the store
     # collapses); a slot home takes a single-use temp then stores. Never
-    # thread a NamedStack dest into emitValue2 — leaves would emit nothing.
+    # thread a NamedStack dest into emitValue — leaves would emit nothing.
     if dst.kind == InFReg:
       var v = dst
-      g.emitFValue2(rhs, v)
-      g.storeScalar2(dst, v)
+      g.emitFValue(rhs, v)
+      g.storeScalar(dst, v)
     elif dst.kind == InReg:
       var v = dst
-      g.emitValue2(rhs, v)
-      g.storeScalar2(dst, v)
+      g.emitValue(rhs, v)
+      g.storeScalar(dst, v)
     elif dst.typ.isFloat:
       var v = g.takeFTmp(dst.typ)                # carry the precise (f N) width
-      g.emitFValue2(rhs, v)
-      g.storeScalar2(dst, v)
+      g.emitFValue(rhs, v)
+      g.storeScalar(dst, v)
       g.freeVal(v)
     else:
       var v = needsReg(dst.typ)
-      g.emitValue2(rhs, v)
-      g.storeScalar2(dst, v)
+      g.emitValue(rhs, v)
+      g.storeScalar(dst, v)
       g.freeVal(v)
 
 # ── fused value core (step 3): implementations ──────────────────────────────
@@ -1716,31 +1671,31 @@ proc emitLeafImm*(g: var CodeGen; dest: var Location; natural: Location) =
   elif dest.kind == NamedStack and dest.spillTemp:
     # `needsReg` under a dry pool minted an etmp slot: the literal MUST be
     # stored into it (silently skipping it hands the consumer's reload
-    # garbage) — through the produce bridge, like produceIntoMem2.
+    # garbage) — through the produce bridge, like produceIntoMem.
     let s = g.takeProduceBridge(dest.typ)
     g.placeImm(s, natural)
-    g.storeReg2(dest, s)
+    g.storeReg(dest, s)
     g.unbindTemp(s)
 
-proc produceIntoMem2*(g: var CodeGen; c: Cursor; dst: Location) =
+proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location) =
   ## FUSED totality bridge: `dst` is an `(s)` spill slot (`etmpN.0`, minted when
   ## `takeTmp` found the pools dry). Produce into the reserved produce bridge
   ## x16 (never allocator-assigned), then store to the slot.
   ##
-  ## x16 is handed to `emitValue2` for the WHOLE node, so it is live for the
+  ## x16 is handed to `emitValue` for the WHOLE node, so it is live for the
   ## node's entire evaluation — the old claim that it is "not held across the
   ## recursion, so deep chains reuse it level-by-level" holds only for a leaf and
-  ## for a load. For a COMBINING node it is false: `emitBin2` computes its
+  ## for a load. For a COMBINING node it is false: `emitBin` computes its
   ## accumulator here and then evaluates the other operand, which re-enters this
   ## proc and would scribble on the partial. That is a silent miscompile — it
   ## returned a pointer where a sum was expected (`addr_chain_depth`).
   ##
   ## The invariant is therefore "x16 is FREE on entry", and it is the CALLER's to
   ## keep: a step that would hold its partial here across a sibling recursion must
-  ## not put it here in the first place — see `emitBin2`'s swap suppression.
+  ## not put it here in the first place — see `emitBin`'s swap suppression.
   ##
   ## What this side CAN do is stop the register looking free while it is not. The
-  ## destination is threaded into `emitValue2` UNBOUND (a leaf may produce raw into
+  ## destination is threaded into `emitValue` UNBOUND (a leaf may produce raw into
   ## it, and only then is it bound for the store), so a nested draw testing
   ## `isBoundTemp` would have called it free and handed it out. `pickedRegs` is the
   ## reserve→bind gap's existing guard everywhere else in this emitter, and it is
@@ -1753,37 +1708,37 @@ proc produceIntoMem2*(g: var CodeGen; c: Cursor; dst: Location) =
   # into it is sized by the SLOT either way — so this changes no machine code. Bound
   # at the narrow destination width instead, the move that brings the value in was a
   # narrowing reg→reg move (`(mov (u 32)bridge (u 64)zi`, `cast[uint32](zi)` spilled
-  # in `toDecimal64`), which nifasm rejects. Same rule, same reason, as `emitCast2`.
+  # in `toDecimal64`), which nifasm rejects. Same rule, same reason, as `emitCast`.
   var slot = dst.typ
   if slot.cls in {ABool, AInt, AUInt} and slot.size < 8: slot = ScalarSlot
   var d = regLoc(s, slot, isTemp = true)
-  g.emitValue2(c, d)
+  g.emitValue(c, d)
   if not g.rb.isBoundTemp(s): g.bindTemp(s, slot)         # a leaf produced raw: bind for the store
-  g.storeReg2(dst, s)
+  g.storeReg(dst, s)
   g.unbindTemp(s)
 
-proc produceIntoFMem2*(g: var CodeGen; c: Cursor; dst: Location) =
+proc produceIntoFMem*(g: var CodeGen; c: Cursor; dst: Location) =
   ## The SIMD twin: produce into the float bridge (v31), then store.
   let bits = dst.typ.size * 8
   let fs = g.md.floatBridgeReg
   var d = fregLoc(fs, dst.typ, isTemp = true)
-  g.emitFValue2(c, d)
+  g.emitFValue(c, d)
   if not g.rb.isBoundFTmp(fs): g.bindFTmp(fs, bits)
   g.emFloatScalarStore(dst.name, fs, bits)
   g.unbindFTmp(fs)
 
-proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED decide-and-emit (a64): resolve `dest` against `c`, emit, return the
-  ## resolved location. Callers route float-typed values to `emitFValue2`.
-  g.bridgeStep("`emitValue2`")                          # I1 + I2
+  ## resolved location. Callers route float-typed values to `emitFValue`.
+  g.bridgeStep("`emitValue`")                           # I1 + I2
   if g.isWideExpr(c):
     # A 64-bit value on a 32-bit target has no register to be resolved into: it
-    # is eight bytes at an address, and `codegen_m64` is the arm that knows how
+    # is eight bytes at an address, and the wide-integer section is the arm that knows how
     # to put them there.
     g.emitWideAsLoc(c, dest)
     return
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest)
+    g.produceIntoMem(c, dest)
     return
   let pos = g.posOf(c)                            # for the keepovf no-fold guard
   case c.kind
@@ -1804,7 +1759,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
     if home.kind != NoLoc:
       g.resolveDest(dest, home)
       if dest.kind == NamedStack and dest.spillTemp:
-        g.produceIntoMem2(c, dest); return
+        g.produceIntoMem(c, dest); return
       if dest.kind == InReg and dest.isTemp and home.kind == InReg and
          home.r == dest.r and g.rb.isMirror(dest.r):
         # The accumulator IS the register still mirroring this value — the load is
@@ -1815,11 +1770,11 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.kind == InReg and not (home.kind == InReg and home.r == dest.r):
         if dest.isTemp and not g.rb.isBoundTemp(dest.r):
           g.bindTemp(dest.r, dest.typ)
-        g.place2(home, dest.r)
+        g.place(home, dest.r)
     else:
       g.forceRegDest(dest)
       if dest.kind == NamedStack and dest.spillTemp:
-        g.produceIntoMem2(c, dest); return
+        g.produceIntoMem(c, dest); return
       let si = g.lookupSym(symName(c))
       if si.cat == scProc:
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
@@ -1828,11 +1783,11 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         var cc = c
         let loc = g.asLoc(cc)
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, loc.typ)
-        g.place2(loc, dest.r)
+        g.place(loc, dest.r)
   of StrLit:
     g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
-      g.produceIntoMem2(c, dest); return
+      g.produceIntoMem(c, dest); return
     let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
     # NUL-terminated: a literal's address alone does not say whether the callee reads
     # it as a `cstring` or as a length-carrying `string` payload. See the x86-64 twin.
@@ -1845,18 +1800,18 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       let (isConst, cval) =
         (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
       if isConst: g.emitLeafImm(dest, immLoc(cval, ScalarSlot))
-      else: g.emitBin2(c, dest)
+      else: g.emitBin(c, dest)
     of ModC:
       let (isConst, cval) =
         (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
       if isConst: g.emitLeafImm(dest, immLoc(cval, ScalarSlot))
-      else: g.emitMod2(c, dest)
-    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c, dest)
-    of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c, dest)
-    of AddrC, HaddrC: g.emitAddr2(c, dest)
-    of CastC, ConvC: g.emitCast2(c, dest)
-    of CallC: g.emitCall2(c, dest)
-    of InstrC: g.emitInstr2(c, dest)
+      else: g.emitMod(c, dest)
+    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue(c, dest)
+    of DerefC, DotC, AtC, PatC: g.emitMemLoad(c, dest)
+    of AddrC, HaddrC: g.emitAddr(c, dest)
+    of CastC, ConvC: g.emitCast(c, dest)
+    of CallC: g.emitCall(c, dest)
+    of InstrC: g.emitInstr(c, dest)
     of NegC, BitnotC:
       block:
         let (isConst, cval) =
@@ -1866,7 +1821,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
           return
       g.forceRegDest(dest)
       if dest.kind == NamedStack and dest.spillTemp:
-        g.produceIntoMem2(c, dest); return
+        g.produceIntoMem(c, dest); return
       var resType, inner: Cursor
       block:
         var cc = c
@@ -1875,13 +1830,13 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
           inner = cc; skip cc
           while cc.hasMore: skip cc
       var iv = dest                               # dest-thread into the operand
-      g.emitValue2(inner, iv)
+      g.emitValue(inner, iv)
       if dest.kind == InReg:
         if dest.isTemp and not g.rb.isBoundTemp(dest.r) and
            not (iv.kind == InReg and iv.r == dest.r):
           g.bindTemp(dest.r, dest.typ)
         if iv.kind == InReg and iv.r != dest.r: g.movReg(dest.r, iv.r)
-        elif iv.kind != InReg: g.place2(iv, dest.r)
+        elif iv.kind != InReg: g.place(iv, dest.r)
         g.emNeg(dest.r)
         if c.exprKind == BitnotC: g.binImm(SubA64, dest.r, 1)  # ~a = -a - 1
         g.normalizeUnaryWidth(resType, dest.r)
@@ -1893,13 +1848,13 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         cc.into:
           inner = cc; skip cc
           while cc.hasMore: skip cc
-      g.emitValue2(inner, dest)
+      g.emitValue(inner, dest)
     of TrueC: g.emitLeafImm(dest, immLoc(1, ScalarSlot))
     of FalseC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
     of NilC:
       g.resolveDest(dest, immLoc(0, g.exprSlot(c)))
       if dest.kind == NamedStack and dest.spillTemp:
-        g.produceIntoMem2(c, dest); return
+        g.produceIntoMem(c, dest); return
       if dest.kind == InReg:
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
         g.ab.tree MovA64: (g.emReg dest.r; g.ab.nilValue())
@@ -1909,8 +1864,8 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         sz = typeSizeAlign(g.prog, t)[0].int64
         while t.hasMore: skip t
       g.emitLeafImm(dest, immLoc(sz, ScalarSlot))
-    else: raiseAssert "arkham a64n: emitValue2(fused) expr " & $c.exprKind
-  else: raiseAssert "arkham a64n: emitValue2(fused) kind " & $c.kind
+    else: raiseAssert "arkham a64n: emitValue(fused) expr " & $c.exprKind
+  else: raiseAssert "arkham a64n: emitValue(fused) kind " & $c.kind
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc emitDivPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
@@ -1933,12 +1888,12 @@ proc emitDivPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   var acc = dest
   if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
   if acc.kind == NamedStack and acc.spillTemp:
-    g.produceIntoMem2(c, acc)                            # pools dry: whole node via x16
+    g.produceIntoMem(c, acc)                             # pools dry: whole node via x16
     dest = acc
     return
   let rD = acc.r
   var ldst = acc
-  g.emitValue2(lhsC, ldst)                               # dividend → the accumulator
+  g.emitValue(lhsC, ldst)                                # dividend → the accumulator
   if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
   g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
   if signed:
@@ -1964,32 +1919,32 @@ proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   var acc = dest
   if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
   if acc.kind == NamedStack and acc.spillTemp:
-    g.produceIntoMem2(c, acc)
+    g.produceIntoMem(c, acc)
     dest = acc
     return
   let rD = acc.r
   var ldst = acc
-  g.emitValue2(lhsC, ldst)
+  g.emitValue(lhsC, ldst)
   if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
   g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
   g.binImm(AndA64, rD, (1'i64 shl k) - 1)
   dest = acc
 
-# ── emitBin2's / emitScalarCmp's operand-side helpers ────────────────────────
+# ── emitBin's / emitScalarCmp's operand-side helpers ────────────────────────
 proc leafLoc(g: var CodeGen; cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
   ## A leaf's location (the x86-64 twin's `leafLoc`). A memory leaf is DEFERRED
   ## when `deferOk` allows: its embedded base/index values are picked now
-  ## (`emitLvalue2`), the access itself folds through a bridge in the consuming
-  ## instruction, and `freeLvalTemps2` releases the picks after. Otherwise the
-  ## leaf resolves through `emitValue2` with a dont-care destination: an
+  ## (`emitLvalue`), the access itself folds through a bridge in the consuming
+  ## instruction, and `freeLvalTemps` releases the picks after. Otherwise the
+  ## leaf resolves through `emitValue` with a dont-care destination: an
   ## immediate stays an `Imm`, a symbol is its home, a memory leaf is loaded.
   result = dontCare
   if isMem and deferOk:
-    g.emitLvalue2(cur)
+    g.emitLvalue(cur)
     result = memLoc(cur, ScalarSlot)
     deferred = true
   else:
-    g.emitValue2(cur, result)
+    g.emitValue(cur, result)
 
 proc cmpBridgeSlot(g: var CodeGen; loc: Location; opC: Cursor): AsmSlot =
   ## The slot a compare operand's bridge is typed at: a pointer operand keeps its
@@ -2001,14 +1956,14 @@ proc placeCmpOperand(g: var CodeGen; loc: Location; opC: Cursor; bridge: Reg) =
   ## Materialize a compare operand into its bridge; an immediate is typed by the
   ## operand's own type so a pointer-typed literal binds as a pointer.
   if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
-  else: g.place2(loc, bridge)
+  else: g.place(loc, bridge)
 
-proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
   ## with the a64 non-destructive 3-op / W-form machinery.
   g.bridgeStep("a binary op with a spilled result", bdTwoInRegs)
-  let op = g.binA64Op(c)
+  let op = g.binInst(c)
   let ek = c.exprKind
   var lhsC, rhsC, resTypeC: Cursor
   block:
@@ -2038,12 +1993,12 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # own type — an `(i 64)` dont-care would throw the value's range away.
     if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
     if acc.kind == NamedStack and acc.spillTemp:
-      g.produceIntoMem2(c, acc)                          # pools dry: whole node via x16
+      g.produceIntoMem(c, acc)                           # pools dry: whole node via x16
       dest = acc
       return
     let rD = acc.r
     var rdst = acc
-    g.emitValue2(rhsC, rdst)                             # rhs → the accumulator
+    g.emitValue(rhsC, rdst)                              # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
     # Same retype the general path does below: the accumulator may be a named
     # local's home whose declared type is not the type of the value now landing
@@ -2054,8 +2009,8 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     let foldOp = if op == SubA64: AddA64 else: op
     if op == SubA64:
       g.emNeg(rD)                       # rD := -rhs
-    g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
-    if lhsMem: g.freeLvalTemps2(lhsC)
+    g.foldRhs(foldOp, rD, lLoc, lhsC)                    # bridges serve Imm/slot/Mem lhs
+    if lhsMem: g.freeLvalTemps(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
     dest = acc
     return
@@ -2065,7 +2020,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
      (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
      not g.exprReadsReg(lhsC, dest.r) and not g.exprReadsReg(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
-  g.emitValue2(lhsC, lDest)
+  g.emitValue(lhsC, lDest)
   # The lhs partial is LIVE in `lDest` across the rhs evaluation, which recurses
   # into arbitrary emission — see the x86-64 twin for the failure this prevents.
   # A bound temp is already excluded from every pick; a fixed destination carries
@@ -2075,7 +2030,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   if lSeal: g.plan.seal {lDest.r}
   var rDest = dontCare
   if ek == DivC: rDest = needsReg(g.valueSlot(rhsC))     # sdiv/udiv need a register rhs
-  g.emitValue2(rhsC, rDest)
+  g.emitValue(rhsC, rDest)
   if lSeal: g.plan.unseal {lDest.r}                        # the partial is consumed below
   var res = dest
   case dest.kind
@@ -2113,28 +2068,28 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
       # divisor out of the destination first and emit the operands in order.
       let b = g.takeBridge(avoid = rD)
       g.movReg(b, rD)                                    # b := rhs (the divisor)
-      g.place2(lDest, rD)                                # dest := lhs
+      g.place(lDest, rD)                                 # dest := lhs
       g.binReg(op, rD, b)                                # dest := lhs div rhs
       g.dropBridge b
     else:
       g.binReg(op, rD, lDest.r)                          # dest := rhs op lhs
       if op == SubA64:
         g.emNeg(rD)                     # dest := lhs - rhs
-  elif lDest.kind == InReg and lDest.r != rD and op in ThreeOpA64:
+  elif lDest.kind == InReg and lDest.r != rD and op in ThreeOpInsts:
     g.foldRhs3(op, rD, lDest.r, rDest, rhsC, w32)        # dest := lhs op rhs (no mov)
   else:
-    g.place2(lDest, rD)                                  # dest := lhs
-    g.foldRhs2(op, rD, rDest, rhsC, w32)                 # dest op= rhs
+    g.place(lDest, rD)                                   # dest := lhs
+    g.foldRhs(op, rD, rDest, rhsC, w32)                  # dest op= rhs
   if not w32:
     g.normalizeBinWidth(resTypeC, rD, op)
   if not reusedRhs: g.freeVal(rDest)
   if not reusedLhs: g.freeVal(lDest)
   if resStaging != NoReg:
-    g.storeReg2(res, resStaging)
+    g.storeReg(res, resStaging)
     g.dropBridge resStaging
   dest = res
 
-proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(mod T a b)` → `dest = a - (a div b)*b` (allocDivModRisc's placement
   ## decided inline).
   g.bridgeStep("a `mod` with a spilled result", bdTwoInRegs)
@@ -2153,16 +2108,16 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitModPow2(c, rt, divC, k, dest)
       return
   var lD = needsReg(g.valueSlot(divC))
-  g.emitValue2(divC, lD)
+  g.emitValue(divC, lD)
   var rD0 = needsReg(g.valueSlot(dvsC))
-  g.emitValue2(dvsC, rD0)
+  g.emitValue(dvsC, rD0)
   var dvsReg: Reg
   var dvsBridge = NoReg
   if rD0.kind == InReg:
     dvsReg = rD0.r
   else:                                                  # pool-dry etmp divisor: bridge reload
     dvsBridge = g.takeBridge(rD0.typ)
-    g.place2(rD0, dvsBridge)
+    g.place(rD0, dvsBridge)
     dvsReg = dvsBridge
   var res = dest
   case dest.kind
@@ -2180,7 +2135,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   let reusedDiv = lD.kind == InReg and lD.r == rD
   if res.kind == InReg and res.isTemp and not reusedDiv and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, res.typ)
-  g.place2(lD, rD)                                       # dest := a
+  g.place(lD, rD)                                        # dest := a
   # `a mod b` needs THREE live registers — a, b and the quotient — and this one
   # expression can already be holding both bridges: one staging a memory result,
   # one reloading a spilled divisor. The budget is two, so when they are gone the
@@ -2213,10 +2168,10 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
     if not dvsOwned:
       raiseAssert "arkham a64n: no register for a `mod` quotient in proc " &
                   g.curProcName & ", picked: " & $g.pickedRegs
-    g.storeReg2(qTmp, rD)                                # slot := a
+    g.storeReg(qTmp, rD)                                 # slot := a
     g.binReg(if signed: SdivA64 else: UdivA64, rD, dvsReg)  # rD := a div b
     g.binReg(MulA64, rD, dvsReg)                         # rD := (a div b)*b
-    g.place2(qTmp, dvsReg)                               # b's reg := a (b now dead)
+    g.place(qTmp, dvsReg)                                # b's reg := a (b now dead)
     g.binReg(SubA64, dvsReg, rD)                         # := a - (a div b)*b
     g.movReg(rD, dvsReg)
     g.freeVal(qTmp)
@@ -2224,12 +2179,12 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   else: g.freeVal(rD0)
   if not reusedDiv: g.freeVal(lD)
   if resStaging != NoReg:
-    g.storeReg2(res, resStaging)
+    g.storeReg(res, resStaging)
     g.dropBridge resStaging
   dest = res
 proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 float binary-arith (allocFBin's policy inline).
-  let op = fbinA64Op(c.exprKind)
+  let op = fbinInst(c.exprKind)
   let ek = c.exprKind
   var lhsC, rhsC: Cursor
   var fslot = defaultFloatSlot()
@@ -2248,11 +2203,11 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     var acc = dest
     if acc.kind != InFReg: acc = g.takeFTmp(fslot)
     if acc.kind == NamedStack and acc.spillTemp:
-      g.produceIntoFMem2(c, acc); dest = acc; return
+      g.produceIntoFMem(c, acc); dest = acc; return
     let bits = if fslot.size == 4: 32 else: 64      # the OP's width, never the temp's
     var rdst = acc
     rdst.typ = fslot                                  # a literal operand materializes at it
-    g.emitFValue2(rhsC, rdst)                          # rhs → the accumulator
+    g.emitFValue(rhsC, rdst)                           # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundFTmp(acc.f): g.bindFTmp(acc.f, bits)
     if lHome.kind == InFReg:
       g.fbin(op, acc.f, lHome.f, bits)
@@ -2265,7 +2220,7 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     return
   if dest.kind != InFReg: dest = g.takeFTmp(fslot)
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoFMem2(c, dest); return
+    g.produceIntoFMem(c, dest); return
   let res = dest
   # The width is the operation's, from its result type, not the temp's the
   # consumer passed (see the x64 twin: a generic 8-byte temp made a float32
@@ -2273,7 +2228,7 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   let bits = if fslot.size == 4: 32 else: 64
   var lD = res
   lD.typ = fslot
-  g.emitFValue2(lhsC, lD)                              # a → the result register
+  g.emitFValue(lhsC, lD)                               # a → the result register
   if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, bits)
   if rhsC.kind == Symbol and g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC)).kind == InFReg:
     let rHome = g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC))
@@ -2283,7 +2238,7 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.fbin(op, res.f, rHome.f, bits)                   # in-place local fold
   else:
     var rD = g.takeFTmp(fslot)
-    g.emitFValue2(rhsC, rD)
+    g.emitFValue(rhsC, rD)
     if rD.kind == InFReg:
       g.fbin(op, res.f, rD.f, bits)
       g.freeVal(rD)
@@ -2294,18 +2249,18 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.dropFBridge()
   dest = res
 
-proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 SIMD value: resolve `dest` (a v-register / eftmp slot) and
   ## materialize the float value there.
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoFMem2(c, dest); return
+    g.produceIntoFMem(c, dest); return
   let f64 = defaultFloatSlot()
   case c.kind
   of FloatLit:
     if dest.kind != InFReg:
       dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
       if dest.kind == NamedStack:
-        g.produceIntoFMem2(c, dest); return
+        g.produceIntoFMem(c, dest); return
     let bits = if dest.typ.size == 4: 32 else: 64
     if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
     let gpr = g.takeBridge()
@@ -2318,7 +2273,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
     if home.kind == NoLoc:                             # a module-level float global / tvar
       var cc = c
       home = g.asLoc(cc)
-    # store forwarding, the float half — see `emitValue2` for the two doors
+    # store forwarding, the float half — see `emitValue` for the two doors
     home = (if dest.kind != InFReg: g.takeFForwarded(home) else: g.forwardFOf(home))
     case home.kind
     of InFReg:
@@ -2335,10 +2290,10 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.kind != InFReg:
         dest = g.takeFTmp(if home.typ.kind == AFloat: home.typ else: g.exprSlot(c))
         if dest.kind == NamedStack:
-          g.produceIntoFMem2(c, dest); return
+          g.produceIntoFMem(c, dest); return
       let bits = if dest.typ.size == 4: 32 else: 64
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
-      g.placeF2(home, dest.f, bits)
+      g.placeF(home, dest.f, bits)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC: g.emitFBin(c, dest)
@@ -2346,7 +2301,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.kind != InFReg:
         dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
         if dest.kind == NamedStack:
-          g.produceIntoFMem2(c, dest); return
+          g.produceIntoFMem(c, dest); return
       let bits = if dest.typ.size == 4: 32 else: 64
       var inner: Cursor
       block:
@@ -2356,9 +2311,9 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
           inner = cc; skip cc
           while cc.hasMore: skip cc
       var iv = dest                                    # dest-thread into the operand
-      g.emitFValue2(inner, iv)
+      g.emitFValue(inner, iv)
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
-      g.ensureFAccum2(dest.f, iv, bits)
+      g.ensureFAccum(dest.f, iv, bits)
       g.ab.tree FnegA64: g.emFReg(dest.f, bits)
     of InfC, NeginfC, NanC:
       # `inf` / `-inf` / `nan` have no `fmov` immediate encoding (a64's 8-bit
@@ -2368,31 +2323,31 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.kind != InFReg:
         dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
         if dest.kind == NamedStack:
-          g.produceIntoFMem2(c, dest); return
+          g.produceIntoFMem(c, dest); return
       let bits = if dest.typ.size == 4: 32 else: 64
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
       let gpr = g.takeBridge()
       g.movImm(gpr, specialFloatBits(c.exprKind, bits))
       g.fmovFromGpr(dest.f, gpr, bits)
       g.dropBridge gpr
-    of ConvC, CastC: g.emitCast2(c, dest)
-    of CallC: g.emitCall2(c, dest)
-    of InstrC: g.emitInstr2(c, dest)             # a vector row / float intrinsic
+    of ConvC, CastC: g.emitCast(c, dest)
+    of CallC: g.emitCall(c, dest)
+    of InstrC: g.emitInstr(c, dest)              # a vector row / float intrinsic
     of DotC, AtC, DerefC, PatC:
       # float lvalue load → fldr res, [addr]
       if dest.kind != InFReg:
         dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: g.exprSlot(c))
         if dest.kind == NamedStack:
-          g.produceIntoFMem2(c, dest); return
+          g.produceIntoFMem(c, dest); return
       let bits = if dest.typ.size == 4: 32 else: 64
-      g.emitLvalue2(c)                                 # pick embedded base/index
-      g.prematLval2(c)
+      g.emitLvalue(c)                                  # pick embedded base/index
+      g.prematLval(c)
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
       g.ab.tree FldrA64:
         g.emFReg(dest.f, bits)
-        g.ab.tree MemX: g.emLvalAddr2(c)
-      g.unbindLvalTemps2(c)
-      g.freeLvalTemps2(c)
+        g.ab.tree MemX: g.emLvalAddr(c)
+      g.unbindLvalTemps(c)
+      g.freeLvalTemps(c)
     of SufC, ParC:
       var inner: Cursor
       block:
@@ -2400,9 +2355,9 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         cc.into:
           inner = cc; skip cc
           while cc.hasMore: skip cc
-      g.emitFValue2(inner, dest)
-    else: raiseAssert "arkham a64n: emitFValue2(fused) expr " & $c.exprKind
-  else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
+      g.emitFValue(inner, dest)
+    else: raiseAssert "arkham a64n: emitFValue(fused) expr " & $c.exprKind
+  else: raiseAssert "arkham a64n: emitFValue(fused) kind " & $c.kind
 proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
@@ -2467,10 +2422,10 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
       bReg = bBridge
     g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
     if bBridge != NoReg: g.dropBridge bBridge
-  if bMem: g.freeLvalTemps2(bC)
+  if bMem: g.freeLvalTemps(bC)
   else: g.freeVal(bD)
   if aBridge != NoReg: g.dropBridge aBridge
-  if aMem: g.freeLvalTemps2(aC)
+  if aMem: g.freeLvalTemps(aC)
   else: g.freeVal(aD)
   if fused: result = NoA64Inst
 
@@ -2542,20 +2497,20 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         of LeC:  (if whenTrue: BlsA64 else: BhiA64)
         else: raiseAssert "arkham a64n: float cond " & $ek
       # Both operands are seeded with the compare's OWN float slot rather
-      # than `dontCare`. `emitFValue2` picks a float LITERAL's bit pattern
+      # than `dontCare`. `emitFValue` picks a float LITERAL's bit pattern
       # from the destination slot, so an unseeded one builds the DOUBLE
       # pattern — and the `fcmp` below, correctly `fbits` wide, then reads
       # the wrong half of it. That is why `f > 1.4'f32` compared garbage
       # while `f > g` with a `float32` variable was right: only the literal
       # operand had no width to go on. Same lesson as the `Mem` destination
-      # in `genStore2` and the field destination in `genFieldStore2`.
+      # in `genStore` and the field destination in `genFieldStore`.
       let cmpSlot = g.exprSlot(aC)
       let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
                   else: dontCare)
       var fa = seed
-      g.emitFValue2(aC, fa)
+      g.emitFValue(aC, fa)
       var fb = seed
-      g.emitFValue2(bC, fb)
+      g.emitFValue(bC, fb)
       assert fa.kind == InFReg and fb.kind == InFReg, "arkham a64n: float cmp operands"
       g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
       g.emBr(tag, toLabel)
@@ -2568,25 +2523,25 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   # A bare truthiness test — `if flag`, `while p` — is a zero test, so it is a
   # `cbz`/`cbnz` too and never needs the flags.
   var v = needsReg(g.valueSlot(c))
-  g.emitValue2(c, v)
+  g.emitValue(c, v)
   let zTag = if whenTrue: CbnzA64 else: CbzA64
   if v.kind == InReg:
     g.ab.tree zTag: (g.emReg v.r; g.ab.sym toLabel)
     g.freeVal(v)
   else:                                            # pool-dry etmp bool: bridge reload
     let b = g.takeBridge(v.typ)
-    g.place2(v, b)
+    g.place(v, b)
     g.ab.tree zTag: (g.emReg b; g.ab.sym toLabel)
     g.dropBridge b
 
-proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED comparison as a 0/1 VALUE: the result temp is reserved and bound
   ## before the condition emits, so operand picks cannot land on it.
   case dest.kind
   of Undef, NeedsReg, RegOrImm: dest = g.takeTmp(ScalarSlot)
   else: discard
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest); return
+    g.produceIntoMem(c, dest); return
   let res = dest
   assert res.kind == InReg, "arkham a64n: cond-value result " & $res.kind
   if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
@@ -2596,13 +2551,13 @@ proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   g.movImm(res.r, 0)
   g.emLab(lEnd)
   dest = res
-proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitMemLoad*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED addressing expr in VALUE position → load `[addr]` into a register.
   let wr = g.pairFieldReg(c)
   if wr != NoReg:
     g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
-      g.produceIntoMem2(c, dest); return
+      g.produceIntoMem(c, dest); return
     let res = dest
     # A POINTER field keeps its real type (`valueSlot`'s rule), exactly as the memory
     # path below does: a `dontCare` destination arrives as the generic `(i 64)`
@@ -2617,32 +2572,32 @@ proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location) =
     return
   g.forceRegDest(dest)
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest); return
+    g.produceIntoMem(c, dest); return
   let res = dest
   let sealedHere = res.kind == InReg and not res.isTemp and not g.plan.isSealed(res.r)
   if sealedHere: g.plan.seal {res.r}
-  g.emitLvalue2(c, globBase = res)              # picks; a global base reuses the result reg
+  g.emitLvalue(c, globBase = res)               # picks; a global base reuses the result reg
   if sealedHere: g.plan.unseal {res.r}
   let cty = resolveType(g.prog, g.getType(c))
   if cty.typeKind in {LengType.ArrayT, LengType.FlexarrayT}:
     # an array / flexarray lvalue DECAYS to its address
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, ScalarSlot)
-    g.prematLval2(c)
-    g.ab.tree LeaA64: (g.emReg res.r; g.emLvalAddr2(c))
-    g.unbindLvalTemps2(c)
+    g.prematLval(c)
+    g.ab.tree LeaA64: (g.emReg res.r; g.emLvalAddr(c))
+    g.unbindLvalTemps(c)
   else:
     var bindSlot = res.typ
     if g.slotIsPointer(g.exprSlot(c)): bindSlot = g.exprSlot(c)
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, bindSlot)
-    g.prematLval2(c)
+    g.prematLval(c)
     g.ab.tree MovA64:
       g.emReg res.r
-      g.ab.tree MemX: g.emLvalAddr2(c)
-    g.unbindLvalTemps2(c)
-  g.freeLvalTemps2(c)
+      g.ab.tree MemX: g.emLvalAddr(c)
+    g.unbindLvalTemps(c)
+  g.freeLvalTemps(c)
   dest = res
 
-proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(addr lvalue)` → a pointer in a register; identity `&(deref p)`
   ## with a register-homed `p` and a transient dest is `p`'s register itself.
   var lv: Cursor
@@ -2661,20 +2616,20 @@ proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location) =
           return
   g.forceRegDest(dest)
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest); return
+    g.produceIntoMem(c, dest); return
   let res = dest
   # Same stale-scalar-in-arg-reg hole as the x64 twin: `&stackAgg` dest-threaded
   # into x0 while a dead bool/int local is still bound there.
   if res.kind == InReg and not res.isTemp and g.rb.isBound(res.r) and
      not g.rb.isBoundTemp(res.r) and not g.rb.isPtrBound(res.r):
     g.releaseStaleName(res.r)
-  g.emitLvalue2(lv, globBase = res)             # a global base reuses the lea dest
+  g.emitLvalue(lv, globBase = res)              # a global base reuses the lea dest
   g.aggrAddrInto(lv, res.r, g.exprSlot(c),
                  doBind = res.isTemp or not g.rb.isBound(res.r))
-  g.freeLvalTemps2(lv)
+  g.freeLvalTemps(lv)
   dest = res
 
-proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)` — the a64 twin: bit-reinterprets use fmov,
   ## a pointer-typed literal spells its cast out (075b051's placeImmTyped).
   let isCast = c.exprKind == CastC
@@ -2689,7 +2644,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
   if g.isWideExpr(inner) and not g.isWideExpr(c) and
      not g.isFloatExpr(c):
     # The NARROWING direction: `int32(x64)` / `cast[uint](x64)`. The widening one
-    # and wide→wide are produced by `emitWideAsLoc`, which `emitValue2` reached
+    # and wide→wide are produced by `emitWideAsLoc`, which `emitValue` reached
     # before this proc; `float(x64)` is not a narrowing at all and is refused a
     # few lines down (`isWideSlot` is about INTEGERS, so a 64-bit float does not
     # answer to it and would otherwise fall in here).
@@ -2707,33 +2662,33 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
       dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ
                         else: defaultFloatSlot())
     if dest.kind == NamedStack and dest.spillTemp:
-      g.produceIntoFMem2(c, dest); return
+      g.produceIntoFMem(c, dest); return
     let res = dest
     let dstBits = if res.typ.size == 4: 32 else: 64
     if g.isFloatExpr(inner):
       var fv = dontCare
-      g.emitFValue2(inner, fv)
+      g.emitFValue(inner, fv)
       if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, dstBits)
       let srcBits = g.floatBits(inner)
       if srcBits == dstBits:
-        g.ensureFAccum2(res.f, fv, dstBits)
+        g.ensureFAccum(res.f, fv, dstBits)
       else:
         if fv.kind == InFReg: g.emFcvt(res.f, fv.f, dstBits, srcBits)
         else:
           let b = g.takeFBridge(srcBits)
-          g.placeF2(fv, b, srcBits)
+          g.placeF(fv, b, srcBits)
           g.emFcvt(res.f, b, dstBits, srcBits)
           g.dropFBridge()
         g.freeVal(fv)
     else:
       var iv = needsReg(ScalarSlot)
-      g.emitValue2(inner, iv)
+      g.emitValue(inner, iv)
       var ivReg: Reg
       var ivBridge = NoReg
       if iv.kind == InReg: ivReg = iv.r
       else:
         ivBridge = g.takeBridge(iv.typ)
-        g.place2(iv, ivBridge)
+        g.place(iv, ivBridge)
         ivReg = ivBridge
       if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, dstBits)
       let (srcW, srcSigned) = g.srcWidthSigned(inner)
@@ -2749,10 +2704,10 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
   if g.isFloatExpr(inner):                      # float → int/ptr
     g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
-      g.produceIntoMem2(c, dest); return
+      g.produceIntoMem(c, dest); return
     let res = dest
     var fv = dontCare
-    g.emitFValue2(inner, fv)
+    g.emitFValue(inner, fv)
     assert fv.kind == InFReg, "arkham a64n: float→int operand " & $fv.kind
     let fbits = if fv.typ.size == 4: 32 else: 64
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
@@ -2790,19 +2745,19 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # really happens — and store the converted value. Falling through instead
     # threaded the slot down as the INNER's destination and bailed out at the
     # spilled guard below, dropping the conversion. Same shape as the two float
-    # arms above; `produceIntoMem2`'s x16-is-free contract is the caller's, as there.
-    g.produceIntoMem2(c, dest); return
+    # arms above; `produceIntoMem`'s x16-is-free contract is the caller's, as there.
+    g.produceIntoMem(c, dest); return
   if dest.kind in {NamedStack, Mem}:
     # a memory-home destination: compute into a temp, re-represent, store
     var tmp = needsReg(dest.typ)
-    g.emitCast2(c, tmp)
+    g.emitCast(c, tmp)
     if tmp.kind == InReg:
-      g.storeReg2(dest, tmp.r)
+      g.storeReg(dest, tmp.r)
       g.freeVal(tmp)
     else:
       let b = g.takeBridge(tmp.typ)
-      g.place2(tmp, b)
-      g.storeReg2(dest, b)
+      g.place(tmp, b)
+      g.storeReg(dest, b)
       g.dropBridge b
     return
   # Pre-retype a register-homed named dest to the INNER's type while the inner
@@ -2834,7 +2789,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # move — `(mov u16tmp i64local)` — which nifasm rejects, even though the very
     # next `lsl`/`lsr` pair is what performs the narrowing.
     iv.typ = ScalarSlot
-  g.emitValue2(inner, iv)
+  g.emitValue(inner, iv)
   dest = iv
   if dest.kind == Imm:
     # A folded constant reinterprets freely, but a narrowing cast must keep only
@@ -2851,17 +2806,17 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # has nowhere to happen there — this used to just `return`, and the cast became
     # a no-op. Stage it: load the slot into the produce bridge, convert, store back.
     # x16 is free by the same argument that let it be used a moment ago: reaching
-    # here means `emitValue2` routed the inner through `produceIntoMem2`, which took
+    # here means `emitValue` routed the inner through `produceIntoMem`, which took
     # and released it.
     let s = g.takeProduceBridge(ScalarSlot)    # canonical 64-bit: the extend narrows
     var rl = regLoc(s, ScalarSlot, isTemp = true)
     g.emScalarLoad(s, dest.name)
-    g.reReprCast2(rl, inner, targetCur, tc, isCast, "")
+    g.reReprCast(rl, inner, targetCur, tc, isCast, "")
     g.emScalarStore(dest.name, s)
     g.unbindTemp(s)
     return
   assert dest.kind == InReg, "arkham a64n: cast result " & $dest.kind
-  g.reReprCast2(dest, inner, targetCur, tc, isCast, preRetyped)
+  g.reReprCast(dest, inner, targetCur, tc, isCast, preRetyped)
 
 type
   MoveSrc = enum
@@ -2899,7 +2854,7 @@ type
     reads: set[Reg]              ## the registers loading this move reads
     freads: set[FReg]
 
-proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
   ## A call: every argument expression runs, each register-passed word becomes a
   ## move into its ABI register, and the moves are performed as one parallel move
@@ -2955,7 +2910,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         retType = q
         while q.hasMore: skip q
     fnptrLoc = needsReg(ScalarSlot)
-    g.emitValue2(targetCur, fnptrLoc)          # fn-ptr target → a held register
+    g.emitValue(targetCur, fnptrLoc)           # fn-ptr target → a held register
     if fnptrLoc.kind != InReg:
       # `needsReg` is a REQUEST, not a guarantee: with every held register taken the
       # value core answers with a spill slot instead. `blr` needs a register, so bring
@@ -2963,7 +2918,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       # stack-passed parameter costs a callee-saved register for the incoming-args
       # base, which is what first drove `deps.buildGraph` over the edge.
       let r = g.takeBridge()
-      g.place2(fnptrLoc, r)
+      g.place(fnptrLoc, r)
       fnptrLoc = regLoc(r, ScalarSlot, isTemp = true)
     fnptrReg = fnptrLoc.r
     if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
@@ -2994,7 +2949,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     tgt = g.callTarget[fsym]
     if tgt.memIntrin.len > 0:
-      g.emitMemIntrin2(argCurs, tgt.memIntrin)   # (fused arg emission inside)
+      g.emitMemIntrin(argCurs, tgt.memIntrin)    # (fused arg emission inside)
       if not (dest.kind == InReg and not dest.isTemp):
         dest = regLoc(g.md.intRetReg, ScalarSlot, isTemp = true)
       elif dest.r != g.md.intRetReg:
@@ -3076,7 +3031,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, resSlot)
           g.movReg(dest.r, g.md.intRetReg)
       of NamedStack, Mem:
-        g.storeReg2(dest, g.md.intRetReg)
+        g.storeReg(dest, g.md.intRetReg)
       else: raiseAssert "arkham a64n: call result dest " & $dest.kind
 
   var callArgSlots: seq[AsmSlot] = @[]
@@ -3100,10 +3055,13 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
   # AAPCS64, and libc is compiled to that rule. `open(path, flags, 0o666)` put the
   # mode in x2, so every file arkham created got whatever the stack happened to
   # hold as its permission bits. Linux/AAPCS64 keeps filling registers, so this is
-  # Darwin-only. The signature names the fixed params only; the tail is produced
-  # into the argument registers it WOULD have taken (caller-saved, and this callee
-  # never reads them), then moved down into an area carved just before the call.
-  let variadicFrom = if tgt.isVarargs and not g.a64Linux: tgt.fixedParams else: -1
+  # Darwin-only. The call goes through a declaration of its own SHAPE whose tail
+  # is `(s)` parameters (`a64.variadicTarget`), so the tail is marshalled exactly
+  # like any other stack argument — no count limit, floats and aggregates alike.
+  let variadicFrom = if tgt.isVarargs and g.md.arch == Arm64 and not g.a64Linux: tgt.fixedParams
+                     else: -1
+  if variadicFrom >= 0:
+    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, variadicFrom)
   let plan = planCall(g.md, callArgSlots, retByRef = false, variadicFrom)
   if doTail:
     for pa in plan.args:
@@ -3147,9 +3105,6 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
          "arkham risc: a fixed-role argument register needs the x64 park (`takeParked`)"
   var sealedArgs: set[Reg] = {}
   var sealedFArgs: set[FReg] = {}
-  var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
-  var tailGp = plan.gpUsed                 # the registers the tail would have taken
-  var tailFp = plan.fpUsed
   var pending: seq[ArgMove] = @[]
   var claims: set[Reg] = {}
   for pl in plan.args:
@@ -3157,7 +3112,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       for k in 0 ..< max(pl.words, 1): claims.incl g.md.gprAt(pl, k)
   var fclaims: set[FReg] = {}
   for j, pl in plan.args:
-    if pl.isFloat and not pl.onStack and not (variadicFrom >= 0 and j >= variadicFrom):
+    if pl.isFloat and not pl.onStack:
       fclaims.incl g.md.floatArgRegs[pl.fpIndex]
   var reads = newSeq[set[Reg]](argCurs.len)      # among the claimed registers
   var freads = newSeq[set[FReg]](argCurs.len)
@@ -3216,7 +3171,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     proc loadAddr(g: var CodeGen; m: ArgMove; b: Reg) =
       ## `b` ← the address a `msSlotPtrWord` / `msHomeWord` / `msGlobalWord` reads through.
       case m.kind
-      of msSlotPtrWord: g.place2(m.loc, b)
+      of msSlotPtrWord: g.place(m.loc, b)
       of msHomeWord:
         g.ab.tree LeaA64: (g.emReg b; g.ab.sym m.name)
       else:
@@ -3227,12 +3182,12 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         case m.kind
         of msLeaf:
           var aD = regLoc(dst, ScalarSlot)
-          g.emitValue2(m.cur, aD)
+          g.emitValue(m.cur, aD)
           assert aD.kind == InReg and aD.r == dst,
                  "arkham risc: a leaf argument was loaded outside its ABI register"
           g.unbindTemp(dst)                    # referenced RAW from here on
         of msReg: g.movReg(dst, m.r)
-        of msLoc: g.place2(m.loc, dst)
+        of msLoc: g.place(m.loc, dst)
         of msPtrWord: g.loadWord(dst, m.r, m.idx, m.bytes)
         of msHomeWord:
           if m.bytes - m.idx * wordSize() >= wordSize():
@@ -3262,7 +3217,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         case m.kind
         of msLeaf:
           var fD = fregLoc(m.fdst, AsmSlot(cls: AFloat, size: m.bytes, align: m.bytes))
-          g.emitFValue2(m.cur, fD)
+          g.emitFValue(m.cur, fD)
           assert fD.kind == InFReg and fD.f == m.fdst,
                  "arkham risc: a float argument was loaded outside its ABI register"
         of msReg: g.fmovF(m.fdst, m.f, bits)
@@ -3297,7 +3252,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       ## A leaf/computed move's expression, evaluated into `p` now; the move
       ## then only moves from there.
       var aD = p
-      if m.fdst != NoFReg: g.emitFValue2(m.cur, aD) else: g.emitValue2(m.cur, aD)
+      if m.fdst != NoFReg: g.emitFValue(m.cur, aD) else: g.emitValue(m.cur, aD)
       m.valueSym = ""
       m.reads = {}; m.freads = {}
       case aD.kind
@@ -3320,7 +3275,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           if copy.kind == InReg:
             g.bindTemp(copy.r, copy.typ)
             g.movReg(copy.r, d)
-          else: g.storeReg2(copy, d)
+          else: g.storeReg(copy, d)
         if copy.kind == InReg:
           m.r = copy.r; m.reads = {copy.r}
         else:
@@ -3394,50 +3349,44 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       let a = argCurs[j]
       let pl = plan.args[j]
       let aSym = if a.kind == Symbol: symName(a) else: ""
-      if variadicFrom >= 0 and j >= variadicFrom:
-        # Darwin's variadic tail: into the register it would have taken, claimed
-        # so nothing later draws it; stored to the stack after phase 2.
-        if g.exprSlot(a).kind == AMem:
-          # C's default argument promotions never produce one, and guessing the
-          # HFA/indirect split would miscompile silently.
-          raiseAssert "arkham a64: aggregate in the variadic tail of " & tgt.asmName
-        elif pl.isFloat:
-          if tailFp >= g.md.floatArgRegs.len:
-            raiseAssert "arkham a64: too many float arguments in the variadic tail of " &
-                        tgt.asmName
-          var fD = fregLoc(g.md.floatArgRegs[tailFp], defaultFloatSlot())
-          g.emitFValue2(a, fD)                 # promoted to double by the front end
-          g.rb.sealF fD.f; sealedFArgs.incl fD.f
-          varTail.add (NoReg, fD.f, pl.byteOff)
-          inc tailFp
-        else:
-          if tailGp >= g.md.intArgRegs.len:
-            raiseAssert "arkham a64: too many arguments in the variadic tail of " &
-                        tgt.asmName
-          let r = g.md.intArgRegs[tailGp]
-          g.releaseArgDest(r, aSym)
-          g.stagedArgs.incl r
-          var aD = regLoc(r, ScalarSlot)
-          g.emitValue2(a, aD)
-          g.unbindTemp(aD.r)
-          g.rb.sealAccum r; sealedArgs.incl r
-          varTail.add (r, NoFReg, pl.byteOff)
-          inc tailGp
-      elif pl.onStack:
+      if pl.onStack:
         # The outgoing slot IS the park: stored now, from wherever the value is.
         if g.exprSlot(a).kind == AMem:
           g.marshalStackAggrArg(a, paramName(j))
+        elif pl.isFloat:
+          # A float past the SIMD argument registers: into a float temp (or its
+          # spill slot, pool dry) and `fstr`d to its outgoing slot. The width is the
+          # argument's own, for the reason the register arm below gives.
+          let fSlot = g.exprSlot(a)
+          let bytes = if fSlot.kind == AFloat: fSlot.size else: defaultFloatSlot().size
+          let bits = bytes * 8
+          let p = g.takeFTmp(AsmSlot(cls: AFloat, size: bytes, align: bytes))
+          if p.kind == InFReg: g.bindFTmp(p.f, bits)
+          var fD = p
+          g.emitFValue(a, fD)
+          var src = NoFReg
+          if fD.kind == InFReg: src = fD.f
+          else:
+            src = g.takeFBridge(bits)
+            g.emFloatScalarLoad(src, fD.name, bits)
+          g.ab.tree FstrA64:
+            g.ab.tree MemX:
+              g.emReg SP
+              g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emFReg(src, bits)
+          if fD.kind != InFReg: g.dropFBridge()
+          g.freeVal(fD)
         elif g.isWideExpr(a):
           g.wideArgToStack(wideArgSlots[j], paramName(j))
         else:
           var aD = needsReg(g.valueSlot(a))
-          g.emitValue2(a, aD)
+          g.emitValue(a, aD)
           var srcReg: Reg
           var srcBridge = NoReg
           if aD.kind == InReg: srcReg = aD.r
           else:
             srcBridge = g.takeBridge(aD.typ)
-            g.place2(aD, srcBridge)
+            g.place(aD, srcBridge)
             srcReg = srcBridge
           g.ab.tree MovA64:
             g.ab.tree MemX:
@@ -3468,16 +3417,16 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
             else: (m.kind = msSlotPtrWord; m.loc = p)
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
           # The address is the computed part: into a park, words read through it.
-          g.emitLvalue2(a)
+          g.emitLvalue(a)
           let p = g.park(addrSlot())
           if p.kind == InReg:
             g.aggrAddrInto(a, p.r, addrSlot(), doBind = true)
           else:
             let b = g.takeBridge(addrSlot())
             g.aggrAddrInto(a, b, addrSlot(), doBind = false)
-            g.storeReg2(p, b)
+            g.storeReg(p, b)
             g.dropBridge b
-          g.freeLvalTemps2(a)
+          g.freeLvalTemps(a)
           fromPtr(p)
         elif a.kind == Symbol and g.lookupSym(aSym).cat in {scGlobal, scTvar}:
           let isTvar = g.lookupSym(aSym).cat == scTvar
@@ -3495,7 +3444,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
             home = synth("aggtmp") & $g.posOf(a) & ".0"
             g.emTypedStackVar(home, tcur)
             g.varType[home] = tn
-            g.genStore2(a, namedStackLoc(home, callArgSlots[j]))
+            g.genStore(a, namedStackLoc(home, callArgSlots[j]))
           let hh = g.plan.homeOfSym(home)
           case hh.kind
           of InReg: fromPtr(regLoc(hh.r, addrSlot()))
@@ -3510,7 +3459,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
               m.kind = (if pl.byRef: msHomeAddr else: msHomeWord)
         if now: g.resolve(ms) else: pending.add ms
       elif pl.isFloat:
-        # The width is the argument's OWN: `emitFValue2` picks a LITERAL's bit
+        # The width is the argument's OWN: `emitFValue` picks a LITERAL's bit
         # pattern from the destination slot, and a `float32` literal materialized
         # as the double pattern has a zero low half (the half `fmov s, s` reads).
         let fSlot = g.exprSlot(a)
@@ -3537,27 +3486,6 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         g.scalarArg(j, m)
     # ── phase 2: one parallel move ───────────────────────────────────────────
     g.resolve(pending)
-    # Drop the variadic tail into a freshly carved outgoing area at [sp+0…]. The
-    # frame nifasm sizes has no room for it (that reservation follows the callee's
-    # DECLARED signature, which names the fixed params only), so carve it here and
-    # give it back straight after the call — 16-aligned, as the ABI requires SP to
-    # be. Carved AFTER phase 2: a fixed argument may have been loaded out of an
-    # `(s)` slot, and those are SP-relative.
-    var varArea = 0
-    if varTail.len > 0:
-      assert plan.stackBytes == varTail.len * 8,
-             "arkham a64: a variadic callee with stack-passed fixed parameters"
-      varArea = (varTail.len * 8 + 15) and not 15
-      g.ab.tree SubA64: (g.ab.rawReg SP; g.ab.intLit varArea)
-      for it in varTail:
-        if it.r != NoReg:
-          g.ab.tree MovA64:
-            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
-            g.emReg it.r
-        else:
-          g.ab.tree FstrA64:
-            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
-            g.emFReg(it.f, 64)
     # Every argument is in place; the call itself clobbers all four, so from the
     # marker on nobody's claim survives.
     g.stagedArgs = {}
@@ -3565,8 +3493,6 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       g.ab.tree SvcA64: g.ab.intLit 0
     elif tgt.extern:
       g.ab.keyword ExtcallA64                # a dynamic import: through its stub
-      if varArea > 0:
-        g.ab.tree AddA64: (g.ab.rawReg SP; g.ab.intLit varArea)
     elif doTail:
       # The arguments are in their ABI registers; from here nothing of ours is
       # live, so undo the prologue and branch. `(popframe)` is inside the
@@ -3617,7 +3543,7 @@ when declared(FldrqOp):
   proc vecHomeF(g: var CodeGen; a: Cursor): FReg =
     ## A 128-bit vector operand: the vectorizer spells every one as a plain local,
     ## and a local of type `(f 128)` lives in a SIMD register or fails loudly at
-    ## its declaration (`genVarDecl2`), so the home lookup here cannot miss.
+    ## its declaration (`genVarDecl`), so the home lookup here cannot miss.
     if a.kind != Symbol:
       lengError a, "a 128-bit vector operand must be a plain local"
     let home = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
@@ -3639,8 +3565,8 @@ when declared(FldrqOp):
       lengError a, "a vector load/store offset must be a non-negative literal multiple of 16"
     result = int(intVal(a))
 
-  proc emitVecInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
-                     argCurs: seq[Cursor]; dest: var Location) =
+  proc emitVecInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                    argCurs: seq[Cursor]; dest: var Location) =
     ## The AdvSIMD rows. Vector VALUES are `(f 128)` locals homed in SIMD
     ## registers; the ops read those homes directly and write the destination
     ## register in place — there is no 128-bit register-register move anywhere,
@@ -3654,7 +3580,7 @@ when declared(FldrqOp):
       let off = g.vecByteOff(argCurs[1])
       let vf = g.vecHomeF(argCurs[2])
       var pd = g.takeInstrReg(g.exprSlot(argCurs[0]), false)
-      g.emitValue2(argCurs[0], pd)
+      g.emitValue(argCurs[0], pd)
       g.ab.tree FstrqA64:
         g.ab.tree MemX:
           g.emReg pd.r
@@ -3664,7 +3590,7 @@ when declared(FldrqOp):
     of FldrqOp:
       let off = g.vecByteOff(argCurs[1])
       var pd = g.takeInstrReg(g.exprSlot(argCurs[0]), false)
-      g.emitValue2(argCurs[0], pd)
+      g.emitValue(argCurs[0], pd)
       if dest.kind != InFReg:
         dest = g.takeFTmp(Vec128Slot)
         if dest.kind == NamedStack:
@@ -3679,7 +3605,7 @@ when declared(FldrqOp):
     of VdupOp:
       let bits = g.vecLaneBits(argCurs[1])
       var fv = dontCare
-      g.emitFValue2(argCurs[0], fv)
+      g.emitFValue(argCurs[0], fv)
       if dest.kind != InFReg:
         dest = g.takeFTmp(Vec128Slot)
         if dest.kind == NamedStack:
@@ -3691,7 +3617,7 @@ when declared(FldrqOp):
         srcF = fv.f
       else:                                        # an eftmp spill (float pool dry)
         srcF = g.takeFBridge(bits)
-        g.placeF2(fv, srcF, bits)
+        g.placeF(fv, srcF, bits)
         viaBridge = true
       g.ab.tree VdupA64:
         g.emFReg(dest.f, 64)
@@ -3748,10 +3674,10 @@ when declared(FldrqOp):
     else:
       raiseAssert "arkham a64n: not a vector op: " & IntrinsicNames[op]
 
-proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
   ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
-  ## go to the `plan.locs` memo so `emitAtomicInstr2` reads them unchanged.
+  ## go to the `plan.locs` memo so `emitAtomicInstr` reads them unchanged.
   ##
   ## An intrinsic row may write memory (the atomics), claim registers of its own
   ## and run an LL/SC retry loop — none of which the mirror map models. It clears,
@@ -3785,7 +3711,7 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
       lengError c, "`" & IntrinsicNames[tgt.op] & "` is a 128-bit vector " &
                 "operation and " & g.md.targetName & " has no SIMD vocabulary"
     if tgt.op in VecOps:
-      g.emitVecInstr2(c, tgt.op, argCurs, dest)
+      g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
   if row.inoutOperand >= 0:
     # A two-address row: the destination operand IS its home, so nothing is
@@ -3795,11 +3721,11 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
     for a in argCurs:
       if i != row.inoutOperand:
         var d = Location(kind: RegOrImm, typ: ScalarSlot)
-        g.emitValue2(a, d)
+        g.emitValue(a, d)
         g.plan.planAtEmitTime(cursorToPosition(g.buf[], a), d)
         ops.add d
       inc i
-    g.emitInoutInstr2(c, tgt.op, argCurs)
+    g.emitInoutInstr(c, tgt.op, argCurs)
     for d in ops:
       if d.kind == InReg: g.freeVal d
     dest = Location(kind: Undef)                # no value: nothing consumes this
@@ -3872,13 +3798,13 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
       # No immediate atomics on a64 (the LL/SC loops have no spare scratch to
       # materialize one — the allocator's atomicValueMayBeImm was x86-only).
       var d = g.takeInstrReg(g.exprSlot(a), tgt.op.isAtomic)
-      g.emitValue2(a, d)
+      g.emitValue(a, d)
       g.plan.planAtEmitTime(cursorToPosition(g.buf[], a), d)
       ops.add d
       inc i
   if sealedHere: g.plan.unseal {res.r}
   if tgt.op.isAtomic:
-    g.emitAtomicInstr2(c, tgt.op, argCurs, res)
+    g.emitAtomicInstr(c, tgt.op, argCurs, res)
     for d in ops:
       if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
     return
@@ -3971,7 +3897,7 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.bindTemp(res.r, res.typ)
   var src = res.r
   if a0.kind == InReg: src = a0.r
-  else: g.place2(a0, res.r)
+  else: g.place(a0, res.r)
   let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
   case tgt.op
   of ClzPinnedOp, ClzOp:
@@ -3997,7 +3923,7 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
     #
     # The encoder stages x3/x4 through x14/x15/x16, which the allocator never hands
     # out — the same reason an atomic's LL/SC loop needs no clobber analysis — so
-    # only their stale NAMES have to go, exactly as `emitAtomicInstr2` does.
+    # only their stale NAMES have to go, exactly as `emitAtomicInstr` does.
     for r in g.md.bridgeRegs: g.releaseStaleName(r)
     g.ab.tree VgreqA64: (g.emReg res.r; g.emReg src)
   else:
@@ -4006,44 +3932,13 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
     if d.kind == InReg and d.r != res.r: g.freeVal(d)
   dest = res
 
-# ── var declarations ─────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  64-bit integers on a 32-bit target (Cortex-M, RV32)
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── case test ────────────────────────────────────────────────────────────────
-
-# ── conditional-move (branchless select) ─────────────────────────────────────
-
-# ── statement dispatch ───────────────────────────────────────────────────────
-
-# ── proc emission / driver (pure-emit path) ──────────────────────────────────
-
-
-# MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
-# below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
-# or RegisterBindingsMatchLoc and replay completeness break.
-# ── driver ──────────────────────────────────────────────────────────────────
-
-const
-  SemiWrite* = 5           ## SYS_WRITE:  r1 = &{handle, buf, len}
-  SemiOpen* = 1            ## SYS_OPEN:   r1 = &{&name, mode, namelen}
-  SemiOpenModeW* = 4       ## the "w" mode; `:tt` opened with it is the console
-  SemiTtyBase* = "`shtty.0"    ## the `:tt` device name, in rodata
-  SemiTtyHandleBase* = "`shwh.0"   ## the cached console handle, one `.bss` word
-  SemiExitExtended* = 0x20 ## SYS_EXIT_EXTENDED: r1 = &{reason, status}
-  SemiBkpt* = 0xAB         ## the `bkpt` immediate that IS the semihosting call
-  AdpStoppedApplicationExit* = 0x20026
-
-# The 64-bit-integer lowering (Cortex-M, M4). INCLUDED here, at the end, so it
-# sees the whole value core it dispatches out of and back into.
-#
-#           Arkham — 64-bit integers on a 32-bit target (Cortex-M, M4)
-#        (c) Copyright 2026 Andreas Rumpf
-#
-#    See the file "license.txt", included in this distribution.
-#
-
-## INCLUDED by `codegen_arm.nim` — not a module of its own, because it is one
+## Here, at the end of the value core, and not a module of its own: it is one
 ## more emitter arm rather than a second code generator, and it needs the whole
-## `*2` value core it dispatches out of and back into.
+## value core it dispatches out of and back into.
 ##
 ## ## `int` is 32 bits on this target
 ##
@@ -4063,9 +3958,9 @@ const
 ## machine model gets four allocatable homes (r4–r7) and an EMPTY volatile temp
 ## pool, because on this ABI the only caller-saved registers ARE the argument
 ## registers, and emitter scratch is drawn while a call's arguments are staged
-## (see `machine_m.nim`). A pair allocator would be competing for two of four
+## (see `machine_cortexm.nim`). A pair allocator would be competing for two of four
 ## homes per live 64-bit value, and every consumer in the shared value core
-## (`place2`, `storeReg2`, `freeVal`, the binding protocol with a formal model
+## (`place`, `storeReg`, `freeVal`, the binding protocol with a formal model
 ## behind it) would have to grow a second-register case.
 ##
 ## So a 64-bit value here is EIGHT BYTES AT AN ADDRESS, and the ops read and
@@ -4098,10 +3993,6 @@ const
 ## every `WideRef` below is base+displacement and never an indexed one.
 
 
-# ── scratch ─────────────────────────────────────────────────────────────────
-
-# ── the two halves as operands ──────────────────────────────────────────────
-
 # ── minting and resolving ───────────────────────────────────────────────────
 
 proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef)
@@ -4109,9 +4000,9 @@ proc wideLvalRef(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
   ## The eight bytes an lvalue expression denotes: `(deref p)`, `(dot o f)`,
   ## `(at a i)`. The address goes into a scratch register; the caller frees it.
   scratch = g.takeWideRegs(1, "a 64-bit lvalue address")[0]
-  g.emitLvalue2(c)
+  g.emitLvalue(c)
   g.aggrAddrInto(c, scratch, addrSlot(), doBind = false)
-  g.freeLvalTemps2(c)
+  g.freeLvalTemps(c)
   baseWide(scratch)
 
 proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef =
@@ -4138,23 +4029,23 @@ proc emitNarrowValueInto(g: var CodeGen; c: Cursor; dest: Reg) =
   ## Emit a NON-wide expression so its value lands in `dest`.
   ##
   ## A LITERAL is produced straight into the pinned register: no temp, no
-  ## `place2`. `dest` is one of the wide lowering's own scratch registers, taken
+  ## `place`. `dest` is one of the wide lowering's own scratch registers, taken
   ## and bound by `takeWideRegs`, and with four of them held (`wideShift`) the
   ## pools are dry: `needsReg` for the literal count `2` in `(shl y 2)` minted an
   ## etmp SLOT, whose store then wanted a produce bridge — and every bridge was one
   ## of those four ("every scratch bridge in use", tests/arkham/bin_alias_order on
   ## the cortex-m 64 corpus). Everything else keeps the temp route: a SYMBOL may
-  ## be a 64-bit slot whose LOW word is what `place2` fetches (`1 shl n` with
+  ## be a 64-bit slot whose LOW word is what `place` fetches (`1 shl n` with
   ## `n: int64` — the pinned route emitted no load at all), and a computed
   ## operand's own emission may need scratch of its own.
   let cc = stripParens(c)
   if cc.kind in {IntLit, UIntLit, CharLit}:
     var v = regLoc(dest, g.valueSlot(c))
-    g.emitValue2(cc, v)
+    g.emitValue(cc, v)
     return
   var v = needsReg(g.valueSlot(c))
-  g.emitValue2(c, v)
-  g.place2(v, dest)
+  g.emitValue(c, v)
+  g.place(v, dest)
   g.freeVal(v)
 
 proc wideFromNarrowExpr(g: var CodeGen; dst: WideRef; c: Cursor; signed: bool) =
@@ -4421,7 +4312,7 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
         #
         # …and a `cast` is unsigned regardless. `cast` is a REINTERPRETATION of
         # the source's bits, so it zero-extends where `conv` sign-extends; this
-        # is `reReprCast2`'s `(not isCast) and srcSigned`, stated again because
+        # is `reReprCast`'s `(not isCast) and srcSigned`, stated again because
         # the wide path does its own widening.
         let it = g.getType(innerC)
         let signedSrc = isSignedType(resolveType(g.prog, it))
@@ -4457,7 +4348,7 @@ proc wideCallInto(g: var CodeGen; c: Cursor; dst: WideRef) =
   ## call that just happened — see `wideValueSlot` — so a register-relative
   ## destination lands in a temp and is copied afterwards.
   var d = dontCare
-  g.emitCall2(c, d)
+  g.emitCall(c, d)
   let lo = g.md.intRetReg
   let hi = g.md.intArgRegs[1]
   if dst.kind == wrSlot:
@@ -4471,7 +4362,7 @@ proc wideCallInto(g: var CodeGen; c: Cursor; dst: WideRef) =
 
 proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location) =
   ## Produce a 64-bit value into a resolved destination `Location` — the
-  ## `genStore2` arm for wide values.
+  ## `genStore` arm for wide values.
   if dst.kind == NamedStack:
     g.emitWideInto(c, slotWide(dst.name))
     return
@@ -4489,7 +4380,7 @@ proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location) =
   g.dropWideRegs(@[a])
 
 proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location) =
-  ## The `emitValue2` arm: a 64-bit value has no register to be resolved into,
+  ## The `emitValue` arm: a 64-bit value has no register to be resolved into,
   ## so it lands in a temp slot and `dest` names that slot.
   ##
   ## `spillTemp` is deliberately FALSE. It means "the emitter must produce into
@@ -4525,7 +4416,7 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
     g.wideLoad(b, src, 0)
     let tslot = slotOf(g.prog, targetC)
     g.extendTo(b, tslot.size * 8, tslot.kind == AInt)
-    g.storeReg2(dest, b)
+    g.storeReg(dest, b)
     g.unbindTemp(b)
     return
   if dest.isTemp and not g.rb.isBoundTemp(dest.r):

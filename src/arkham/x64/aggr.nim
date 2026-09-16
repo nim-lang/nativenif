@@ -15,7 +15,7 @@
 
 import std / [assertions, sets]
 import nifcore
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, regbind]
 import machine as machine_x64
@@ -25,7 +25,7 @@ proc genMemIntrinBody*(g: var CodeGen; builtin: string) =
   ## The inline `mem*` loop, assuming the args are already loaded (dst→rdi,
   ## src/val→rsi, n→rdx) and rsi/rdx/rcx are bound to checked names. Result → RAX.
   ## Shared by the legacy `genMemIntrin` (reactive `genInto` arg-load) and the
-  ## value-core `emitMemIntrin2` (args placed by `emitValue2` into the ABI regs).
+  ## value-core `emitMemIntrin` (args placed by `emitValue` into the ABI regs).
   ## The dest pointer (rdi) and the byte/result (rax) stay raw — irreducible ABI regs.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
@@ -35,7 +35,7 @@ proc genMemIntrinBody*(g: var CodeGen; builtin: string) =
     # is why bif sat ~3× behind gcc. Split:
     #   n < 64  → qword loop + byte tail (same shape as memset; no overrun)
     #   n ≥ 64  → `rep movsq` + `rep movsb` (the 1.4 MB token block, etc.)
-    # A compile-time n ≤ 64 is unrolled in `emitMemIntrin2` and never reaches here.
+    # A compile-time n ≤ 64 is unrolled in `emitMemIntrin` and never reaches here.
     let qwordDone = g.freshLabel()
     let byteLoop = g.freshLabel()
     let smallDone = g.freshLabel()
@@ -271,7 +271,7 @@ proc genAtomicXadd(g: var CodeGen; dst, pReg, work: Reg; val: Location;
     g.workOp(if sub: SubX64 else: AddX64, work, val)   # new = old ± delta
   g.movReg(dst, work)
 
-proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+proc emitAtomicInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
   ## An atomic row's x86-64 sequence, on operands the ALLOCATOR placed (see the
   ## section header above for the register discipline). `res` is the row's result
@@ -375,7 +375,7 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
       g.unbindTemp(a.r)
 
-proc genAggrCopy2*(g: var CodeGen; dstVar, srcVar: string; typeSym: SymId; tmp: Reg) =
+proc genAggrCopy*(g: var CodeGen; dstVar, srcVar: string; typeSym: SymId; tmp: Reg) =
   ## Whole-aggregate copy `dstVar ← srcVar`, one FIELD at a time through the allocator-
   ## provided scratch GPR `tmp` (typed per field, so a pointer field keeps `(ptr T)`).
   ## Both operands address by name via emAggrFieldMem (a stack `(s)` slot's dot form,

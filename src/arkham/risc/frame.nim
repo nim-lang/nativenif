@@ -18,11 +18,11 @@
 
 import std / [assertions, tables]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
                     mirrors, regbind, abi]
 import machine_a64 as machine
-from machine_m as machine_m import nil
+from machine_cortexm import nil
 import emit, mem, aggr, value
 
 proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
@@ -173,49 +173,6 @@ proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.ab.keyword SO
   g.ab.ptrType: g.emTypeSym(typeSym)
   g.ab.close()
-
-proc emitSyprocA64*(g: var CodeGen; sp: SyscallProc) =
-  ## Emit a `(syproc :name (params …) (result …)? NR)` decl for a Linux syscall:
-  ## params in the syscall ABI registers (x0–x5, identical to AAPCS64's arg regs),
-  ## result in x0, and the AArch64 syscall number. A `svc` preserves every register
-  ## but x0, so no `(clobber …)` is emitted (the `(svc)` marker marks x0 itself).
-  ## Invoked inline at call sites via the `(svc 0)` marker; emits no code.
-  var c = sp.decl
-  c.into:
-    inc c                                        # name
-    var pc = c; skip c                           # params slot; c → return type
-    g.ab.tree SyprocD:
-      g.ab.symDef sp.asmName
-      var idx = 0
-      g.ab.tree ParamsD:
-        if pc.kind == TagLit:                    # (params (param …) …)
-          pc.into:
-            while pc.hasMore:
-              pc.into:                           # (param :name pragmas type)
-                inc pc                           # name → positional pN.0
-                skip pc                          # pragmas
-                if idx >= g.md.intArgRegs.len:
-                  raiseAssert "arkham a64: syscall with too many arguments"
-                g.ab.tree ParamD:
-                  g.ab.symDef paramName(idx)
-                  g.ab.rawReg g.md.intArgRegs[idx]
-                  g.genTypeBody(pc)
-                while pc.hasMore: skip pc
-              inc idx
-      g.ab.tree ResultD:                         # c at the return type
-        if not retIsVoid(c):
-          g.ab.symDef synth("ret.0")
-          g.ab.rawReg g.md.intRetReg
-          g.genTypeBody(c)
-      if sp.sysNrA64 < 0:
-        # A row whose AArch64 column is `-1` (a legacy call the asm-generic ABI
-        # dropped: `open`, `stat`, `fork`, …). Emitting it anyway would trap with
-        # x8 = -1, i.e. a silent ENOSYS that surfaces as `fileExists` always false
-        # rather than as a build error. std/posix routes each of these through the
-        # `*at`/`*2` form under `linuxA64Raw`; reaching here means one was missed.
-        raiseAssert "arkham a64: no AArch64 syscall for " & sp.asmName
-      g.ab.intLit sp.sysNrA64.int64
-    while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
 proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `(var :name (reg) type)` + bind `r` to `name` for its scope. arkham keeps
@@ -442,10 +399,15 @@ proc bridgeStackParam(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSl
     g.dropBridge v
     g.dropBridge base
     return
-  let s = g.pickStagingA64()
+  let s = g.pickUnboundReg()
   if s == NoReg:
-    raiseAssert "arkham a64: no register to bridge stack parameter " & slotName &
-                " in proc " & g.curProcName
+    # Every register is some home. The bridges are in no pool, and this runs before
+    # the first body statement, so none of them is holding anything yet.
+    let v = g.takeBridge(typ)
+    g.emLoadIncomingArg(v, byteOff)
+    g.emScalarStore(slotName, v)
+    g.dropBridge v
+    return
   g.pickedRegs.incl s
   g.bindTemp(s, typ)
   g.emLoadIncomingArg(s, byteOff)
@@ -497,12 +459,30 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = c.symId
         while c.hasMore: skip c               # type (+ anything else)
       if not pl.onStack: continue
-      if pl.isFloat:
-        # `emitParamMoves` skips every stack-passed parameter, so if this one is
-        # skipped here too it is silently never loaded. Say so instead.
-        lengError decl, "arkham: a stack-passed FLOAT parameter (`" & nm &
-                  "`) is not supported yet", lengInfo(decl)
       let loc = g.plan.homeOfSym(nm)
+      if pl.isFloat:
+        # A float past the SIMD argument registers: its bytes into its home through
+        # the float bridge — `fldr` from the incoming area, then into a SIMD home or
+        # the `(s)` slot the allocator spilled it to.
+        let bits = slotOf(g.prog, typeCur).size * 8
+        let f = g.takeFBridge(bits)
+        if g.md.frameStyle == BlockFrame:
+          let b = g.takeBridge()
+          g.emIncomingArgBase(b)
+          g.ab.tree FldrA64: (g.emFReg(f, bits); g.emIncomingArgMem(b, pl.byteOff))
+          g.dropBridge b
+        else:
+          g.ab.tree FldrA64: (g.emFReg(f, bits); g.emIncomingArgMem(NoReg, pl.byteOff))
+        case loc.kind
+        of InFReg: g.fmovF(loc.f, f, bits)
+        of NamedStack:
+          g.emFloatStackVar(nm, bits)
+          g.emFloatScalarStore(nm, f, bits)
+        else:
+          raiseAssert "arkham risc: stack-passed float parameter home " & $loc.kind &
+                      ": " & nm
+        g.dropFBridge()
+        continue
       if g.isWideType(typeCur):
         # A stack-passed 64-bit parameter: eight bytes of the incoming area into
         # the slot the allocator gave it (a scalar wider than a register never
@@ -638,7 +618,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
       # inferred from a pool it happens not to be in (design.md, "Fixed-register
       # roles must be stated, not assumed" — the same rule the atomics broke).
       #
-      # `takeHeld`'s second chance and `pickStagingA64` judge a callee-saved register
+      # `takeHeld`'s second chance and `pickUnboundReg` judge a callee-saved register
       # by `rb.isBound`, deliberately bypassing the whole-proc `regHoldsHome` union
       # because it is too conservative for an ordinary local (disjoint scopes). A
       # plain scalar/pointer parameter is moved into its home with a raw `mov` and
@@ -712,18 +692,12 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.wideParamToHome(nm, pl.gpFirst)
       elif loc.kind == InFReg:
         # Float parameter: in a leaf proc it stays in its incoming v{fpIndex}; if
-        # the allocator gave it a callee-saved home, move it there. A STACK-passed
-        # float has no `v{fpIndex}` to read — `FloatArgRegs[pl.fpIndex]` would name
-        # another parameter's register and silently move the wrong value, so say so
-        # instead. (>8 float params; the integer side is handled above.)
-        assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
-          " in " & g.curProcName
+        # the allocator gave it a callee-saved home, move it there. (A stack-passed
+        # one never reaches here — see the `pl.onStack` arm above.)
         g.fmovF(loc.f, g.md.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming SIMD arg register into it so `addr`/loads/stores work.
-        assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
-          " in " & g.curProcName
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
         g.emFloatScalarStore(nm, g.md.floatArgRegs[pl.fpIndex], bits)
@@ -740,13 +714,16 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.movReg(loc.r, g.md.gprAt(pl))
         else: raiseAssert "arkham v1: stack-resident parameter: " & nm
 
-proc emitSignature*(g: var CodeGen; decl: Cursor) =
+proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = []) =
   ## Emit the proc's `(params)/(result)/(clobber)`: the ABI stated explicitly —
   ## positional `p{i}` register params (v-registers for floats, `(regs …)` for
   ## aggregates and wide scalars, `(s)` past the register file) and an `x0` /
   ## `d0` result — so nifasm cross-checks every call site. The clobber set is
   ## always the convention's, derived here (never per-proc precomputed), which
   ## is reliable across modules.
+  ##
+  ## `tail` is a Darwin variadic call shape's tail (see `VariadicExtern`): one `(s)`
+  ## word-slotted parameter per slot, after the declared ones.
   block:
     var c = decl
     c.into:
@@ -765,7 +742,9 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
         if c.kind == TagLit:                  # (params (param …) …)
           # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
           # argument file, so the plan is never shifted (retByRef=false).
-          let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+          let fixedSlots = paramSlots(g.prog, c)
+          let plan = planCall(g.md, fixedSlots & @tail, retByRef = false,
+                              variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
           var pIdx = 0
           c.into:
             while c.hasMore:
@@ -843,6 +822,17 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
                       g.ab.keyword SO           # 9th+ → stack-passed `(s)`
                     g.genTypeBody(c)            # the param type (consumes it)
                 while c.hasMore: skip c
+          for k in 0 ..< tail.len:
+            # Apple's variadic slots: a double, an integer/pointer word, a ≤16B
+            # aggregate's words, a larger aggregate's pointer — all 8-byte slotted.
+            let pl = plan.args[fixedSlots.len + k]
+            g.ab.tree ParamD:
+              g.ab.symDef paramName(pl.ord)
+              g.ab.keyword SO
+              if pl.isFloat: g.ab.floatType(64)
+              elif pl.isAgg and not pl.byRef:
+                g.ab.arrayType: (g.ab.uintType(64); g.ab.intLit int64(pl.words))
+              else: g.ab.uintType(64)
         else:
           skip c                              # no params slot → consume it
       g.ab.tree ResultD:                      # c now at the return type
@@ -881,7 +871,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
     if not declIsNoReturn(decl):
       g.emConvClobbers()
 
-proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
+proc storeFReg(g: var CodeGen; dst: Location; src: FReg; bits: int) =
   case dst.kind
   of InFReg: g.fmovF(dst.f, src, bits)
   of NamedStack: g.emFloatScalarStore(dst.name, src, bits)
@@ -889,14 +879,14 @@ proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
     let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(dst.name))
     g.emFStore(src, b, bits); g.dropBridge b
   of Mem:
-    g.prematLval2(dst.cur)
+    g.prematLval(dst.cur)
     g.ab.tree FstrA64:
-      g.ab.tree MemX: g.emLvalAddr2(dst.cur)
+      g.ab.tree MemX: g.emLvalAddr(dst.cur)
       g.emFReg(src, bits)
-    g.unbindLvalTemps2(dst.cur)
-  else: raiseAssert "arkham a64n: storeFReg2 dst " & $dst.kind
+    g.unbindLvalTemps(dst.cur)
+  else: raiseAssert "arkham a64n: storeFReg dst " & $dst.kind
 
-proc copyStructThroughPtr2*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
+proc copyStructThroughPtr*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
   ## pointer return). This runs at the `ret` and crosses NO call, so both scratch
   ## registers it needs — the source address and the word-transfer temp — come from the

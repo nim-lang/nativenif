@@ -17,8 +17,7 @@
 import std / [strutils, os]
 
 
-import machinedesc, planer
-import "../risc/machine_m"
+import machinedesc, planner
 import regbind, context
 
 

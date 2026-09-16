@@ -82,7 +82,7 @@ the implementation:
  * **The table is code, not addresses.** `mtvec` holds a base plus a two-bit
    MODE, and in vectored mode cause `c` jumps to `base + 4*c` — one WORD that has
    to be an INSTRUCTION. So the "vector table" is a run of `j handler`, emitted
-   as an ordinary proc (`runtime.emTrapTableRv`) and pointed at with the same
+   as an ordinary proc (`rv32.emitTrapTable`) and pointed at with the same
    `(adr …)` any other symbol gets. Nothing in the image writer knows about it,
    which was the point: the alternative — a new image-layout number for the base
    — would have cost a shared tag id on every target to describe something only

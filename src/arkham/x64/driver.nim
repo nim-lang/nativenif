@@ -15,7 +15,7 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind]
 import machine as machine_x64
@@ -60,7 +60,6 @@ proc setEntryAbi(g: var CodeGen; decl: Cursor; isNaked: bool) =
   ## push rdi/rsi in the prologue of whatever proc followed a callback.
   let win64 = isWin64AbiProc(g.prog, decl)
   g.entryMd = if win64: win64EntryOf(x64MachineA) else: g.md
-  if win64: g.checkWin64EntryAbi(decl)
   # `{.naked.}` is a promise that this proc emits no prologue, and the rdi/rsi
   # saves ARE prologue. An `.assembler` body that declares itself naked owns every
   # register it touches — including these two — the same way it already owns rbx
@@ -109,7 +108,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.retIsVoid = rc.kind == DotToken            # `(proc :f (params …) . (pragmas …) …)`
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrSym = rc.symId
-      g.retIndirect = g.aggrByRef(g.retAggrSym)
+      g.retIndirect = g.entryMd.passesByRef(aggrByteSize(g.prog, g.retAggrSym))
     elif rc.kind == TagLit and rc.typeKind == FT:
       g.retIsFloat = true                       # float return → xmm0
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
@@ -150,7 +149,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamCallerSaveDbg):
     # The ALLOCATOR's side of the caller-save audit: for every value it gave a
     # caller-saved home, the live interval it made that decision on, plus every call
-    # position inside it. `emitCall2` prints where it actually saved (`CSCALL`);
+    # position inside it. `emitCall` prints where it actually saved (`CSCALL`);
     # `scratchpad/csdiff.py` joins the two. The emitted asm alone cannot answer this —
     # a value that is live but UNBOUND at a call looks correct to an asm-level audit
     # (nothing to save) and is fatal at run time.
@@ -194,9 +193,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.indirectReg = RBX
     g.plan.usedCallee.incl RBX                   # saved/restored like any callee reg
   # Pure-emit path: the allocator already assigned every value position; emit once.
-  # (The frame is finalized INSIDE emitProcBody2, after the body — body-buffer model.
+  # (The frame is finalized INSIDE emitProcBody, after the body — body-buffer model.
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — keep rsp 16-aligned for that call.)
+  # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. Every per-proc
+  # table (regLocal/boundTemps + the ra.locs snapshot) must be reset here or
+  # RegisterBindingsMatchLoc breaks.
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.postDivergeBinds.setLen 0; g.nameBindTyp.clear()
@@ -211,7 +213,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamBridgeDbg):
     tightCompositions = 0
     lastResortTakes = 0
-  g.emitProcBody2(info, an.hasCall)
+  g.emitProcBody(info, an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE tight=" & $tightCompositions & " lastResort=" &
                      $lastResortTakes & " " & info.asmName
@@ -289,20 +291,23 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## The foreign edge keeps the unshrunk `win64Machine` — that is an ABI, not an
   ## allocation choice (see `stress.nim`).
   setTargetWord Word64             # x86-64: 8-byte pointers, 8-byte platform int
-  var g = newCodeGen(buf, x64MachineA)
-  g.ab.renderReg = x64RegName                 # render register slots as x86 names
+  var g = newCodeGen(buf, x64MachineA, x64RegName)   # register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows)
   g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
+    for (name, decl) in g.prog.mainTypeList:
+      g.genType(name, decl)
     if windows:
       # Every `importc` on Windows is a DLL import (there are no raw syscalls to
       # lower to — see `collect`), and every import names its OWN library via
       # the decl's `(dynlib …)` pragma; arkham hardcodes no library name. Externs
       # are emitted grouped per dll behind that dll's `(imp …)` — nifasm binds
-      # an `(extproc …)` against the last import library seen.
+      # an `(extproc …)` against the last import library seen. After the types:
+      # a signature names the aggregate types it passes, and nifasm resolves them
+      # as it reads the declaration.
       var dlls: seq[string] = @[]
       for ex in g.prog.externOrder:
         if ex.dll notin dlls: dlls.add ex.dll
@@ -310,8 +315,6 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         g.ab.tree ImpD: g.ab.str dll
         for ex in g.prog.externOrder:
           if ex.dll == dll: g.emitWinExtproc(ex)
-    for (name, decl) in g.prog.mainTypeList:
-      g.genType(name, decl)
     for name, decl in g.prog.globals:
       g.genGlobal(name, decl)
     # `arkham.tls.0` (the per-thread block FS points at) is owned and emitted by
@@ -323,6 +326,9 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.emitSyproc(sp)
     for info in g.prog.procs:
       genProc(g, info)
+    for v in g.variadicExterns:                 # the variadic call shapes the bodies used
+      g.ab.tree ImpD: g.ab.str v.dll
+      g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm

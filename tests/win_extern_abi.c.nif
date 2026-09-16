@@ -1,0 +1,23 @@
+(.nif27)
+(stmts
+ (type :DivT.0 . (object . (fld :quot.0 . (i 32)) (fld :rem.0 . (i 32))))
+ (proc :pow.0 (params (param :x.0 . (f 64)) (param :y.0 . (f 64))) (f 64)
+  (pragmas (importc "pow") (dynlib "msvcrt")) (stmts .))
+ (proc :div.0 (params (param :n.0 . (i 32)) (param :d.0 . (i 32))) DivT.0
+  (pragmas (importc "div") (dynlib "msvcrt")) (stmts .))
+ (type :LldivT.0 . (object . (fld :quot.0 . (i 64)) (fld :rem.0 . (i 64))))
+ (proc :lldiv.0 (params (param :n.0 . (i 64)) (param :d.0 . (i 64))) LldivT.0
+  (pragmas (importc "lldiv") (dynlib "ucrtbase")) (stmts .))
+ (proc :ExitProcess.0 (params (param :code.0 . (u 32))) .
+  (pragmas (importc "ExitProcess") (dynlib "kernel32")) (stmts .))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (var :score.0 . (i 64) 0)
+  (var :p.0 . (f 64) (call pow.0 2.0 10.0))
+  (if (elif (eq p.0 1024.0) (stmts (asgn score.0 (add (i 64) score.0 1)))))
+  (var :q.0 . DivT.0 (call div.0 17 5))
+  (if (elif (eq (dot q.0 quot.0 0) 3) (stmts (asgn score.0 (add (i 64) score.0 2)))))
+  (if (elif (eq (dot q.0 rem.0 0) 2) (stmts (asgn score.0 (add (i 64) score.0 4)))))
+  (var :l.0 . LldivT.0 (call lldiv.0 1000000000007 10))
+  (if (elif (eq (dot l.0 quot.0 0) 100000000000) (stmts (asgn score.0 (add (i 64) score.0 8)))))
+  (if (elif (eq (dot l.0 rem.0 0) 7) (stmts (asgn score.0 (add (i 64) score.0 16)))))
+  (call ExitProcess.0 (conv (u 32) score.0)))))

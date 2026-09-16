@@ -87,7 +87,7 @@ type
                              ## allocator entirely. See `doc/intrinsics.md` §8.
     irqName*: string         ## `(interrupt "SysTick")`: the exception or interrupt
                              ## this proc handles. The name is the target's to read —
-                             ## `machine_m.interruptSlot` turns it into a slot in the
+                             ## `machine_cortexm.interruptSlot` turns it into a slot in the
                              ## interrupt table — and it is empty for an ordinary proc.
     isNaked*: bool           ## `(naked)`: emit NO prologue and NO epilogue. The proc
                              ## does not touch SP, so on entry SP still points at the
@@ -191,7 +191,7 @@ const NoTypeSym* = default(SymId)
 # `open`, AArch64 only `openat`). To teach arkham a new syscall, add one row here.
 #
 # A `-1` is not a fallback: emitting it would trap with the number register set to
-# -1, i.e. a silent ENOSYS. `emitSyprocA64` rejects one outright, and std/posix
+# -1, i.e. a silent ENOSYS. `a64.emitSyproc` rejects one outright, and std/posix
 # reaches every AArch64-missing call through the `*at` / `*2` / `clone` form the
 # kernel does have (see `linuxA64Raw` there) — so the `-1` rows below are only ever
 # selected by an x86-64 target.
@@ -244,7 +244,7 @@ const LinuxSyscalls* = {
   # Process creation / replacement, used by os.execShellCmd's libc-free `system()`
   # (fork + execve of `/bin/sh -c` + wait). AArch64's asm-generic ABI has no `fork`
   # syscall — std/posix builds it from `clone` below, so a `-1` here can only be
-  # reached by an x86-64 target (`emitSyprocA64` rejects it loudly otherwise).
+  # reached by an x86-64 target (`a64.emitSyproc` rejects it loudly otherwise).
   "fork":       (57,  -1),
   # AArch64's `fork()` is `clone(SIGCHLD, 0, 0, 0, 0)`; std/posix spells that out
   # under `linuxA64Raw`. The number is the plain `clone`, not `clone3`.
@@ -398,7 +398,7 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         of InterruptP:
           # `(interrupt "SysTick")` — the vector this proc handles. WHICH names
           # exist is this back end's question (sem deliberately does not ask), so
-          # only the string is taken here; `generateM` resolves it against the
+          # only the string is taken here; `generateCortexM` resolves it against the
           # target's table and refuses an unknown one BY NAME.
           c.into:
             if c.hasMore: (irqN = strVal(c); inc c)
@@ -1640,7 +1640,7 @@ proc constFold*(p: var Program; c: Cursor): (bool, int64) =
   ## (`(i|u|c N)`), the guard that keeps this away from `.assembler` bodies,
   ## where `(add (rax) 5)` is an instruction. The result wraps to the op's
   ## width exactly as the runtime instruction would (`shr` on a signed type is
-  ## an ARITHMETIC shift, matching `emitBin2`'s sar; division truncates toward
+  ## an ARITHMETIC shift, matching `emitBin`'s sar; division truncates toward
   ## zero). A fold whose runtime behaviour is a trap or target-dependent is
   ## REFUSED instead of guessed: division by zero, signed INT64_MIN div -1,
   ## and a shift count outside `[0, bits)`. Returns (false, 0) for anything
@@ -1704,7 +1704,7 @@ proc constFold*(p: var Program; c: Cursor): (bool, int64) =
       of ShlC, ShrC:
         if ib < 0 or ib >= bits: return (false, 0)   # target-dependent at runtime
         if c.exprKind == ShlC: v = a shl ib
-        elif signed: v = cast[uint64](ashr(ia, ib))  # sar, as emitBin2 chooses
+        elif signed: v = cast[uint64](ashr(ia, ib))  # sar, as emitBin chooses
         else: v = maskToWidth(a, bits, signed = false) shr ib
       of DivC, ModC:
         if ib == 0: return (false, 0)                # the runtime trap stays runtime

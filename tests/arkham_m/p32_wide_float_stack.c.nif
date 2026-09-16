@@ -1,0 +1,8 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :wide.0 (params (param :w0.0 . (i 64)) (param :w1.0 . (i 64)) (param :w2.0 . (i 64)) (param :w3.0 . (i 64)) (param :f0.0 . (f 32)) (param :f1.0 . (f 32)) (param :f2.0 . (f 32)) (param :f3.0 . (f 32)) (param :f4.0 . (f 32)) (param :f5.0 . (f 32)) (param :f6.0 . (f 32)) (param :f7.0 . (f 32)) (param :f8.0 . (f 32)) (param :f9.0 . (f 32)) (param :x.0 . (i 64))) (i 32) . (stmts (ret (add (i 32) (add (i 32) (sub (i 32) (conv (i 32) w3.0) (conv (i 32) w0.0)) (sub (i 32) (conv (i 32) x.0) (conv (i 32) w1.0))) (conv (i 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (add (f 32) (mul (f 32) f0.0 (suf 1.0 "f32")) (mul (f 32) f1.0 (suf 2.0 "f32"))) (mul (f 32) f2.0 (suf 3.0 "f32"))) (mul (f 32) f3.0 (suf 4.0 "f32"))) (mul (f 32) f4.0 (suf 5.0 "f32"))) (mul (f 32) f5.0 (suf 6.0 "f32"))) (mul (f 32) f6.0 (suf 7.0 "f32"))) (mul (f 32) f7.0 (suf 8.0 "f32"))) (mul (f 32) f8.0 (suf 9.0 "f32"))) (mul (f 32) f9.0 (suf 10.0 "f32"))))))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (call exit.0 (call wide.0 4294967300 4294967296 7 4294967310 (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") (suf 1.0 "f32") 4294967299))
+))
+)

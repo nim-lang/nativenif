@@ -1764,7 +1764,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lea dest, [dest]` is a no-op. It is not incidental: the 3-operand
         # `(at base index scratch)` form computes the address INTO the scratch and
         # hands back `okMem{base: scratch}`, and arkham deliberately passes the
-        # consuming instruction's destination as that scratch (`prematLval2`'s
+        # consuming instruction's destination as that scratch (`prematLval`'s
         # `hint`, so the stride needs no third register). The address is therefore
         # already in `dest` by the time we get here.
         if not (op.mem.base == dest and not op.mem.hasIndex and

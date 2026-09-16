@@ -15,7 +15,7 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [machinedesc, planer, programs, asmbuf,
+import "../core" / [machinedesc, planner, programs, asmbuf,
                     context, diag, asmcommon, 
                     mirrors, regbind]
 import machine as machine_x64
@@ -148,7 +148,7 @@ proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   if argCurs.len != row.arity:
     lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
               g.asmInfo
-  let tag = x64InoutTag(op)
+  let tag = inoutInst(op)
   if tag == NopX64:
     lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
               g.asmInfo
@@ -355,7 +355,7 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
 proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
   g.asmNoteInfo(c)
-  # Tail position, tracked exactly as `genStmt2` does: only the LAST statement of
+  # Tail position, tracked exactly as `genStmt` does: only the LAST statement of
   # a straight-line `stmts`/`scope` inherits it. A `ret` there falls through to the
   # epilogue instead of jumping to it — in a mode whose premise is one-to-one, a
   # `jmp` to the very next label is an instruction the user did not write.
