@@ -160,6 +160,12 @@ const arkhamA64Unsupported: seq[string] = @[
   # corpus pins ithaqua's and jorogumo's handling, the two backends that carry it for
   # hand-written fixtures. See `arkhamKnownUnsupported`.
   "eh_onerr",
+  # `bintrin`'s two `Popcount` rows. The `Ctz`/`Clz` rows lower on a64 (and the
+  # portable `intrinsics` covers those anyway); what a64 has no row for is the
+  # population count, which the backend refuses by design — "guard the call with
+  # a `when`" (doc/intrinsics.md). One fixture per intrinsic *group* was the
+  # cheaper corpus, so the group is quarantined for its one missing row.
+  "bintrin",
 ]
 
 const arkhamX64Unsupported: seq[string] = @[
@@ -823,7 +829,12 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
     let base = extractFilename(file)
     if base.startsWith("mod_") or base.startsWith("err_"): continue
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in skip or name in arkhamStagedVec: continue
+    # `arkhamKnownUnsupported` is a construct NO arkham backend lowers (`onerr`):
+    # the plain pass tolerates its absence, and a starved register file has
+    # nothing to add to that answer. Without this, every stress pass reports an
+    # absent construct as NEW pressure breakage.
+    if name in skip or name in arkhamKnownUnsupported or name in arkhamStagedVec:
+      continue
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let asmNif = workDir / (name & ".stress.nif")
@@ -2518,13 +2529,7 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
   # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes
   # the same known set and level as the qemu `linux_arm64` pass below.
   arkhamStressTests(arch = (when defined(macosx): "arm64" else: "x64"),
-                    # A fixture the plain pass already marks arkham-unsupported
-                    # cannot compile under a starved register file either, so the
-                    # stress pass skips it too — it is an absent construct (`onerr`,
-                    # see `arkhamKnownUnsupported`), not a pressure defect worth
-                    # parking as `known`.
-                    skip = arkhamKnownUnsupported &
-                           (when defined(macosx): arkhamDarwinUnsupported &
+                    skip = (when defined(macosx): arkhamDarwinUnsupported &
                                                   arkhamA64Unsupported
                             else: arkhamOsxOnly & arkhamX64Unsupported),
                     known = (when defined(macosx): arkhamStressA64Known
@@ -2583,6 +2588,13 @@ when defined(linux) and defined(amd64):
 # because the earlier passes left the `mod_*` modules in the same nimcache.)
 const arkhamDarwinAssembleKnown: seq[string] = @[
   "assembler_x64", "intrinsics_x64", "naked_stacktrace_x64",   # x86-64-pinned
+  # This pass consults only its own list — it is the one that does not honour
+  # `arkhamA64Unsupported`, and the two stems quarantined there for a MISSING
+  # CONSTRUCT (not a Darwin gap) have to be named here too or they read as new
+  # AArch64 breakage: `onerr`, which no arkham backend lowers
+  # (`arkhamKnownUnsupported`), and `bintrin`'s `Popcount` rows, which AArch64
+  # refuses by design.
+  "eh_onerr", "bintrin",
 ]
 proc arkhamDarwinAssembleTests() =
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
