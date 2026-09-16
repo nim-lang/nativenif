@@ -86,8 +86,9 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         # Parse stack variable name for offset
         if n.kind != Symbol:
           error("Expected stack variable name in dot expression", n)
-        let stackVarName = getSym(n)
-        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+        let stackVarNameCur = n
+        let stackSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+        template stackVarName: string = getSym(stackVarNameCur)  # for the diagnostics
         if stackSym == nil or not stackSym.typ.isOnStack:
           error("Expected stack variable in dot, got: " & stackVarName, n)
         # Unwrap StackOffT to get the base type
@@ -194,8 +195,9 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
           baseReg = parseRegister(n)
           if n.kind != Symbol:
             error("Expected stack variable name in at expression", n)
-          let stackVarName = getSym(n)
-          let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+          let stackVarNameCur = n
+          let stackSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+          template stackVarName: string = getSym(stackVarNameCur)  # for the diagnostics
           if stackSym == nil or not stackSym.typ.isOnStack:
             error("Expected stack variable in at, got: " & stackVarName, n)
           let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
@@ -362,8 +364,9 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
     elif t == LabTagId:
       inc n
       if n.kind != Symbol: error("Expected label usage", n)
-      let name = getSym(n)
-      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      let nameCur = n
+      let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+      template name: string = getSym(nameCur)  # for the diagnostics
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       if sym == ctx.tlsSizeSym: ctx.tlsSizeUsed = true   # emit the cell (appendTlsSize)
@@ -419,8 +422,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
             let idxOp = parseOperand(n, ctx)   # keeps the binding guards
             indexReg = idxOp.reg
           elif n.kind == Symbol:
-            let indexName = getSym(n)
-            let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
+            let indexSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
             if indexSym != nil and indexSym.kind in {skVar, skParam} and
                indexSym.reg != InvalidTagId:
               indexReg = tagToRegister(indexSym.reg, n)
@@ -534,8 +536,9 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
               inc n
             elif n.kind == Symbol:
               # Could be index register or stack variable (used as offset)
-              let indexName = getSym(n)
-              let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
+              let indexNameCur = n
+              let indexSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+              template indexName: string = getSym(indexNameCur)  # for the diagnostics
               if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.typ.isOnStack:
                 # Stack variable - use its offset as displacement and preserve type (unwrap StackOffT)
                 displacement = int32(indexSym.offset)
@@ -701,8 +704,9 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
     result.typ = Type(kind: IntLitT, bits: 64, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
@@ -870,8 +874,9 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
       error("Expected memory destination", n)
     result = op
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     # A param (skParam) is bound to a register / stack slot exactly like a var, so
     # it is a valid destination too (mirrors parseDestA64 and the source paths).
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):

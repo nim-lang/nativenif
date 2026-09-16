@@ -95,8 +95,7 @@ type
     callEmitted*: bool           # True after (call), (tailcall) or (extcall)
     isTailcall*: bool            # the marker was `(tailcall)`: control does not come
                                 # back, so there is no result to bind
-    target*: string              # Target proc/symbol name (a qualified name whose
-                                # module suffix `lookupWithAutoImport` parses — string)
+    target*: SymId               # Target proc/symbol
     typ*: Type                   # ProcT type (contains params, results, clobbers)
     extProcIdx*: int             # Index into extProcs for external calls
     argsSet*: HashSet[SymId]    # Arguments assigned (keyed by `Param.name`, an interned id)
@@ -269,9 +268,13 @@ type
     extProcs*: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount*: int  # Number of GOT slots allocated
     # Module system / dead code elimination
-    pendingSymbols*: seq[string]  # Symbols pending code generation
-    generatedSymbols*: HashSet[string]  # Symbols already generated
-    dedupTable*: Table[string, string]  # Maps dedup key to canonical symbol name
+    pendingSymbols*: seq[SymId]  # Symbols pending code generation
+    generatedSymbols*: HashSet[SymId]  # Symbols already generated
+    dedupTable*: Table[SymId, SymId]  # Maps dedup key to canonical symbol
+    dedupKeys*: seq[uint32]     # Per SymId, memoized `extractDedupKey`: 0 = not
+                                # computed yet, 1 = none, otherwise key id + 2
+    thisModuleId*: StrId        # `thisModule` interned, compared against a
+                                # symbol's module component
     definedLabels*: HashSet[int]  # LabelIds of *local* labels already defined in the
                         # current proc (populated by (lab …), cleared per proc). A
                         # `jmp`/`jcc`/`b`/`bcc` whose target is in here is a BACKWARD
@@ -465,12 +468,13 @@ proc newGenContext*(mainPool: Pool; baseDir, thisModule: string;
     pool: mainPool,
     baseDir: baseDir,
     thisModule: thisModule,
+    thisModuleId: mainPool.strings.getOrIncl(thisModule),
     imports: @[],
     extProcs: @[],
     gotSlotCount: 0,
     pendingSymbols: @[],
-    generatedSymbols: initHashSet[string](),
-    dedupTable: initTable[string, string](),
+    generatedSymbols: initHashSet[SymId](),
+    dedupTable: initTable[SymId, SymId](),
     entryStubOffset: -1,
     winEntryOffset: -1,
     symMap: symMap,

@@ -30,8 +30,9 @@ proc genIteM(n: var Cursor; ctx: var GenContext) =
   let lEnd = ctx.buf.createLabel()
   let oldClobbered = ctx.clobberedM
   if n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil or sym.kind != skCfvar:
       error("Expected cfvar in ite condition: " & name, n)
     if sym.used: error("Control flow variable '" & name & "' used more than once", n)
@@ -76,8 +77,9 @@ proc genJtrueM(n: var Cursor; ctx: var GenContext) =
   inc n
   var target = LabelId(-1)
   while n.hasMore and n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil or sym.kind != skCfvar: error("Expected cfvar in jtrue: " & name, n)
     if int(target) == -1: target = LabelId(sym.offset)
     sym.used = true
@@ -161,8 +163,9 @@ proc genPrepareM(n: var Cursor; ctx: var GenContext) =
   var hdr = n
   inc hdr
   if hdr.kind != Symbol: error("Expected proc symbol, got " & $hdr.kind, hdr)
-  let name = getSym(hdr)
-  let sym = lookupWithAutoImport(ctx, ctx.scope, name, hdr)
+  let target = getSymId(hdr)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, target, hdr)
+  template name: string = getSym(hdr)   # spelled out only where a message needs it
   if sym == nil: error("Unknown symbol: " & name, hdr)
 
   let outerCall = ctx.callContext
@@ -172,7 +175,7 @@ proc genPrepareM(n: var Cursor; ctx: var GenContext) =
           "arguments on the stack: both would write the one outgoing area", hdr)
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
-    target: name,
+    target: target,
     argsSet: initHashSet[SymId](),
     resultsSet: initHashSet[SymId](),
     callEmitted: false)
@@ -803,8 +806,7 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     # `(kill name…)` — end a register binding so the register may be rebound.
     inc n
     while n.hasMore and n.kind == Symbol:
-      let name = getSym(n)
-      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
       if sym != nil and sym.reg != InvalidTagId:
         if rawTagIsMFloatReg(sym.reg):
           ctx.mFRegBindings.del(tagToFloatRegisterM(sym.reg, n))
