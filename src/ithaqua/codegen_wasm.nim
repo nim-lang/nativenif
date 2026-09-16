@@ -2361,38 +2361,6 @@ proc genStmt(g: var WasmGen; c: var Cursor) =
       skip t
       while t.hasMore: skip t
     skip c
-  of StoreS:
-    # (store value lvalue) — asgn with reversed operands. Wasm needs the
-    # address BEFORE the value, so stash the value in a scratch local.
-    var t = c
-    t.into:
-      let rhs = t
-      skip t
-      let lhs = t
-      # evaluation order: value first (matches textual order)
-      let lhsT = lengType(g, lhs)
-      let sc = scalOf(g, lhsT)
-      if sc.kind == skMem:
-        genLvalAddr(g, lhs)
-        genExpr(g, rhs)                        # order swap acceptable for aggregates? keep strict:
-        err g, "aggregate (store) not supported yet"
-      else:
-        genValueAs(g, rhs, sc)
-        case valType(sc)
-        of ValI64:
-          g.localSet g.p.scratchI64
-          genLvalAddr(g, lhs)
-          g.localGet g.p.scratchI64
-        of ValI32:
-          g.localSet g.p.scratchI32
-          genLvalAddr(g, lhs)
-          g.localGet g.p.scratchI32
-        else:
-          err g, "float (store) not supported yet"
-        g.emitStore sc
-      skip t
-      while t.hasMore: skip t
-    skip c
   of CallS:
     genCall(g, c, wantValue = false)
     skip c
