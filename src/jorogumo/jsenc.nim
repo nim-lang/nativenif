@@ -447,12 +447,42 @@ proc nameOf(c: Cursor): string =
   of Ident, StrLit: strVal(c)
   else: raiseAssert "jsenc: name expected, got " & $c.kind
 
+const
+  ExternIdentStart = {'a'..'z', 'A'..'Z', '_', '$'}
+  ExternIdentChars = ExternIdentStart + {'0'..'9'}
+
+proc externName(sym: string): string =
+  ## What `$1`/`$#` substitute for. Nim's `setExternName` (`pragmas.nim` in
+  ## 2.2.4) resolves the pattern with `extname % s.name.s` at DECLARATION time,
+  ## so the text reaching the call site carries the proc's PLAIN Nim name,
+  ## unmangled — which is exactly why `dom.nim`'s `#.$1(#, #)` reaches
+  ## `insertAdjacentText` and not a unique symbol. jorogumo carries the mangled
+  ## `NAME.DISAMBIG.MODULESUFFIX` into the splice, and a Nim identifier cannot
+  ## contain a dot, so the source name is whatever precedes the first one.
+  ##
+  ## A base that is not a JS identifier — an operator, a quoted name — is
+  ## REFUSED. Nim pastes such a name in verbatim and emits text that cannot
+  ## parse; a back end here does not generate syntax it knows to be broken, and
+  ## `#`-only templates or an explicit extern name bind those shapes anyway.
+  let cut = find(sym, '.')
+  result = if cut > 0: substr(sym, 0, cut - 1) else: sym
+  var legal = result.len > 0 and result[0] in ExternIdentStart
+  if legal:
+    for ch in result:
+      if ch notin ExternIdentChars:
+        legal = false
+        break
+  if not legal:
+    raiseAssert "importjs: `$1` needs a JS-legal proc name, but `" & sym &
+      "` does not have one"
+
 proc spliceTemplate(name, tpl: string; args: openArray[string]): string =
   ## The `importjs` template language, pinned EMPIRICALLY against Nim
   ## 2.2.4's jsgen (`#.$1(#, #)` → `self.insertAdjacentText(position, data)`;
   ## `$$(#)` → `$("sel")`): `#` consumes the next argument, `$1` and `$#`
-  ## name the proc (that is how `dom.nim` reaches the method name), `@`
-  ## spreads the arguments not yet consumed, `$$` is a literal `$`. A bare
+  ## name the proc (that is how `dom.nim` reaches the method name — `name`
+  ## here is `externName`, NOT the mangled symbol), `@` spreads the
+  ## arguments not yet consumed, `$$` is a literal `$`. A bare
   ## `$` before anything else is a template error in Nim too — reject it the
   ## same way rather than passing it through.
   result = ""
@@ -707,7 +737,10 @@ proc exprText(c: Cursor; indent: int): string =
     while it.hasMore:
       args.add exprText(it, indent)
       skip it
-    result = spliceTemplate(name, tpl, args)
+    # `$1`/`$#` want the Nim source name, not the symbol `NAME` carries — see
+    # `externName`. `#`-only templates never look at it, which is why this gap
+    # stayed invisible until a `dom.nim`-shaped binding was tried for real.
+    result = spliceTemplate(externName(name), tpl, args)
   # ── operations: first child is the WidthCode, operands follow it
   of Add, Sub, Mul, Div, Mod, Shl, Shr, And, Or, Xor, LAnd, LOr,
      Not, Neg, BNot, Eq, Neq, Lt, Le, Gt, Ge:

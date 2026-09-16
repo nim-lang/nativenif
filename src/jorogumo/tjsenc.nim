@@ -340,11 +340,14 @@ block string_escapes:
     "\"a\\\"b\\\\c\\nd\\tx\\x00e\\u2028f héllo\""
 
 block raw_splice:
-  # the dom.nim shapes, pinned against Nim 2.2.4's jsgen:
+  # The dom.nim shapes, pinned against Nim 2.2.4's jsgen. The symbols carry the
+  # PIPELINE's mangling (`NAME.DISAMBIG.MODULESUFFIX`), not bare words: `$1`/`$#`
+  # have to un-mangle to the Nim source name, and goldens written with bare
+  # names would pass whether or not that un-mangling happens.
   var b = createTop()
   b.tree ExprStmt:
     b.tree Raw:
-      b.symUse "insertAdjacentText"
+      b.symUse "insertAdjacentText.0.dom"
       b.strLit "#.$1(#, #)"
       b.symUse "self"
       b.strLit "afterend"
@@ -355,7 +358,7 @@ block raw_splice:
   var b2 = createTop()
   b2.tree ExprStmt:
     b2.tree Raw:
-      b2.symUse "jq"
+      b2.symUse "jq.0.mod"
       b2.strLit "$$(#)"
       b2.strLit "sel"
   expect "escaped dollar", render(b2), "$(\"sel\");"
@@ -363,12 +366,41 @@ block raw_splice:
   var b3 = createTop()
   b3.tree ExprStmt:
     b3.tree Raw:
-      b3.symUse "after"
+      b3.symUse "after.0.mod"
       b3.strLit "#.$1(@)"
       b3.symUse "self"
       b3.symUse "a"
       b3.symUse "b"
   expect "varargs spread", render(b3), "self.after(a, b);"
+
+  var b4 = createTop()
+  b4.tree ExprStmt:
+    b4.tree Raw:
+      b4.symUse "focus.0.dom"
+      b4.strLit "#.$#()"
+      b4.symUse "el"
+  expect "dollar-hash names the proc too", render(b4), "el.focus();"
+
+  # Two refusals: a proc whose name cannot be a JS identifier, and a `$` form
+  # Nim's `%` would not have resolved. Splicing either one emits text node
+  # rejects at parse time with nothing pointing back at the pragma, which is
+  # worse than a compiler error naming the template.
+  var refused = 0
+  for (sym, tpl) in [("+.0.mod", "#.$1(#)"), ("ok.0.mod", "($1 + $2)")]:
+    try:
+      var b5 = createTop()
+      b5.tree ExprStmt:
+        b5.tree Raw:
+          b5.symUse sym
+          b5.strLit tpl
+          b5.symUse "a"
+      discard render(b5)
+    except AssertionDefect:
+      inc refused
+  if refused != 2:
+    echo "FAIL bad extern templates are refused (", refused, " of 2 refused)"
+    quit 1
+  echo "ok bad extern templates refused"
 
 # ── 3. statements ───────────────────────────────────────────────────────────
 
