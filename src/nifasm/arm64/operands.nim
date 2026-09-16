@@ -353,8 +353,9 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
     elif t == LabTagId:
       inc n
       if n.kind != Symbol: error("Expected label usage", n)
-      let name = getSym(n)
-      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      let nameCur = n
+      let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+      template name: string = getSym(nameCur)  # for the diagnostics
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       inc n
@@ -430,8 +431,7 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
               offset = int32(getInt(n))
               inc n
             elif n.kind == Symbol:
-              let indexName = getSym(n)
-              let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
+              let indexSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
               if indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
                 hasIndex = true
                 indexReg = tagToRegisterA64(indexSym.reg, n)
@@ -552,8 +552,9 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
     result.typ = Type(kind: IntLitT, bits: 64, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
@@ -689,8 +690,9 @@ proc parseDestA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
       error("Expected memory destination", n)
     result = op
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check

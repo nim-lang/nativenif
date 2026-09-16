@@ -38,9 +38,9 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   ## emitted, cross-module references resolved as ordinary direct relocations) —
   ## exactly like a local symbol, only the declaration is read from the foreign
   ## module's stream (at its indexed byte offset) instead of the main TokenBuf.
-  if ctx.nameOf(sym.name) in ctx.generatedSymbols:
+  if sym.name in ctx.generatedSymbols:
     return
-  ctx.generatedSymbols.incl ctx.nameOf(sym.name)
+  ctx.generatedSymbols.incl sym.name
 
   if sym.moduleName notin ctx.modules:
     return  # Module not loaded, can't generate
@@ -82,8 +82,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
             var relc = rc
             into relc:
               let blobOff = getInt(relc); skip relc
-              let tname = getSym(relc)
-              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, getSymId(relc), relc)
               skip relc                       # past the target symbol
               if tsym != nil:
                 ctx.rodataRebases.add (owner: sym, blobOff: blobOff.int, target: tsym)
@@ -105,8 +104,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
             var relc = rc
             into relc:
               let blobOff = getInt(relc); skip relc
-              let tname = getSym(relc)
-              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, getSymId(relc), relc)
               skip relc                       # past the target symbol
               if tsym != nil:
                 # One WORD, not a fixed eightbyte: arkham reserves exactly
@@ -166,8 +164,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
             var relc = rc
             into relc:
               let blobOff = getInt(relc); skip relc
-              let tname = getSym(relc)
-              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, getSymId(relc), relc)
               skip relc                       # past the target symbol
               if tsym != nil:
                 # One WORD, matching the placeholder arkham reserved — the same
@@ -204,17 +201,17 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
 proc processReachableSymbols(ctx: var GenContext) =
   ## Process all pending symbols until queue is empty
   while ctx.pendingSymbols.len > 0:
-    let fullName = ctx.pendingSymbols.pop()
-    if fullName in ctx.generatedSymbols:
+    let id = ctx.pendingSymbols.pop()
+    if id in ctx.generatedSymbols:
       continue
 
     # Handle deduplication
-    let canonicalName = getCanonicalName(ctx, fullName)
-    if canonicalName != fullName and canonicalName in ctx.generatedSymbols:
+    let canonical = canonicalOf(ctx, id)
+    if canonical != id and canonical in ctx.generatedSymbols:
       continue  # Already generated the canonical version
 
-    # Find the symbol by its full qualified name (nominal identity).
-    let sym = ctx.scope.lookup(ctx.symIdOf(fullName))
+    # Find the symbol by its interned qualified name (nominal identity).
+    let sym = ctx.scope.lookup(id)
     if sym != nil:
       generateSymbol(ctx, sym)
 
@@ -378,7 +375,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   ctx.tlsBlockSym = Symbol(name: ctx.symIdOf("arkham.tls.0"), kind: skGvar,
                            typ: Type(kind: UIntT, bits: 8), offset: -1)
   scope.define(ctx.tlsBlockSym)
-  ctx.generatedSymbols.incl "arkham.tls.0"
+  ctx.generatedSymbols.incl ctx.symIdOf("arkham.tls.0")
 
   # Same treatment for the stack-trace table's label: nifasm owns the data, so it
   # owns the symbol. Defining it up front is what lets `lea D, (lab arkham.traceinfo.0)`
@@ -387,14 +384,14 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # buffer reset below (the reset restarts label numbering).
   ctx.traceSym = Symbol(name: ctx.symIdOf(TraceInfoSymbol), kind: skLabel, offset: -1)
   scope.define(ctx.traceSym)
-  ctx.generatedSymbols.incl TraceInfoSymbol
+  ctx.generatedSymbols.incl ctx.symIdOf(TraceInfoSymbol)
 
   # And for the thread-local-block size cell, which is the same arrangement once
   # more: nifasm owns the bytes, so it owns the symbol, and defining it here is
   # what lets `lea D, (lab arkham.tlssize.0)` resolve as a label.
   ctx.tlsSizeSym = Symbol(name: ctx.symIdOf(TlsSizeSymbol), kind: skLabel, offset: -1)
   scope.define(ctx.tlsSizeSym)
-  ctx.generatedSymbols.incl TlsSizeSymbol
+  ctx.generatedSymbols.incl ctx.symIdOf(TlsSizeSymbol)
 
   # The block's self-pointer: an ordinary thread-local at offset 0, pre-allocated
   # so `allocTlsSlotX64` never hands that slot to a variable. arkham reads it to
@@ -405,7 +402,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   ctx.tlsSelfSym = Symbol(name: ctx.symIdOf(TlsSelfSymbol), kind: skTvar,
                           typ: Type(kind: UIntT, bits: 64), offset: 0)
   scope.define(ctx.tlsSelfSym)
-  ctx.generatedSymbols.incl TlsSelfSymbol
+  ctx.generatedSymbols.incl ctx.symIdOf(TlsSelfSymbol)
 
   # The Windows pair. Both are defined unconditionally — the architecture is only
   # known after `pass1` reads the `(arch …)` directive, and both are inert off
@@ -420,14 +417,14 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                                typ: Type(kind: UIntT, bits: 64),
                                offset: TebTlsPtrOffset, gsFixedSlot: true)
   scope.define(ctx.winTebTlsPtrSym)
-  ctx.generatedSymbols.incl TebTlsPtrSymbol
+  ctx.generatedSymbols.incl ctx.symIdOf(TebTlsPtrSymbol)
   # `arkham.tlsindex.0` is an ordinary `.bss` global; `setupTlsWin` gives it its
   # slot once the layout is settled, and the PE TLS directory names its address.
   ctx.winTlsIndexSym = Symbol(name: ctx.symIdOf(TlsIndexSymbol), kind: skGvar,
                               typ: Type(kind: UIntT, bits: 64),
                               size: -1, offset: -1)
   scope.define(ctx.winTlsIndexSym)
-  ctx.generatedSymbols.incl TlsIndexSymbol
+  ctx.generatedSymbols.incl ctx.symIdOf(TlsIndexSymbol)
 
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
@@ -446,9 +443,9 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           inc tn                              # tvar tag
           if tn.kind == SymbolDef:
             let sym = scope.lookup(getSymId(tn))
-            if sym != nil and sym.kind == skTvar and ctx.nameOf(sym.name) notin ctx.generatedSymbols:
+            if sym != nil and sym.kind == skTvar and sym.name notin ctx.generatedSymbols:
               allocTlsSlotX64(ctx, sym, start)
-              ctx.generatedSymbols.incl ctx.nameOf(sym.name)   # don't re-allocate in generateSymbol
+              ctx.generatedSymbols.incl sym.name   # don't re-allocate in generateSymbol
           tn = start
         skip tn
 

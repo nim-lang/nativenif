@@ -238,6 +238,12 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
   # the per-pass binary search.
   var relocPositions = newSeq[int](relocs.len)
   for i in 0 ..< relocs.len: relocPositions[i] = relocs[i].position
+  # `lowerBound(relocPositions, relocs[i].position)`, which every pass asks for
+  # every jump: the first reloc at the same position.
+  var firstAtPos = newSeq[int](relocs.len)
+  for i in 0 ..< relocs.len:
+    firstAtPos[i] = if i > 0 and relocPositions[i - 1] == relocPositions[i]: firstAtPos[i - 1]
+                    else: i
 
   # ── fixpoint: grow every short jump that overflows rel8, until none do ──
   var changed = true
@@ -256,7 +262,7 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
     for i in 0 ..< relocs.len:
       if not isShort[i]: continue
       let dist = newPos(labelPos[int(relocs[i].target)]) -
-                 (newPos(relocs[i].position) + 2)   # rel8 measured from 2-byte end
+                 (relocs[i].position - savPrefix[firstAtPos[i]] + 2)   # rel8 measured from 2-byte end
       if not canUseShortJump(dist):
         isShort[i] = false                          # overflow → grow back to long
         changed = true

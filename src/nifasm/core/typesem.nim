@@ -49,6 +49,8 @@ proc parseExtprocSig*(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseUnionBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc resolveForeignSym(ctx: var GenContext; modname, fullName: string;
                         scope: Scope; n: Cursor): Symbol
+proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: SymId;
+                           n: Cursor): Symbol
 proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string;
                            n: Cursor): Symbol
 
@@ -337,9 +339,9 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
     if ctx.arch in {Arch.X64, Arch.WinX64} and
-       ctx.nameOf(result.name) notin ctx.generatedSymbols:
+       result.name notin ctx.generatedSymbols:
       allocTlsSlotX64(ctx, result, declStartCur)
-      ctx.generatedSymbols.incl ctx.nameOf(result.name)
+      ctx.generatedSymbols.incl result.name
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
     # constant-scalar initializer laid out as static data — see arkham genGlobal).
@@ -405,26 +407,28 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   else:
     return nil
 
-proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
+proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: SymId; n: Cursor): Symbol =
   ## Lookup a symbol, lazily opening + following names into foreign modules.
   ## Also marks the symbol as used for dependency tracking.
   ##
   ## Important: Symbols with module suffixes (e.g., `foo.0.mymodule`) are distinct
   ## from local symbols (e.g., `foo.0`). When a module suffix is present, we only
   ## look in the foreign module, not in the local scope.
-  let modname = extractModule(name)
-  if modname != "" and modname != ctx.thisModule:
-    # Foreign symbol: open the module's index, then resolve this one decl lazily
-    # if it isn't already in scope. (A `…0.<thisModule>` suffix names *this*
-    # module's own symbol — arkham emits self-module globals fully qualified — so
-    # it must NOT be treated as foreign, which would shadow the local definition.)
-    openForeignModule(ctx, modname, n)
-    result = scope.lookup(ctx.symIdOf(name))
-    if result == nil:
-      result = resolveForeignSym(ctx, modname, name, scope, n)
-  else:
-    # This is a local symbol - look up in current scope
-    result = scope.lookup(ctx.symIdOf(name))
+  ##
+  ## Keyed by id: this runs for every symbol operand of every instruction, and the
+  ## module suffix is already a component of the pool's symbol record.
+  result = scope.lookup(name)
+  if result == nil:
+    let module = ctx.pool.symbols[name].module
+    if module != StrId(0) and module != ctx.thisModuleId:
+      # Foreign symbol: open the module's index, then resolve this one decl lazily.
+      # (A `…0.<thisModule>` suffix names *this* module's own symbol — arkham emits
+      # self-module globals fully qualified — so it must NOT be treated as foreign,
+      # which would shadow the local definition.) A foreign symbol already in scope
+      # was defined by exactly this path, so its module is open.
+      let modname = ctx.pool.strings[module]
+      openForeignModule(ctx, modname, n)
+      result = resolveForeignSym(ctx, modname, ctx.nameOf(name), scope, n)
 
   # Mark symbol as used for dependency tracking
   if result != nil:
@@ -435,15 +439,17 @@ proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string; n: C
     # pointing at a non-canonical duplicate's own (never-defined) label id would fail
     # linking with "Label not found". First sighting of a key becomes canonical; later
     # duplicates resolve back to it (its symbol is already in scope from that sighting).
-    let resultName = ctx.nameOf(result.name)
-    let dedupKey = extractDedupKey(resultName)
-    if dedupKey != "" and dedupKey in ctx.dedupTable and
-       ctx.dedupTable[dedupKey] != resultName:
-      let canon = scope.lookup(ctx.symIdOf(ctx.dedupTable[dedupKey]))
+    let resultName = result.name
+    let canonName = canonicalOf(ctx, resultName)
+    if canonName != resultName:
+      let canon = scope.lookup(canonName)
       if canon != nil: result = canon
     # `markSymbolUsed` owns dedupTable registration + pending-queue insertion for the
     # first-seen (canonical) name; we only READ the table above to redirect duplicates.
     markSymbolUsed(ctx, resultName)
+
+proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
+  lookupWithAutoImport(ctx, scope, ctx.symIdOf(name), n)
 
 proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   ## Parse the pointee of a `(ptr X)` / `(aptr X)`. A pointer is 8 bytes whatever
@@ -485,8 +491,9 @@ proc resolvedBase*(t: Type; ctx: var GenContext; n: Cursor): Type =
 
 proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil or sym.kind != skType:
       error("Unknown type: " & name, n)
     result = sym.typ

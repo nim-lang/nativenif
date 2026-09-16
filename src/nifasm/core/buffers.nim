@@ -60,6 +60,15 @@ proc removeRange*(buf: var Bytes; at, count: int) =
     buf.data[i - count] = buf.data[i]
   buf.data.setLen(oldLen - count)
 
+proc compact*(buf: var Bytes; dst, src, count: int) {.inline.} =
+  ## Move `count` bytes from `src` down to `dst` (`dst <= src`); the caller
+  ## truncates with `setLen` once every surviving span has been moved.
+  if count > 0 and dst != src:
+    moveMem(addr buf.data[dst], addr buf.data[src], count)
+
+proc setLen*(buf: var Bytes; newLen: int) {.inline.} =
+  buf.data.setLen(newLen)
+
 proc `[]=`*(buf: var Bytes; i: int; b: byte) {.inline.} =
   buf.data[i] = b
 

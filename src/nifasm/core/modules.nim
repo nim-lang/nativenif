@@ -54,36 +54,50 @@ proc extractDedupKey*(s: string): string =
   else:
     result = ""
 
-proc markSymbolUsed*(ctx: var GenContext; fullName: string) =
+proc dedupKeyOf*(ctx: var GenContext; s: SymId; key: var SymId): bool =
+  ## `extractDedupKey` of `s`'s spelling, interned into `key`; false when `s` is
+  ## not an instantiation. Every mention of a symbol asks, so the answer is
+  ## computed from the string once per symbol and memoized by id.
+  let i = int(uint32(s))
+  if i >= ctx.dedupKeys.len: ctx.dedupKeys.setLen max(i + 1, ctx.dedupKeys.len * 2)
+  if ctx.dedupKeys[i] == 0'u32:
+    let k = extractDedupKey(ctx.nameOf(s))
+    ctx.dedupKeys[i] = if k == "": 1'u32 else: uint32(ctx.symIdOf(k)) + 2'u32
+  result = ctx.dedupKeys[i] != 1'u32
+  if result: key = SymId(ctx.dedupKeys[i] - 2'u32)
+
+proc markSymbolUsed*(ctx: var GenContext; s: SymId) =
   ## Mark a symbol as used, adding it to pending list if not yet generated.
   ## Both main module and foreign module symbols are subject to dead code elimination.
   ## Only symbols that are actually referenced (via lookupWithAutoImport) are marked as used.
   ## Handles deduplication: if symbol has a dedup key and we've seen that key before,
   ## the symbol is merged with the canonical one
-  if fullName in ctx.generatedSymbols:
+  if s in ctx.generatedSymbols:
     return
 
-  let dedupKey = extractDedupKey(fullName)
-  if dedupKey != "":
+  var key: SymId
+  if dedupKeyOf(ctx, s, key):
     # Check if we already have a canonical symbol for this key
-    if dedupKey in ctx.dedupTable:
+    if key in ctx.dedupTable:
       # Already have this key, merge by using existing canonical
       return
     else:
       # First occurrence of this key, register as canonical
-      ctx.dedupTable[dedupKey] = fullName
+      ctx.dedupTable[key] = s
 
-  # Add to pending if not already there (for both main module and foreign symbols)
-  if fullName notin ctx.generatedSymbols:
-    ctx.pendingSymbols.add fullName
+  # Add to pending (for both main module and foreign symbols)
+  ctx.pendingSymbols.add s
 
-proc getCanonicalName*(ctx: GenContext; fullName: string): string =
-  ## Get the canonical name for a symbol (for dedup merging)
-  let dedupKey = extractDedupKey(fullName)
-  if dedupKey != "" and dedupKey in ctx.dedupTable:
-    result = ctx.dedupTable[dedupKey]
+proc markSymbolUsed*(ctx: var GenContext; fullName: string) =
+  markSymbolUsed(ctx, ctx.symIdOf(fullName))
+
+proc canonicalOf*(ctx: var GenContext; s: SymId): SymId =
+  ## The canonical symbol `s` is merged with (for dedup merging); `s` itself if none.
+  var key: SymId
+  if dedupKeyOf(ctx, s, key):
+    result = ctx.dedupTable.getOrDefault(key, s)
   else:
-    result = fullName
+    result = s
 
 proc importOrdinal*(ctx: var GenContext; libPath: string): int =
   ## The ordinal of `libPath` in the image's import table, importing it if this is

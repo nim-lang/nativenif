@@ -194,9 +194,10 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
   # All generated procs (and data referenced below) become exported symbols. The
   # synthetic per-thread TLS block is an internal artifact (unused on arm64), never
   # a real exported global.
+  let tlsBlock = a.symIdOf("arkham.tls.0")
   for name in a.generatedSymbols:
-    if name == "arkham.tls.0": continue
-    let sym = a.rootScope.lookup(a.symIdOf(name))
+    if name == tlsBlock: continue
+    let sym = a.rootScope.lookup(name)
     if sym != nil: discard defOf(sym)
 
   # An `_main` alias at the entry proc so the system crt can find it.

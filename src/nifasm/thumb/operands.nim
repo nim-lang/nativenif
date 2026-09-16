@@ -425,8 +425,9 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
             inc n
           elif n.hasMore and n.kind == Symbol:
             # A stack PARAMETER's name: its offset in the incoming argument area.
-            let fname = getSym(n)
-            let fsym = lookupWithAutoImport(ctx, ctx.scope, fname, n)
+            let fnameCur = n
+            let fsym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+            template fname: string = getSym(fnameCur)  # for the diagnostics
             if fsym == nil: error("Unknown symbol in (mem ...): " & fname, n)
             result.mem.offset += int32(fsym.offset)
             inc n
@@ -448,8 +449,9 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
     result.typ = Type(kind: IntLitT, bits: 32, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil: error("Unknown symbol: " & name, n)
     case sym.kind
     of skVar, skParam:
@@ -558,8 +560,9 @@ proc parseDestM*(n: var Cursor; ctx: var GenContext): OperandM =
     if op.kind != okMem: error("Expected memory destination", n)
     result = op
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil: error("Unknown symbol: " & name, n)
     if sym.kind in {skVar, skParam}:
       if sym.typ.isOnStack:

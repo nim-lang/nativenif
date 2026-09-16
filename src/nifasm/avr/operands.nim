@@ -400,8 +400,9 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
     result.typ = Type(kind: IntLitT, bits: 16, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil: error("Unknown symbol: " & name, n)
     case sym.kind
     of skVar, skParam:

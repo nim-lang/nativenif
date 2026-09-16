@@ -1,7 +1,7 @@
 # Nifasm - Relocation System
 # A system for tracking and managing relocations in the instruction stream
 
-import std/[tables, sets]
+import std/[tables, sets, algorithm]
 import buffers
 
 type
@@ -676,37 +676,49 @@ proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
   # these two are inert today. Should threading reach RV32, `rkRvBranch` has no
   # relaxation — retargeting one past ±4 KiB fails in `patchRvBranch`.
 
-proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
-  ## Delete the instruction starting at each position in `deadPos` (each MUST be the
-  ## start of a reloc whose `originalSize` bytes are removed), then rebase every label
-  ## and surviving reloc and drop the pruned relocs. Returns this step's old→new
-  ## byte-position map (length `buf.data.len + 1`, indexed by the PRE-prune offset) so
-  ## callers can compose it into a running map. Arch-agnostic: touches only positions.
-  var relocByPos = initTable[int, int]()
-  for i in 0 ..< buf.relocs.len: relocByPos[buf.relocs[i].position] = i
+proc prunePositions(buf: var Buffer; dead: seq[bool]): seq[int] =
+  ## Delete the instruction of every reloc `i` with `dead[i]` (its `originalSize`
+  ## bytes), then rebase every label and surviving reloc and drop the pruned
+  ## relocs. Returns this step's old→new byte-position map (length
+  ## `buf.data.len + 1`, indexed by the PRE-prune offset; a byte inside a deleted
+  ## instruction maps to where its successor lands) so callers can compose it
+  ## into a running map. Arch-agnostic: touches only positions.
+  ##
+  ## The code buffer is the whole program's, so the surviving bytes move span by
+  ## span; the deleted instructions are few.
+  var spans: seq[(int, int)] = @[]          # (position, size) of each deletion
+  for i in 0 ..< buf.relocs.len:
+    if dead[i]: spans.add (buf.relocs[i].position, buf.relocs[i].originalSize)
+  spans.sort()
   let curLen = buf.data.len
   result = newSeq[int](curLen + 1)
-  var newData = initBytes()
-  var oldI = 0
-  while oldI < curLen:
-    result[oldI] = newData.len
-    if oldI in deadPos:
-      oldI += buf.relocs[relocByPos[oldI]].originalSize    # skip the whole instruction
-    else:
-      newData.add buf.data[oldI]
-      inc oldI
-  result[curLen] = newData.len
+  var src = 0
+  var dst = 0
+  for (pos, size) in spans:
+    if pos < src: continue                  # a second reloc on a deleted instruction
+    let keep = pos - src
+    buf.data.compact(dst, src, keep)
+    for k in 0 ..< keep: result[src + k] = dst + k
+    dst += keep
+    for k in pos ..< pos + size: result[k] = dst
+    src = pos + size
+  let keep = curLen - src
+  buf.data.compact(dst, src, keep)
+  for k in 0 ..< keep: result[src + k] = dst + k
+  dst += keep
+  result[curLen] = dst
+  buf.data.setLen dst
   for k in 0 ..< buf.labels.len:
     buf.labels[k].position = result[buf.labels[k].position]
   for k in 0 ..< buf.fixedRanges.len:      # no deletion happens INSIDE a fixed range
     buf.fixedRanges[k] = (result[buf.fixedRanges[k][0]], result[buf.fixedRanges[k][1]])
-  var newRelocs: seq[RelocEntry] = @[]
-  for r in buf.relocs:
-    if r.position in deadPos: continue
-    newRelocs.add RelocEntry(position: result[r.position], target: r.target,
-                             kind: r.kind, originalSize: r.originalSize)
-  buf.data = newData
-  buf.relocs = newRelocs
+  var kept = 0
+  for i in 0 ..< buf.relocs.len:
+    if dead[i]: continue
+    buf.relocs[kept] = buf.relocs[i]
+    buf.relocs[kept].position = result[buf.relocs[i].position]
+    inc kept
+  buf.relocs.setLen kept
 
 proc threadJumps*(buf: var Buffer): seq[int] =
   ## Architecture-agnostic jump optimization on the `(relocs, labels, data)` model —
@@ -739,7 +751,7 @@ proc threadJumps*(buf: var Buffer): seq[int] =
   # rebuilt from scratch every pass; only the backing storage is reused).
   var labelPos = initTable[int, int]()      # label id → byte position
   var uncondAt = initTable[int, int]()      # byte position → reloc index
-  var deadPos = initHashSet[int]()          # positions of dead-jump instructions
+  var dead: seq[bool] = @[]                 # per reloc: a dead jump, pruned
   while changed and guard <= buf.relocs.len + 1:
     changed = false
     inc guard
@@ -773,17 +785,20 @@ proc threadJumps*(buf: var Buffer): seq[int] =
         # not a byte change; loop again so a newly-exposed dead jump is pruned
 
     # ── 2. PRUNE: collect unconditional jumps to their own fall-through ──
-    deadPos.clear()
+    dead.setLen 0
+    dead.setLen buf.relocs.len
+    var anyDead = false
     for i in 0 ..< buf.relocs.len:
       let r = buf.relocs[i]
       if isUncondJump(r.kind) and labelPos.hasKey(int(r.target)) and
          labelPos[int(r.target)] == r.position + r.originalSize and
          not inFixedRange(buf, r.position):    # a casejmp slot keeps its exact size
-        deadPos.incl r.position
-    if deadPos.len == 0: continue             # threading may still have changed targets
+        dead[i] = true
+        anyDead = true
+    if not anyDead: continue                  # threading may still have changed targets
 
     # Drop the dead-jump bytes and compose this step's map into the running one.
-    let iterMap = prunePositions(buf, deadPos)
+    let iterMap = prunePositions(buf, dead)
     for o in 0 .. origLen: result[o] = iterMap[result[o]]
     changed = true
 
@@ -872,16 +887,17 @@ proc invertCondJumps*(buf: var Buffer): seq[int] =
       if isUncondJump(buf.relocs[i].kind):
         uncondAt[buf.relocs[i].position] = i
 
-    var deadPos = initHashSet[int]()            # unconditional jumps removed by inversion
+    var dead = newSeq[bool](buf.relocs.len)     # per reloc: a jump removed by inversion
+    var deadCount = 0
     for i in 0 ..< buf.relocs.len:
       if not isInvertibleCond(buf.relocs[i].kind): continue
       let jccPos = buf.relocs[i].position
       if inFixedRange(buf, jccPos): continue    # a casejmp slot keeps its exact size
       let jmpPos = jccPos + buf.relocs[i].originalSize    # the branch's fall-through
       if not uncondAt.hasKey(jmpPos): continue            # fall-through is not a bare jump
-      if jmpPos in deadPos: continue                       # jump already claimed this pass
-      if inFixedRange(buf, jmpPos): continue               # jmp inside a frozen region
       let j = uncondAt[jmpPos]
+      if dead[j]: continue                                 # jump already claimed this pass
+      if inFixedRange(buf, jmpPos): continue               # jmp inside a frozen region
       let afterJmp = jmpPos + buf.relocs[j].originalSize
       # The branch must target exactly the instruction after the jump (label `L`)…
       if not labelPos.hasKey(int(buf.relocs[i].target)): continue
@@ -893,12 +909,13 @@ proc invertCondJumps*(buf: var Buffer): seq[int] =
       invertCondBytes(buf, jccPos, buf.relocs[i].kind)
       buf.relocs[i].kind = inverseCond(buf.relocs[i].kind)
       buf.relocs[i].target = buf.relocs[j].target
-      deadPos.incl jmpPos
+      dead[j] = true
+      inc deadCount
 
-    if deadPos.len == 0: break
+    if deadCount == 0: break
     when defined(nifasmDbgInvert):
-      stderr.writeLine "nifasmDbgInvert: folded " & $deadPos.len & " jcc-over-jmp site(s)"
-    let iterMap = prunePositions(buf, deadPos)
+      stderr.writeLine "nifasmDbgInvert: folded " & $deadCount & " jcc-over-jmp site(s)"
+    let iterMap = prunePositions(buf, dead)
     for o in 0 .. origLen: result[o] = iterMap[result[o]]
     changed = true
 

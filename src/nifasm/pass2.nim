@@ -143,7 +143,9 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
       let lab = ctx.buf.createLabel()
       sym.offset = int(lab)
     ctx.buf.defineLabel(LabelId(sym.offset))
-    ctx.definedLabels.clear()   # fresh backward-jump tracking per proc
+    # fresh backward-jump tracking per proc; a new set, since `clear` walks the
+    # whole capacity the largest proc left behind
+    ctx.definedLabels = initHashSet[int]()
 
     # Open this proc's debug-info record. The CFA at a proc's entry is fixed by
     # the ABI: on x86-64 the `call` has pushed the return address (CFA = SP+8),
@@ -451,7 +453,7 @@ proc pass2*(n: Cursor; ctx: var GenContext) =
             # lookupWithAutoImport above) does not emit a duplicate copy.
             n = start
             pass2Proc(n, ctx)
-            ctx.generatedSymbols.incl name
+            ctx.generatedSymbols.incl ctx.symIdOf(name)
             ctx.entrySym = sym             # the FS-setup prologue jumps here
           else:
             # Regular proc - skip, will be generated if referenced

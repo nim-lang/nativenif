@@ -70,8 +70,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   var hdr = n
   inc hdr                    # peek at the target symbol (does not advance n)
   if hdr.kind != Symbol: error("Expected proc symbol or type, got " & $hdr.kind, hdr)
-  let name = getSym(hdr)
-  let sym = lookupWithAutoImport(ctx, ctx.scope, name, hdr)
+  let target = getSymId(hdr)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, target, hdr)
+  template name: string = getSym(hdr)   # spelled out only where a message needs it
 
   # A prepare block may NEST inside another: arkham emits that for an argument that is
   # itself a call — `f(g(x))`, which hexer leaves unflattened in a global's initializer
@@ -92,7 +93,7 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
 
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
-    target: name,
+    target: target,
     argsSet: initHashSet[SymId](),
     resultsSet: initHashSet[SymId](),
     callEmitted: false,
@@ -130,8 +131,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     # bare extern has no signature to check against, so only the marker is verified.
     ctx.callContext.state = CallContextState.ExternalCall
     ctx.callContext.typ = sym.typ
+    let extName = name
     for i, ext in ctx.extProcs:
-      if ext.name == name:
+      if ext.name == extName:
         ctx.callContext.extProcIdx = i
         break
   else:
@@ -442,8 +444,9 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
 
   if n.kind == Symbol:
     # Control flow variable: (ite cfvar ...)
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil or sym.kind != skCfvar: error("Expected cfvar in ite condition: " & name, n)
 
     # Check if this cfvar has already been used
@@ -563,8 +566,9 @@ proc genJtrueX64(n: var Cursor; ctx: var GenContext) =
   var firstCfvar = true
 
   while n.kind == Symbol:
-    let name = getSym(n)
-    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    let nameCur = n
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+    template name: string = getSym(nameCur)  # for the diagnostics
     if sym == nil: error("Unknown cfvar: " & name, n)
     if sym.kind != skCfvar: error("Symbol is not a cfvar: " & name, n)
 
@@ -583,8 +587,9 @@ proc genJtrueX64(n: var Cursor; ctx: var GenContext) =
 proc genKillX64(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != Symbol: error("Expected symbol to kill", n)
-  let name = getSym(n)
-  let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+  let nameCur = n
+  let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+  template name: string = getSym(nameCur)  # for the diagnostics
   if sym == nil: error("Unknown variable to kill: " & name, n)
 
   if sym.typ.isOnStack:
@@ -1683,8 +1688,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     var dest: x86.Register
     if n.kind == Symbol:
-      let name = getSym(n)
-      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
       # A register-homed local OR param is a legal `lea` destination: `lea` DEFINES it,
       # and a param kept in its incoming arg register (e.g. `lea rdi, [rdi+off]` when the
       # param is dead afterwards) is exactly the address-of-a-field marshalling arkham
@@ -1706,8 +1710,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       # (lea dest (lab label)) - RIP-relative address
       inc n
       if n.kind != Symbol: error("Expected label name", n)
-      let name = getSym(n)
-      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      let nameCur = n
+      let sym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
+      template name: string = getSym(nameCur)  # for the diagnostics
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       if sym == ctx.tlsSizeSym: ctx.tlsSizeUsed = true   # emit the cell (appendTlsSize)
@@ -1723,8 +1728,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         displacement = int32(getInt(n))
         inc n
       elif n.kind == Symbol:
-        let offsetName = getSym(n)
-        let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
+        let offsetSym = lookupWithAutoImport(ctx, ctx.scope, getSymId(n), n)
         if offsetSym != nil and offsetSym.kind == skTvar:
           # `lea dest, (fsbase) tvar` ⇒ dest = fsbase + tvar.offset = &tvar. A
           # thread-local has no link-time address (it lives at FS_base + offset);
