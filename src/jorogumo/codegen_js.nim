@@ -22,7 +22,7 @@
 import std / [tables, sets, strutils, base64, assertions, algorithm]
 import nifcore, nifcdecl
 import jsnif, jsenc
-import "../arkham/core" / [asmslots, programs, typenav]
+import "../arkham/core" / [asmslots, programs, typenav, typeutil]
 
 const
   JsPtrSize* = 4
@@ -1525,6 +1525,12 @@ proc genTypedBinop(g: var JsGen; c: Cursor) =
   if op == NoJs: err g, "not a binary operation: " & $c.exprKind
   var t = c
   t.into:
+    # arkham's shared rule, called rather than restated. `(add (ptr T) p n)`
+    # does not say whether `n` counts bytes or elements, and JS is the one host
+    # where a wrong reading still RUNS — Number + Number gives a Number — so the
+    # twin refuses rather than inventing a semantics. `div`/`mod` are covered
+    # here too, as the rule intends.
+    checkArithResultType(g.prog, t, "jorogumo")
     let w = widthOf(g, t)
     skip t
     g.outp.openTree op
