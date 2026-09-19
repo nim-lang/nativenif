@@ -75,13 +75,18 @@
 ## reuse it); the union of callee-saved registers ever used drives the
 ## prologue/epilogue.
 
+import std / envvars
+import std / syncio
 import std / [tables, sets, assertions, os, strutils]
+
+include compat2   # getOrQuit on host Nim
 
 let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
   ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
 import nifcore, nifcdecl, asmslots, machinedesc, analyser, programs, typenav
 import abi
+from stress import envInt
 export abi         # CallPlan / planCall / ParamPlace: the one ABI classifier the
                    # allocator and both emitters consume (see abi.nim)
 
@@ -245,8 +250,13 @@ proc initLocSpan(base, len: int): LocSpan {.inline.} =
   ## Zero-inits `len` `Location`s (kind `Undef`, ordinal 0 — an unwritten position).
   LocSpan(base: base, data: newSeq[Location](len))
 
-proc `[]`(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
-proc `[]`(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
+when defined(nimony):
+  # Nimony has no `lent`/`var` overload pair; its accessors return `var` from an
+  # immutable receiver (see `std/tables`).
+  proc `[]`(s: LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
+else:
+  proc `[]`(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
+  proc `[]`(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
 proc `[]=`(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
 
 proc planned*(plan: Plan; pos: int): Location {.inline.} =
@@ -319,26 +329,28 @@ proc homeOf(b: Builder; name: string): Location {.inline.} =
 
 # ── physical register pools ────────────────────────────────────────────────
 
-proc takeReg(b: var Builder; pool: var set[Reg]; cands: openArray[Reg]): Reg =
+proc takeReg(sealed: set[Reg]; pool: var set[Reg]; cands: openArray[Reg]): Reg =
   ## Take the first free, non-sealed register from `cands`. A sealed register
   ## is committed to an in-flight ABI call and must never be h(re)allocated.
+  ## (`sealed` is the builder's `plan.sealed`; the builder itself is not passed,
+  ## as `pool` is one of its fields.)
   for r in cands:
-    if r in pool and r notin b.plan.sealed:
+    if r in pool and r notin sealed:
       excl pool, r
       return r
   result = NoReg
 
-proc takeReg(b: var Builder; pool: var set[Reg]; cands: set[Reg]): Reg =
+proc takeReg(sealed: set[Reg]; pool: var set[Reg]; cands: set[Reg]): Reg =
   ## `takeReg` over an unordered candidate set: picks the lowest free, non-sealed
   ## slot. For a candidate pool with no ABI preference order (`callerSaveHomeCandidates`)
   ## the choice among equals is arbitrary anyway.
   for r in cands:
-    if r in pool and r notin b.plan.sealed:
+    if r in pool and r notin sealed:
       excl pool, r
       return r
   result = NoReg
 
-proc takeFReg(b: var Builder; pool: var set[FReg]; cands: openArray[FReg]): FReg =
+proc takeFReg(pool: var set[FReg]; cands: openArray[FReg]): FReg =
   ## Take the first free SIMD register from `cands` out of `pool`.
   for f in cands:
     if f in pool:
@@ -398,7 +410,7 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
     # xmm regs at all (SysV), so a float local always spills there — exactly the
     # behavior before precise `AllRegs`, when the empty callee pool forced a spill.
     if AddrTaken in props: return b.spillTo(name, slot)
-    var f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
+    var f = takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
     if f != NoFReg:
       b.plan.usedCalleeF.incl f
       return fregLoc(f, slot)
@@ -414,7 +426,7 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       # emitter's own float scratch shrinks by one per vector local; when it
       # runs dry the vector rows fail loudly ("out of SIMD registers") rather
       # than miscompiling.
-      f = b.takeFReg(b.freeVolF, b.md.floatTempRegs)
+      f = takeFReg(b.freeVolF, b.md.floatTempRegs)
       if f != NoFReg: return fregLoc(f, slot)
     return b.spillTo(name, slot)
   if AddrTaken in props or not slot.inRegClass:
@@ -428,7 +440,7 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       # scarce callee-saved reg for it starves the cross-call locals — which have NO other
       # option — into spills (a register-class priority inversion). Reserve callee-saved
       # for the values that can only use it.
-      r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+      r = takeReg(b.plan.sealed, b.freeVol, b.md.intLocalTempRegs)
       # The fixed-role volatiles come BEFORE the callee-saved fallback, not after
       # it. `ShiftRegOk`/`DivRegOk` are the same interval proof as `AllRegs` but
       # per register — this value's life never overlaps rcx's shift-count role /
@@ -439,10 +451,10 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       # them at all: `rawLineInfo`, a leaf, pushed all six callee-saved registers
       # while rcx and rdx sat free.
       if r == NoReg and ShiftRegOk in props and b.md.shiftCountReg != NoReg:
-        r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
+        r = takeReg(b.plan.sealed, b.freeVol, [b.md.shiftCountReg])
       if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
-        r = b.takeReg(b.freeVol, [b.md.divRemReg])
-      if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+        r = takeReg(b.plan.sealed, b.freeVol, [b.md.divRemReg])
+      if r == NoReg: r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
     else:
       # AArch64: VOLATILES FIRST, callee-saved as the fallback — for `AllRegs` values,
       # which is the branch we are in. `AllRegs` means the live range contains no call
@@ -468,8 +480,8 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       # to turn `tests/arkham/atomic_cas_regpressure` from "one local spilled, the CAS
       # got its third operand register" into the emitter's documented out-of-registers
       # assert — a totality gap (see `arkhamStressA64Known`), never a wrong answer.
-      r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
-      if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+      r = takeReg(b.plan.sealed, b.freeVol, b.md.intLocalTempRegs)
+      if r == NoReg: r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
     # Still nothing? A local whose interval crosses no variable shift / no div may
     # additionally home in the shift-count / div-rem register: their fixed role
     # never overlaps this local's life (guaranteed by the interval test that set
@@ -477,9 +489,9 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
     # per-fixed-role-register generalization of `AllRegs` — more homes for the hot,
     # call-free leaf functions that are otherwise spill-bound.
     if r == NoReg and ShiftRegOk in props and b.md.shiftCountReg != NoReg:
-      r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
+      r = takeReg(b.plan.sealed, b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
-      r = b.takeReg(b.freeVol, [b.md.divRemReg])
+      r = takeReg(b.plan.sealed, b.freeVol, [b.md.divRemReg])
   elif DiesAtCall in props:
     # The one call in this value's interval is the call that CONSUMES it (the
     # death-point exemption in `analyser`), so the value need not survive anything —
@@ -504,13 +516,13 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
     # Fallback to callee-saved keeps the register COUNT identical to before, so no
     # local that had a register loses one.
     if b.md.arch == X86:
-      if RetRegOk in props: r = b.takeReg(b.freeVol, [b.md.intRetReg])
+      if RetRegOk in props: r = takeReg(b.plan.sealed, b.freeVol, [b.md.intRetReg])
     else:
-      r = b.takeReg(b.freeVol, b.md.intTempRegs)
-    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+      r = takeReg(b.plan.sealed, b.freeVol, b.md.intTempRegs)
+    if r == NoReg: r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
   else:
     # may be live across a real call → must be callee-saved (or stack)
-    r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
   if r == NoReg:
     when defined(arkhamSpillDbg):
       # How many call points does this value's interval actually cross, and how
@@ -684,7 +696,7 @@ proc demoteToStack(b: var Builder; victim: string) =
   ## of `locs[symPos[victim]]` — and because every use reads through `symPos` (the
   ## emitter late-binds via `locationOfSym`), every use, walked or not, sees the new
   ## home. Sound across every control-flow path: the home is memory everywhere.
-  let vpos = b.plan.symPos[victim]
+  let vpos = b.plan.symPos.getOrQuit(victim)
   b.plan.callerSaveHomes.del victim     # its home is memory now: nothing to save/restore
   b.plan.locs[vpos] = namedStackLoc(victim, b.plan.planned(vpos).typ)
   b.plan.hasStackVars = true
@@ -751,8 +763,8 @@ let callerSaveOn = not existsEnv("ARKHAM_NO_CALLERSAVE")
   ## param copied the POINTER, silently aliasing the params — see the AsgnS
   ## reclassification in both emitters). `ARKHAM_NO_CALLERSAVE=1` is the off switch
   ## for A/B measurement; the bisect knobs below still work.
-let csBisectMod = (if existsEnv("ARKHAM_CS_MOD"): parseInt(getEnv("ARKHAM_CS_MOD")) else: 0)
-let csBisectRem = (if existsEnv("ARKHAM_CS_REM"): parseInt(getEnv("ARKHAM_CS_REM")) else: 0)
+let csBisectMod = envInt("ARKHAM_CS_MOD")
+let csBisectRem = envInt("ARKHAM_CS_REM")
 proc readCsProcList(): HashSet[string] =
   ## `ARKHAM_CS_PROCS=<file>` restricts the rescue to the `proc=` names listed one per
   ## line in that file — the bisect axis the hash knob only approximates. arkham runs
@@ -799,6 +811,7 @@ proc callsCrossedAfterInit(b: Builder; vi: VarInfo): int =
   ## its value is born at, not from its declaration. A call inside the initializer
   ## (`let x = f(…)`) therefore does not count: the register holds nothing to save
   ## there, and the value is produced by that very call.
+  result = 0
   for p in b.an.callPositions:
     if p > vi.initEndPos and p <= vi.freeAfter: inc result
 
@@ -862,7 +875,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   # The argument registers are fine: a rescued value is stored to its `csave` slot
   # and its reads redirected there before any marshalling writes them
   # (`emCallerSaveOpen`), which is the mechanism's whole point.
-  var r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+  var r = takeReg(b.plan.sealed, b.freeVol, b.md.intLocalTempRegs)
   if r == NoReg: return fallback
   b.plan.callerSaveHomes[name] = vi.freeAfter
   # The save slot is declared in the PROLOGUE, not at the decl. arkham emits by a
@@ -1006,7 +1019,8 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
             " init=" & $svi.initClass & " weight=" & $svi.weight &
             " inloop=" & $svi.declInLoop & "\n"
       if aliasSrc.len > 0:
-        b.plan.symPos[name] = b.plan.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
+        let srcHome = b.plan.symPos.getOrQuit(aliasSrc)
+        b.plan.symPos[name] = srcHome                 # c2 resolves to c1's LIVE home (no own reg)
         b.plan.aliasedCasts.incl name                 # emitter emits neither decl nor store for it
         b.plan.homesDirty = true
       else:
@@ -1131,7 +1145,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                               (AllRegs in props and not clobbered)
               var r: Reg
               if (hasCall or clobbered) and not stayInArg:
-                r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+                r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
                 if r == NoReg:
                   pairOk = false
                   break
@@ -1187,7 +1201,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               if AddrTaken in props:
                 loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
               elif hasCall:
-                let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
+                let f = takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
                 if f != NoFReg:
                   b.plan.usedCalleeF.incl f
                   loc = fregLoc(f, effSlot)
@@ -1251,7 +1265,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body:
               # a callee-saved home the prologue fills with `mov home, argReg`.
-              let r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+              let r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
               if r != NoReg:
                 b.plan.usedCallee.incl r
                 loc = regLoc(r, effSlot)
@@ -1292,7 +1306,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               loc = memHome()
               b.plan.hasStackVars = true
             else:
-              var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+              var r = takeReg(b.plan.sealed, b.freeCallee, b.md.intCalleeSaved)
               if r == NoReg and spillableRegParams.len > 0:
                 # No free callee-saved register: evict an earlier scalar register
                 # param to its stack slot and reuse its register for this stack param.
@@ -1565,7 +1579,7 @@ proc locationOfSym*(plan: Plan; name: string; pos: int): Location {.inline.} =
     let act = plan.callerSaveActive.getOrDefault(name, noLoc)
     if act.kind != NoLoc: return act
   if plan.segs.len > 0 and plan.segs.hasKey(name):
-    let s = plan.segs[name]
+    let s = plan.segs.getOrQuit(name)
     if s.len > 0:
       var i = s.len - 1
       while i > 0 and s[i].fromPos > pos: dec i

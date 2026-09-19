@@ -25,10 +25,13 @@
 ## Ported from `src/wip/native/analyser.nim` to the nifcore cursor API; keyed
 ## by symbol *name* (nifcore has no stable SymId for inline-short symbols).
 
-import std / [tables, sets, assertions, os, strutils]
+import std / syncio
+import std / [tables, sets, assertions, os, strutils, envvars]
 import nifcore
 import nifcdecl
 import asmslots
+
+include compat2   # getOrQuit on host Nim
 
 let birthFilterEnv = getEnv("ARKHAM_BIRTH_FILTER")
   ## debug bisection toggle: "" = birth-point exemption everywhere (normal);
@@ -252,8 +255,8 @@ template iterStmts(c: var Context; n: var Cursor; body: untyped) =
   n.into:
     while n.hasMore:
       var e = n; skip e                   # end position of this child statement
-      c.stmtStart[^1] = posOf(c, n)
-      c.stmtEnd[^1] = posOf(c, e)
+      c.stmtStart[c.stmtStart.len - 1] = posOf(c, n)
+      c.stmtEnd[c.stmtEnd.len - 1] = posOf(c, e)
       body
 
 template scopeFrame(c: var Context; body: untyped) =
@@ -328,7 +331,7 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     c.res.vars[vn] = vi
     if hasValue:
       analyse(c, n)              # analyse the initializer
-      c.res.vars[vn].initEndPos = posOf(c, n)   # the value's birth point
+      c.res.vars.getOrQuit(vn).initEndPos = posOf(c, n)  # the value's birth point
     else: inc n                  # consume the `.`
 
 proc resultSpineWalk(c: var Context; n: var Cursor; onSpine: bool) =
@@ -380,9 +383,9 @@ proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bo
   case n.kind
   of Symbol:
     let an = symName(n)
-    if c.res.vars.hasKey(an) and c.res.vars[an].paramIdx >= 0:
-      if (not cleanCall) or c.res.vars[an].paramIdx != ordinal:
-        c.res.vars[an].argUnsafe = true
+    if c.res.vars.hasKey(an) and c.res.vars.getOrQuit(an).paramIdx >= 0:
+      if (not cleanCall) or c.res.vars.getOrQuit(an).paramIdx != ordinal:
+        c.res.vars.getOrQuit(an).argUnsafe = true
   of TagLit:
     if n.stmtKind == NoStmt:
       n.into:
@@ -445,7 +448,7 @@ proc analyse(c: var Context; n: var Cursor) =
   of Symbol:
     let vn = symName(n)
     if c.res.vars.hasKey(vn):
-      let e = addr c.res.vars[vn]
+      let e = addr c.res.vars.getOrQuit(vn)
       if c.inAsgnTarget > 0: inc e.defs
       else: inc e.usages
       # each use counts; uses inside loops count `LoopWeight`× per nesting level —
@@ -656,7 +659,7 @@ proc analyse(c: var Context; n: var Cursor) =
           if not probe.hasMore: break argWalk
           let calleeSym = if probe.kind == Symbol: symName(probe) else: ""
           if calleeSym.len > 0 and c.res.vars.hasKey(calleeSym):
-            c.res.vars[calleeSym].argUnsafe = true         # a param used as a call target
+            c.res.vars.getOrQuit(calleeSym).argUnsafe = true  # a param used as a call target
           let cleanCall = calleeSym.len > 0 and calleeSym in c.cleanCallees
           skip probe                                       # past the callee → arguments
           var ordinal = 0
@@ -705,7 +708,7 @@ proc analyse(c: var Context; n: var Cursor) =
       # re-read after that call on the next iteration → it cannot stay in its incoming
       # arg register across the loop. Flag it; the ArgResident gate then denies it.
       if frame.sawCall:
-        for pnm in frame.usedParams: c.res.vars[pnm].usedAfterCall = true
+        for pnm in frame.usedParams: c.res.vars.getOrQuit(pnm).usedAfterCall = true
       # Propagate to the enclosing loop: its back-edge re-reaches this whole sub-loop.
       if c.loopStack.len > 0:
         if frame.sawCall: c.loopStack[^1].sawCall = true

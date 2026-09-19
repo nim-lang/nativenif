@@ -23,6 +23,7 @@
 ## makes that forwarding a splice rather than a translation.
 
 
+import std / syncio
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagconv, tagpool, tags]
 

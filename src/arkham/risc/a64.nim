@@ -11,7 +11,7 @@
 ## body may not pin. The shared load/store emitter reaches
 ## these qualified — `a64.emitAtomic` — so the target is visible at the call site.
 
-import std / [assertions, tables, strformat]
+import std / [assertions, tables]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, mirrors, regbind]
@@ -43,11 +43,11 @@ proc emitAtomicRmw(g: var CodeGen; dst, p, v: Reg; opStr: string;
   let neu = g.emOp g.md.atomicScratch[1]
   let st = g.emOp g.md.atomicScratch[2]
   let w = wsfx(bits)
-  let update = if isXchg: &"(mov {neu} {vS})" else: &"(mov {neu} {old}) ({opStr} {neu} {vS})"
+  let update = if isXchg: ("(mov " & neu & " " & vS & ")") else: ("(mov " & neu & " " & old & ") (" & opStr & " " & neu & " " & vS & ")")
   # Structured `(loop …)`: nifasm emits the back-edge internally. The exclusive
   # store SUCCEEDS when `st == 0` → the forward `(beq lDone)` leaves the loop.
-  g.ab.splice &"(loop (stmts (ldaxr {old} {pS}{w}) " & update & " " &
-              &"(stlxr {st} {neu} {pS}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
+  g.ab.splice ("(loop (stmts (ldaxr " & old & " " & pS & w & ") ") & update & " " &
+              ("(stlxr " & st & " " & neu & " " & pS & w & ") (cmp " & st & " 0) (beq " & lDone & "))) (lab :" & lDone & ")")
   g.movReg(dst, g.md.atomicScratch[if returnNew: 1 else: 0])
 
 proc emitAtomic*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
@@ -108,11 +108,11 @@ proc emitAtomic*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     # re-reads. The failure path MUST publish what was actually there — that is the
     # whole protocol: the caller retries against the value it now holds.
     g.ab.splice(
-      &"(ldar {exp} {ep}{w}) (loop (stmts (ldaxr {old} {pp}{w}) " &
-      &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}{w}) " &
-      &"(cmp {st} 0) (beq {lSucc}))) " &
-      &"(lab :{lSucc}) (mov {ret} 1) (b {lDone}) " &
-      &"(lab :{lFail}) (clrex) (stlr {old} {ep}{w}) (mov {ret} 0) (lab :{lDone})")
+      ("(ldar " & exp & " " & ep & w & ") (loop (stmts (ldaxr " & old & " " & pp & w & ") ") &
+      ("(cmp " & old & " " & exp & ") (bne " & lFail & ") (stlxr " & st & " " & d & " " & pp & w & ") ") &
+      ("(cmp " & st & " 0) (beq " & lSucc & "))) ") &
+      ("(lab :" & lSucc & ") (mov " & ret & " 1) (b " & lDone & ") ") &
+      ("(lab :" & lFail & ") (clrex) (stlr " & old & " " & ep & w & ") (mov " & ret & " 0) (lab :" & lDone & ")"))
   else:
     # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
     # empty, so this is the message that column promises.

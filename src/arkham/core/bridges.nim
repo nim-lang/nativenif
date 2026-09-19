@@ -26,6 +26,7 @@
 ##    allocator did. The gap between the last two is exactly the thing design.md
 ##    calls x86-64's open question, and `tightCompositions` counts it.
 
+import std / assertions
 import machinedesc, context
 
 const BridgeCheck* = defined(arkhamStress) or defined(arkhamBridgeCheck) or
@@ -95,12 +96,15 @@ proc bridgeScopePop*(g: var CodeGen; live: int; held: string) =
   ## crash and never would be — the register stays bound and the next step
   ## silently runs with one fewer, until something far away asserts.
   let sc = g.bridgeScopes.pop()
-  if getCurrentException() != nil:
-    # Unwinding already. A step abandoned mid-way has of course not released its
-    # registers, so the leak below is a CONSEQUENCE of the failure in flight and
-    # raising it here would replace the real diagnostic with a derived one —
-    # which is exactly what it did on first use.
-    return
+  when not defined(nimony):
+    # (Under Nimony `raiseAssert` quits rather than unwinds, so there is no
+    # failure in flight to defer to.)
+    if getCurrentException() != nil:
+      # Unwinding already. A step abandoned mid-way has of course not released its
+      # registers, so the leak below is a CONSEQUENCE of the failure in flight and
+      # raising it here would replace the real diagnostic with a derived one —
+      # which is exactly what it did on first use.
+      return
   if live > sc.base:
     raiseAssert "arkham " & g.md.targetName & ": bridge leak — " & sc.what &
       " left " & $(live - sc.base) & " of its " & $sc.cap &

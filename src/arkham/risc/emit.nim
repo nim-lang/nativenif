@@ -17,18 +17,22 @@
 ## Also here: the immediate encoders. `add`/`sub` take a 12-bit immediate,
 ## `and`/`orr`/`eor` take a bitmask immediate that is not a range at all, and
 ## Thumb-2 takes a third shape again — so "can this constant be folded into the
-## instruction" is a real question with three answers, and both `isLogicalImm`
-## (from nifasm's own encoder) and `thumbimm` are consulted rather than guessed.
+## instruction" is a real question with three answers, and both `a64imm`
+## and `thumbimm` (the shared `src/common` twins of nifasm's encoders) are
+## consulted rather than guessed.
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / syncio
+import std / [assertions, tables, sets, strutils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     stress, context, typeutil, bridges, 
                     mirrors, temps, typenav, regbind, abi]
 import machine_a64 as machine
 from machine_cortexm import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
+from a64imm import nil
 from thumbimm import nil
+
+include compat2   # getOrQuit on host Nim
 
 type
   RiscInst* = A64Inst
@@ -540,7 +544,7 @@ proc emAggrFieldMem*(g: var CodeGen; base, field: string) =
   of NamedStack: g.emFieldMem(base, field)
   of StackPtr:
     raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
-  of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
+  of InReg:      g.emPtrFieldMem(loc.r, g.varType.getOrQuit(base), field)
   of InRegPair:
     raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & base
   else:
@@ -563,7 +567,7 @@ proc emAggrDot*(g: var CodeGen; base, field: string) =
   of InReg:
     g.ab.tree DotX:
       g.ab.tree CastX:
-        g.ab.ptrType: g.emTypeSym(g.varType[base])
+        g.ab.ptrType: g.emTypeSym(g.varType.getOrQuit(base))
         g.emReg loc.r
       g.ab.sym field
   of InRegPair:
@@ -777,11 +781,11 @@ proc extendTo*(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   if SubwordExtend in g.md.caps and width in [8, 16]:
     let op = (if width == 8: (if signed: "sxtb" else: "uxtb")
               else: (if signed: "sxth" else: "uxth"))
-    g.ab.splice &"({op} {d} {d})"
+    g.ab.splice ("(" & op & " " & d & " " & d & ")")
   else:
     let sh = regWidth - width
     let down = if signed: "asr" else: "lsr"
-    g.ab.splice &"(lsl {d} {sh}) ({down} {d} {sh})"
+    g.ab.splice ("(lsl " & d & " " & $sh & ") (" & down & " " & d & " " & $sh & ")")
 
 proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &global` — adrp+add (nifasm resolves the gvar to its `.bss`/`.data`
@@ -1223,17 +1227,20 @@ proc liveBridges*(g: CodeGen): int =
   ## store), holding it with `pickedRegs` alone — so a bound-only count would miss
   ## precisely the site whose invariant this is. Counting bound-only reports a
   ## peak-across-recursion of 1 where the truth is 2.
+  result = 0
   var seen: set[Reg] = {}
   for r in g.md.bridgeRegs:
     if r notin seen and (g.rb.isBoundTemp(r) or r in g.pickedRegs):
       seen.incl r; inc result
 
 proc distinctBridges*(g: CodeGen): int =
+  result = 0
   var seen: set[Reg] = {}
   for r in g.md.bridgeRegs:
     if r notin seen: seen.incl r; inc result
 
 proc heldBridgeNames*(g: CodeGen): string =
+  result = ""
   var seen: set[Reg] = {}
   for r in g.md.bridgeRegs:
     if r notin seen and (g.rb.isBoundTemp(r) or r in g.pickedRegs):
@@ -1490,7 +1497,7 @@ proc globalAddrSlot*(g: var CodeGen; name: string): AsmSlot =
 proc restoreMemBase*(g: var CodeGen; pos: int) =
   if g.savedHomes.hasKey(pos):
     g.dropBridge g.plan.planned(pos).r
-    g.plan.planAtEmitTime(pos, g.savedHomes[pos])
+    g.plan.planAtEmitTime(pos, g.savedHomes.getOrQuit(pos))
     g.savedHomes.del pos
 
 proc inlineAggrHome*(g: var CodeGen; c: Cursor): string =
@@ -1514,7 +1521,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
       # An allocated register, or — when the walk had none to give — the bridge
       # `prematLval` derived `&g` into late (see `lateGlobalBase`).
       let baseReg = if planned.kind == InReg: planned.r
-                    else: g.lvalGlobBase[g.posOf(c)]
+                    else: g.lvalGlobBase.getOrQuit(g.posOf(c))
       let si = g.lookupSym(nm)
       var d = si.decl
       inc d; skip d; skip d                               # (gvar …): name, pragmas → type
@@ -1525,12 +1532,12 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
         g.emReg baseReg
     elif loc.kind == InReg and g.varType.hasKey(nm):      # by-ref aggregate param (pointer)
       g.ab.tree CastX:
-        g.ab.ptrType: g.emTypeSym(g.varType[nm])
+        g.ab.ptrType: g.emTypeSym(g.varType.getOrQuit(nm))
         g.emReg loc.r
     elif loc.kind == StackPtr:
       g.ab.tree CastX:
         g.ab.ptrType: g.emTypeSym(loc.pointeeType)
-        g.emReg g.lvalGlobBase[g.posOf(c)]
+        g.emReg g.lvalGlobBase.getOrQuit(g.posOf(c))
     elif loc.kind == InRegPair:
       raiseAssert "arkham a64n: address of InRegPair local " & nm
     else:                                                 # a `(s)` stack-var base
@@ -1555,8 +1562,8 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
           else: g.emReg g.plan.planned(g.posOf(cc)).r          # register index
           skip cc
-          if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
-            g.emReg g.plan.aux[atPos].scratch[0]            # non-scale stride scratch
+          if g.plan.aux.hasKey(atPos) and g.plan.aux.getOrQuit(atPos).scratch.len > 0:
+            g.emReg g.plan.aux.getOrQuit(atPos).scratch[0]  # non-scale stride scratch
           while cc.hasMore: skip cc
     of DerefC:
       var pointee = g.getType(c)
@@ -1587,8 +1594,8 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
           else: g.emReg g.plan.planned(g.posOf(cc)).r
           skip cc
-          if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
-            g.emReg g.plan.aux[patPos].scratch[0]           # non-scale stride scratch
+          if g.plan.aux.hasKey(patPos) and g.plan.aux.getOrQuit(patPos).scratch.len > 0:
+            g.emReg g.plan.aux.getOrQuit(patPos).scratch[0]  # non-scale stride scratch
           while cc.hasMore: skip cc
     of BaseobjC:
       # `(baseobj BaseType depth lvalue)` — object→base view. Base sub-object at offset 0,
@@ -1649,7 +1656,7 @@ proc releaseStrideScratch(g: var CodeGen; atPos: int) =
   ## Release it after the consuming `(mem …)`/`(lea …)`. `dropBridge` and the pool
   ## release are the same two operations, so the only difference a bridge makes is
   ## that the position stops being marked.
-  let r = g.plan.aux[atPos].scratch[0]
+  let r = g.plan.aux.getOrQuit(atPos).scratch[0]
   g.lvalStrideOnBridge.excl atPos
   g.pickedRegs.excl r
   g.unbindTemp(r)
@@ -1719,7 +1726,7 @@ proc isLogicalImmA64(v: int64): bool =
   ## is the difference between `and x, y, #0xff` and materializing the constant
   ## into a register first. nifasm owns the encoding; this only has to agree with
   ## it on WHICH values are representable, and it answers with the same routine.
-  arm64.isLogicalImm(cast[uint64](v))
+  a64imm.isLogicalImm(cast[uint64](v))
 
 proc logicalImmOk*(g: CodeGen; v: int64): bool {.inline.} =
   ## Whether `v` may ride along as an immediate operand of `and`/`orr`/`eor`.
@@ -1786,12 +1793,12 @@ proc atomicBits*(g: var CodeGen; ptrArg: Cursor): int =
     result = typeSizeAlign(g.prog, resolveType(g.prog, t))[0] * 8
   else:
     result = 64
-  if result notin {8, 16, 32, 64}: result = 64
+  if result != 8 and result != 16 and result != 32 and result != 64: result = 64
 
 proc wsfx*(bits: int): string =
   ## Trailing access-width operand for the LL/SC asm-NIF text (omitted for 64-bit, the
   ## nifasm parse default — keeps the common case's output unchanged).
-  if bits != 64: &" {bits}" else: ""
+  if bits != 64: (" " & $bits) else: ""
 
 proc instrOperandReg*(g: CodeGen; cur: Cursor): Reg =
   ## The register an already-emitted `(instr …)` operand landed in. `allocInstr`
@@ -2067,7 +2074,7 @@ proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false) =
         if cc.kind notin {IntLit, UIntLit}:
           g.freeVal(g.plan.planned(g.posOf(cc)))
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
+      if g.plan.aux.hasKey(atPos) and g.plan.aux.getOrQuit(atPos).scratch.len > 0:
         g.releaseStrideScratch(atPos)
     of PatC:
       let patPos = g.posOf(c)
@@ -2078,7 +2085,7 @@ proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false) =
         if cc.kind notin {IntLit, UIntLit}:
           g.freeVal(g.plan.planned(g.posOf(cc)))
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
+      if g.plan.aux.hasKey(patPos) and g.plan.aux.getOrQuit(patPos).scratch.len > 0:
         g.releaseStrideScratch(patPos)
     of BaseobjC:
       var cc = c

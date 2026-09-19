@@ -63,6 +63,12 @@ type
     hasStackArgs*: bool  ## any argument is stack-passed
     stackBytes*: int     ## bytes of the stack-argument area (8-rounded slots)
 
+proc withTail*(fixed: seq[AsmSlot]; tail: openArray[AsmSlot]): seq[AsmSlot] =
+  ## `fixed` followed by a variadic call shape's `tail` — the argument list
+  ## `planCall` classifies for a variadic signature.
+  result = fixed
+  for s in tail: result.add s
+
 proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
                variadicFrom = -1): CallPlan =
   ## Classify `slots` (caller: one per argument expression; callee: one per
@@ -213,6 +219,7 @@ proc incomingGprs*(md: MachineDesc; plan: CallPlan): set[Reg] =
   ## pointer and every register-passed word. Not a prefix of `intArgRegs` under a
   ## positional convention, where a float argument leaves its position's GPR unused
   ## — which is why this is a set and not `gpUsed`.
+  result = default(set[Reg])
   if plan.retByRef: result.incl md.intArgRegs[0]
   for pl in plan.args:
     if not pl.isFloat and not pl.onStack:

@@ -39,6 +39,8 @@
 import std / [tables, assertions]
 import machinedesc, asmslots
 
+include compat2   # getOrQuit on host Nim
+
 type
   MirrorKind* = enum
     ## What a register still holds a copy of. Both are OBSERVATIONS about a
@@ -169,14 +171,19 @@ proc takeMirrors*(rb: var RegBind): tuple[gprs, fprs: seq[string]] =
   ## non-issue here), a call, an `(instr …)` row. Returns the names to `(kill …)`.
   ## Total and cheap: a missing invalidation is a miscompile, so forgetting is
   ## the default and remembering is the special case.
+  ##
+  ## The kills come out in REGISTER order, not the tables' order: a `Table` walk
+  ## follows the hash function, which is not the same under every compiler.
   result = (gprs: newSeq[string](), fprs: newSeq[string]())
-  for r in rb.m.mirror.keys:
+  for r in low(Reg)..high(Reg):
+    if not rb.m.mirror.hasKey(r): continue
     let nm = rb.regLocal.getOrDefault(r, "")
     if nm.len > 0:
       result.gprs.add nm
       rb.regLocal.del r
       rb.regBindPtr.excl r
-  for f in rb.m.fmirror.keys:
+  for f in low(FReg)..high(FReg):
+    if not rb.m.fmirror.hasKey(f): continue
     let nm = rb.fregLocal.getOrDefault(f, "")
     if nm.len > 0:
       result.fprs.add nm
@@ -244,12 +251,12 @@ proc sameShape(a, b: AsmSlot): bool {.inline.} =
 proc valueMirror*(rb: RegBind; name: string; want: AsmSlot): Reg =
   ## The GPR still holding `name`'s value, or `NoReg`.
   result = rb.m.ofVal.getOrDefault(name, NoReg)
-  if result != NoReg and not sameShape(rb.m.mirror[result].slot, want):
+  if result != NoReg and not sameShape(rb.m.mirror.getOrQuit(result).slot, want):
     result = NoReg
 
 proc fvalueMirror*(rb: RegBind; name: string; want: AsmSlot): FReg =
   result = rb.m.fofVal.getOrDefault(name, NoFReg)
-  if result != NoFReg and not sameShape(rb.m.fmirror[result].slot, want):
+  if result != NoFReg and not sameShape(rb.m.fmirror.getOrQuit(result).slot, want):
     result = NoFReg
 
 proc addrMirror*(rb: RegBind; name: string): Reg =
@@ -278,7 +285,10 @@ proc boundFName*(rb: RegBind; f: FReg): string {.inline.} =
 proc isBoundFTmp*(rb: RegBind; f: FReg): bool {.inline.} = f in rb.boundFTmps
 
 iterator gprBindings*(rb: RegBind): (Reg, string) =
-  for r, name in rb.regLocal: yield (r, name)
+  ## In register order, not `regLocal`'s: callers emit from this walk, and a
+  ## `Table` walk follows the hash function, which differs between compilers.
+  for r in low(Reg)..high(Reg):
+    if rb.regLocal.hasKey(r): yield (r, rb.regLocal.getOrQuit(r))
 
 # ── GPR transitions ─────────────────────────────────────────────────────────
 

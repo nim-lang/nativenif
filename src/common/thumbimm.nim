@@ -21,8 +21,7 @@
 ## copies together. Keeping it here is dependency-free for both: this module
 ## imports nothing.
 ##
-## The AArch64 twin needs no such module: `arm64.isLogicalImm` is already reachable
-## from arkham, and `isLogicalImmA64` just calls it.
+## The AArch64 twin is `a64imm`, for the same reason.
 
 proc encodeModifiedImm*(value: uint32; encoding: var uint32): bool =
   ## Returns false when `value` is not representable, in which case the caller
@@ -57,7 +56,7 @@ proc encodeModifiedImm*(value: uint32; encoding: var uint32): bool =
 
 proc isModifiedImm*(value: uint32): bool {.inline.} =
   ## Is `value` representable at all? The question a code generator asks.
-  var enc: uint32
+  var enc = 0'u32
   encodeModifiedImm(value, enc)
 
 proc isModifiedImm*(v: int64): bool {.inline.} =

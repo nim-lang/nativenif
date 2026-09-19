@@ -1,0 +1,4 @@
+# The Nimony twin of `nim.cfg`'s `--path`s (Nimony reads this file, not nim.cfg):
+# nimony's NIF libraries from the sibling repo, and the shared `src/common` dir.
+../../../nimony/src/lib
+../common

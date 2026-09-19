@@ -133,6 +133,7 @@ const
 
   IntCallerSaved* = {P0, P18, P20, P22, P24, X, Z}
 
+let
   avrMachine* = MachineDesc(
     arch: Avr,
     intRetReg: IntRet,

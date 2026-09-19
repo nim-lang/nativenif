@@ -15,6 +15,7 @@
 ## materialises on the way has to be released again in the same order
 ## (`unbindLvalTemps`), or the pool leaks across statements.
 
+import std / syncio
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
@@ -23,6 +24,8 @@ import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
 import "../../nifasm/image/tracetable"
 import machine as machine_x64
 import emit
+
+include compat2   # getOrQuit on host Nim
 
 const arkhamNameAggrBase* = not defined(arkhamNoNameAggrBase)
   ## Address a register-homed pointer-to-aggregate BY NAME in field accesses, and
@@ -192,7 +195,7 @@ proc extendTo*(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   ## kept only for the widths x86 has no extension form for — nothing emits those
   ## today, but the fallback keeps the helper total.
   if width <= 0 or width >= 64: return
-  if width in {8, 16, 32}:
+  if width in [8, 16, 32]:
     g.ab.tree (if signed: MovsxX64 else: MovzxX64):
       g.emReg dest; g.emReg dest; g.ab.intLit int64(width)
     return
@@ -233,7 +236,7 @@ proc globalFoldsIntoAccess*(g: var CodeGen; name: string): bool =
   if not g.globalIsGvarSlot(name): return false
   var t = resolveType(g.prog, g.globalDeclType(name))
   let s = typeToSlot(t)
-  result = s.cls in {AInt, AUInt} and s.size in {4, 8}
+  result = s.cls in {AInt, AUInt} and s.size in [4, 8]
 
 proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &threadvar` — THIS thread's block address plus the tvar's FS offset.
@@ -286,7 +289,7 @@ proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
     #
     # All three rebinds are naming directives: zero machine code.
     let heldTemp = g.rb.isBoundTemp(dest)
-    let heldSlot = (if heldTemp and g.tmpBindTyp.hasKey(dest): g.tmpBindTyp[dest]
+    let heldSlot = (if heldTemp and g.tmpBindTyp.hasKey(dest): g.tmpBindTyp.getOrQuit(dest)
                     else: AddrSlot)
     var heldLocal: seq[tuple[r: Reg, name: string]] = @[]
     if not heldTemp:
@@ -522,7 +525,7 @@ proc emAggrFieldMem*(g: var CodeGen; base, field: string) =
   of NamedStack: g.emFieldMem(base, field)
   of StackPtr:
     raiseAssert "arkham x64: spilled by-ref field must go through a loaded pointer: " & base
-  of InReg:      g.emPtrFieldMemSym(base, g.varType[base], field)
+  of InReg:      g.emPtrFieldMemSym(base, g.varType.getOrQuit(base), field)
   of InRegPair:
     raiseAssert "arkham x64: InRegPair field must go through pairFieldReg: " & base
   else:
@@ -679,7 +682,7 @@ proc emitIntrinsicOps*(g: var CodeGen; op: IntrinsicOp; argBits: int;
   ## the user's `.register` annotation) — they differ only in how `dst`/`src0`
   ## were chosen, never in what gets emitted. For an in-place row the caller has
   ## already seeded `dst` from operand 0 and passes `src0 == dst`.
-  let bits = if argBits in {8, 16, 32}: 32 else: 64
+  let bits = if argBits in [8, 16, 32]: 32 else: 64
   case op
   of BsfOp, CtzOp:
     # count-trailing-zeros == index of the least-significant set bit. `src == 0` is
@@ -743,7 +746,7 @@ proc emitInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   if tag == NopX64:
     lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
               lengInfo(c)
-  proc emitDest(g: var CodeGen; d: Cursor) =
+  proc emitDest(g: var CodeGen; d: Cursor; op: IntrinsicOp) =
     var inner = d
     var sym = d
     if d.kind == TagLit and d.exprKind == HaddrC:
@@ -761,12 +764,12 @@ proc emitInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
       lengError d, "the destination of `" & IntrinsicNames[op] & "` has no " &
                 "register or stack home", lengInfo(d)
   if row.arity == 1:
-    g.ab.tree tag: g.emitDest(argCurs[0])
+    g.ab.tree tag: g.emitDest(argCurs[0], op)
   else:
     # The source was already emitted and memo'd by the fused emitInstr.
     let src = g.plan.planned(cursorToPosition(g.buf[], argCurs[1]))
     g.ab.tree tag:
-      g.emitDest(argCurs[0])
+      g.emitDest(argCurs[0], op)
       case src.kind
       of InReg: g.emReg src.r
       of Imm: g.ab.intLit src.ival
@@ -790,7 +793,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
       # or, for a transient load, the emit-time staging reg parked in `lvalGlobBase`.
       # Type it `(cast (ptr globalType) reg)` so the enclosing dot/at can compute the offset.
       let pos = cursorToPosition(g.buf[], c)
-      let baseReg = (if g.lvalGlobBase.hasKey(pos): g.lvalGlobBase[pos]
+      let baseReg = (if g.lvalGlobBase.hasKey(pos): g.lvalGlobBase.getOrQuit(pos)
                      else: g.plan.planned(pos).r)
       let si = g.lookupSym(nm)
       var d = si.decl
@@ -807,7 +810,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
       # would degrade to a bare `(rdi)` wherever the binding is not live, and then the
       # register looks free to every filter that asks `rb`.
       g.ab.tree CastX:
-        g.ab.ptrType: g.emTypeSym(g.varType[nm])
+        g.ab.ptrType: g.emTypeSym(g.varType.getOrQuit(nm))
         g.emAggrPtrBase(nm)
     elif loc.kind == StackPtr:
       # spilled by-ref POINTER: premat loaded it into lvalGlobBase; type it like
@@ -815,7 +818,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
       let pos = cursorToPosition(g.buf[], c)
       g.ab.tree CastX:
         g.ab.ptrType: g.emTypeSym(loc.pointeeType)
-        g.emReg g.lvalGlobBase[pos]
+        g.emReg g.lvalGlobBase.getOrQuit(pos)
     elif loc.kind == InRegPair:
       raiseAssert "arkham x64n: address of InRegPair local " & nm
     else:                                               # a `(s)` stack-var base
@@ -845,7 +848,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
             g.emReg g.plan.planned(cursorToPosition(g.buf[], cc)).r
           skip cc
           if g.lvalStride.hasKey(atPos):
-            g.emReg g.lvalStride[atPos]                 # 3-operand form: non-SIB stride scratch
+            g.emReg g.lvalStride.getOrQuit(atPos)       # 3-operand form: non-SIB stride scratch
           while cc.hasMore: skip cc
     of DerefC:
       var pointee = g.getType(c)                        # deref result = the pointee type
@@ -878,7 +881,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
             g.emReg g.plan.planned(cursorToPosition(g.buf[], cc)).r
           skip cc
           if g.lvalStride.hasKey(patPos):
-            g.emReg g.lvalStride[patPos]                # 3-operand form: non-SIB stride scratch
+            g.emReg g.lvalStride.getOrQuit(patPos)      # 3-operand form: non-SIB stride scratch
           while cc.hasMore: skip cc
     of BaseobjC:
       # `(baseobj BaseType depth lvalue)` — an object→base view. The base sub-object is at
@@ -966,7 +969,7 @@ proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
   if c.kind == Symbol:
     let pos = cursorToPosition(g.buf[], c)
     if g.lvalGlobBase.hasKey(pos):                    # transient global-base staging reg
-      let s = g.lvalGlobBase[pos]
+      let s = g.lvalGlobBase.getOrQuit(pos)
       g.unbindTemp(s)
       g.plan.unseal s
       g.lvalGlobBase.del pos
