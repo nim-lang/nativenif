@@ -46,7 +46,8 @@ proc insertRepeated*(buf: var Bytes; at: int; b: byte; count: int) =
   let oldLen = buf.data.len
   buf.data.setLen(oldLen + count)
   for i in countdown(oldLen - 1, at):
-    buf.data[i + count] = buf.data[i]
+    let b = buf.data[i]
+    buf.data[i + count] = b
   for i in 0 ..< count:
     buf.data[at + i] = b
 
@@ -57,7 +58,8 @@ proc removeRange*(buf: var Bytes; at, count: int) =
   if count <= 0: return
   let oldLen = buf.data.len
   for i in at + count ..< oldLen:
-    buf.data[i - count] = buf.data[i]
+    let b = buf.data[i]
+    buf.data[i - count] = b
   buf.data.setLen(oldLen - count)
 
 proc compact*(buf: var Bytes; dst, src, count: int) {.inline.} =
@@ -82,7 +84,7 @@ proc `$`*(buf: Bytes): string =
   result = ""
   for i, b in buf.data:
     if i > 0: result.add(" ")
-    result.add(b.toHex(2).toUpper())
+    result.add(toHex(BiggestInt(b), 2))
 
 
 proc patchThumbMovwMovtPair*(buf: var Bytes; at: int; value: uint32) =

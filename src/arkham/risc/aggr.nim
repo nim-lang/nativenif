@@ -47,7 +47,7 @@ proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int;
     # bounds: read them as one word and shift the tail down into place.
     g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, aggrSize - w, w))
     g.binImm(LsrA64, dst, int64((w - n) * 8))
-  elif n in {1, 2, 4} and n <= w:
+  elif n in [1, 2, 4] and n <= w:
     g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff, n))
   elif baseDies:
     let part = if n > 4: 4 else: 2                   # 2·part >= n > part
@@ -71,7 +71,7 @@ proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
   ## twin of `loadAggrTail`, and the reason it cannot simply store a full word: the
   ## bytes past the aggregate belong to whatever sits next to it.
   let n = aggrSize - byteOff
-  if n in {1, 2, 4} and n <= wordSize():
+  if n in [1, 2, 4] and n <= wordSize():
     g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff, n); g.emReg src)
   else:
     let tmp = g.takeBridge(avoid = base)
@@ -115,7 +115,9 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
     baseReg = loc.r                                    # a by-ref aggregate's pointer
   else:
     bridge = g.takeBridge()
-    case (if loc.kind == NoLoc: g.lookupSym(varName).cat else: scNone)
+    var cat = scNone
+    if loc.kind == NoLoc: cat = g.lookupSym(varName).cat
+    case cat
     of scGlobal: g.emGlobalAddr(bridge, varName)       # `(ret NoNifLineInfo)`: a global
     of scTvar: g.genTlvAddr(varName, bridge)           # source, addressed with `adr`
     else:

@@ -82,7 +82,9 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
   ## relation (eq/ne/lt/le). Fills `sd` and returns true; false (→ the caller's
   ## branch lowering) for anything that does not fit. Arch-independent: the a64
   ## backend lowers a match to `csel`, the x64 backend to `cmov`.
-  var condC, thenAsgn, elseAsgn: Cursor
+  var condC = default(Cursor)
+  var thenAsgn = default(Cursor)
+  var elseAsgn = default(Cursor)
   var haveElif, haveElse = false
   var ok = true
   var cc = c
@@ -109,7 +111,8 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
       else: ok = false
       skip cc
   if not (ok and haveElif and haveElse): return false
-  var thenBody, elseBody: Cursor
+  var thenBody = default(Cursor)
+  var elseBody = default(Cursor)
   if not singleAsgnOf(thenAsgn, thenBody): return false
   if not singleAsgnOf(elseAsgn, elseBody): return false
   if condC.kind != TagLit or condC.exprKind notin {EqC, NeqC, LtC, LeC}: return false
@@ -119,8 +122,10 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
     aC = pc; skip pc
     bC = pc
   if g.isFloatExpr(aC): return false
-  var thenDst, elseDst: string
-  var thenRhs, elseRhs: Cursor
+  var thenDst = ""
+  var elseDst = ""
+  var thenRhs = default(Cursor)
+  var elseRhs = default(Cursor)
   if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false
   if not selectAsgnDstRhs(elseBody, elseDst, elseRhs): return false
   if thenDst != elseDst: return false

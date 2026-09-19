@@ -11,7 +11,8 @@
 ## register — for what the profile lacks or reserves. The shared load/store emitter reaches these
 ## qualified — `cortexm.emitAtomic` — so the target is visible at the call site.
 
-import std / [assertions, tables, strformat]
+import std / syncio
+import std / [assertions, tables]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, mirrors, regbind]
@@ -133,7 +134,7 @@ proc emitAtomic*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   else: discard
   for r in g.bridgeRegs: g.releaseStaleName(r)
   let bits = g.atomicBits(argCurs[0])
-  if bits notin {8, 16, 32}:
+  if bits notin [8, 16, 32]:
     lengError c, "a " & $bits & "-bit atomic has no Cortex-M lowering: ARMv7-M " &
               "has no `ldrexd`/`strexd`, and two exclusive pairs over the halves " &
               "would be two claims rather than one atom", lengInfo(c)

@@ -18,6 +18,7 @@
 ## emitter would have had to reimplement the register-binding protocol, which is
 ## the part with a formal model behind it (`proofs/arkham_bindings.tla`).
 
+import std / syncio
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
@@ -267,11 +268,14 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident "cortex_m"
-    for (name, decl) in g.prog.mainTypeList:
+    for i in 0 ..< g.prog.mainTypeList.len:
+      let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)
-    for name, decl in g.prog.globals:
+    let globalDecls = g.prog.globalsInOrder()
+    for (name, decl) in globalDecls:
       g.genGlobal(name, decl)
-    for name, decl in g.prog.tvars:
+    let tvarDecls = g.prog.tvarsInOrder()
+    for (name, decl) in tvarDecls:
       g.genTvar(name, decl)             # one thread here, so each becomes a gvar
     g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
     if g.prog.syscalls.len > 0:
@@ -286,7 +290,8 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.intType(32)
       g.ab.intLit 0
       g.ab.close()
-    for sp in g.prog.syscalls:            # semihosting shims, called like any proc
+    for i in 0 ..< g.prog.syscalls.len:  # semihosting shims, called like any proc
+      let sp = g.prog.syscalls[i]
       g.emitSemihostRuntime(sp)
     # The board, forwarded for nifasm to place segments from — with every size
     # NORMALIZED TO BYTES. The units are a convenience for whoever writes the
@@ -313,14 +318,16 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             g.ab.tree BytesX: g.ab.intLit int64(g.board.noinitSize)
         g.ab.tree NifasmDecl.CoreD: g.ab.intLit int64(g.board.core)
     cortexm.emitInterruptTable(g)       # before the bodies only so it reads first
-    for info in g.prog.procs:
+    for i in 0 ..< g.prog.procs.len:
+      let info = g.prog.procs[i]
       genProc(g, info)
     # AFTER the bodies: whether anything divides is only known once they are
     # emitted. A firmware image has no `libgcc` to borrow `__aeabi_ldivmod`
     # from, so it carries its own — once, and only if used.
     if g.needsUDiv64: g.emitUDivMod64()
     if g.needsSDiv64: g.emitSDivMod64()
-    for (nm, bytes) in g.rodata:
+    for i in 0 ..< g.rodata.len:
+      let (nm, bytes) = g.rodata[i]
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes
@@ -357,11 +364,14 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident "riscv32"
-    for (name, decl) in g.prog.mainTypeList:
+    for i in 0 ..< g.prog.mainTypeList.len:
+      let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)
-    for name, decl in g.prog.globals:
+    let globalDecls = g.prog.globalsInOrder()
+    for (name, decl) in globalDecls:
       g.genGlobal(name, decl)
-    for name, decl in g.prog.tvars:
+    let tvarDecls = g.prog.tvarsInOrder()
+    for (name, decl) in tvarDecls:
       g.genTvar(name, decl)             # one thread here, so each becomes a gvar
     g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
     if g.prog.syscalls.len > 0:
@@ -373,14 +383,17 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.intType(32)
       g.ab.intLit 0
       g.ab.close()
-    for sp in g.prog.syscalls:            # semihosting shims, called like any proc
+    for i in 0 ..< g.prog.syscalls.len:  # semihosting shims, called like any proc
+      let sp = g.prog.syscalls[i]
       g.emitSemihostRuntime(sp)
     rv32.emitInterruptTable(g)            # before the bodies only so it reads first
-    for info in g.prog.procs:
+    for i in 0 ..< g.prog.procs.len:
+      let info = g.prog.procs[i]
       genProc(g, info)
     if g.needsUDiv64: g.emitUDivMod64()
     if g.needsSDiv64: g.emitSDivMod64()
-    for (nm, bytes) in g.rodata:
+    for i in 0 ..< g.rodata.len:
+      let (nm, bytes) = g.rodata[i]
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes
@@ -415,22 +428,29 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
       # only; the variadic tail is Apple's stack-passed one, which the call site
       # lays out itself (see `emitCallInner`).
-      for ex in g.prog.externOrder:
+      for i in 0 ..< g.prog.externOrder.len:
+        let ex = g.prog.externOrder[i]
         g.ab.tree ExtprocD:
           g.ab.symDef ex.asmName
           g.ab.str ex.extName
           g.emitSignature(ex.decl)
-    for (name, decl) in g.prog.mainTypeList:
+    for i in 0 ..< g.prog.mainTypeList.len:
+      let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)
-    for name, decl in g.prog.globals:
+    let globalDecls = g.prog.globalsInOrder()
+    for (name, decl) in globalDecls:
       g.genGlobal(name, decl)
-    for name, decl in g.prog.tvars:
+    let tvarDecls = g.prog.tvarsInOrder()
+    for (name, decl) in tvarDecls:
       g.genTvar(name, decl)
-    for sp in g.prog.syscalls:                  # one `(syproc …)` per used syscall
+    for i in 0 ..< g.prog.syscalls.len:  # one `(syproc …)` per used syscall
+      let sp = g.prog.syscalls[i]
       a64.emitSyproc(g, sp)
-    for info in g.prog.procs:
+    for i in 0 ..< g.prog.procs.len:
+      let info = g.prog.procs[i]
       genProc(g, info)
-    for v in g.variadicExterns:                 # the variadic call shapes the bodies used
+    for i in 0 ..< g.variadicExterns.len:  # the variadic call shapes the bodies used
+      let v = g.variadicExterns[i]
       g.ab.tree ExtprocD:
         g.ab.symDef v.asmName
         g.ab.str v.extName
@@ -440,7 +460,8 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # actual cross-module linking is nifasm's job: a module-suffixed symbol like
     # `Foo.0.othermod` makes nifasm auto-import `othermod.asm.nif` (which arkham
     # produced when it compiled that module). Emitting the decl inline is ignored.
-    for (nm, bytes) in g.rodata:
+    for i in 0 ..< g.rodata.len:
+      let (nm, bytes) = g.rodata[i]
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes

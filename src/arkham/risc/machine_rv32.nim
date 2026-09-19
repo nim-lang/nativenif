@@ -130,8 +130,9 @@ const
     ## `R8` (x8): not an ABI volatile, but the third leg of `atomicScratch`, so
     ## any proc with an atomic destroys it and the declaration must say so.
 
-  BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1]]
+  BridgeRegs* = IntBridgeRegs
 
+let
   ## The RV32 machine description handed to the register allocator.
   rv32Machine* = MachineDesc(
     arch: Rv32,
@@ -165,7 +166,7 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
-    atomicScratch: [IntBridgeRegs[0], IntBridgeRegs[1], R8],
+    atomicScratch: [R29, R30, R8],
       # The LL/SC triple: `old`, `new`/`expected`, and the store STATUS, all held
       # across a retry loop the allocator knows nothing about.
       #

@@ -21,6 +21,7 @@
 ##    `genInstA64` step over it once before dispatching, and the handful of
 ##    places that consume a whole node use `intoOperands`.
 
+import std / assertions
 import nifcore
 import tags
 
@@ -42,7 +43,7 @@ proc createAsmTagPool*(): TagPool =
   ## Seeding the whole vocabulary is what keeps the escape a decision this file
   ## makes rather than one the input makes.
   result = newTagPool()
-  for e in TagEnum:
+  for e in low(TagEnum)..high(TagEnum):
     if e == InvalidTagId: continue
     let id = result.registerTag(TagData[e][0])
     assert uint32(id) == uint32(TagData[e][1]),

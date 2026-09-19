@@ -743,7 +743,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
           # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
           # argument file, so the plan is never shifted (retByRef=false).
           let fixedSlots = paramSlots(g.prog, c)
-          let plan = planCall(g.md, fixedSlots & @tail, retByRef = false,
+          let plan = planCall(g.md, withTail(fixedSlots, tail), retByRef = false,
                               variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
           var pIdx = 0
           c.into:

@@ -22,6 +22,8 @@ import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
 import machine as machine_x64
 import emit, mem, aggr, value
 
+include compat2   # getOrQuit on host Nim
+
 const X64SyscallArgRegs* = [RDI, RSI, RDX, R10, R8, R9]
   ## The x86-64 Linux syscall argument registers. Identical to the C ABI EXCEPT
   ## arg4: the kernel takes it in r10, not rcx (rcx is destroyed by the `syscall`
@@ -648,7 +650,7 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
         if arkhamNameAggrBase and g.varType.hasKey(nm):
           # A by-reference aggregate whose pointer arrived on the stack: name it, for
           # the same reason `emitParamMoves` does (see `emRegAggrPtrVar`).
-          g.emRegAggrPtrVar(nm, loc.r, g.varType[nm])
+          g.emRegAggrPtrVar(nm, loc.r, g.varType.getOrQuit(nm))
         # The 8-byte load above reads the whole eightbyte, but a sub-8-byte
         # scalar's upper bits are NOT the value's extension: our own callers
         # store through the arg slot's declared width (a 4-byte `mov` for a

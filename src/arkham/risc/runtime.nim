@@ -20,6 +20,7 @@
 ##
 ## All three are emitted only for the targets that need them.
 
+import std / syncio
 import std / [assertions]
 import nifcore
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,

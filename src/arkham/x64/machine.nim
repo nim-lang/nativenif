@@ -51,6 +51,7 @@ const
   ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
   x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
 
+let
   ## System V AMD64 calling convention, as the arch-neutral allocator needs it.
   ##  * integer args:   rdi, rsi, rdx, rcx, r8, r9
   ##  * integer return: rax
@@ -127,6 +128,7 @@ const
     intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
     convClobbersGpr: @x64ClobbersGpr)
 
+const
   WinShadowSpace* = 32
     ## Win64 requires the caller to reserve 32 bytes below the return address that
     ## the callee may spill its four register arguments into — present whether or
@@ -152,6 +154,7 @@ const
   ## `> threshold` rule `planCall` implements) and indexes an SSE argument register
   ## POSITIONALLY, skipping the GPR of the same position. No Windows API arkham binds
   ## takes either.
+let
   win64Machine* = MachineDesc(
     arch: X86,
     intRetReg: RAX,

@@ -21,6 +21,7 @@
 ## or invert one), because they are pure lookup and everything branch-shaped
 ## needs them.
 
+import std / syncio
 import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
@@ -28,6 +29,8 @@ import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     mirrors, temps, exprpred, regbind, abi, bridges, typenav]
 import machine as machine_x64
 from symparser import derivedName
+
+include compat2   # getOrQuit on host Nim
 
 const FloatRet* = F0    # xmm0: SysV scalar-float return + first float argument
 
@@ -117,6 +120,7 @@ const StagingGuaranteed* = 1
   ## demand exceeded this number.
 
 proc heldStagingNames*(g: CodeGen): string =
+  result = ""
   for r in StagingCandidates:
     if r in g.stagingHeld:
       if result.len > 0: result.add ", "
@@ -358,7 +362,7 @@ proc namedBindings*(g: CodeGen): seq[tuple[r: Reg, name: string]] =
 proc restoreBindings*(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
   for it in saved:
     if g.rb.isBound(it.r): continue           # still ours, or legitimately re-let
-    let bt = g.nameBindTyp[it.name]
+    let bt = g.nameBindTyp.getOrQuit(it.name)
     g.ab.tree RebindX64:                      # zero machine code: a naming directive
       g.ab.symDef it.name
       if bt.aggrSym != NoTypeSym:
@@ -759,6 +763,7 @@ proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
   ## True if a float local/param currently lives in SIMD register `f` (per the
   ## allocator's view). A leaf-proc float param sits in its incoming arg register
   ## (xmm0–7), so the float staging pick must not clobber it.
+  result = false
   for name, pos in g.plan.symPos:
     let loc = g.plan.planned(pos)
     if loc.kind == InFReg and loc.f == f: return true
@@ -936,11 +941,11 @@ proc bindTypeOf*(g: var CodeGen; r: Reg): Cursor =
   ## which is not always what its expression's static type says — see `emitCast`.
   result = default(Cursor)
   if g.rb.isBoundTemp(r):
-    if g.tmpBindTyp.hasKey(r): result = g.tmpBindTyp[r].typ
+    if g.tmpBindTyp.hasKey(r): result = g.tmpBindTyp.getOrQuit(r).typ
   else:
     let nm = g.rb.boundName(r)
     if nm.len > 0 and g.nameBindTyp.hasKey(nm):
-      let bt = g.nameBindTyp[nm]
+      let bt = g.nameBindTyp.getOrQuit(nm)
       if bt.aggrSym == NoTypeSym: result = bt.typ
 
 proc rebindTempAs*(g: var CodeGen; r: Reg; typeCur: Cursor) =
@@ -1134,7 +1139,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
   # a param's NAME ordinal advances by exactly 1 per param, decoupled from the
   # GPR index (a stack/float param consumes 0 GPRs, an aggregate several).
   let fixedSlots = paramSlots(g.prog, c)
-  let plan = planCall(amd, fixedSlots & @tail, retByRef,
+  let plan = planCall(amd, withTail(fixedSlots, tail), retByRef,
                       variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
   var pIdx = 0
   g.ab.tree ParamsD:
@@ -1470,6 +1475,7 @@ proc atomicRegClaims*(op: IntrinsicOp): set[Reg] =
   ##    needs one. A load reads straight into its destination and a compare-exchange
   ##    works out of `rax`, so those two claim no `work` (this is exactly the
   ##    `needsWork` test below, and the two must stay in step).
+  result = default(set[Reg])
   if op in {AtomicCompareExchangeOp, AtomicFetchAndOp, AtomicFetchOrOp,
             AtomicFetchXorOp}:
     result.incl RAX
@@ -1563,7 +1569,7 @@ proc directCallTarget*(g: var CodeGen; fsym: string): CallTarget =
         foreignAbi: isForeignAbiProctype(g.prog, proctype))
     else:
       g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
-  g.callTarget[fsym]
+  g.callTarget.getOrQuit(fsym)
 
 proc winVariadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
                         fixed: int): string =
@@ -1578,7 +1584,7 @@ proc winVariadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlo
     of AFloat: key.add 'f'
     of AMem: key.add(if win64Machine.passesByRef(s.size): 'r' else: 'a')
     else: key.add 'i'
-  var ex: Extern
+  var ex = default(Extern)
   for e in g.prog.externOrder:
     if e.asmName == asmName: ex = e
   assert ex.asmName.len > 0, "arkham win_x64: a variadic call to an unknown extern " & asmName
@@ -1687,7 +1693,7 @@ proc restoreMemBase*(g: var CodeGen; pos: int) =
   ## Undo `reloadMemBase`: release the staging reg and restore the local's stack home.
   if g.savedHomes.hasKey(pos):
     g.giveBack g.plan.planned(pos).r
-    g.plan.planAtEmitTime(pos, g.savedHomes[pos])
+    g.plan.planAtEmitTime(pos, g.savedHomes.getOrQuit(pos))
     g.savedHomes.del pos
 
 proc lvalUsesReg*(g: var CodeGen; c: Cursor; r: Reg): bool =
@@ -1755,7 +1761,7 @@ proc lvalGlobBaseReg*(g: var CodeGen; c: Cursor): Reg =
 proc dropLvalStride*(g: var CodeGen; atPos: int) =
   ## Release a `takeLvalStride` scratch after the consuming `(mem …)`/`(lea …)`.
   if g.lvalStride.hasKey(atPos):
-    let s = g.lvalStride[atPos]
+    let s = g.lvalStride.getOrQuit(atPos)
     if atPos in g.lvalStrideBorrowed:
       # The consumer's destination register: it owns it, so it frees it.
       g.lvalStrideBorrowed.excl atPos
@@ -1941,8 +1947,8 @@ proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
     if g.symType.hasKey(varName):
       # Its declared type, whatever it is — see `restoreBindings` for why a blanket
       # `(i 64)` is not good enough for a non-pointer either.
-      isPtr = isPtrType(resolveType(g.prog, g.symType[varName]))
-      var tc = g.symType[varName]
+      isPtr = isPtrType(resolveType(g.prog, g.symType.getOrQuit(varName)))
+      var tc = g.symType.getOrQuit(varName)
       g.genTypeBody(tc)
     else:
       g.ab.intType(64)
@@ -1958,6 +1964,7 @@ proc emCallerSaveOpen*(g: var CodeGen): CallerSaveWindow =
   ## (`plan.callerSaveActive`). Idempotent with respect to an ENCLOSING window — a value
   ## already active is skipped, since its register may already be clobbered, so
   ## re-saving would store garbage, and reads already resolve to the outer slot.
+  result = default(CallerSaveWindow)
   for it in g.callerSaveSetAt():
     if not g.plan.callerSaveActive.hasKey(it.name): result.saved.add it
   if result.saved.len == 0: return

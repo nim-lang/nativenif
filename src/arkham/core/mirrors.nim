@@ -14,6 +14,7 @@
 ## the memory is written by something else, a call clobbers it, or the name goes
 ## out of scope. Getting the invalidation right is the whole content here.
 
+import std / envvars
 import std / [tables, sets, os]
 
 import nifcore

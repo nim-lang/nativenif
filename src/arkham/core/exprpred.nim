@@ -165,6 +165,7 @@ proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
   ## predecessor branch, which an interval test under-approximates. The allocator only
   ## hands out a caller-saved home to a value that is valid wherever it is bound, so
   ## "save whenever bound" is always well-defined. Sorted for deterministic output.
+  result = default(seq[tuple[reg: Reg, name: string]])
   if g.plan.callerSaveHomes.len == 0: return
   for reg, name in g.rb.gprBindings:
     if g.plan.callerSaveHomes.hasKey(name):

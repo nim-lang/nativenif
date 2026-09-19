@@ -389,6 +389,7 @@ proc arrivesNormalized*(g: var CodeGen; src: Cursor; width: int; signed: bool): 
   ## the fact is established by the very next instruction nifasm emits, never from
   ## a whole-function invariant. Shared by both backends because every fact it
   ## reads is a Leng-level or nifasm-level one, not an encoding-level one.
+  result = false
   if width <= 0 or width >= 64: return false
   # 1. The source's own scalar type ALREADY is (width, signed). arkham keeps every
   #    sub-64-bit scalar normalized to its type's width in a register — that is the

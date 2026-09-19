@@ -147,13 +147,13 @@ proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
             limit: int; folded: var int) =
   ## One step of a sibling walk, with the one-node lookahead the rules need.
-  var dst: SymId
-  var immNode: Cursor
+  var dst = SymId(0)
+  var immNode = c
   if movImmDest(buf, c, dst, immNode):
     when defined(arkhamPeepDbg): inc dbgCand
     var la = c
     skip la
-    var destNode: Cursor
+    var destNode = la
     when defined(arkhamPeepDbg):
       if la.hasMore and movFromSym(buf, la, dst, destNode): inc dbgPair
     if la.hasMore and movFromSym(buf, la, dst, destNode) and

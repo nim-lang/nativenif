@@ -14,6 +14,8 @@
 ## the mirror map and the plan at once — hence `tempCensus`, which exists to
 ## make a pool-dry failure say WHY rather than just that.
 
+import std / envvars
+import std / syncio
 import std / [strutils, os]
 
 
@@ -112,7 +114,10 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
                   (if l.typ.size > 0: "/" & $l.typ.size else: "")
       stderr.writeLine "HOMEAUDIT " & g.curProcName & " " & $r & " admits [" & who & "]"
 
-template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
+when not defined(nimony):
+  {.pragma: untyped.}
+
+template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) {.untyped.} =
   ## The volatile GPRs `pickTempReg` may hand out, in preference order, BEFORE the
   ## callee-saved fallback. `intTempRegs` is `r10` ALONE on x86-64, so the second
   ## simultaneously-live expression temp went straight to a callee-saved register —
@@ -134,12 +139,12 @@ template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
   ## shift (and by `rep movs`, which only ever runs inside a call — where no temp
   ## is live anyway). A proc that contains neither has no second use for them.
   block:
-    for r in g.md.intTempRegs: body            # r10
-    for r in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
+    for r {.inject.} in g.md.intTempRegs: body            # r10
+    for r {.inject.} in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
     if g.md.divRemReg != NoReg and not g.plan.divRegClobbered:
-      let r = g.md.divRemReg; body
+      let r {.inject.} = g.md.divRemReg; body
     if g.md.shiftCountReg != NoReg and not g.plan.shiftRegClobbered:
-      let r = g.md.shiftCountReg; body
+      let r {.inject.} = g.md.shiftCountReg; body
     # R11, the staging bridge, is NOT here — TRIED AND REVERTED. Adding it last (only
     # where the alternative is a callee-saved push and pop) looks free, because
     # `pickStagingScratch` has a callee-saved totality backstop of its own. It is not:
