@@ -101,7 +101,12 @@ const arkhamKnownUnsupported: seq[string] =
   # reorder in allocBin/allocFBin, plus the produce-into-memory spill bridge) and the
   # runtime `(aconstr …)`/`(oconstr …)` constructor as a direct call argument are both
   # handled on x86-64 AND AArch64. No quarantine remains.
-  @[]
+  @["eh_onerr",   # `(onerr ACTION FN ARGS…)` is the flag model's checked call:
+                  # ithaqua lowers it and jorogumo has the twin; arkham x64n has no
+                  # `onerr` in genStmt2 and asserts. The fixture exists to pin the
+                  # JS/wasm pair, not to promise native code for a shape hexer no
+                  # longer emits either.
+    ]
 
 const arkhamStagedVec: seq[string] =
   # Staged exactly like the risc backend's AdvSIMD block (`when declared(FldrqOp)`):
@@ -149,6 +154,18 @@ const arkhamA64Unsupported: seq[string] = @[
   # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr` StackPtr arm
   # is in place and mirrors x86-64; it is what this gap currently keeps unreachable.
   "aconstr_byref_spilled",
+  # `(onerr ACTION FN ARGS…)` — the flag model's checked call. Not an a64 gap: NO
+  # arkham backend (x64, a64, cortex) lowers `onerr`, and its absence is fine because
+  # neither `hexer` nor the `eraiser` emits it into Leng any more — the `onerr` in the
+  # corpus pins ithaqua's and jorogumo's handling, the two backends that carry it for
+  # hand-written fixtures. See `arkhamKnownUnsupported`.
+  "eh_onerr",
+  # `bintrin`'s two `Popcount` rows. The `Ctz`/`Clz` rows lower on a64 (and the
+  # portable `intrinsics` covers those anyway); what a64 has no row for is the
+  # population count, which the backend refuses by design — "guard the call with
+  # a `when`" (doc/intrinsics.md). One fixture per intrinsic *group* was the
+  # cheaper corpus, so the group is quarantined for its one missing row.
+  "bintrin",
 ]
 
 const arkhamX64Unsupported: seq[string] = @[
@@ -812,7 +829,12 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
     let base = extractFilename(file)
     if base.startsWith("mod_") or base.startsWith("err_"): continue
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in skip or name in arkhamStagedVec: continue
+    # `arkhamKnownUnsupported` is a construct NO arkham backend lowers (`onerr`):
+    # the plain pass tolerates its absence, and a starved register file has
+    # nothing to add to that answer. Without this, every stress pass reports an
+    # absent construct as NEW pressure breakage.
+    if name in skip or name in arkhamKnownUnsupported or name in arkhamStagedVec:
+      continue
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let asmNif = workDir / (name & ".stress.nif")
@@ -2280,6 +2302,12 @@ const cortexMUnsupported: seq[string] = @[
   "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "darwin_varargs_many",
   "naked_stacktrace_x64",
 
+  # `(onerr ACTION FN ARGS…)` — no arkham backend lowers it (and, unlike the
+  # by-name refusals above, `genStmt2` asserts on it). Fine: neither `hexer` nor
+  # the `eraiser` emits `onerr` into Leng; the fixture pins the wasm/JS pair that
+  # carries it. See `arkhamKnownUnsupported` and `arkhamA64Unsupported`.
+  "eh_onerr",
+
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
   # exclusives have no 64-bit form on this core either — there is no `ldrexd`, and
@@ -2560,6 +2588,13 @@ when defined(linux) and defined(amd64):
 # because the earlier passes left the `mod_*` modules in the same nimcache.)
 const arkhamDarwinAssembleKnown: seq[string] = @[
   "assembler_x64", "intrinsics_x64", "naked_stacktrace_x64",   # x86-64-pinned
+  # This pass consults only its own list — it is the one that does not honour
+  # `arkhamA64Unsupported`, and the two stems quarantined there for a MISSING
+  # CONSTRUCT (not a Darwin gap) have to be named here too or they read as new
+  # AArch64 breakage: `onerr`, which no arkham backend lowers
+  # (`arkhamKnownUnsupported`), and `bintrin`'s `Popcount` rows, which AArch64
+  # refuses by design.
+  "eh_onerr", "bintrin",
 ]
 proc arkhamDarwinAssembleTests() =
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
