@@ -17,7 +17,7 @@
 ## `(ssize)` placeholders are patched HERE and not at the instruction that
 ## carries one: the peak stack depth is not known until the body is done.
 
-import std / [tables, sets, algorithm]
+import std / [tables, sets, algorithm, syncio]
 import nifcore
 import core / [context, sem, cursors, diagnostics, typesem, 
                emit, tags, model, tagconv, decls, stackslots, relocs,
@@ -39,6 +39,8 @@ import rv32/regs as rvregs
 import thumb/board
 import rv32/instr
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
+
+include compat2   # getOrQuit on host Nim
 
 proc genInst(n: var Cursor; ctx: var GenContext)
 
@@ -97,7 +99,7 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
       if t.kind == Symbol:
         let id = getSymId(t)
         if id in locals:
-          acc = max(acc, base + computeStackArgSize(locals[id]))
+          acc = max(acc, base + computeStackArgSize(locals.getOrQuit(id)))
         else:
           let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
           if s != nil and s.typ != nil and s.typ.kind == ProcT:

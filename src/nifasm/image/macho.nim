@@ -1,10 +1,12 @@
 # Mach-O binary format writer for macOS
 
-import std / [streams, os, strutils]
+import std / [streams, os, strutils, syncio, assertions]
 
 import ../core/buffers
 import dwarf   # the per-proc unwind FACTS; `__TEXT,__eh_frame` below is the same
                # DWARF encoding the ELF path emits
+
+include compat2   # canRaise
 
 type
   # Import info for dynamic linking
@@ -265,6 +267,7 @@ const
   REBASE_TYPE_POINTER* = 1'u8
 
 proc initMachOHeader(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; flags: uint32 = 0): MachO_Header =
+  result = default(MachO_Header)
   result.magic = MH_MAGIC_64
   result.cputype = cputype
   result.cpusubtype = cpusubtype
@@ -276,6 +279,7 @@ proc initMachOHeader(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; fla
 
 proc initSegment64(segname: string; vmaddr, vmsize, fileoff, filesz: uint64;
                     maxprot, initprot: uint32; nsects: uint32): MachO_Segment64 =
+  result = default(MachO_Segment64)
   result.cmd = LC_SEGMENT_64
   result.cmdsize = uint32(sizeof(MachO_Segment64) + nsects.int * sizeof(MachO_Section64))
   result.segname = default(typeof(result.segname))
@@ -293,6 +297,7 @@ proc initSegment64(segname: string; vmaddr, vmsize, fileoff, filesz: uint64;
 
 proc initSection64(sectname, segname: string; address, size: uint64;
                     offset: uint32; align: uint32; flags: uint32): MachO_Section64 =
+  result = default(MachO_Section64)
   result.sectname = default(typeof(result.sectname))
   for i, c in sectname:
     if i < 16:
@@ -313,6 +318,7 @@ proc initSection64(sectname, segname: string; address, size: uint64;
   result.reserved3 = 0
 
 proc initEntryPoint(entryoff: uint64): MachO_EntryPoint =
+  result = default(MachO_EntryPoint)
   result.cmd = LC_MAIN
   result.cmdsize = uint32(sizeof(MachO_EntryPoint))
   result.entryoff = entryoff
@@ -381,7 +387,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
                  bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[];
                  rebases: seq[RodataRebase] = @[];
                  symMap: seq[(int, string)] = @[];
-                 unwind: seq[ProcUnwind] = @[]) =
+                 unwind: seq[ProcUnwind] = @[]) {.canRaise.} =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
@@ -549,7 +555,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
     strTab.add 0'u8                       # string index 0 is the empty name
     for p in unwind:
       if p.stop <= p.start: continue
-      var nl: MachO_Nlist64
+      var nl = default(MachO_Nlist64)
       nl.n_strx = uint32(strTab.len)
       nl.n_type = N_SECT
       nl.n_sect = 1                       # `__text` is section 1
@@ -588,7 +594,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
                                   uint32(codeFileOffset), 2, textSectionFlags)  # align 2^2 = 4
   # `__eh_frame` is data, not instructions: no `S_ATTR_PURE_INSTRUCTIONS`, or a
   # disassembler walks the CFI as code.
-  var ehSection: MachO_Section64
+  var ehSection = default(MachO_Section64)
   if hasEhFrame:
     ehSection = initSection64("__eh_frame", "__TEXT", textSectionVmaddr + ehOff,
                               uint64(ehFrame.len),
@@ -596,7 +602,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
 
   # Create DATA segment and its sections (__got, __thread_vars, __thread_data,
   # __bss — only those that are present), in vm order.
-  var dataSegment: MachO_Segment64
+  var dataSegment = default(MachO_Segment64)
   var dataSections: seq[MachO_Section64] = @[]
 
   if hasData:
@@ -635,7 +641,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
                                        VM_PROT_READ, VM_PROT_READ, 0)
 
   # Create LC_DYLD_INFO_ONLY. Linkedit layout: [rebase][bind][string table].
-  var dyldInfo: MachO_DyldInfo
+  var dyldInfo = default(MachO_DyldInfo)
   dyldInfo.cmd = LC_DYLD_INFO_ONLY
   dyldInfo.cmdsize = uint32(sizeof(MachO_DyldInfo))
   if rebaseInfo.len > 0:
@@ -658,7 +664,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
   dyldInfo.export_size = 0
 
   # Create LC_SYMTAB (minimal, empty symbol table)
-  var symtab: MachO_Symtab
+  var symtab = default(MachO_Symtab)
   symtab.cmd = LC_SYMTAB
   symtab.cmdsize = uint32(sizeof(MachO_Symtab))
   if symEntries.len > 0:
@@ -674,7 +680,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
     symtab.strsize = 1  # At least 1 byte for null terminator
 
   # Create LC_DYSYMTAB (dynamic symbol table, minimal)
-  var dysymtab: MachO_DySymtab
+  var dysymtab = default(MachO_DySymtab)
   dysymtab.cmd = LC_DYSYMTAB
   dysymtab.cmdsize = uint32(sizeof(MachO_DySymtab))
   # All fields 0 - no dynamic symbols, except that the proc symbols above are all
@@ -686,13 +692,13 @@ proc writeMachO*(code: Bytes; bssSize: int;
     dysymtab.iundefsym = uint32(symEntries.len)
 
   # Create LC_LOAD_DYLINKER
-  var dylinker: MachO_DyLinker
+  var dylinker = default(MachO_DyLinker)
   dylinker.cmd = LC_LOAD_DYLINKER
   dylinker.cmdsize = uint32(dylinkerSize)
   dylinker.name_offset = uint32(sizeof(MachO_DyLinker))  # Name follows immediately
 
   # Create LC_LOAD_DYLIB for libSystem.B.dylib
-  var dylib: MachO_DyLib
+  var dylib = default(MachO_DyLib)
   dylib.cmd = LC_LOAD_DYLIB
   dylib.cmdsize = uint32(dylibSize)
   dylib.name_offset = uint32(sizeof(MachO_DyLib))  # Name follows immediately
@@ -853,8 +859,8 @@ proc writeMachO*(code: Bytes; bssSize: int;
                (uint32(modifiedCode[pos+6]) shl 16) or (uint32(modifiedCode[pos+7]) shl 24)
       if ((lo shr 24) and 0x3F'u32) == 0x39'u32:
         let size = (lo shr 30) and 0x3'u32
-        doAssert (pageOff and ((1'u64 shl size) - 1)) == 0,
-          "gload/gstore: global page-offset not aligned to its access size"
+        if (pageOff and ((1'u64 shl size) - 1)) != 0:
+          quit "nifasm: gload/gstore: global page-offset not aligned to its access size"
         lo = lo or (uint32((pageOff shr size) and 0xFFF) shl 10)
       else:
         lo = lo or (uint32(pageOff and 0xFFF) shl 10)
@@ -948,7 +954,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
     for i, b in strTab: linkeditData[strTabOff.int + i] = b
   else:
     # Add null terminator for empty string table at the end
-    linkeditData[^1] = 0
+    linkeditData[linkeditData.len - 1] = 0
   f.writeData(unsafeAddr linkeditData[0], linkeditData.len)
 
   # BSS is not written to file (zero-initialized by loader)
@@ -976,7 +982,7 @@ proc encodeRelInfo(symIdx: int; kind: MachORelKind): uint32 =
 proc writeMachOObject*(code: Bytes; dataImage: seq[byte];
                        syms: seq[MachOSym]; nDefined: int;
                        textRels, dataRels: seq[MachORel];
-                       cputype, cpusubtype: uint32; outfile: string) =
+                       cputype, cpusubtype: uint32; outfile: string) {.canRaise.} =
   ## Emit a relocatable `MH_OBJECT` for the system linker to finish (the path used
   ## when the program links against foreign `.o`s / frameworks, e.g. Objective-C).
   ## Unlike `writeMachO` it does no address layout, GOT/stub synthesis, dyld bind
@@ -1038,14 +1044,14 @@ proc writeMachOObject*(code: Bytes; dataImage: seq[byte];
   textSection.reloff = uint32(textRelOff)
   textSection.nreloc = uint32(textRels.len)
 
-  var dataSection: MachO_Section64
+  var dataSection = default(MachO_Section64)
   if hasData:
     dataSection = initSection64("__data", "__DATA", uint64(dataAddr),
                                 uint64(dataImage.len), uint32(dataFileOff), 3, S_REGULAR)
     dataSection.reloff = uint32(dataRelOff)
     dataSection.nreloc = uint32(dataRels.len)
 
-  var symtab: MachO_Symtab
+  var symtab = default(MachO_Symtab)
   symtab.cmd = LC_SYMTAB
   symtab.cmdsize = uint32(sizeof(MachO_Symtab))
   symtab.symoff = uint32(symOff)
@@ -1053,7 +1059,7 @@ proc writeMachOObject*(code: Bytes; dataImage: seq[byte];
   symtab.stroff = uint32(strOff)
   symtab.strsize = uint32(strtab.len)
 
-  var dysymtab: MachO_DySymtab
+  var dysymtab = default(MachO_DySymtab)
   dysymtab.cmd = LC_DYSYMTAB
   dysymtab.cmdsize = uint32(sizeof(MachO_DySymtab))
   dysymtab.iextdefsym = 0
@@ -1089,7 +1095,7 @@ proc writeMachOObject*(code: Bytes; dataImage: seq[byte];
   # Symbol table.
   for _ in afterRels ..< symOff: f.write(0'u8)
   for i, s in syms:
-    var nl: MachO_Nlist64
+    var nl = default(MachO_Nlist64)
     nl.n_strx = strx[i]
     if s.defined:
       nl.n_type = N_SECT or N_EXT

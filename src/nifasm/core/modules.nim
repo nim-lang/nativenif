@@ -75,7 +75,7 @@ proc markSymbolUsed*(ctx: var GenContext; s: SymId) =
   if s in ctx.generatedSymbols:
     return
 
-  var key: SymId
+  var key = default(SymId)
   if dedupKeyOf(ctx, s, key):
     # Check if we already have a canonical symbol for this key
     if key in ctx.dedupTable:
@@ -93,7 +93,7 @@ proc markSymbolUsed*(ctx: var GenContext; fullName: string) =
 
 proc canonicalOf*(ctx: var GenContext; s: SymId): SymId =
   ## The canonical symbol `s` is merged with (for dedup merging); `s` itself if none.
-  var key: SymId
+  var key = default(SymId)
   if dedupKeyOf(ctx, s, key):
     result = ctx.dedupTable.getOrDefault(key, s)
   else:

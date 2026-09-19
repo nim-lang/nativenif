@@ -29,6 +29,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as avr
 import regs
 
+include compat2   # getOrQuit on host Nim
+
 type
   AvrMemKind* = enum
     amPtr       ## `X`, or `Y+q` / `Z+q` — the indirect forms
@@ -143,9 +145,10 @@ proc unbindNames*(ctx: var GenContext; reg: avr.Register; isPair: bool) =
 proc checkFree(ctx: var GenContext; r: avr.Register; n: Cursor) =
   if r in ctx.avrRegBindings:
     error("Register " & regName(r) & " is bound to variable '" &
-          ctx.avrRegBindings[r] & "', use the variable name instead", n)
+          ctx.avrRegBindings.getOrQuit(r) & "', use the variable name instead", n)
 
 proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
+  result = default(OperandAvr)
   if n.kind == TagLit:
     let t = n.tag
     if rawTagIsAvrPair(t):
@@ -309,8 +312,8 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
         fieldName = getSym(n)
         inc n
         while n.hasMore: skip n
-      var objType: Type
-      var baseMem: AvrMem
+      var objType = default(Type)
+      var baseMem = default(AvrMem)
       if baseOp.typ != nil and baseOp.typ.kind == TypeKind.PtrT:
         objType = resolvedBase(baseOp.typ, ctx, n)
         if objType == nil or objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
@@ -358,7 +361,7 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
         error("AVR: `(at …)` folds only a CONSTANT index — there is no scaled " &
               "address mode here, so a computed one is arkham's to add", n)
       var elemType: Type = nil
-      var baseMem: AvrMem
+      var baseMem = default(AvrMem)
       if baseOp.kind == okMem and baseOp.typ != nil and
          baseOp.typ.kind == TypeKind.StackOffT and
          baseOp.typ.offType.kind == TypeKind.ArrayT:
@@ -456,6 +459,7 @@ proc parseDestAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
   ## A destination differs from a source in exactly one way: writing a register
   ## that hosts a named local is legal when the write is what `rebind` recorded,
   ## so the bound-register check does not apply. Everything else is shared.
+  result = default(OperandAvr)
   if n.kind == TagLit and rawTagIsAvrPair(n.tag):
     result.kind = okReg
     result.isPair = true

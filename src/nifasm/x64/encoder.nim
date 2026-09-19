@@ -191,7 +191,7 @@ proc emitMovToMemSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits
   # one those encodings select AH/CH/DH/BH instead.
   let forceRex = bits == 8 and int(reg) in 4..7
   if rex.r or rex.b or rex.x or forceRex: dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0x88 else: 0x89)       # MOV r/m8,r8  /  MOV r/m(16|32),r
+  dest.add(if bits == 8: 0x88'u8 else: 0x89)       # MOV r/m8,r8  /  MOV r/m(16|32),r
   dest.emitMem(int(reg), mem)
 
 proc emitMovImmToMem*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) =
@@ -667,7 +667,7 @@ proc emitCmpSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits: int
   if mem.hasIndex and needsRex(mem.index): rex.x = true
   let forceRex = bits == 8 and int(reg) in 4..7  # SPL/BPL/SIL/DIL need REX (else AH/CH/DH/BH)
   if rex.r or rex.b or rex.x or forceRex: dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0x38 else: 0x39)       # CMP r/m8,r8 / CMP r/m(16|32),r
+  dest.add(if bits == 8: 0x38'u8 else: 0x39)       # CMP r/m8,r8 / CMP r/m(16|32),r
   dest.emitMem(int(reg), mem)
 
 proc emitCmpSized*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int) =
@@ -681,7 +681,7 @@ proc emitCmpSized*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int
   if mem.hasIndex and needsRex(mem.index): rex.x = true
   let forceRex = bits == 8 and int(reg) in 4..7
   if rex.r or rex.b or rex.x or forceRex: dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0x3A else: 0x3B)       # CMP r8,r/m8 / CMP r,r/m(16|32)
+  dest.add(if bits == 8: 0x3A'u8 else: 0x3B)       # CMP r8,r/m8 / CMP r,r/m(16|32)
   dest.emitMem(int(reg), mem)
 
 # ---- sub-width (8/16/32-bit) register ALU --------------------------------
@@ -793,7 +793,7 @@ proc emitTestImmSizedM*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits: i
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
   if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.add(if bits == 8: 0xF6'u8 else: 0xF7)
   dest.emitMem(0, mem)
   if bits == 8:
     dest.add(byte(imm and 0xFF))
@@ -810,7 +810,7 @@ proc emitTestImmSizedR*(dest: var Bytes; reg: Register; imm: int32; bits: int) =
   if needsRex(reg): rex.b = true
   if rex.b or (bits == 8 and force8Rex(reg)):
     dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.add(if bits == 8: 0xF6'u8 else: 0xF7)
   dest.add(encodeModRM(amDirect, 0, int(reg)))
   if bits == 8:
     dest.add(byte(imm and 0xFF))
@@ -829,7 +829,7 @@ proc emitShiftImmSizedR*(dest: var Bytes; reg: Register; count: int;
   if needsRex(reg): rex.b = true
   if rex.b or (bits == 8 and force8Rex(reg)):
     dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0xC0 else: 0xC1)
+  dest.add(if bits == 8: 0xC0'u8 else: 0xC1)
   dest.add(encodeModRM(amDirect, digit, int(reg)))
   dest.add(byte(count and 0xFF))
 
@@ -840,7 +840,7 @@ proc emitShiftClSizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
   if needsRex(reg): rex.b = true
   if rex.b or (bits == 8 and force8Rex(reg)):
     dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0xD2 else: 0xD3)
+  dest.add(if bits == 8: 0xD2'u8 else: 0xD3)
   dest.add(encodeModRM(amDirect, digit, int(reg)))
 
 proc emitUnarySizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
@@ -850,7 +850,7 @@ proc emitUnarySizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
   if needsRex(reg): rex.b = true
   if rex.b or (bits == 8 and force8Rex(reg)):
     dest.add(encodeRex(rex))
-  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.add(if bits == 8: 0xF6'u8 else: 0xF7)
   dest.add(encodeModRM(amDirect, digit, int(reg)))
 
 proc emitTest*(dest: var Bytes; a, b: Register) =
@@ -1466,7 +1466,7 @@ proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
   if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
-  dest.add(if bits == 8: 0x86 else: 0x87)  # XCHG r/m8,r8  /  XCHG r/m(16|32|64),r
+  dest.add(if bits == 8: 0x86'u8 else: 0x87)  # XCHG r/m8,r8  /  XCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 proc emitXadd*(dest: var Bytes; a, b: Register) =
@@ -1498,7 +1498,7 @@ proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(if bits == 8: 0xC0 else: 0xC1)  # XADD r/m8,r8  /  XADD r/m(16|32|64),r
+  dest.add(if bits == 8: 0xC0'u8 else: 0xC1)  # XADD r/m8,r8  /  XADD r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange
@@ -1533,7 +1533,7 @@ proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64)
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(if bits == 8: 0xB0 else: 0xB1)  # CMPXCHG r/m8,r8  /  CMPXCHG r/m(16|32|64),r
+  dest.add(if bits == 8: 0xB0'u8 else: 0xB1)  # CMPXCHG r/m8,r8  /  CMPXCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange with 8-byte operand

@@ -31,6 +31,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as rv
 import regs
 
+include compat2   # getOrQuit on host Nim
+
 type
   MemoryOperandRv* = object
     ## A resolved `base + offset` address. The whole addressing vocabulary of the
@@ -95,6 +97,7 @@ proc argWordTypeRv(p: ptr Param): Type =
     p.typ
 
 proc parseOperandRv*(n: var Cursor; ctx: var GenContext): OperandRv =
+  result = default(OperandRv)
   if n.kind == TagLit:
     let t = n.tag
     if rawTagIsRvFloatReg(t):
@@ -105,13 +108,13 @@ proc parseOperandRv*(n: var Cursor; ctx: var GenContext): OperandRv =
       result.typ = Type(kind: TypeKind.FloatT, bits: (if w == rv.FpD: 64 else: 32))
       if result.freg in ctx.rvFRegBindings:
         error("Register " & $result.freg & " is bound to variable '" &
-              ctx.rvFRegBindings[result.freg] & "', use the variable name instead", n)
+              ctx.rvFRegBindings.getOrQuit(result.freg) & "', use the variable name instead", n)
     elif rawTagIsRvGpr(t):
       result.reg = parseRegisterRv(n)
       result.typ = rvRegType()
       if result.reg in ctx.rvRegBindings:
         error("Register " & $result.reg & " is bound to variable '" &
-              ctx.rvRegBindings[result.reg] & "', use the variable name instead", n)
+              ctx.rvRegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
     elif t == NilTagId:
       result.kind = okImm
       result.immVal = 0
@@ -224,7 +227,7 @@ proc parseOperandRv*(n: var Cursor; ctx: var GenContext): OperandRv =
       if n.kind != Symbol: error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
-      var objType: Type
+      var objType = default(Type)
       var baseReg = rv.X0
       var baseOffset: int32 = 0
       if baseOp.typ.kind == TypeKind.PtrT:
@@ -273,7 +276,7 @@ proc parseOperandRv*(n: var Cursor; ctx: var GenContext): OperandRv =
         let indexOp = parseOperandRv(n, ctx)
         if not isIntegerType(indexOp.typ):
           error("Array index must be integer type, got " & $indexOp.typ, n)
-        var elemType: Type
+        var elemType = default(Type)
         var baseReg = rv.X0
         var baseOffset: int32 = 0
         if baseOp.typ.kind == TypeKind.AptrT:
@@ -480,6 +483,7 @@ proc parseDestRv*(n: var Cursor; ctx: var GenContext): OperandRv =
   ## A DESTINATION operand. Not simply `parseOperandRv`: an `(arg …)` destination
   ## RECORDS that the argument was bound, which is what the prepare block checks
   ## on the way out, and a variable destination un-clobbers its register.
+  result = default(OperandRv)
   if n.kind == TagLit and rawTagIsRvFloatReg(n.tag):
     result.isFloat = true
     let (f, w) = parseFloatRegisterRv(n)
@@ -488,13 +492,13 @@ proc parseDestRv*(n: var Cursor; ctx: var GenContext): OperandRv =
     result.typ = Type(kind: TypeKind.FloatT, bits: (if w == rv.FpD: 64 else: 32))
     if result.freg in ctx.rvFRegBindings:
       error("Register " & $result.freg & " is bound to variable '" &
-            ctx.rvFRegBindings[result.freg] & "', use the variable name instead", n)
+            ctx.rvFRegBindings.getOrQuit(result.freg) & "', use the variable name instead", n)
   elif n.kind == TagLit and rawTagIsRvGpr(n.tag):
     result.reg = parseRegisterRv(n)
     result.typ = rvRegType()
     if result.reg in ctx.rvRegBindings:
       error("Register " & $result.reg & " is bound to variable '" &
-            ctx.rvRegBindings[result.reg] & "', use the variable name instead", n)
+            ctx.rvRegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
     # Binding a REGISTER argument inside a prepare block. Unlike an ordinary
     # register destination this deliberately skips the binding check: the argument

@@ -12,13 +12,18 @@
 ## `genStmtM` deliberately does NOT wrap nested nodes in a listing row, which
 ## the other two selectors do. That asymmetry predates the split.
 
-import std / [tables, sets]
+import std / [tables, sets, assertions]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
                     listing, tags, model, tagconv, decls, 
                     stackslots, relocs, buffers]
 import encoder as thumb2
 import regs, operands
+
+include compat2   # getOrQuit on host Nim
+
+when not defined(nimony):
+  {.pragma: untyped.}   # Nimony: an unchecked template body, so `emitter(…)` can call a parameter
 
 proc genStmtM(n: var Cursor; ctx: var GenContext)
 proc genInstM(n: var Cursor; ctx: var GenContext)
@@ -96,7 +101,7 @@ proc bindFRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## its prior tenant so a stale value shows up as "Unknown symbol" rather than
   ## as a silent clobber.
   if freg in ctx.mFRegBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.mFRegBindings[freg]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.mFRegBindings.getOrQuit(freg)))
     ctx.mFRegBindings.del(freg)
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = regTag
@@ -110,7 +115,7 @@ proc bindRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## error rather than a silent clobber. The "(re)bind implies a kill" rule that
   ## `rebind` and `withreg` share; mirrors `bindRegA64`/`bindRegX64`.
   if reg in ctx.mRegBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.mRegBindings[reg]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.mRegBindings.getOrQuit(reg)))
     ctx.mRegBindings.del(reg)
   ctx.clobberedM.excl(reg)   # a fresh binding abandons a prior call's clobber
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
@@ -336,7 +341,7 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
   # own `inc n` still lands on operand 0. Same step as genInstX64/genInstA64.
   if isEscapedTag(n): inc n
 
-  template bin3(emitter: untyped) =
+  template bin3(emitter: untyped) {.untyped.} =
     ## `(op3 D A B)` → `D = A op B`, with B folded through a scratch when it is
     ## not already a register (Thumb-2's 3-operand forms take no immediate).
     inc n
@@ -352,7 +357,7 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       ctx.loadToRegM(br, b, start)
     emitter(ctx.buf.data, dr, ar, br)
 
-  template bin2(emitter: untyped) =
+  template bin2(emitter: untyped) {.untyped.} =
     ## `(op D S)` → `D = D op S`, the two-operand spelling. Thumb-2 is a
     ## three-operand ISA, so this is `op3 D, D, S`.
     inc n
@@ -366,7 +371,7 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       ctx.loadToRegM(sr, sOp, start)
     emitter(ctx.buf.data, dr, dr, sr)
 
-  template unary(emitter: untyped) =
+  template unary(emitter: untyped) {.untyped.} =
     inc n
     let d = parseDestM(n, ctx)
     let sOp = parseOperandM(n, ctx)

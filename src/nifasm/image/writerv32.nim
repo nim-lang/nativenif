@@ -27,10 +27,12 @@
 ## `thumb/board` accepts for RV32 only keeps the handlers reachable — nothing
 ## here reads `ctx.interrupts`, unlike `writecortexm`.
 
-import std / [tables]
+import std / [tables, syncio]
 
 import "../core" / [context, sem, relocs, buffers]
 import elf32
+
+include compat2   # getOrQuit on host Nim
 
 const
   Rv32LoadAddr* = 0x8000_0000'u32
@@ -94,12 +96,12 @@ proc writeRv32Image*(a: var GenContext; code: seq[byte];
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
     for it in a.rodataSymInits:
       if not labelPos.hasKey(it.labelId): continue
-      let sitePos = labelPos[it.labelId] + it.blobOff
+      let sitePos = labelPos.getOrQuit(it.labelId) + it.blobOff
       var targetVaddr = 0'u32
       case it.sym.kind
       of skProc, skRodata:
         if labelPos.hasKey(it.sym.offset):
-          targetVaddr = Rv32LoadAddr + uint32(labelPos[it.sym.offset])
+          targetVaddr = Rv32LoadAddr + uint32(labelPos.getOrQuit(it.sym.offset))
       of skGvar:
         targetVaddr = Rv32SramAddr + uint32(it.sym.size)
       else: discard
@@ -134,7 +136,7 @@ proc writeRv32Image*(a: var GenContext; code: seq[byte];
       case it.sym.kind
       of skProc, skRodata:
         if not labelPos.hasKey(it.sym.offset): continue
-        targetVaddr = Rv32LoadAddr + uint32(labelPos[it.sym.offset])
+        targetVaddr = Rv32LoadAddr + uint32(labelPos.getOrQuit(it.sym.offset))
       of skGvar:
         targetVaddr = Rv32SramAddr + uint32(it.sym.size)
       else: continue

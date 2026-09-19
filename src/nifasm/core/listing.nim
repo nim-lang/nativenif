@@ -20,9 +20,11 @@
 ## a template each selector expands its own copy instead of routing the
 ## recursion through a shared dispatcher.
 
-import std / [strutils, algorithm]
+import std / [strutils, algorithm, syncio]
 import nifcore, nifcoreparse
 import context
+
+include compat2   # onRaiseQuit
 
 const
   ListingTextCap* = 300
@@ -92,9 +94,10 @@ proc remapListing*(ctx: var GenContext; posMap: seq[int]) =
     let s = posMap[ctx.listRows[k].start]
     let e = posMap[ctx.listRows[k].stop]
     if e > s:
-      ctx.listRows[keep] = ctx.listRows[k]
-      ctx.listRows[keep].start = s
-      ctx.listRows[keep].stop = e
+      var row = ctx.listRows[k]
+      row.start = s
+      row.stop = e
+      ctx.listRows[keep] = row
       inc keep
   ctx.listRows.setLen keep
 
@@ -137,4 +140,4 @@ proc writeListing*(ctx: GenContext; path: string; textVaddr: int) =
     s.add '\t'; s.add r.procName
     s.add '\t'; s.add r.text
     s.add '\n'
-  writeFile(path, s)
+  onRaiseQuit writeFile(path, s)

@@ -62,7 +62,10 @@ type
     ## into it stay valid. (A `ref` so a handle stays valid even if `ctx.modules`
     ## rehashes while a decl body recursively pulls in further foreign modules.)
     buf*: TokenBuf                          # whole-module tree (main module only)
-    foreign*: ForeignModule                 # lazy per-symbol loader (foreign only)
+    when defined(nimony):
+      foreign*: nil ForeignModule           # lazy per-symbol loader (foreign only)
+    else:
+      foreign*: ForeignModule
     loaded*: bool  # True if already loaded into scope
 
   Arch* = enum

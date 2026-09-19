@@ -26,6 +26,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as thumb2
 import regs
 
+include compat2   # getOrQuit on host Nim
+
 type
   OperandM* = object
     kind*: OperandKind
@@ -80,6 +82,7 @@ proc argWordTypeM(p: ptr Param): Type =
   else: p.typ
 
 proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
+  result = default(OperandM)
   if n.kind == TagLit:
     let t = n.tag
     if rawTagIsMFloatReg(t):
@@ -88,7 +91,7 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
       result.typ = Type(kind: TypeKind.FloatT, bits: 32)
       if result.freg in ctx.mFRegBindings:
         error("Register " & $result.freg & " is bound to variable '" &
-              ctx.mFRegBindings[result.freg] & "', use the variable name instead", n)
+              ctx.mFRegBindings.getOrQuit(result.freg) & "', use the variable name instead", n)
     elif rawTagIsMGpr(t):
       result.reg = parseRegisterM(n)
       result.typ = mRegType()
@@ -96,7 +99,7 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
       # generator bug — it silently clobbers the value. Spell the name instead.
       if result.reg in ctx.mRegBindings:
         error("Register " & $result.reg & " is bound to variable '" &
-              ctx.mRegBindings[result.reg] & "', use the variable name instead", n)
+              ctx.mRegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
     elif t == NilTagId:
       result.kind = okImm
       result.immVal = 0
@@ -219,7 +222,7 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
       if n.kind != Symbol: error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
-      var objType: Type
+      var objType = default(Type)
       var baseReg = thumb2.R0
       var baseOffset: int32 = 0
       var baseIndex = thumb2.R0
@@ -277,7 +280,7 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
         let indexOp = parseOperandM(n, ctx)
         if not isIntegerType(indexOp.typ):
           error("Array index must be integer type, got " & $indexOp.typ, n)
-        var elemType: Type
+        var elemType = default(Type)
         var baseReg = thumb2.R0
         var baseOffset: int32 = 0
         var baseHasIndex = false
@@ -501,19 +504,20 @@ proc parseOperandM*(n: var Cursor; ctx: var GenContext): OperandM =
     error("Expected operand", n)
 
 proc parseDestM*(n: var Cursor; ctx: var GenContext): OperandM =
+  result = default(OperandM)
   if n.kind == TagLit and rawTagIsMFloatReg(n.tag):
     result.isFloat = true
     result.freg = parseFloatRegisterM(n)
     result.typ = Type(kind: TypeKind.FloatT, bits: 32)
     if result.freg in ctx.mFRegBindings:
       error("Register " & $result.freg & " is bound to variable '" &
-            ctx.mFRegBindings[result.freg] & "', use the variable name instead", n)
+            ctx.mFRegBindings.getOrQuit(result.freg) & "', use the variable name instead", n)
   elif n.kind == TagLit and rawTagIsMGpr(n.tag):
     result.reg = parseRegisterM(n)
     result.typ = mRegType()
     if result.reg in ctx.mRegBindings:
       error("Register " & $result.reg & " is bound to variable '" &
-            ctx.mRegBindings[result.reg] & "', use the variable name instead", n)
+            ctx.mRegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
     # Binding a REGISTER argument inside a prepare block. Unlike an ordinary
     # register destination this deliberately skips the `mRegBindings` check: the

@@ -38,7 +38,7 @@
 ## GPR rather than a flag, so the branch becomes a comparison followed by a
 ## `bne`/`beq` against `x0`.
 
-import std / [tables, sets, algorithm]
+import std / [tables, sets, algorithm, assertions]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
                     tags, model, tagconv, decls, stackslots, relocs, buffers,
@@ -249,20 +249,28 @@ proc genJtrueRv(n: var Cursor; ctx: var GenContext) =
 
 proc bindFRegRv(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                 freg: rv.FloatRegister) =
+  # At most one register holds `name` (every bind drops the previous one), so
+  # which one the scan finds first does not matter.
+  var stale = freg
   for r, nm in ctx.rvFRegBindings:
     if nm == name and r != freg:
-      ctx.rvFRegBindings.del r
+      stale = r
       break
+  if stale != freg: ctx.rvFRegBindings.del stale
   ctx.rvFRegBindings[freg] = name
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ, reg: regTag)
   ctx.scope.define(sym)
 
 proc bindRegRv(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                reg: rv.Register) =
+  # At most one register holds `name` (every bind drops the previous one), so
+  # which one the scan finds first does not matter.
+  var stale = reg
   for r, nm in ctx.rvRegBindings:
     if nm == name and r != reg:
-      ctx.rvRegBindings.del r
+      stale = r
       break
+  if stale != reg: ctx.rvRegBindings.del stale
   ctx.rvRegBindings[reg] = name
   ctx.clobberedRv.excl reg
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ, reg: regTag)

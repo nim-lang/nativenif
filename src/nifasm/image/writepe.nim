@@ -11,10 +11,12 @@
 ## ELF: nothing generated keeps a frame pointer, and on Windows it is the OS
 ## itself — not just a debugger — that walks frames with them.
 
-import std / [tables]
+import std / [tables, syncio]
 
 import "../core" / [context, sem, relocs, buffers]
 import pe, writecommon
+
+include compat2   # getOrQuit on host Nim
 
 proc writeExe*(a: var GenContext; outfile: string) =
   fillTraceTable(a)
@@ -32,7 +34,7 @@ proc writeExe*(a: var GenContext; outfile: string) =
       pe.IMAGE_FILE_MACHINE_AMD64
 
   # Build dynlink info for external procs
-  var dynlink: pe.DynLinkInfo
+  var dynlink = default(pe.DynLinkInfo)
   for lib in a.imports:
     dynlink.libs.add pe.ImportedLibInfo(name: lib.name, ordinal: lib.ordinal)
   for ext in a.extProcs:
@@ -62,7 +64,7 @@ proc writeExe*(a: var GenContext; outfile: string) =
     absSites.add pe.AbsSite(inData: true, pos: it.off.int)
   for it in a.rodataSymInits:
     if labelPos.hasKey(it.labelId):
-      absSites.add pe.AbsSite(inData: false, pos: labelPos[it.labelId] + it.blobOff)
+      absSites.add pe.AbsSite(inData: false, pos: labelPos.getOrQuit(it.labelId) + it.blobOff)
 
   # The patch hook below runs inside `writePE`, so it cannot capture the `var
   # GenContext` itself — take the site lists it needs (cheap ref-counted seqs) and a
@@ -72,18 +74,18 @@ proc writeExe*(a: var GenContext; outfile: string) =
   let bssSymInits = a.bssSymInits
   let rodataSymInits = a.rodataSymInits
 
-  proc symVaddr(lay: pe.PeLayout; sym: Symbol): uint64 =
+  proc symVaddr(lay: pe.PeLayout; sym: Symbol): uint64 {.closure.} =
     ## The runtime address of `sym`: a proc/rodata label sits in `.text`, a global in
     ## `.data`. (The `.bss` byte offset of a global is kept in `sym.size`.)
     case sym.kind
     of skProc, skRodata:
       if labelPos.hasKey(sym.offset):
-        lay.imageBase + lay.textRva.uint64 + labelPos[sym.offset].uint64
+        lay.imageBase + lay.textRva.uint64 + labelPos.getOrQuit(sym.offset).uint64
       else: 0'u64
     of skGvar: lay.imageBase + lay.dataRva.uint64 + sym.size.uint64
     else: 0'u64
 
-  proc patchAddrs(lay: pe.PeLayout) =
+  proc patchAddrs(lay: pe.PeLayout) {.closure.} =
     ## Bake every address that only the final layout determines. The ELF twin of this
     ## lives in `writeElf`; both are driven by the same three site lists.
     # Each global's RIP-relative `lea` placeholder: a 7-byte instruction with a disp32
@@ -105,7 +107,7 @@ proc writeExe*(a: var GenContext; outfile: string) =
     # which lives in `.text` at its own label.
     for it in rodataSymInits:
       if not labelPos.hasKey(it.labelId): continue
-      let sitePos = labelPos[it.labelId] + it.blobOff
+      let sitePos = labelPos.getOrQuit(it.labelId) + it.blobOff
       let v = symVaddr(lay, it.sym)
       for i in 0 ..< it.size:
         if sitePos + i < codeBuf[].data.len:
@@ -123,6 +125,9 @@ proc writeExe*(a: var GenContext; outfile: string) =
   # `driver.setupTlsWin`). Empty on every other target, and on a Windows image
   # with no thread-locals at all.
   let tlsIndexOff = if a.winTlsIndexSym != nil: a.winTlsIndexSym.size else: -1
-  writePE(a.buf, dataImage, a.bssOffset, entryOff, machine, outfile, dynlink,
-          absSites, patchAddrs, (if a.debugInfo: a.unwind else: @[]),
-          a.winTlsTemplate, tlsIndexOff)
+  try:
+    writePE(a.buf, dataImage, a.bssOffset, entryOff, machine, outfile, dynlink,
+            absSites, patchAddrs, (if a.debugInfo: a.unwind else: @[]),
+            a.winTlsTemplate, tlsIndexOff)
+  except:
+    quit "nifasm: cannot write " & outfile

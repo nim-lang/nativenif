@@ -17,6 +17,7 @@ import tags, decls               # the tag ids, and `tag` — the escape-aware r
 import sem                       # asmWordBits: the target's own scalar width
 
 proc getInt*(n: Cursor): int64 =
+  result = 0
   if n.kind == IntLit:
     result = n.intVal
   else:
@@ -61,6 +62,7 @@ proc normScalarBits*(bits: int64): int =
 # here needs to wrap it.
 
 proc getSym*(n: Cursor): string =
+  result = ""
   case n.kind
   of Symbol:
     result = symName(n)
@@ -85,6 +87,7 @@ proc getSymDef*(n: var Cursor): string =
   skip n
 
 proc getStr*(n: Cursor): string =
+  result = ""
   if n.kind == StrLit:
     result = n.strVal
   else:

@@ -14,13 +14,15 @@
 ## into a scratch base first — and which scratch is free is a fact about the
 ## binding tables, not about the instruction.
 
-import std / [tables, sets]
+import std / [tables, sets, assertions]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
                     tags, model, decls, 
                     stackslots, relocs]
 import encoder as arm64
 import regs
+
+include compat2   # getOrQuit on host Nim
 
 type
   OperandA64* = object
@@ -88,11 +90,12 @@ proc parseFloatOperandA64*(n: var Cursor; ctx: var GenContext): arm64.FloatRegis
   ## sees the use); a `Symbol` is resolved to the v-register its float local is bound
   ## to. The SIMD twin of `parseGprA64` — turns a raw use of a still-live bound float
   ## register into a build error instead of a silent clobber.
+  result = default(arm64.FloatRegister)
   if isA64FpRegOperand(n):
     result = tagToFloatRegA64(n.tag)
     if result in ctx.a64FRegBindings:
       error("Register " & $result & " is bound to variable '" &
-            ctx.a64FRegBindings[result] & "', use the variable name instead", n)
+            ctx.a64FRegBindings.getOrQuit(result) & "', use the variable name instead", n)
     inc n
   elif n.kind == Symbol:
     let sym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
@@ -130,6 +133,7 @@ proc parseFloatOperandA64*(n: var Cursor; ctx: var GenContext): arm64.FloatRegis
     error("Expected fp register (dN/sN) or float variable", n)
 
 proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
+  result = default(OperandA64)
   if n.kind == TagLit:
     let t = n.tag
     if rawTagIsA64Reg(t):
@@ -139,7 +143,7 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
       # silent clobber of the value it holds): spell the variable by name instead.
       if result.reg in ctx.a64RegBindings:
         error("Register " & $result.reg & " is bound to variable '" &
-              ctx.a64RegBindings[result.reg] & "', use the variable name instead", n)
+              ctx.a64RegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
     elif t == NilTagId:
       # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
       # with any pointer, never a sized integer). See `compatible`'s NilT arm.
@@ -155,7 +159,7 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
-      var objType: Type
+      var objType = default(Type)
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
       var baseIndex: arm64.Register
@@ -223,8 +227,8 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
         var indexOp = parseOperandA64(n, ctx)
         if not isIntegerType(indexOp.typ):
           error("Array index must be integer type, got " & $indexOp.typ, n)
-        var elemType: Type
-        var baseReg: arm64.Register
+        var elemType = default(Type)
+        var baseReg = default(arm64.Register)
         var baseOffset: int32 = 0
         var baseIndex: arm64.Register
         var baseShift: int = 0
@@ -261,7 +265,7 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
           error("at requires aptr, pointer-to-array, or stack array, got " & $baseOp.typ, n)
 
         var hasScratch = false
-        var scratchReg: arm64.Register
+        var scratchReg = default(arm64.Register)
         if n.hasMore:
           # The scratch is a raw `(xN)` or — when arkham `rebind`-bound it to a checked
           # name — the variable name; both resolve through parseOperandA64 to a register.
@@ -645,12 +649,13 @@ proc parseGprA64*(n: var Cursor; ctx: var GenContext): arm64.Register =
   result = op.reg
 
 proc parseDestA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
+  result = default(OperandA64)
   if n.kind == TagLit and rawTagIsA64Reg(n.tag):
     result.reg = parseRegisterA64(n)
     result.typ = Type(kind: RegisterT, regBits: 64)
     if result.reg in ctx.a64RegBindings:
       error("Register " & $result.reg & " is bound to variable '" &
-            ctx.a64RegBindings[result.reg] & "', use the variable name instead", n)
+            ctx.a64RegBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
     # (arg name [k]) as destination - binds a register argument inside a prepare block.
     # `into` bounds the cursor to the arg's children so the optional word index `k` (the

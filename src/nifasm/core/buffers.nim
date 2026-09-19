@@ -6,6 +6,11 @@ type
   Bytes* = object
     data: seq[byte]
 
+when defined(nimony):
+  proc add*[T](s: var seq[T]; other: openArray[T]) =
+    ## Host Nim's `seq.add(openArray)`, which Nimony's system does not have.
+    for x in other: s.add x
+
 proc initBytes*(): Bytes =
   result = Bytes(data: @[])
 

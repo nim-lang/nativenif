@@ -16,7 +16,11 @@
 ## module. Splitting them further is not a matter of taste; Nim has no cyclic
 ## imports.
 
-import std / [tables, sets]
+when defined(nimony):
+  # `findParam`/`findResult` answer nil for a name that is not there.
+  {.feature: "lenientnils".}
+
+import std / [tables, sets, assertions]
 import nifcore, nifmodules
 import "../../../../nimony/src/lib" / foreignmodules   # `hasDecl` on a lazily-opened module
 import "../../../../nimony/src/lib" / symparser
@@ -37,6 +41,8 @@ from "../rv32/encoder" as rv32 import nil
   # and it names registers of whichever target the declaration was written
   # for, which is why all three tables are in scope here and nowhere else
   # in `core`.
+
+include compat2   # getOrQuit on host Nim
 
 # Nominal typing makes these nine one cycle: a `(type …)` can name a foreign
 # symbol, resolving one parses a declaration, and that is more type parsing.
@@ -69,6 +75,7 @@ proc parseClobbers*(n: var Cursor; a64: var set[arm64.Register];
                    m: var set[thumb2.Register];
                    av: var set[avr.Register];
                    rvs: var set[rv32.Register]): set[x86.Register] =
+  result = default(set[x86.Register])
   # (clobber (rax) (rbx) ...) — or its AArch64 twin (clobber (x0) (x1) ...), or
   # Cortex-M's (clobber (r0) (r1) ...), or AVR's (clobber (rp24) (r18) ...).
   #
@@ -264,9 +271,10 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   ## pointee stays nominal via `parsePtrType`; only a by-value reference forces a
   ## follow). `declStart` is unused for foreign symbols — generateSymbol re-reads
   ## the cached decl by name.
-  let m = ctx.modules[modname]            # ref: stable across table growth
-  if not hasDecl(m.foreign, fullName): return nil
-  var c = getDecl(m.foreign, fullName, asmTags, ctx.pool)  # cursor at the one decl tree
+  let m = ctx.modules.getOrQuit(modname)            # ref: stable across table growth
+  let fm = m.foreign                      # nil only for the main module
+  if fm == nil or not hasDecl(fm, fullName): return nil
+  var c = getDecl(fm, fullName, asmTags, ctx.pool)  # cursor at the one decl tree
   let declStartCur = c                    # the un-entered decl (a tvar reads its initializer)
   let declTag = tagToNifasmDecl(c.tag)
   case declTag
@@ -490,6 +498,7 @@ proc resolvedBase*(t: Type; ctx: var GenContext; n: Cursor): Type =
   result = t.base
 
 proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+  result = default(Type)
   if n.kind == Symbol:
     let nameCur = n
     let sym = lookupWithAutoImport(ctx, scope, getSymId(n), n)
@@ -653,6 +662,7 @@ proc parseUnionBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   result = Type(kind: UnionT, fields: flds, size: finalSize, align: maxAlign)
 
 proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
+  result = default(seq[Param])
   # (params (param :name (reg) Type) ...)
   for pc in params(n):
     if declTag(pc) != ParamD: error("Expected param declaration", pc)
@@ -711,6 +721,7 @@ proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] 
   skip n # advance past the whole (params …) node
 
 proc parseResult*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
+  result = default(seq[Param])
   # (result (ret :name (reg) Type) ...)
   if n.kind == TagLit and tagToNifasmDecl(n.tag) == ResultD:
     loopInto n:

@@ -1,4 +1,9 @@
 
+when defined(nimony):
+  # `Scope.parent` is a nilable linked list (the outermost scope has none) and
+  # `lookup` answers nil for an unknown name.
+  {.feature: "lenientnils".}
+
 import std / [tables]
 import tags
 import ../x64/encoder as x86
@@ -261,6 +266,7 @@ proc isVoidPtr(t: Type): bool =
     ((t.base != nil and t.base.kind == VoidT) or t.baseName == "void")
 
 proc compatible*(want, got: Type): bool =
+  result = false
   if want == got: return true
   # RegisterT is lenient - accepts/provides any type that fits
   if want.kind == RegisterT:

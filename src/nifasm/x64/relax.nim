@@ -22,6 +22,8 @@
 import std / [tables, sets, algorithm, sequtils]
 import "../core" / [buffers, relocs]
 
+include compat2   # getOrQuit on host Nim
+
 proc canUseShortJump(distance: int): bool {.inline.} =
   ## Whether a displacement fits x86's signed 8-bit (rel8) jump form.
   distance >= -128 and distance <= 127
@@ -55,7 +57,7 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind
-  of rkJe: 0x74
+  of rkJe: 0x74'u8
   of rkJne: 0x75
   of rkJg: 0x7F
   of rkJl: 0x7C
@@ -114,6 +116,7 @@ proc backwardBranchTargets*(buf: Buffer): seq[int] =
   ## candidates `alignCodeX64` pads to a 16-byte boundary. Collect from the reloc
   ## list right before `shortenX64Jumps` (afterwards the shortened jumps are
   ## patched inline and no longer tracked).
+  result = default(seq[int])
   let lp = buf.labelPositions
   var seen = initHashSet[int]()
   for r in buf.relocs:
@@ -256,12 +259,12 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
     for i in 0 ..< relocs.len:
       savPrefix[i + 1] = savPrefix[i] +
         (if isShort[i]: longSizeOf(relocs[i].kind) - 2 else: 0)
-    proc newPos(p: int): int =
+    proc newPos(p: int): int {.closure.} =
       let below = lowerBound(relocPositions, p)   # # of relocs with position < p
       p - savPrefix[below]
     for i in 0 ..< relocs.len:
       if not isShort[i]: continue
-      let dist = newPos(labelPos[int(relocs[i].target)]) -
+      let dist = newPos(labelPos.getOrQuit(int(relocs[i].target))) -
                  (relocs[i].position - savPrefix[firstAtPos[i]] + 2)   # rel8 measured from 2-byte end
       if not canUseShortJump(dist):
         isShort[i] = false                          # overflow → grow back to long
@@ -293,7 +296,7 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
       let r = relocs[ri]
       if isShrinkableX64(r.kind) and isShort[ri]:
         let newSelf = result[r.position]
-        let newTgt = result[labelPos[int(r.target)]]
+        let newTgt = result[labelPos.getOrQuit(int(r.target))]
         let disp = newTgt - (newSelf + 2)
         newData.add(if r.kind == rkJmp: 0xEB'u8 else: shortJccOpcode(r.kind))
         newData.add(byte(disp and 0xFF))

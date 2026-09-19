@@ -1,8 +1,10 @@
 # Nifasm - Relocation System
 # A system for tracking and managing relocations in the instruction stream
 
-import std/[tables, sets, algorithm]
+import std/[tables, sets, algorithm, syncio]
 import buffers
+
+include compat2   # getOrQuit on host Nim
 
 type
   # Label system for jump optimization
@@ -153,7 +155,7 @@ proc getLabelPosition*(buf: Buffer; label: LabelId): int =
   for labelDef in buf.labels:
     if labelDef.id == label:
       return labelDef.position
-  raise newException(ValueError, "Label not found")
+  quit("nifasm: Label not found")
 
 proc labelPositions*(buf: Buffer): seq[int] =
   ## Every label's position, indexed by its id; `-1` for an id never defined (0 is a
@@ -233,20 +235,20 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
   case kind
   of rkAvrRjmp, rkAvrRcall:
     if (distance and 1) != 0:
-      raise newException(ValueError, "AVR branch to an odd address: " & $distance)
+      quit("nifasm: AVR branch to an odd address: " & $distance)
     let off = distance div 2
     if off < -2048 or off > 2047:
-      raise newException(ValueError,
-        "AVR rjmp/rcall out of range: " & $distance & " bytes (limit ±4 KB); " &
+      quit(
+        "nifasm: AVR rjmp/rcall out of range: " & $distance & " bytes (limit ±4 KB); " &
         "the two-word `jmp`/`call` reaches all of flash")
     patchAvrWord(buf, at, 0xF000'u16, uint16(off) and 0x0FFF)
   of rkAvrBrcond:
     if (distance and 1) != 0:
-      raise newException(ValueError, "AVR branch to an odd address: " & $distance)
+      quit("nifasm: AVR branch to an odd address: " & $distance)
     let off = distance div 2
     if off < -64 or off > 63:
-      raise newException(ValueError,
-        "AVR conditional branch out of range: " & $distance &
+      quit(
+        "nifasm: AVR conditional branch out of range: " & $distance &
         " bytes (limit ±128); invert the condition and branch over an `rjmp`")
     # bits 9:3 are the displacement; the condition (bits 2:0 and 10) stays.
     patchAvrWord(buf, at, 0xFC07'u16, (uint16(off) and 0x7F) shl 3)
@@ -255,10 +257,10 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
     # bits 8:4 of the first, k16 in its bit 0, and k15..k0 in the second.
     let target = distance + int(buf.absBase)
     if (target and 1) != 0:
-      raise newException(ValueError, "AVR call to an odd address: " & $target)
+      quit("nifasm: AVR call to an odd address: " & $target)
     let k = target div 2
     if k < 0 or k > 0x3FFFFF:
-      raise newException(ValueError, "AVR jmp/call target out of flash: " & $target)
+      quit("nifasm: AVR jmp/call target out of flash: " & $target)
     patchAvrWord(buf, at, 0xFE0E'u16,
                  (uint16((k shr 17) and 0x1F) shl 4) or uint16((k shr 16) and 1))
     patchAvrWord(buf, at + 2, 0x0000'u16, uint16(k and 0xFFFF))
@@ -271,7 +273,7 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
     patchAvrWord(buf, at, 0xF0F0'u16, kBits(value and 0xFF))
     patchAvrWord(buf, at + 2, 0xF0F0'u16, kBits((value shr 8) and 0xFF))
   else:
-    raise newException(ValueError, "not an AVR relocation: " & $kind)
+    quit("nifasm: not an AVR relocation: " & $kind)
 
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
@@ -284,7 +286,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
     let currentPos = reloc.position
     let t = int(reloc.target)
     if t < 0 or t >= labelPos.len or labelPos[t] < 0:
-      raise newException(ValueError, "Label not found")   # as `getLabelPosition`
+      quit("nifasm: Label not found")   # as `getLabelPosition`
     let targetPos = labelPos[t]
     let distance = calculateRelocDistance(currentPos, targetPos, reloc.kind)
 
@@ -435,8 +437,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       let neg = hi < 0
       let mag = if neg: -hi else: hi
       if mag > 0xFFF:
-        raise newException(ValueError,
-          "AArch64 address materialization out of range: " & $distance &
+        quit(
+          "nifasm: AArch64 address materialization out of range: " & $distance &
           " bytes (limit ±16 MB)")
       let imm21 = uint32(int32(lo) and 0x1FFFFF)
       var adrInstr = uint32(buf.data[currentPos]) or
@@ -471,8 +473,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       let wide = reloc.kind != rkTBcond
       let limit = if wide: 1 shl 24 else: 1 shl 20
       if distance < -limit or distance >= limit or (distance and 1) != 0:
-        raise newException(ValueError,
-          "Thumb branch out of range or misaligned: " & $distance &
+        quit(
+          "nifasm: Thumb branch out of range or misaligned: " & $distance &
           " bytes (limit ±" & $(limit div 1024 div 1024) & " MB)")
       let off = int32(distance) shr 1              # in halfwords
       let s0 = uint16((off shr 23) and 0x1)        # sign
@@ -510,8 +512,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       let target = currentPos + 4 + distance
       let delta = target - pcAligned
       if delta < -4095 or delta > 4095:
-        raise newException(ValueError,
-          "Thumb ADR out of range: " & $delta & " bytes (limit ±4 KB)")
+        quit(
+          "nifasm: Thumb ADR out of range: " & $delta & " bytes (limit ±4 KB)")
       let mag = uint32(if delta < 0: -delta else: delta)
       let i = uint16((mag shr 11) and 0x1)
       let imm3 = uint16((mag shr 8) and 0x7)
@@ -544,10 +546,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       # placeholder (`x0` for a jump, `ra` for a call), which is the whole
       # difference between the two kinds, so it is preserved rather than re-derived.
       if (distance and 1) != 0:
-        raise newException(ValueError, "RV32 jal to an odd address: " & $distance)
+        quit("nifasm: RV32 jal to an odd address: " & $distance)
       if distance < -(1 shl 20) or distance >= (1 shl 20):
-        raise newException(ValueError,
-          "RV32 jal out of range: " & $distance & " bytes (limit ±1 MB)")
+        quit(
+          "nifasm: RV32 jal out of range: " & $distance & " bytes (limit ±1 MB)")
       let d = cast[uint32](int32(distance))
       var instr = uint32(buf.data[currentPos]) or
                   (uint32(buf.data[currentPos + 1]) shl 8) or
@@ -567,10 +569,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       # low bit implicit again — so ±4 KiB. Everything else in the word (funct3,
       # which IS the condition, and both source registers) is preserved.
       if (distance and 1) != 0:
-        raise newException(ValueError, "RV32 branch to an odd address: " & $distance)
+        quit("nifasm: RV32 branch to an odd address: " & $distance)
       if distance < -4096 or distance > 4094:
-        raise newException(ValueError,
-          "RV32 branch out of range: " & $distance & " bytes (limit ±4 KB); " &
+        quit(
+          "nifasm: RV32 branch out of range: " & $distance & " bytes (limit ±4 KB); " &
           "the selector must invert it over a `jal`")
       let d = cast[uint32](int32(distance))
       var instr = uint32(buf.data[currentPos]) or
@@ -614,8 +616,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
-        raise newException(ValueError,
-          "AArch64 ADR out of range: " & $distance & " bytes (limit ±1 MB)")
+        quit(
+          "nifasm: AArch64 ADR out of range: " & $distance & " bytes (limit ±1 MB)")
       let imm21 = uint32(int32(distance) and 0x1FFFFF)
       let baseInstr = uint32(buf.data[currentPos]) or
                       (uint32(buf.data[currentPos + 1]) shl 8) or
@@ -689,7 +691,7 @@ proc prunePositions(buf: var Buffer; dead: seq[bool]): seq[int] =
   var spans: seq[(int, int)] = @[]          # (position, size) of each deletion
   for i in 0 ..< buf.relocs.len:
     if dead[i]: spans.add (buf.relocs[i].position, buf.relocs[i].originalSize)
-  spans.sort()
+  spans.sort(proc (a, b: (int, int)): int = cmp(a[0], b[0]))   # positions are distinct
   let curLen = buf.data.len
   result = newSeq[int](curLen + 1)
   var src = 0
@@ -715,8 +717,9 @@ proc prunePositions(buf: var Buffer; dead: seq[bool]): seq[int] =
   var kept = 0
   for i in 0 ..< buf.relocs.len:
     if dead[i]: continue
-    buf.relocs[kept] = buf.relocs[i]
-    buf.relocs[kept].position = result[buf.relocs[i].position]
+    var r = buf.relocs[i]
+    r.position = result[r.position]
+    buf.relocs[kept] = r
     inc kept
   buf.relocs.setLen kept
 
@@ -774,9 +777,9 @@ proc threadJumps*(buf: var Buffer): seq[int] =
       var hops = 0
       while hops <= buf.relocs.len:
         if not labelPos.hasKey(int(dest)): break
-        let tp = labelPos[int(dest)]
+        let tp = labelPos.getOrQuit(int(dest))
         if not uncondAt.hasKey(tp): break
-        let nxt = buf.relocs[uncondAt[tp]].target
+        let nxt = buf.relocs[uncondAt.getOrQuit(tp)].target
         if int(nxt) == int(dest): break        # self-loop: stop
         dest = nxt
         inc hops
@@ -791,7 +794,7 @@ proc threadJumps*(buf: var Buffer): seq[int] =
     for i in 0 ..< buf.relocs.len:
       let r = buf.relocs[i]
       if isUncondJump(r.kind) and labelPos.hasKey(int(r.target)) and
-         labelPos[int(r.target)] == r.position + r.originalSize and
+         labelPos.getOrQuit(int(r.target)) == r.position + r.originalSize and
          not inFixedRange(buf, r.position):    # a casejmp slot keeps its exact size
         dead[i] = true
         anyDead = true
@@ -895,13 +898,13 @@ proc invertCondJumps*(buf: var Buffer): seq[int] =
       if inFixedRange(buf, jccPos): continue    # a casejmp slot keeps its exact size
       let jmpPos = jccPos + buf.relocs[i].originalSize    # the branch's fall-through
       if not uncondAt.hasKey(jmpPos): continue            # fall-through is not a bare jump
-      let j = uncondAt[jmpPos]
+      let j = uncondAt.getOrQuit(jmpPos)
       if dead[j]: continue                                 # jump already claimed this pass
       if inFixedRange(buf, jmpPos): continue               # jmp inside a frozen region
       let afterJmp = jmpPos + buf.relocs[j].originalSize
       # The branch must target exactly the instruction after the jump (label `L`)…
       if not labelPos.hasKey(int(buf.relocs[i].target)): continue
-      if labelPos[int(buf.relocs[i].target)] != afterJmp: continue
+      if labelPos.getOrQuit(int(buf.relocs[i].target)) != afterJmp: continue
       # …and nothing may target the jump itself — else deleting it would silently
       # redirect that path to the fall-through instead of the jump's destination.
       if jmpPos in labelAt: continue

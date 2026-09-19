@@ -106,6 +106,7 @@ const
   STT_FUNC* = 2'u8
 
 proc initHeader*(entry: uint64; machine: Elf64_Half): Elf64_Ehdr =
+  result = default(Elf64_Ehdr)
   result.e_ident[EI_MAG0] = ELFMAG0
   result.e_ident[EI_MAG1] = ELFMAG1
   result.e_ident[EI_MAG2] = ELFMAG2
@@ -131,6 +132,7 @@ proc initHeader*(entry: uint64; machine: Elf64_Half): Elf64_Ehdr =
   result.e_shstrndx = 0
 
 proc initPhdr*(offset, vaddr, filesz, memsz: uint64; flags: uint32): Elf64_Phdr =
+  result = default(Elf64_Phdr)
   result.p_type = PT_LOAD
   result.p_flags = flags
   result.p_offset = offset
@@ -141,6 +143,7 @@ proc initPhdr*(offset, vaddr, filesz, memsz: uint64; flags: uint32): Elf64_Phdr 
   result.p_align = 0x1000
 
 proc initShdr*(name, typ, flags, address, offset, size, link, info, addralign, entsize: uint64): Elf64_Shdr =
+  result = default(Elf64_Shdr)
   result.sh_name = name.Elf64_Word
   result.sh_type = typ.Elf64_Word
   result.sh_flags = flags.Elf64_Xword

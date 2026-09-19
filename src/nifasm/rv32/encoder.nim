@@ -30,6 +30,7 @@
 ## move 32 bits, and there is no `fmv.x.d` — a double cannot pass through a GPR
 ## at all, only through memory. `emitFmvXW` therefore takes no width.
 
+import std / [assertions]
 import ../core/[buffers, relocs]
 
 type

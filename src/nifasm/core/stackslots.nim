@@ -13,6 +13,7 @@ type
     freeSlots*: seq[Slot]
 
 proc initSlotManager*(): SlotManager =
+  result = default(SlotManager)
   result.stackSize = 0
   result.maxStackSize = 0
   result.freeSlots = @[]
