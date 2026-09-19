@@ -21,6 +21,8 @@ import "../core" / [machinedesc, planner, programs, asmbuf,
 import machine as machine_x64
 import emit, mem, value, frame
 
+include compat2   # getOrQuit on host Nim
+
 type
   AsmDeclLoc* = object
     ## Where a `.assembler` param/local was DECLARED to live — the shared
@@ -337,16 +339,16 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
         case initC.kind
         of Symbol:
           if g.isAsmStackSym(initC):
-            g.ab.tree MovX64: (g.emReg g.asmReg[nm]; g.emStackMem(symName(initC)))
+            g.ab.tree MovX64: (g.emReg g.asmReg.getOrQuit(nm); g.emStackMem(symName(initC)))
           else:
-            g.movReg(g.asmReg[nm], g.asmRegOf(initC))
-        of IntLit: g.movImm(g.asmReg[nm], intVal(initC))
-        of UIntLit: g.movImm(g.asmReg[nm], cast[int64](uintVal(initC)))
+            g.movReg(g.asmReg.getOrQuit(nm), g.asmRegOf(initC))
+        of IntLit: g.movImm(g.asmReg.getOrQuit(nm), intVal(initC))
+        of UIntLit: g.movImm(g.asmReg.getOrQuit(nm), cast[int64](uintVal(initC)))
         of TagLit:
           if initC.exprKind != InstrC:
             lengError initC, "an `.assembler` initializer must be one instruction or an atom",
                       g.asmInfo
-          g.asmInstr(nameC, g.asmReg[nm], initC)
+          g.asmInstr(nameC, g.asmReg.getOrQuit(nm), initC)
         else:
           lengError initC, "unsupported `.assembler` initializer", g.asmInfo
       skip cc

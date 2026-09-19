@@ -61,6 +61,8 @@ from a64 import nil
 from cortexm import nil
 from rv32 import nil
 
+include compat2   # getOrQuit on host Nim
+
 proc armFrameSaved(g: CodeGen): set[Reg] =
   ## The callee-saved registers this back end's prologue actually saves — the
   ## same list `computeFrame` walks, which is the ARCHITECTURAL one and not
@@ -323,8 +325,7 @@ proc asmVoidInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   if argCurs.len != row.arity:
     lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
               g.asmInfo
-  case op
-  of BkptOp:
+  if op == BkptOp:
     let imm = argCurs[0]
     if imm.kind notin {IntLit, UIntLit}:
       # There is no register form: the comment field lives in the instruction
@@ -466,7 +467,7 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   # `tgt.argBits` the allocated path reads. Cortex-M has 32-bit registers and
   # nothing else, so a row asking for 64 there is refused by nifasm's width check
   # rather than encoded as something narrower.
-  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  let bits = if tgt.argBits in [8, 16, 32]: 32 else: 64
   if tgt.op in {ClzPinnedOp, ClzOp, RbitOp, CtzOp, RevOp, BswapOp} and
      BitScanOps notin g.md.caps:
     # Refused BY NAME rather than lowered. There is a software sequence for each
@@ -545,15 +546,15 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
       if loc.kind == aslStack: g.asmStore(nm, initC)
       elif initC.kind == TagLit:
         case initC.exprKind
-        of InstrC: g.asmInstr(nameC, g.asmReg[nm], initC)
+        of InstrC: g.asmInstr(nameC, g.asmReg.getOrQuit(nm), initC)
         of AddrC, HaddrC:
-          g.asmAddrOf(g.asmReg[nm], initC)
+          g.asmAddrOf(g.asmReg.getOrQuit(nm), initC)
           g.asmFlagsFresh = false
         else:
           lengError initC, "an `.assembler` initializer must be one instruction, " &
                     "an `addr`, or an atom", g.asmInfo
       else:
-        g.asmLoad(g.asmReg[nm], initC)
+        g.asmLoad(g.asmReg.getOrQuit(nm), initC)
         g.asmFlagsFresh = false
       skip cc
     while cc.hasMore: skip cc

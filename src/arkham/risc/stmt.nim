@@ -12,7 +12,7 @@
 ## and leaves the ordinary path to it when the shape is not exactly right, which
 ## is what keeps the recogniser honest about what it does not handle.
 
-import std / [assertions, tables, strformat]
+import std / [assertions, tables]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, constdata, exprpred,
@@ -96,7 +96,7 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; csel<cc> DST, A, B` — no forward jumps, no label. Returns false for
   ## anything that does not fit; the caller then falls back to branch lowering.
-  var sd: SelectDiamond
+  var sd = default(SelectDiamond)
   if not g.matchSelectDiamond(c, sd): return false
   # ── emit: cmp (sets NZCV) → THEN→bridge → ELSE→DST → csel DST, bridge, DST ──
   # The cmp reads the condition operands at their ORIGINAL values (DST not yet
@@ -479,7 +479,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         if g.ovfSigned:
           g.binReg(SmulhA64, rA, rB)                        # rA := high(a*b); `a` now dead
           g.movReg(rB, rD)                                  # rB := d
-          g.ab.splice &"(asr {g.emOp(rB)} 63)"             # rB := d asr 63 (expected high)
+          g.ab.splice ("(asr " & g.emOp(rB) & " 63)")             # rB := d asr 63 (expected high)
           g.binReg(EorA64, rA, rB)                          # rA := high ^ expected (0 ⟺ no ovf)
         else:
           g.binReg(UmulhA64, rA, rB)                        # rA := high(a*b) (0 ⟺ no ovf)

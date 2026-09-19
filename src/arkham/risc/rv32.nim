@@ -12,7 +12,8 @@
 ## load/store emitter reaches these qualified — `rv32.emitAtomic` — so the target
 ## is visible at the call site.
 
-import std / [assertions, tables, strformat]
+import std / syncio
+import std / [assertions, tables]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, mirrors, regbind]

@@ -15,9 +15,13 @@
 ## A `TypeCtx` is a lightweight *view* — pointers into whoever owns the symbol
 ## tables (the `CodeGen`). It carries no storage of its own and is cheap to copy.
 
+import std / assertions
+import std / syncio
 import std / tables
 import nifcore, nifcdecl
 import asmslots, programs
+include compat2   # getOrQuit on host Nim
+
 when defined(fieldDebug):
   import nifcoreparse
 
@@ -47,14 +51,15 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
   ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
   ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLoc`/
   ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
-  if tc.globals[].hasKey(nm): return SymInfo(cat: scGlobal, decl: tc.globals[][nm])
-  if tc.tvars[].hasKey(nm): return SymInfo(cat: scTvar, decl: tc.tvars[][nm])
-  if tc.callTarget[].hasKey(nm) and not tc.callTarget[][nm].indirect:
+  result = default(SymInfo)
+  if tc.globals[].hasKey(nm): return SymInfo(cat: scGlobal, decl: tc.globals[].getOrQuit(nm))
+  if tc.tvars[].hasKey(nm): return SymInfo(cat: scTvar, decl: tc.tvars[].getOrQuit(nm))
+  if tc.callTarget[].hasKey(nm) and not tc.callTarget[].getOrQuit(nm).indirect:
     # An `indirect` entry is the cached call path THROUGH a fn-ptr variable —
     # the symbol itself is a global/tvar, not a proc. Emitting such a call
     # first must not make a later `(asgn sym …)` (or any lvalue use) classify
     # the variable as a proc, so fall through to the decl lookups for it.
-    return SymInfo(cat: scProc, asmName: tc.callTarget[][nm].asmName)
+    return SymInfo(cat: scProc, asmName: tc.callTarget[].getOrQuit(nm).asmName)
   var found = false
   let d = lookupForeignDecl(tc.prog[], nm, found)
   if found:
@@ -88,7 +93,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   case c.kind
   of Symbol:
     let nm = symName(c)
-    if tc.symType[].hasKey(nm): return tc.symType[][nm]
+    if tc.symType[].hasKey(nm): return tc.symType[].getOrQuit(nm)
     let si = tc.lookupSym(nm)
     case si.cat
     of scProc:

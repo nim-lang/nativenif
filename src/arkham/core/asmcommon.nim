@@ -27,6 +27,8 @@ import diag
 # from here and add their own `asmPinReg`, so a rule stated once cannot drift
 # into two subtly different subsets of the same source language.
 
+include compat2   # getOrQuit on host Nim
+
 type
   AsmDeclKind* = enum
     aslNone,       ## no location pragma at all
@@ -124,7 +126,7 @@ proc asmRegOf*(g: var CodeGen; c: Cursor): Reg =
   if not g.asmReg.hasKey(nm):
     lengError c, "`" & userName(nm) & "` has no declared location — every local in an " &
               "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
-  result = g.asmReg[nm]
+  result = g.asmReg.getOrQuit(nm)
 
 proc instrOpAt*(g: var CodeGen; c: Cursor): IntrinsicOp =
   ## The row an `(instr SYM …)` node names, or `NoIntrinsicOp` if `c` is not one.

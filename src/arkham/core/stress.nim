@@ -28,9 +28,19 @@
 ## The whole mode compiles to nothing without `-d:arkhamStress`, so a shipped
 ## arkham cannot be perturbed by a stray environment variable.
 
+import std / [envvars, parseutils]
 import machinedesc
 
 const StressEnabled* = defined(arkhamStress)
+
+proc envInt*(name: string): int =
+  ## The integer the environment variable `name` holds; 0 when it is unset, empty
+  ## or not a number. (`parseutils`, not `strutils.parseInt`: the latter raises,
+  ## which under Nimony every caller would have to catch.)
+  let s = getEnv(name)
+  var v = BiggestInt(0)
+  if s.len > 0 and parseBiggestInt(s, v) == s.len: result = int(v)
+  else: result = 0
 
 const
   CalleeSavedFloor = 2
@@ -50,11 +60,7 @@ when StressEnabled:
     ## `ARKHAM_STRESS=k`: keep at most `k` registers per allocatable pool. Unset /
     ## empty / unparseable / `<= 0` leaves the mode dormant, so a
     ## `-d:arkhamStress` binary is a drop-in replacement for the shipped one.
-    let s = getEnv("ARKHAM_STRESS").strip
-    if s.len == 0: 0
-    else:
-      try: parseInt(s)
-      except ValueError: 0
+    envInt("ARKHAM_STRESS")
 else:
   const stressKeep* = 0
 

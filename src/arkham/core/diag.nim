@@ -14,6 +14,7 @@
 ## rejections are ordinary user errors and have to read like one.
 
 
+import std / syncio
 import symparser
 import nifcore
 

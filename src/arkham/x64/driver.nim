@@ -13,6 +13,7 @@
 ## `.assembler` body branches off to `asmproc` instead, because nothing about
 ## it goes through the allocator.
 
+import std / syncio
 import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
@@ -298,7 +299,8 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
-    for (name, decl) in g.prog.mainTypeList:
+    for i in 0 ..< g.prog.mainTypeList.len:
+      let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)
     if windows:
       # Every `importc` on Windows is a DLL import (there are no raw syscalls to
@@ -309,27 +311,35 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # a signature names the aggregate types it passes, and nifasm resolves them
       # as it reads the declaration.
       var dlls: seq[string] = @[]
-      for ex in g.prog.externOrder:
+      for i in 0 ..< g.prog.externOrder.len:
+        let ex = g.prog.externOrder[i]
         if ex.dll notin dlls: dlls.add ex.dll
       for dll in dlls:
         g.ab.tree ImpD: g.ab.str dll
-        for ex in g.prog.externOrder:
+        for i in 0 ..< g.prog.externOrder.len:
+          let ex = g.prog.externOrder[i]
           if ex.dll == dll: g.emitWinExtproc(ex)
-    for name, decl in g.prog.globals:
+    let globalDecls = g.prog.globalsInOrder()
+    for (name, decl) in globalDecls:
       g.genGlobal(name, decl)
     # `arkham.tls.0` (the per-thread block FS points at) is owned and emitted by
     # nifasm, the linker — one unified block sized for ALL bundled modules' tvars,
     # plus the entry-prologue `arch_prctl` that sets FS. arkham only references it.
-    for name, decl in g.prog.tvars:
+    let tvarDecls = g.prog.tvarsInOrder()
+    for (name, decl) in tvarDecls:
       g.genTvar(name, decl)
-    for sp in g.prog.syscalls:                  # one `(syproc …)` per used syscall
+    for i in 0 ..< g.prog.syscalls.len:  # one `(syproc …)` per used syscall
+      let sp = g.prog.syscalls[i]
       g.emitSyproc(sp)
-    for info in g.prog.procs:
+    for i in 0 ..< g.prog.procs.len:
+      let info = g.prog.procs[i]
       genProc(g, info)
-    for v in g.variadicExterns:                 # the variadic call shapes the bodies used
+    for i in 0 ..< g.variadicExterns.len:  # the variadic call shapes the bodies used
+      let v = g.variadicExterns[i]
       g.ab.tree ImpD: g.ab.str v.dll
       g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
-    for (nm, bytes) in g.rodata:
+    for i in 0 ..< g.rodata.len:
+      let (nm, bytes) = g.rodata[i]
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes

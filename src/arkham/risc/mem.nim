@@ -14,7 +14,7 @@
 ## below, and it is why so much of this asks the binding tables which register is
 ## free rather than picking one.
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / [assertions, tables, sets, strutils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, 
@@ -25,6 +25,8 @@ import emit
 from a64 import nil
 from cortexm import nil
 from rv32 import nil
+
+include compat2   # getOrQuit on host Nim
 
 proc takeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg   # defined below
 
@@ -130,7 +132,7 @@ proc bindStrideScratch*(g: var CodeGen; atPos: int; recycle: Reg) =
       g.lvalStrideOnBridge.excl atPos   # no bridge of its own to release
     g.plan.aux[atPos] = ExprAux(scratch: @[r])
   else:
-    g.bindTemp(g.plan.aux[atPos].scratch[0], ScalarSlot)
+    g.bindTemp(g.plan.aux.getOrQuit(atPos).scratch[0], ScalarSlot)
 
 proc freeExpr*(g: var CodeGen; c: Cursor) =
   ## PHASE B release: give back whatever `getExpr` homed at `c`'s position, once the
@@ -158,7 +160,7 @@ proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
       if pos in g.lateBaseBorrowedAt:
         g.lateBaseBorrowedAt.excl pos     # the caller's register; the caller releases it
       else:
-        g.dropBridge g.lvalGlobBase[pos]
+        g.dropBridge g.lvalGlobBase.getOrQuit(pos)
       g.lvalGlobBase.del pos
     return
   if c.kind == TagLit:
@@ -175,8 +177,8 @@ proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
         g.unbindLvalTemps(cc); skip cc
         if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
-        g.unbindTemp(g.plan.aux[atPos].scratch[0])
+      if g.plan.aux.hasKey(atPos) and g.plan.aux.getOrQuit(atPos).scratch.len > 0:
+        g.unbindTemp(g.plan.aux.getOrQuit(atPos).scratch[0])
     of DerefC:
       var cc = c
       cc.into:
@@ -190,8 +192,8 @@ proc unbindLvalTemps*(g: var CodeGen; c: Cursor) =
         skip cc
         if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
-        g.unbindTemp(g.plan.aux[patPos].scratch[0])
+      if g.plan.aux.hasKey(patPos) and g.plan.aux.getOrQuit(patPos).scratch.len > 0:
+        g.unbindTemp(g.plan.aux.getOrQuit(patPos).scratch[0])
     of BaseobjC:                                          # transparent: release inner lvalue
       var cc = c
       cc.into:

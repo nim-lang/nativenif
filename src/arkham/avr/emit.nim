@@ -16,6 +16,7 @@
 ## top of some local. An unbound pair (a bridge) is spelled raw, which is exactly
 ## the claim `rawReg`'s doc comment describes.
 
+import std / assertions
 import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,

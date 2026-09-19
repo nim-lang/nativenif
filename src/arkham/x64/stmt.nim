@@ -18,6 +18,7 @@
 ## that are only ever branched on, so the compare's answer can travel in the
 ## flags and the `setcc` that would materialise them never happens.
 
+import std / syncio
 import std / [assertions, tables, sets, algorithm]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
@@ -25,6 +26,8 @@ import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     mirrors, select, exprpred]
 import machine as machine_x64
 import emit, mem, aggr, value, frame
+
+include compat2   # getOrQuit on host Nim
 
 const CaseJmpMinBranches* = 4
   ## Below this the cmp/je chain is at most 3 compares — cheaper than the
@@ -159,7 +162,7 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; cmov<cc> DST, A` — no forward jumps, no label. Returns false for anything
   ## that does not fit; the caller then falls back to branch lowering.
-  var sd: SelectDiamond
+  var sd = default(SelectDiamond)
   if not g.matchSelectDiamond(c, sd): return false
   # ── emit: THEN→scratch → ELSE→DST → cmp (sets flags) → cmov DST, scratch ──
   # The COMPARE MUST BE LAST. Materializing a value is not flag-neutral: a store
@@ -397,7 +400,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         while t.kind == TagLit and t.exprKind == NotC:
           inc t; inc negations
         let src = symName(t)
-        var tag = g.condFuse.tag[src]
+        var tag = g.condFuse.tag.getOrQuit(src)
         for _ in 1 .. negations: tag = invertJcc(tag)
         g.condFuse.tag.del src
         g.condFuse.tag[b2] = tag
@@ -744,7 +747,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
   # Referenced labels first: a `(lab :L)` that some `(jmp L)` targets is a JOIN, so
   # the flags arriving there are whatever the other path left.
   var jumpTargets = initHashSet[string]()
-  var symCount = initCountTable[string]()
+  var symCount = initTable[string, int]()
     ## Every `Symbol` occurrence in the body, by name. A `SymbolDef` is a different
     ## kind and does not count, so the fusable bool — one `(asgn b …)` target and one
     ## `(elif b …)` condition — is exactly the name with a count of 2. That is a
@@ -765,7 +768,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
       ch.into:
         while ch.hasMore:
           if ch.kind == TagLit: stack.add ch
-          elif ch.kind == Symbol: symCount.inc symName(ch)
+          elif ch.kind == Symbol: inc symCount.mgetOrPut(symName(ch), 0)
           skip ch
 
   var pendingSym = ""          # a candidate `(asgn b <cmp>)` seen, nothing emitted since
@@ -774,7 +777,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
   var chainDecls: seq[string] = @[]
   var declPos = initTable[string, int]()
 
-  proc walk(g: var CodeGen; n: Cursor) =
+  proc walk(g: var CodeGen; n: Cursor) {.closure.} =
     var c = n
     c.into:
       while c.hasMore:
@@ -838,12 +841,12 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
                   inc t; inc guard
                 if t.kind == Symbol: copyOf = symName(t)
             while ac.hasMore: skip ac
-          if lhs.len > 0 and isCmp and symCount[lhs] == 2:
+          if lhs.len > 0 and isCmp and symCount.getOrDefault(lhs) == 2:
             pendingSym = lhs; pendingPos = pos
             copyPos.setLen 0                 # a fresh chain head: drop any aborted chain
             chainDecls = @[lhs]
           elif lhs.len > 0 and copyOf.len > 0 and copyOf == pendingSym and
-               symCount[lhs] == 2:
+               symCount.getOrDefault(lhs) == 2:
             # `b2 = b1` / `b2 = not b1`, both single-use: the answer is still only in
             # the flags. hexer renames the result bool once per inlined splice, so this
             # link is what connects `isValid`'s `(eq …)` to the caller's branch.
@@ -860,12 +863,12 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
             g.condFuse.cmp.incl pendingPos
             for p in copyPos: g.condFuse.link.incl p
             for nm in chainDecls:
-              if declPos.hasKey(nm): g.condFuse.decl.incl declPos[nm]
+              if declPos.hasKey(nm): g.condFuse.decl.incl declPos.getOrQuit(nm)
           else:
             when defined(arkhamFuseDbg):
               if s.len > 0:
                 stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & s &
-                  " pending=" & pendingSym & " count=" & $symCount[s]
+                  " pending=" & pendingSym & " count=" & $symCount.getOrDefault(s)
           pendingSym = ""; copyPos.setLen 0; chainDecls.setLen 0
           walk(g, c)                       # the branches themselves still get scanned
           skip c

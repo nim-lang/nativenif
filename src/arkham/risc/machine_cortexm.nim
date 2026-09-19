@@ -168,8 +168,9 @@ const
   ## the draw reaches it only where it would otherwise have had nothing. The
   ## AArch64 twin is `machine.AtomicScratchRegs`, and both are read through
   ## `MachineDesc.bridgeRegs`.
-  BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge]
+  BridgeRegs* = [R10, R11, ProduceBridge]   # `IntBridgeRegs` + `ProduceBridge`
 
+let
   ## The Cortex-M machine description handed to the register allocator.
   cortexMMachine* = MachineDesc(
     arch: ThumbM,
@@ -203,7 +204,7 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
-    atomicScratch: [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge],
+    atomicScratch: [R10, R11, ProduceBridge],
     floatBridgeReg: F31,                   # `machine.FloatBridgeReg`; s31 here
     memIntrinScratch: [R3, R4, R5],
     caps: {SubwordExtend, Freestanding, AllFlagBranches, BitScanOps},

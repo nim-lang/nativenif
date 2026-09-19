@@ -26,6 +26,8 @@ import risc/driver               # every load/store target: AArch64 (Darwin/Linu
 import x64/driver                # x86-64 / Linux backend
 import avr/driver                # AVR / avr5, bare metal
 
+include compat2                  # onRaiseQuit
+
 const
   Version = "0.1.0"
   Usage = """arkham — native code generator for Leng """ & Version & """
@@ -56,6 +58,21 @@ Supported --os/--cpu combinations (same symbols as Nimony's flags):
    embedded/avr is bare-metal avr5; see doc/internals/avr.md.
    embedded/riscv32 is bare-metal RV32IMAFD)
 """
+
+when defined(nimony):
+  # `system.hostOS`/`hostCPU` are compile-time magics Nimony does not expose
+  # (nimony's own `nifconfig` derives them the same way). Only the platforms
+  # arkham itself can be built for need a spelling here.
+  const
+    hostCPU =
+      when defined(arm64): "arm64"
+      elif defined(arm): "arm32"
+      elif defined(riscv32): "riscv32"
+      else: "amd64"
+    hostOS =
+      when defined(windows): "windows"
+      elif defined(macosx): "macosx"
+      else: "linux"
 
 proc archOf(os, cpu: string): string =
   ## Map a Nimony-style (--os, --cpu) pair onto arkham's internal arch name.
@@ -124,7 +141,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "riscv32", "rv32":
                generateRv32(buf, input, tags, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
-  writeFile(output, code)
+  onRaiseQuit writeFile(output, code)
 
 proc main() =
   var input, output, arch, os, cpu = ""

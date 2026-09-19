@@ -30,7 +30,7 @@
 ## end-to-end; floats (HFAs in v0–v7), stack-passed args, and aggregate value
 ## codegen `raiseAssert` for now.
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / [assertions, tables, sets, strutils, sequtils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
@@ -55,6 +55,8 @@ from a64 import nil
 # x0–x5, result x0) instead of a Darwin dynamic `extcall`, so nifasm's static ELF
 # backend serves it without a dynamic linker. `LinuxA64ExitNr` and the table live
 # in `programs`; AArch64 uses the asm-generic unistd numbers (write=64 not 1).
+
+include compat2   # getOrQuit on host Nim
 
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
 
@@ -463,7 +465,7 @@ proc prematLval*(g: var CodeGen; c: Cursor) =
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
         if late: g.prematLval(baseCur)
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
+      if g.plan.aux.hasKey(atPos) and g.plan.aux.getOrQuit(atPos).scratch.len > 0:
         g.bindStrideScratch(atPos, recycle)
     of PatC:
       let patPos = g.posOf(c)
@@ -485,7 +487,7 @@ proc prematLval*(g: var CodeGen; c: Cursor) =
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
         if late: g.prematAddrVal(baseCur)
         while cc.hasMore: skip cc
-      if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
+      if g.plan.aux.hasKey(patPos) and g.plan.aux.getOrQuit(patPos).scratch.len > 0:
         g.bindStrideScratch(patPos, recycle)
     of BaseobjC:                                          # transparent: materialize inner lvalue
       var cc = c
@@ -1135,7 +1137,10 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
       skip cc
   if loaded != NoReg: g.dropBridge loaded
 
-template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
+when not defined(nimony):
+  {.pragma: untyped.}
+
+template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp, addrOp: untyped) {.untyped.} =
   block:
     var tc = c; inc tc
     let elemTyRaw = innerType(g.prog, resolveType(g.prog, tc))  # nominal element type
@@ -1145,7 +1150,7 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
     var cc = c
     cc.into:
       skip cc
-      var i = 0
+      var i {.inject.} = 0
       while cc.hasMore:
         let valC = cc
         if elemSlot.kind == AMem:                       # nested aggregate element
@@ -1157,7 +1162,7 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           g.genStore(valC, namedStackLoc(tmpName, elemSlot))   # build (no bridge held)
           g.withBridges(bdTwoInRegs, "an `aconstr` aggregate element copy"):
             let eptr = g.takeBridge()
-            g.ab.tree LeaA64: (g.emReg eptr; addrOp(i))   # &element[i]
+            g.ab.tree LeaA64: (g.emReg eptr; addrOp)   # &element[i]
             let tmp = g.takeBridge(avoid = eptr)
             g.flatCopyToPtr(tmpName, aggrByteSize(g.prog, ntn), eptr, tmp)
             g.dropBridge tmp
@@ -1166,14 +1171,14 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           skip cc
           continue
         if g.isWideSlot(elemSlot):
-          # A 64-bit array element. `destOp(i)` is an `(at …)` operand typed with
+          # A 64-bit array element. `destOp` is an `(at …)` operand typed with
           # the ELEMENT type, and a 64-bit-typed move is not one this target has
           # — the eight bytes go through the element's address instead. The value
           # is produced FIRST, because it may contain a call and the address
           # register would not survive one.
           let wnm = g.wideValueIntoTemp(valC)
           let ew = g.takeBridge()
-          g.ab.tree LeaA64: (g.emReg ew; addrOp(i))
+          g.ab.tree LeaA64: (g.emReg ew; addrOp)
           g.wideCopyToAddr(wnm, ew)
           g.dropBridge ew
           inc i
@@ -1198,7 +1203,7 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           if v.kind == InFReg: fr = v.f
           else:                                         # eftmp spill (pool-dry) → bridge
             fr = g.takeFBridge(bits); g.placeF(v, fr, bits); fb = true
-          g.ab.tree FstrA64: (destOp(i); g.emFReg(fr, bits))
+          g.ab.tree FstrA64: (destOp; g.emFReg(fr, bits))
           if fb: g.dropFBridge()
           elif v.isTemp: g.unbindFTmp(v.f)
         else:
@@ -1209,7 +1214,7 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           else:                                         # etmp spill (pool-dry) → bridge
             vb = g.takeBridge(v.typ); g.place(v, vb); vr = vb
           g.ab.tree MovA64:
-            destOp(i)
+            destOp
             if etIsPtr:
               g.ab.tree CastX:
                 g.genTypeBody(etc)
@@ -1240,14 +1245,10 @@ proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location) =
     g.emScalarLoad(base, dst.ptrName)
     var atc = c; inc atc                                # the array type
     let elemTy = innerType(g.prog, resolveType(g.prog, atc))
-    template destThroughPtr(i) = g.emPtrElemMem(base, elemTy, i)
-    template elemAddrThroughPtr(i) = g.emPtrElemAt(base, elemTy, i)
-    g.aconstrElemStores(c, destThroughPtr, elemAddrThroughPtr)
+    g.aconstrElemStores(c, i, g.emPtrElemMem(base, elemTy, i), g.emPtrElemAt(base, elemTy, i))
     g.dropBridge base
   else:
-    template destInSlot(i) = g.emAggrElemMem(dst.name, i)
-    template elemAddrInSlot(i) = g.emAggrElemAt(dst.name, i)
-    g.aconstrElemStores(c, destInSlot, elemAddrInSlot)
+    g.aconstrElemStores(c, i, g.emAggrElemMem(dst.name, i), g.emAggrElemAt(dst.name, i))
 
 proc genConstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval(lhs)
@@ -1256,9 +1257,7 @@ proc genConstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
 
 proc genAconstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval(lhs)
-  template dest(i) = g.emLvalElemMem(lhs, i)
-  template elemAddr(i) = g.emLvalElemAt(lhs, i)
-  g.aconstrElemStores(c, dest, elemAddr)
+  g.aconstrElemStores(c, i, g.emLvalElemMem(lhs, i), g.emLvalElemAt(lhs, i))
   g.unbindLvalTemps(lhs)
 
 proc genBaseobj*(g: var CodeGen; c: Cursor; dst: Location) =
@@ -1449,7 +1448,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
   if dst.kind in {NamedStack, StackPtr} and dst.typ.kind == AMem:
     # `StackPtr` reaches its aggregate through the slot's pointer; `NamedStack` IS it.
     let dstVar = (if dst.kind == StackPtr: dst.ptrName else: dst.name)
-    let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
+    let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType.getOrQuit(dstVar))
     if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       g.genAconstr(rhs, dst)
@@ -1495,9 +1494,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
         var atc = rhs; inc atc                            # the array type
         let elemTy = innerType(g.prog, resolveType(g.prog, atc))
-        template dest(i) = g.emPtrElemMem(addrT, elemTy, i)  # element i through &g
-        template elemAddr(i) = g.emPtrElemAt(addrT, elemTy, i)
-        g.aconstrElemStores(rhs, dest, elemAddr)
+        g.aconstrElemStores(rhs, i, g.emPtrElemMem(addrT, elemTy, i), g.emPtrElemAt(addrT, elemTy, i))
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in x0:x1
         var d = dontCare
         g.emitCall(rhs, d)
@@ -2450,7 +2447,8 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     return
   if c.kind == TagLit and c.exprKind in {AndC, OrC, NotC}:
     let ek = c.exprKind
-    var aC, bC: Cursor
+    var aC = default(Cursor)
+    var bC = default(Cursor)
     block:
       var cc = c
       cc.into:
@@ -2947,7 +2945,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
           indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl))
       else:
         g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
-    tgt = g.callTarget[fsym]
+    tgt = g.callTarget.getOrQuit(fsym)
     if tgt.memIntrin.len > 0:
       g.emitMemIntrin(argCurs, tgt.memIntrin)    # (fused arg emission inside)
       if not (dest.kind == InReg and not dest.isTemp):
@@ -3009,7 +3007,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   if doTail and g.tailCallLeaksFrame(argCurs): doTail = false
   var heldArgs: seq[Location] = @[]
 
-  proc settleCallResult(g: var CodeGen; dest: var Location) =
+  proc settleCallResult(g: var CodeGen; dest: var Location) {.closure.} =
     if not hasResult or resultByRef: return
     if resultIsFloat:
       let rbits = if resSlot.size == 4: 32 else: 64
@@ -3121,7 +3119,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       if g.exprReadsReg(argCurs[j], r): reads[j].incl r
     for f in fclaims:
       if g.exprReadsFReg(argCurs[j], f): freads[j].incl f
-  proc placeNow(j: int; m: ArgMove; computes = false): bool =
+  proc placeNow(j: int; m: ArgMove; computes = false): bool {.closure.} =
     ## May argument `j`'s move `m` write its ABI register during phase 1? A move
     ## that `computes` its value is evaluation, not movement: the stress mode
     ## leaves it be (see `stressLateMoves`).
@@ -3130,7 +3128,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       if k != j and (if m.fdst != NoFReg: m.fdst in freads[k] else: m.dst in reads[k]):
         return false
     true
-  proc park(g: var CodeGen; slot: AsmSlot): Location =
+  proc park(g: var CodeGen; slot: AsmSlot): Location {.closure.} =
     ## A value held until the moves: a temp outside the argument registers, or
     ## a spill slot when none is free. Freed after the call.
     let r = g.pickTempReg(avoid = claims)
@@ -3142,7 +3140,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
       g.pickedRegs.incl r
       result = regLoc(r, slot, isTemp = true)
     heldArgs.add result
-  proc fpark(g: var CodeGen; bytes: int): Location =
+  proc fpark(g: var CodeGen; bytes: int): Location {.closure.} =
     ## A float park: a SIMD temp (never an argument register), or a spill slot.
     result = g.takeFTmp(AsmSlot(cls: AFloat, size: bytes, align: bytes))
     heldArgs.add result
@@ -3150,7 +3148,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   g.stagedArgs = {}
   g.ab.tree PrepareA64:
     g.ab.sym tgt.asmName
-    proc bindArg(g: var CodeGen; dst: Reg; j, word: int) =
+    proc bindArg(g: var CodeGen; dst: Reg; j, word: int) {.closure.} =
       g.ab.tree MovA64:
         g.ab.tree ArgX:
           g.ab.sym paramName(j)
@@ -3210,7 +3208,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
         of msTvarAddr: g.genTlvAddr(m.name, dst)
         of msWideTrunc: g.wideArgTruncated(m.name, dst)
         of msWideWord: g.wideLoad(dst, slotWide(m.name), m.idx)
-    proc emitMove(g: var CodeGen; m: ArgMove) =
+    proc emitMove(g: var CodeGen; m: ArgMove) {.closure.} =
       if m.fdst != NoFReg:
         let bits = m.bytes * 8
         g.rb.sealF m.fdst; sealedFArgs.incl m.fdst
@@ -3298,7 +3296,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
           else: g.emFloatScalarStore(copy.name, d, m.bytes * 8)
         if copy.kind == InFReg: (m.f = copy.f; m.freads = {copy.f})
         else: (m.kind = msLoc; m.loc = copy; m.freads = {})
-    proc scalarArg(g: var CodeGen; j: int; m: var ArgMove) =
+    proc scalarArg(g: var CodeGen; j: int; m: var ArgMove) {.closure.} =
       ## A scalar argument's one move, integer or float: early when it may be;
       ## else a computed value is evaluated into a park, and a leaf stays where
       ## it lives.
@@ -3334,16 +3332,18 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
           var grp: seq[ArgMove] = @[]
           for i in countdown(ms.len - 1, 0):
             if sameAddr(ms[i], m0) and eligible(ms, i):
-              grp.insert(ms[i], 0)
+              grp.insert([ms[i]], 0)
               ms.delete i
           g.emitAddrGroup(grp)
         elif pick >= 0:
           g.emitMove(ms[pick])
           ms.delete pick
         elif ms[0].fdst != NoFReg:
-          g.fredirect(ms, ms[0].fdst)
+          let fd = ms[0].fdst
+          g.fredirect(ms, fd)
         else:
-          g.redirect(ms, ms[0].dst)
+          let d = ms[0].dst
+          g.redirect(ms, d)
     # ── phase 1: every argument expression runs ──────────────────────────────
     for j in 0 ..< argCurs.len:
       let a = argCurs[j]
@@ -3457,7 +3457,9 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
             for m in ms.mitems:
               m.name = home
               m.kind = (if pl.byRef: msHomeAddr else: msHomeWord)
-        if now: g.resolve(ms) else: pending.add ms
+        if now: g.resolve(ms)
+        else:
+          for m in ms: pending.add m
       elif pl.isFloat:
         # The width is the argument's OWN: `emitFValue` picks a LITERAL's bit
         # pattern from the destination slot, and a `float32` literal materialized
@@ -3479,7 +3481,9 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                          word: (if pl.isWideScalar: k else: -1),
                          kind: (if pl.isWideScalar: msWideWord else: msWideTrunc))
           if not placeNow(j, ms[^1]): now = false
-        if now: g.resolve(ms) else: pending.add ms
+        if now: g.resolve(ms)
+        else:
+          for m in ms: pending.add m
       else:
         var m = ArgMove(fdst: NoFReg, f: NoFReg, dst: g.md.gprAt(pl), nameIdx: j, word: -1,
                         kind: msLeaf, cur: a, r: NoReg, reads: reads[j])
@@ -3555,7 +3559,7 @@ when declared(FldrqOp):
   proc vecLaneBits(g: var CodeGen; a: Cursor): int =
     ## The trailing lane-width knob: an int LITERAL, read here and folded into the
     ## emitted instruction — never evaluated into a register (see `ptLaneBits`).
-    if a.kind != IntLit or int(intVal(a)) notin {32, 64}:
+    if a.kind != IntLit or int(intVal(a)) notin [32, 64]:
       lengError a, "a vector op's lane-bits operand must be the literal 32 or 64"
     result = int(intVal(a))
 
@@ -3830,7 +3834,7 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
       else: g.getType(argCurs[1])
     let cell = slotOf(g.prog, cellTyp)
     if cell.kind == AMem or cell.kind == AFloat or cell.size > wordSize() or
-       cell.size notin {1, 2, 4, 8}:
+       cell.size notin [1, 2, 4, 8]:
       lengError c, "a volatile access must be ONE machine access, and a " &
                 $cell.size & "-byte cell is not one on this target — no " &
                 "widening, no splitting into halves, because for a device " &
@@ -3898,7 +3902,7 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   var src = res.r
   if a0.kind == InReg: src = a0.r
   else: g.place(a0, res.r)
-  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  let bits = if tgt.argBits in [8, 16, 32]: 32 else: 64
   case tgt.op
   of ClzPinnedOp, ClzOp:
     g.ab.tree ClzA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
@@ -4208,7 +4212,7 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
     g.wideStore(dst, 1, t)
     g.dropWideRegs(@[t])
   of Symbol:
-    var scratch: Reg
+    var scratch = default(Reg)
     let src = g.wideSymRef(c, scratch)
     g.wideCopy(dst, src)
     if scratch != NoReg: g.unbindTemp(scratch)
@@ -4236,7 +4240,7 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
       g.wideStoreImm(dst, 0, sz)
       g.wideStoreImm(dst, 1, 0)
     of DerefC, DotC, AtC, PatC:
-      var scratch: Reg
+      var scratch = default(Reg)
       let src = g.wideLvalRef(c, scratch)
       g.wideCopy(dst, src)
       if scratch != NoReg: g.unbindTemp(scratch)

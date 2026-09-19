@@ -34,6 +34,7 @@
 ##    memory, and the accumulator of the multiply.
 ##  * `ProduceBridge` (Z) is the indirect-call target and the flash pointer.
 
+import std / assertions
 import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
@@ -295,6 +296,7 @@ proc accessWidth(g: var CodeGen; c: Cursor): int =
 proc isPow2(n: int): bool {.inline.} = n > 0 and (n and (n - 1)) == 0
 
 proc log2i(n: int): int =
+  result = 0
   var w = n
   while w > 1: (w = w shr 1; inc result)
 
@@ -975,7 +977,8 @@ proc emGlobalInits(g: var CodeGen) =
   ## than a copy loop would for a large array, which is exactly why an aggregate
   ## global is refused by name here; and it needs no instruction nifasm would
   ## have to invent, which is why it is the form chosen.
-  for nifName, decl in g.prog.globals:
+  let globalDecls = g.prog.globalsInOrder()      # declaration order, and a snapshot
+  for (nifName, decl) in globalDecls:
     if nifName in g.prog.importcOnlyGvars: continue
     var c = decl
     c.into:

@@ -18,11 +18,13 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions, sets]
+import std / [tables, assertions, sets, syncio]
 import nifcore, nifcdecl, nifcoreparse
 import asmslots, nifmodules
 import "../../../../nimony/src/lib" / [symparser, nifreader, intrinsics]
 export intrinsics
+
+include compat2   # getOrQuit on host Nim
 
 type
   Extern* = object
@@ -119,6 +121,8 @@ type
                                             ## the init proc must run them in source order — a
                                             ## `Table` walk would order them by hash
     tvars*: Table[string, Cursor]           ## thread-local var name → its decl cursor (macOS TLV)
+    tvarOrder*: seq[string]                 ## the same names in declaration order (see
+                                            ## `globalOrder`: output must not follow hash order)
     typeDecls*: TypeEnv                     ## resolved type env: main + requested foreign
     mainTypeList*: seq[(string, Cursor)]    ## main-module types, in declaration order
     requestedForeign*: seq[(string, Cursor)] ## foreign types referenced (cross-module
@@ -501,11 +505,24 @@ proc fixedParamCount(decl: Cursor): int =
           inc i
     while c.hasMore: skip c
 
+proc globalsInOrder*(p: Program): seq[(string, Cursor)] =
+  ## The module's globals in declaration order. A snapshot, so the caller may grow
+  ## the program's tables while it walks them; and ordered, because a `Table` walk
+  ## follows the hash function, which is not the same under every compiler.
+  result = @[]
+  for nm in p.globalOrder: result.add (nm, p.globals.getOrQuit(nm))
+
+proc tvarsInOrder*(p: Program): seq[(string, Cursor)] =
+  ## `globalsInOrder` for the thread-locals.
+  result = @[]
+  for nm in p.tvarOrder: result.add (nm, p.tvars.getOrQuit(nm))
+
 proc resolveType*(p: var Program; c: Cursor): Cursor
 proc slotOf*(p: var Program; c: Cursor): AsmSlot
 
 proc hasStdcallPragma(c: Cursor): bool =
   ## Does the `(pragmas …)` node at `c` name the `stdcall` calling convention?
+  result = false
   if c.substructureKind != PragmasU: return false
   var pc = c
   pc.into:
@@ -522,6 +539,7 @@ proc isForeignAbiProctype*(p: Program; c: Cursor): bool =
   ## one indirect call that must be marshalled the Win64 way. `std/windows/winlean`
   ## reaches its `dynlib` imports exactly like this: each is a function-pointer global
   ## that `GetProcAddress` fills in, so the call site has only the proctype to go on.
+  result = false
   if not p.windows: return false
   var t = c
   if t.kind != TagLit or t.typeKind != ProctypeT: return false
@@ -545,6 +563,7 @@ proc isWin64AbiProc*(p: Program; decl: Cursor): bool =
   ## of arkham's own SysV arrival registers while Windows had put them in rcx/rdx/…
   ## Nothing diagnosed that, because a proc definition and a proctype are different
   ## nodes and only the latter was asked the question.
+  result = false
   if not p.windows: return false
   var c = decl
   c.into:
@@ -716,10 +735,12 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         let isTvar = c.stmtKind == TvarS
         gc.into:
           let nm = symName(gc); inc gc
-          if isTvar: result.tvars[nm] = gStart   # thread-local (macOS TLV)
+          if isTvar:
+            if not result.tvars.hasKey(nm): result.tvarOrder.add nm
+            result.tvars[nm] = gStart            # thread-local (macOS TLV)
           else:
+            if not result.globals.hasKey(nm): result.globalOrder.add nm
             result.globals[nm] = gStart          # ordinary .bss global / const
-            result.globalOrder.add nm
           # An importc/exportc gvar uses its bare C name so the (single) nifasm
           # root scope links an `exportc` definition to `importc` references across
           # bundled modules (C-style global linkage). importc-WITHOUT-exportc means
@@ -864,7 +885,7 @@ proc loadModule(p: var Program; suffix: string): ForeignModule =
   ## must carry an embedded `.indexat` index (run `nimony/tools/reindex.nim` on
   ## hand-written fixtures); the shared `nifmodules` loader keeps the reader open
   ## for lazy per-symbol jumps.
-  if p.loaded.hasKey(suffix): return p.loaded[suffix]
+  if p.loaded.hasKey(suffix): return p.loaded.getOrQuit(suffix)
   var sc = p.scheme
   sc.name = suffix
   let path = $sc
@@ -886,7 +907,7 @@ proc lookupType*(p: var Program; id: SymId): Cursor =
   ## suffix off, and asking a foreign module's index for a symbol (that index is
   ## keyed by text). Foreign decls are interned into `p.pool` (see `getDecl`), so an
   ## id from a foreign type's body is comparable with a main-module one.
-  if p.typeDecls.hasKey(id): return p.typeDecls[id]
+  if p.typeDecls.hasKey(id): return p.typeDecls.getOrQuit(id)
   let name = symString(p.pool, id)
   let s = splitSymName(name)
   if s.module.len == 0:
@@ -898,7 +919,7 @@ proc lookupType*(p: var Program; id: SymId): Cursor =
   if s.module == p.scheme.name:
     let localName = name[0 ..< name.len - s.module.len]
     let localId = symId(p.pool, localName)
-    if p.typeDecls.hasKey(localId): return p.typeDecls[localId]
+    if p.typeDecls.hasKey(localId): return p.typeDecls.getOrQuit(localId)
     raiseAssert "arkham: unknown local type " & name
   let m = loadModule(p, s.module)
   if not hasDecl(m, name):
@@ -915,6 +936,7 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   ## reference to our own module, or a symbol absent from the foreign module —
   ## so a single call classifies "local vs foreign" without a separate probe.
   ## A resolved decl is recorded in `requestedForeign` so nifasm links it.
+  result = default(Cursor)
   found = false
   let s = splitSymName(name)
   if s.module == p.scheme.name: return
@@ -1002,7 +1024,7 @@ proc instrTargetOf*(p: var Program; name: string): InstrTarget =
   ## symbol was registered by `collect`; a foreign one is loaded from its owning
   ## module's embedded index and classified the SAME way that module's pass 0 did
   ## — the pragma travels with the declaration, so there is nothing to re-derive.
-  if p.instrTarget.hasKey(name): return p.instrTarget[name]
+  if p.instrTarget.hasKey(name): return p.instrTarget.getOrQuit(name)
   var found = false
   let declCur = lookupForeignDecl(p, name, found)
   if not found:
@@ -1400,7 +1422,7 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
     if nc.kind == SymbolDef: localDecl[nc.symId] = pi.decl
   for (id, name) in callees:
     if localDecl.hasKey(id):
-      if declIsNoReturn(localDecl[id]): result.incl id
+      if declIsNoReturn(localDecl.getOrQuit(id)): result.incl id
     elif isForeignSym(p, name):
       var found = false
       let d = lookupForeignDecl(p, name, found)

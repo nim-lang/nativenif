@@ -44,7 +44,8 @@ proc rejectForAvr(g: CodeGen) =
       lengError decl, "AVR: the global `" & name & "` is not implemented yet " &
                       "(see M6 in doc/internals/avr.md)", lengInfo(decl)
   if g.prog.tvars.len > 0:
-    for name, decl in g.prog.tvars:
+    let tvarDecls = g.prog.tvarsInOrder()
+    for (name, decl) in tvarDecls:
       lengError decl, "AVR has no thread-local storage: `" & name & "`",
                 lengInfo(decl)
   if g.prog.syscalls.len > 0:
@@ -63,9 +64,11 @@ proc generateAvr*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   g.adoptProgram()
   g.ab.tree StmtsAvr:
     g.ab.tree NifasmDecl.ArchD: g.ab.ident "avr"
-    for name, decl in g.prog.globals:
+    let globalDecls = g.prog.globalsInOrder()
+    for (name, decl) in globalDecls:
       g.genGlobalAvr(name, decl)
-    for info in g.prog.procs:
+    for i in 0 ..< g.prog.procs.len:
+      let info = g.prog.procs[i]
       g.isEntryProc = info.isEntry
       g.genProcAvr(info)
   result = g.ab.render("." & g.prog.thisModuleSuffix)

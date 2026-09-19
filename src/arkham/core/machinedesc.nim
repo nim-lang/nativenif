@@ -21,6 +21,7 @@
 ## knowledge of any concrete ABI. A backend describes its register file and
 ## calling convention by populating a `MachineDesc`.
 
+import std / assertions
 import asmslots
 import nifcore   # `Cursor`: a `Mem` location captures the lvalue subtree to re-emit
 
@@ -361,6 +362,22 @@ type
                                      ## four under AAPCS32 — which is the whole
                                      ## reason it is a field.
 
+when defined(nimony):
+  # Nimony's `system` has no generic `$` for sets; these render like Nim's.
+  proc `$`*(s: set[Reg]): string =
+    result = "{"
+    for r in s:
+      if result.len > 1: result.add ", "
+      result.add $r
+    result.add "}"
+
+  proc `$`*(s: set[FReg]): string =
+    result = "{"
+    for r in s:
+      if result.len > 1: result.add ", "
+      result.add $r
+    result.add "}"
+
 type
   LocKind* = enum
     Undef          ## the dontCare target (fill me in), and the "produces no value"
@@ -700,7 +717,7 @@ proc passesByRef*(md: MachineDesc; size: int): bool =
   ## convention — as an argument, and as a result through a hidden pointer? SysV and
   ## AAPCS: above `aggrByRefThreshold`. Win64: unless it is exactly the width of a
   ## register a single load can fill (1, 2, 4 or 8 bytes).
-  if md.positionalArgs: size notin {1, 2, 4, 8}
+  if md.positionalArgs: size != 1 and size != 2 and size != 4 and size != 8
   else: size > md.aggrByRefThreshold
 
 proc checkMachine*(md: MachineDesc) =
@@ -716,38 +733,38 @@ proc checkMachine*(md: MachineDesc) =
   if md.memIntrinScratch[0] != NoReg:
     var mem: set[Reg] = {}
     for r in md.memIntrinScratch:
-      doAssert r != NoReg,
+      assert r != NoReg,
         "machine " & md.targetName & " reserves a PARTIAL memIntrinScratch triple"
-      doAssert r notin mem,
+      assert r notin mem,
         "machine " & md.targetName & " names the same register twice in `memIntrinScratch`"
       mem.incl r
-      doAssert r in md.intArgRegs or r in md.intTempRegs or
+      assert r in md.intArgRegs or r in md.intTempRegs or
                r in md.intLocalTempRegs or r in md.intCalleeSaved,
         "machine " & md.targetName & " names " & $r & " as memcpy scratch, which is " &
         "not a register its allocator hands out"
   if md.bridgeRegs.len == 0:
     # x86-64 reserves a single `stagingBridgeReg` instead of a bridge list.
-    doAssert md.stagingBridgeReg != NoReg,
+    assert md.stagingBridgeReg != NoReg,
       "machine " & md.targetName & " reserves no emitter scratch at all"
     return
-  doAssert md.bridgeRegs.len >= EmitterBridgeDemand,
+  assert md.bridgeRegs.len >= EmitterBridgeDemand,
     "machine " & md.targetName & " reserves " & $md.bridgeRegs.len &
     " emitter bridges; the shared emitter holds up to " & $EmitterBridgeDemand
   var seen: set[Reg] = {}
   for r in md.bridgeRegs:
-    doAssert r != NoReg, "machine " & md.targetName & " has a NoReg bridge"
-    doAssert r notin seen,
+    assert r != NoReg, "machine " & md.targetName & " has a NoReg bridge"
+    assert r notin seen,
       "machine " & md.targetName & " lists the same register twice in " &
       "`bridgeRegs`, so it has fewer bridges than it claims — this is how RV32 " &
       "shipped `[R29, R30, R30]` and asserted on every two-ended aggregate copy"
     seen.incl r
-  doAssert md.produceBridge == md.bridgeRegs[^1],
+  assert md.produceBridge == md.bridgeRegs[^1],
     "machine " & md.targetName & "'s produce bridge is not the last `bridgeRegs` entry"
   # A bridge the allocator can also hand out is not a reservation.
   for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
                md.intCalleeSaved]:
     for r in pool:
-      doAssert r notin seen,
+      assert r notin seen,
         "machine " & md.targetName & " allocates " & $r & ", which it also " &
         "reserves as an emitter bridge"
   # The atomic triple, if the target claims one, is subject to the same rule: an
@@ -755,10 +772,10 @@ proc checkMachine*(md: MachineDesc) =
   if md.atomicScratch[0] != NoReg:
     var atom: set[Reg] = {}
     for r in md.atomicScratch:
-      doAssert r != NoReg,
+      assert r != NoReg,
         "machine " & md.targetName & " reserves a PARTIAL atomic scratch triple; " &
         "an LL/SC loop needs old, new and status together, or none at all"
-      doAssert r notin atom,
+      assert r notin atom,
         "machine " & md.targetName & " names the same register twice in " &
         "`atomicScratch`, so its `ldaxr`/`stlxr` loop would use one register for " &
         "two of old/new/status"
@@ -766,6 +783,6 @@ proc checkMachine*(md: MachineDesc) =
     for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
                  md.intCalleeSaved]:
       for r in pool:
-        doAssert r notin atom,
+        assert r notin atom,
           "machine " & md.targetName & " allocates " & $r & ", which its atomic " &
           "sequences claim for the whole retry loop"
