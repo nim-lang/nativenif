@@ -113,7 +113,7 @@ proc takeParam*(c: var Cursor): AsmParam =
     result.typ = c
     skip c
 
-iterator params*(c: Cursor): Cursor =
+iterator params*(c: Cursor): Cursor {.sideEffect.} =
   ## `c` at a `(params …)` (or `(result …)`) node. Yields a cursor at each
   ## child `(param …)`/`(ret …)` entry. Does not mutate `c`.
   var c = c
@@ -169,7 +169,7 @@ proc takeTypeDecl(c: var Cursor): TypeDecl =
     result.body = c
     skip c
 
-iterator fields*(c: Cursor): Cursor =
+iterator fields*(c: Cursor): Cursor {.sideEffect.} =
   ## `c` at an `(object …)`/`(union …)` node. Yields a cursor at each `(fld …)`
   ## child, tolerating (and skipping) a leading non-`fld` slot — the optional
   ## Leng inheritance/base type carried only by `object`. Does not mutate `c`.

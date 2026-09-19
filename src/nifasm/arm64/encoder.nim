@@ -2,6 +2,7 @@
 # A dependency-free ARM64 assembler that emits binary instruction bytes
 
 
+import std / [assertions, syncio]
 import ../core/[buffers, relocs]
 import a64imm
 export a64imm.isLogicalImm
@@ -288,7 +289,8 @@ proc emitEor*(dest: var Bytes; rd, rn, rm: Register) =
 proc emitLogicalImm(dest: var Bytes; base: uint32; rd, rn: Register; value: uint64) =
   ## `<op> rd, rn, #value` — `base` carries sf+opc (see the three wrappers).
   var enc: uint32 = 0
-  doAssert encodeLogicalImm(value, enc), "not a logical immediate: " & $value
+  if not encodeLogicalImm(value, enc):
+    quit "nifasm: not a logical immediate: " & $value
   let instr = base or (enc shl 10) or (encodeReg(rn) shl 5) or encodeReg(rd)
   dest.addUint32(instr)
 
@@ -419,7 +421,7 @@ proc emitLdr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
   ## Offset must be 8-byte aligned and in range [0, 32760]
   let scaledOffset = offset div 8
   if scaledOffset < 0 or scaledOffset > 4095:
-    raise newException(ValueError, "LDR offset out of range")
+    quit("nifasm: LDR offset out of range")
   # LDR Xt, [Xn, #offset]: 1111 1001 01ii iiii iiii iinn nnnt tttt
   let instr = 0xF9400000'u32 or
               (uint32(scaledOffset) shl 10) or
@@ -490,7 +492,7 @@ proc emitStr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
   ## Offset must be 8-byte aligned and in range [0, 32760]
   let scaledOffset = offset div 8
   if scaledOffset < 0 or scaledOffset > 4095:
-    raise newException(ValueError, "STR offset out of range")
+    quit("nifasm: STR offset out of range")
   # STR Xt, [Xn, #offset]: 1111 1001 00ii iiii iiii iinn nnnt tttt
   let instr = 0xF9000000'u32 or
               (uint32(scaledOffset) shl 10) or
@@ -855,7 +857,7 @@ proc emitFldr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32; 
   let scale = if single: 4 else: 8
   let scaled = offset div scale
   if (offset mod scale) != 0 or scaled < 0 or scaled > 0xFFF:
-    raise newException(ValueError, "FP LDR offset out of range")
+    quit("nifasm: FP LDR offset out of range")
   let base = if single: 0xBD400000'u32 else: 0xFD400000'u32
   dest.addUint32(base or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
 
@@ -864,7 +866,7 @@ proc emitFstr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32; 
   let scale = if single: 4 else: 8
   let scaled = offset div scale
   if (offset mod scale) != 0 or scaled < 0 or scaled > 0xFFF:
-    raise newException(ValueError, "FP STR offset out of range")
+    quit("nifasm: FP STR offset out of range")
   let base = if single: 0xBD000000'u32 else: 0xFD000000'u32
   dest.addUint32(base or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
 
@@ -876,7 +878,7 @@ proc emitLdrQ*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) 
   ## LDR Qt, [Xn, #offset] — 128-bit load (unsigned offset, scaled by 16).
   let scaled = offset div 16
   if (offset and 15) != 0 or scaled < 0 or scaled > 0xFFF:
-    raise newException(ValueError, "Q LDR offset out of range")
+    quit("nifasm: Q LDR offset out of range")
   dest.addUint32(0x3DC00000'u32 or (uint32(scaled) shl 10) or
                  (encodeReg(rn) shl 5) or encodeFReg(rt))
 
@@ -884,7 +886,7 @@ proc emitStrQ*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) 
   ## STR Qt, [Xn, #offset] — 128-bit store (unsigned offset, scaled by 16).
   let scaled = offset div 16
   if (offset and 15) != 0 or scaled < 0 or scaled > 0xFFF:
-    raise newException(ValueError, "Q STR offset out of range")
+    quit("nifasm: Q STR offset out of range")
   dest.addUint32(0x3D800000'u32 or (uint32(scaled) shl 10) or
                  (encodeReg(rn) shl 5) or encodeFReg(rt))
 
@@ -934,7 +936,7 @@ proc emitFstpPre*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offset
   ## STP Dt1, Dt2, [Xn, #offset]! — pre-indexed store pair of doubles.
   let scaled = offset div 8
   if (offset and 7) != 0 or scaled < -64 or scaled > 63:
-    raise newException(ValueError, "FP STP offset out of range")
+    quit("nifasm: FP STP offset out of range")
   dest.addUint32(0x6D800000'u32 or ((uint32(scaled) and 0x7F) shl 15) or
                  (encodeFReg(rt2) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt1))
 
@@ -942,7 +944,7 @@ proc emitFldpPost*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offse
   ## LDP Dt1, Dt2, [Xn], #offset — post-indexed load pair of doubles.
   let scaled = offset div 8
   if (offset and 7) != 0 or scaled < -64 or scaled > 63:
-    raise newException(ValueError, "FP LDP offset out of range")
+    quit("nifasm: FP LDP offset out of range")
   dest.addUint32(0x6CC00000'u32 or ((uint32(scaled) and 0x7F) shl 15) or
                  (encodeFReg(rt2) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt1))
 
@@ -952,7 +954,7 @@ proc emitStp*(dest: var Bytes; rt1, rt2: Register; rn: Register; offset: int32) 
   ## Used for pushing pairs of registers to stack
   let scaledOffset = offset div 8
   if scaledOffset < -64 or scaledOffset > 63:
-    raise newException(ValueError, "STP offset out of range")
+    quit("nifasm: STP offset out of range")
   # STP Xt1, Xt2, [Xn, #offset]!: 1010 1001 10ii iiii itt tttnn nnnt tttt
   let instr = 0xA9800000'u32 or
               ((uint32(scaledOffset) and 0x7F) shl 15) or
@@ -966,7 +968,7 @@ proc emitLdp*(dest: var Bytes; rt1, rt2: Register; rn: Register; offset: int32) 
   ## Used for popping pairs of registers from stack
   let scaledOffset = offset div 8
   if scaledOffset < -64 or scaledOffset > 63:
-    raise newException(ValueError, "LDP offset out of range")
+    quit("nifasm: LDP offset out of range")
   # LDP Xt1, Xt2, [Xn], #offset: 1010 1000 11ii iiii itt tttnn nnnt tttt
   let instr = 0xA8C00000'u32 or
               ((uint32(scaledOffset) and 0x7F) shl 15) or

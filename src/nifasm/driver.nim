@@ -19,7 +19,7 @@
 ## Windows. They are nifasm's own code rather than any module's, which is why
 ## they are built after every real proc has been emitted.
 
-import std / [tables, sets, os]
+import std / [tables, sets, os, syncio]
 import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader]
 import core / [context, sem, cursors, typesem, modules, 
@@ -31,6 +31,8 @@ from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
 import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writeavr, writerv32]
 import pass1, pass2
+
+include compat2   # getOrQuit on host Nim
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   ## Generate code for a single reachable symbol on-demand. nifasm is the linker:
@@ -45,10 +47,11 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   if sym.moduleName notin ctx.modules:
     return  # Module not loaded, can't generate
 
-  let m = ctx.modules[sym.moduleName]
+  let m = ctx.modules.getOrQuit(sym.moduleName)
   var n: Cursor
-  if sym.isForeign:
-    n = getDecl(m.foreign, ctx.nameOf(sym.name), asmTags, ctx.pool)  # cached one-decl tree
+  let fm = m.foreign
+  if sym.isForeign and fm != nil:
+    n = getDecl(fm, ctx.nameOf(sym.name), asmTags, ctx.pool)  # cached one-decl tree
   else:
     n = cursorAt(m.buf, sym.declStart)
   let declTag = tagToNifasmDecl(n.tag)
@@ -426,8 +429,9 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   scope.define(ctx.winTlsIndexSym)
   ctx.generatedSymbols.incl ctx.symIdOf(TlsIndexSymbol)
 
-  var n1 = beginRead(ctx.modules[MainModuleName].buf)
-  pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
+  let mainModule = ctx.modules.getOrQuit(MainModuleName)   # a ref: its `buf` is not `ctx`'s
+  var n1 = beginRead(mainModule.buf)
+  pass1(n1, scope, ctx, MainModuleName, mainModule.buf)
 
   # x86-64: a thread-local is read/written as `FS:[sym.offset]` with the
   # displacement baked at the *reference* site (no relocation), so every tvar's
@@ -435,7 +439,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # compiled before the tvar's lazy `generateSymbol` would capture the default 0.
   # (macOS/A64 resolves tvars through relocated descriptors and allocates lazily.)
   if ctx.arch in {Arch.X64, Arch.WinX64}:
-    var tn = beginRead(ctx.modules[MainModuleName].buf)
+    var tn = beginRead(ctx.modules.getOrQuit(MainModuleName).buf)
     if tn.kind == TagLit and tn.tag == StmtsTagId:
       loopInto tn:
         if tn.kind == TagLit and tagToNifasmDecl(tn.tag) == TvarD:
@@ -459,7 +463,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
 
   # Generate code for entry point (top-level instructions only)
   # This marks symbols as used via lookupWithAutoImport when they are referenced
-  var n = beginRead(ctx.modules[MainModuleName].buf)
+  var n = beginRead(ctx.modules.getOrQuit(MainModuleName).buf)
   pass2(n, ctx)
 
   # Process all pending symbols (both main module and foreign modules)
@@ -492,7 +496,10 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       quit "nifasm: the memory-map flags apply to the cortex_m target only"
     case ctx.arch
     of Arch.X64, Arch.LinuxA64:
-      writeElf(ctx, outfile)
+      try:
+        writeElf(ctx, outfile)
+      except:
+        quit "nifasm: cannot write " & outfile
     of Arch.A64:
       writeMachO(ctx, outfile)
     of Arch.WinX64, Arch.WinA64:
@@ -516,7 +523,10 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
                "' has no address"
         entryOff = pos
-      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
+      try:
+        writeFile(outfile, writeRv32Image(ctx, code, entryOff))
+      except:
+        quit "nifasm: cannot write " & outfile
     of Arch.CortexM:
       # A firmware image, not a hosted executable: vector table, then code.
       #
@@ -542,7 +552,10 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
                "' has no address"
         entryOff = pos
-      writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
+      try:
+        writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
+      except:
+        quit "nifasm: cannot write " & outfile
     of Arch.Avr:
       # A firmware image: a reset `jmp`, then the code.
       #
@@ -568,8 +581,12 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
                "' has no address"
         entryOff = pos
-      writeFile(outfile, writeAvrImage(ctx, code, entryOff))
+      try:
+        writeFile(outfile, writeAvrImage(ctx, code, entryOff))
+      except:
+        quit "nifasm: cannot write " & outfile
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:
-    if modname != MainModuleName and module.foreign != nil:
-      nifreader.close(module.foreign.r)
+    let fm = module.foreign
+    if modname != MainModuleName and fm != nil:
+      nifreader.close(fm.r)

@@ -12,13 +12,15 @@
 ## format and their syscall convention, not in their instruction set, so what
 ## varies here is guarded by `ctx.arch` rather than duplicated.
 
-import std / [tables, sets]
+import std / [tables, sets, assertions]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
                     listing, emit, tags, model, tagconv, decls,
                     tagpool, stackslots, relocs, buffers]
 import encoder as arm64
 import regs, operands
+
+include compat2   # getOrQuit on host Nim
 
 proc genStmtA64(n: var Cursor; ctx: var GenContext)
 proc genInstA64(n: var Cursor; ctx: var GenContext)
@@ -354,7 +356,7 @@ proc genLoopA64(n: var Cursor; ctx: var GenContext) =
 proc genJtrueA64(n: var Cursor; ctx: var GenContext) =
   let start = n
   inc n
-  var jumpTarget: LabelId
+  var jumpTarget = default(LabelId)
   var firstCfvar = true
   while n.kind == Symbol:
     let nameCur = n
@@ -394,7 +396,7 @@ proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## silent clobber). The "(re)bind implies a kill of the prior tenant" rule shared by
   ## `rebind` and `withreg`. Mirrors x64's `bindRegX64`.
   if reg in ctx.a64RegBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.a64RegBindings[reg]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.a64RegBindings.getOrQuit(reg)))
     ctx.a64RegBindings.del(reg)
   ctx.clobberedA64.excl(reg)   # a fresh binding abandons a prior call's clobber (see bindRegX64)
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
@@ -409,7 +411,7 @@ proc bindFRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## (`(f 32)`/`(f 64)`) so a *named* use recovers s/d. Used for float register locals
   ## and float scratch temps.
   if reg in ctx.a64FRegBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.a64FRegBindings[reg]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.a64FRegBindings.getOrQuit(reg)))
     ctx.a64FRegBindings.del(reg)
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = regTag

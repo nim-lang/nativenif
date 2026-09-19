@@ -21,6 +21,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as x86
 import regs, operands
 
+include compat2   # getOrQuit on host Nim
+
 proc genStmtX64(n: var Cursor; ctx: var GenContext)
 proc genInstX64(n: var Cursor; ctx: var GenContext)
 
@@ -562,7 +564,7 @@ proc genJtrueX64(n: var Cursor; ctx: var GenContext) =
   # The jump targets are stored in the cfvar symbols
   let start = n
   inc n
-  var jumpTarget: LabelId
+  var jumpTarget = default(LabelId)
   var firstCfvar = true
 
   while n.kind == Symbol:
@@ -614,7 +616,7 @@ proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## than a silent clobber. This is the "(re)bind implies a kill (of the prior
   ## tenant)" rule shared by `rebind` and `withreg`.
   if reg in ctx.regBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.regBindings[reg]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.regBindings.getOrQuit(reg)))
     ctx.regBindings.del(reg)
   # Establishing a fresh binding abandons whatever a prior call left in `reg`: arkham
   # only rebinds-at-borrow right before writing the scratch, so the register's stale
@@ -632,7 +634,7 @@ proc bindXmmX64(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
   ## `name`, killing its prior tenant first. Used for float register locals and
   ## float scratch temps.
   if xmm in ctx.xmmBindings:
-    ctx.scope.undefine(ctx.symIdOf(ctx.xmmBindings[xmm]))
+    ctx.scope.undefine(ctx.symIdOf(ctx.xmmBindings.getOrQuit(xmm)))
     ctx.xmmBindings.del(xmm)
   let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = xmmTag
@@ -645,6 +647,7 @@ proc parseRebindHeader(n: var Cursor; ctx: var GenContext):
   ## Parse `:name TYPE (reg)` (the cursor is past the rebind/withreg tag, inside the
   ## node) and establish the binding. Shared by `rebind` and `withreg`. The register
   ## may be a GPR (`(rN)`) or — for a float binding — an xmm register (`(xmmN)`).
+  result = default(tuple[name: string; typ: Type; isXmm: bool; regTag: TagEnum; reg: x86.Register; xmm: x86.XmmRegister])
   if n.kind != SymbolDef: error("Expected name for rebind/withreg", n)
   result.name = symName(n); inc n
   result.typ = parseType(n, ctx.scope, ctx)
@@ -705,7 +708,7 @@ proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
     if selOp.kind != okReg:
       error("casejmp selector must be a register or register-bound local", start)
     # T: the base scratch — write-only, so parse it like a `lea` destination.
-    var baseReg: x86.Register
+    var baseReg = default(x86.Register)
     if not leaRegBase(n, ctx, baseReg):
       error("casejmp scratch must be a register or register-bound local", start)
     if baseReg == selOp.reg:
@@ -1393,7 +1396,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.kind != okReg: error(mnemonic & " source must be a register", n)
     if n.kind != IntLit: error(mnemonic & " requires a width operand (8, 16 or 32)", n)
     let bits = int(getInt(n)); inc n
-    if bits notin {8, 16, 32}: error(mnemonic & " width must be 8, 16 or 32", n)
+    if bits notin [8, 16, 32]: error(mnemonic & " width must be 8, 16 or 32", n)
     x86.emitRegExt(ctx.buf.data, dest.reg, op.reg, bits, signed)
     # The destination is freshly written, so an earlier call's clobber no longer
     # applies — same rule as `mov`/`lea` (see genMovX64).
@@ -1705,7 +1708,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("lea destination must be a register", n)
 
     # Check if next is a label or register
-    var baseReg: x86.Register
+    var baseReg = default(x86.Register)
     if n.kind == TagLit and n.tag == LabTagId:
       # (lea dest (lab label)) - RIP-relative address
       inc n
@@ -1809,7 +1812,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if not movTypeOk(okMem, gtyp, okReg, vtyp): typeError(gtyp, vtyp, start)
       checkPtrStore(gtyp, okReg, vtyp, start)
     let (bits, signed) = intMemAccess(gtyp)
-    if bits notin {32, 64}:
+    if bits notin [32, 64]:
       error(what & " needs a 4- or 8-byte global (got " & $bits &
             " bits) — use (lea …) + (mem …) for a narrower one", n)
     let pos = x86.emitMovRipPlaceholder(ctx.buf, vreg, bits, signed, isLoad)

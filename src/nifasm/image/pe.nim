@@ -1,13 +1,16 @@
 # PE (Portable Executable) binary format writer for Windows
 
-import std / [streams, tables]
+import std / [streams, tables, syncio]
 
 when not defined(windows):
   import std / os
 
 import ../core/[buffers, relocs]
+
 import dwarf   # the per-proc unwind FACTS (`ProcUnwind`); `.pdata`/`.xdata` below
                # is the third encoding of them, next to `.eh_frame` and Mach-O's
+
+include compat2   # canRaise
 
 type
   # Import info for dynamic linking (same as macho.nim)
@@ -200,6 +203,7 @@ type
   PePatchProc* = proc (lay: PeLayout) {.closure.}
 
 proc initDosHeader(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
+  result = default(IMAGE_DOS_HEADER)
   result.e_magic = IMAGE_DOS_SIGNATURE
   result.e_cblp = 0x90
   result.e_cp = 0x03
@@ -210,6 +214,7 @@ proc initDosHeader(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
   result.e_lfanew = peHeaderOffset
 
 proc initFileHeader(machine: uint16; numSections: uint16; optHeaderSize: uint16): IMAGE_FILE_HEADER =
+  result = default(IMAGE_FILE_HEADER)
   result.Machine = machine
   result.NumberOfSections = numSections
   result.TimeDateStamp = 0  # Can be set to current time
@@ -226,6 +231,7 @@ proc initOptionalHeader64(
   sizeOfHeaders: uint32;
   subsystem: uint16 = IMAGE_SUBSYSTEM_WINDOWS_CUI
 ): IMAGE_OPTIONAL_HEADER64 =
+  result = default(IMAGE_OPTIONAL_HEADER64)
   result.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC
   result.MajorLinkerVersion = 14
   result.MinorLinkerVersion = 0
@@ -281,6 +287,7 @@ proc initSectionHeader(
   rawAddress: uint32;
   characteristics: uint32
 ): IMAGE_SECTION_HEADER =
+  result = default(IMAGE_SECTION_HEADER)
   for i in 0..<min(8, name.len):
     result.Name[i] = byte(name[i])
   result.VirtualSize = virtualSize
@@ -372,7 +379,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
               patch: PePatchProc = nil;
               unwind: seq[ProcUnwind] = @[];
               tlsTemplate: seq[byte] = @[];
-              tlsIndexDataOff: int = -1) =
+              tlsIndexDataOff: int = -1) {.canRaise.} =
   ## Write a PE executable file.
   ##
   ## `dataImage` is the writable data section's initial contents (`bssSize` bytes; a
@@ -750,7 +757,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     IMAGE_SCN_CNT_CODE or IMAGE_SCN_MEM_EXECUTE or IMAGE_SCN_MEM_READ
   )
 
-  var idataSection: IMAGE_SECTION_HEADER
+  var idataSection = default(IMAGE_SECTION_HEADER)
   var idataFileOffset = 0'u32
   var idataRawSize = 0'u32
   if hasExtProcs:
@@ -766,7 +773,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     )
 
   # .data section (globals) — after .idata, or straight after .text
-  var dataSection: IMAGE_SECTION_HEADER
+  var dataSection = default(IMAGE_SECTION_HEADER)
   var dataFileOffset = 0'u32
   var dataRawSize = 0'u32
   if hasData:
@@ -783,7 +790,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     )
 
   # .tls section: the directory, the NULL callback array, then the template.
-  var tlsSection: IMAGE_SECTION_HEADER
+  var tlsSection = default(IMAGE_SECTION_HEADER)
   var tlsFileOffset = 0'u32
   var tlsRawSize = 0'u32
   var tlsBytes: seq[byte] = @[]
@@ -791,7 +798,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     tlsFileOffset = if hasData: dataFileOffset + dataRawSize
                     elif hasExtProcs: idataFileOffset + idataRawSize
                     else: textFileOffset + textRawSize
-    tlsBytes = newSeq[byte](tlsSize)
+    tlsBytes = newSeq[byte](int(tlsSize))
     let base = DEFAULT_IMAGE_BASE
     template putQ(at: uint32; v: uint64) =
       for i in 0 ..< 8: tlsBytes[int(at) + i] = byte((v shr (8 * i)) and 0xFF)
@@ -836,7 +843,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_DISCARDABLE
   )
 
-  var pdataSection: IMAGE_SECTION_HEADER
+  var pdataSection = default(IMAGE_SECTION_HEADER)
   var pdataFileOffset = 0'u32
   var pdataRawSize = 0'u32
   if hasPdata:
@@ -854,7 +861,7 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   # Write file
   var f = newFileStream(outfile, fmWrite)
   if f == nil:
-    raise newException(IOError, "Failed to create file: " & outfile)
+    quit("nifasm: Failed to create file: " & outfile)
 
   # DOS Header (use writeData for explicit binary write)
   f.writeData(unsafeAddr dosHeader, sizeof(dosHeader))

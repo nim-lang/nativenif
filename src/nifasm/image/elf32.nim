@@ -23,6 +23,7 @@
 ## then resets by reading the interrupt table, so `e_entry` is advisory and the
 ## table is what actually decides where execution begins.
 
+import std/assertions
 import ../core/buffers
 
 type

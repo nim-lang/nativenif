@@ -13,10 +13,12 @@
 ## ELF: a tvar goes through a TLV descriptor dyld resolves, and a pointer inside
 ## a writable const is a rebase opcode rather than a baked address.
 
-import std / [tables, sets, algorithm]
+import std / [tables, sets, algorithm, syncio]
 import nifcore
 import "../core" / [context, sem, relocs, listing]
 import macho, writecommon
+
+include compat2   # getOrQuit on host Nim
 
 when defined(macosx):
   import std / osproc
@@ -40,7 +42,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
 
   # Build dynlink info for external procs
-  var dynlink: macho.DynLinkInfo
+  var dynlink = default(macho.DynLinkInfo)
   for lib in a.imports:
     dynlink.libs.add macho.ImportedLibInfo(name: lib.name, ordinal: lib.ordinal)
   for ext in a.extProcs:
@@ -55,7 +57,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
   # Thread-local storage (macOS TLV): one 24-byte descriptor per tvar, the
   # __thread_data init template, and the adrp+add sites referencing each
   # descriptor (carried by descriptor index).
-  var tlv: macho.TlvInfo
+  var tlv = default(macho.TlvInfo)
   for sym in a.tlvSyms: tlv.descriptorOffsets.add sym.size
   tlv.threadData = a.tlvData
   for (pos, sym) in a.tlvSites: tlv.sites.add (pos, sym.offset)
@@ -76,7 +78,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
                                        targetOff: it.target.size)
       elif labelPos.hasKey(it.target.offset):
         rebases.add macho.RodataRebase(fieldOff: fieldOff, targetInData: false,
-                                       targetOff: labelPos[it.target.offset])
+                                       targetOff: labelPos.getOrQuit(it.target.offset))
     of skGvar:
       rebases.add macho.RodataRebase(fieldOff: fieldOff, targetInData: true,
                                      targetOff: it.target.size)
@@ -96,7 +98,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
                                        targetOff: it.sym.size)
       elif labelPos.hasKey(it.sym.offset):
         rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: false,
-                                       targetOff: labelPos[it.sym.offset])
+                                       targetOff: labelPos.getOrQuit(it.sym.offset))
     of skGvar:
       rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: true,
                                      targetOff: it.sym.size)
@@ -108,7 +110,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
   if a.symMap:
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
-        symMapRows.add (labelPos[sym.offset], a.nameOf(name))
+        symMapRows.add (labelPos.getOrQuit(sym.offset), a.nameOf(name))
     symMapRows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
   if a.listing:
     # Only `writeMachO` knows where __text lands, so these rows stay __text-relative;
@@ -118,15 +120,18 @@ proc writeMachO*(a: var GenContext; outfile: string) =
   # `LC_SYMTAB` + `__TEXT,__eh_frame` from the same per-proc facts the ELF path
   # encodes: proc names for lldb, and CFI so it can unwind a frame-pointer-less
   # stack. Both are debugger-only; `--no-debug-info` drops them.
-  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
-                   a.bssInits, rebases, symMapRows,
-                   (if a.debugInfo: a.unwind else: @[]))
+  try:
+    macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
+                     a.bssInits, rebases, symMapRows,
+                     (if a.debugInfo: a.unwind else: @[]))
+  except:
+    quit "nifasm: cannot write " & outfile
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
     let codesignResult = execCmd("codesign -s - " & quoteShell(outfile))
     if codesignResult != 0:
-      raise newException(OSError, "codesign failed with exit code " & $codesignResult)
+      quit("nifasm: codesign failed with exit code " & $codesignResult)
 
 proc machoName(name: string): string =
   ## Mangle a nifasm symbol into a Mach-O symbol. macOS C ABI prefixes globals
@@ -162,7 +167,7 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
   var syms: seq[macho.MachOSym] = @[]
   var defIndex = initTable[string, int]()   # mangled name -> index in `syms`
 
-  proc addDef(name: string; sec: macho.MachOSecKind; value: uint64): int =
+  proc addDef(name: string; sec: macho.MachOSecKind; value: uint64): int {.closure.} =
     result = defIndex.getOrDefault(name, -1)
     if result < 0:
       result = syms.len
@@ -170,19 +175,19 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
       syms.add macho.MachOSym(name: name, sec: sec, value: value, defined: true)
 
   let mpool = a.pool   # capturable pool ref (the nested `defOf` cannot close over `a`)
-  proc defOf(sym: Symbol): int =
+  proc defOf(sym: Symbol): int {.closure.} =
     ## Ensure `sym` is in the table as a defined symbol; return its index (or -1 if
     ## it has no resolvable location, e.g. an un-emitted proc).
     case sym.kind
     of skProc:
       if labelPos.hasKey(sym.offset):
-        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos.getOrQuit(sym.offset)))
       else: -1
     of skRodata:
       if sym.dataConst:
         (if sym.size < dataRegionSize: addDef(machoName(symString(mpool, sym.name)), macho.moData, uint64(sym.size)) else: -1)
       elif labelPos.hasKey(sym.offset):
-        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos.getOrQuit(sym.offset)))
       else: -1
     of skGvar:
       # A data symbol must point inside the emitted `__data` region; a zero-size
@@ -202,7 +207,7 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
 
   # An `_main` alias at the entry proc so the system crt can find it.
   if a.entrySym != nil and labelPos.hasKey(a.entrySym.offset):
-    discard addDef("_main", macho.moText, uint64(labelPos[a.entrySym.offset]))
+    discard addDef("_main", macho.moText, uint64(labelPos.getOrQuit(a.entrySym.offset)))
 
   # --- relocations ---------------------------------------------------------------
   # The reloc loops below also pull their *defined* targets into the table via
@@ -222,7 +227,7 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
   for (labelId, blobOff, sym, _) in a.rodataSymInits:
     let si = defOf(sym)
     if si >= 0 and labelPos.hasKey(labelId):
-      textRels.add macho.MachORel(address: labelPos[labelId] + blobOff,
+      textRels.add macho.MachORel(address: labelPos.getOrQuit(labelId) + blobOff,
                                   symIdx: si, kind: macho.mrUnsigned)
 
   # Symbol-address initializers of globals (in __data): 8-byte UNSIGNED.
@@ -242,7 +247,7 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
 
   # Undefined symbols: one per external proc (deduplicated by external name).
   var undefIndex = initTable[string, int]()
-  proc undefOf(extName: string): int =
+  proc undefOf(extName: string): int {.closure.} =
     result = undefIndex.getOrDefault(extName, -1)
     if result < 0:
       result = syms.len
@@ -265,5 +270,8 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
         if it.off.int + i < dataImage.len:
           dataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
 
-  macho.writeMachOObject(code, dataImage, syms, nDefined, textRels, dataRels,
-                         cputype, cpusubtype, outfile)
+  try:
+    macho.writeMachOObject(code, dataImage, syms, nDefined, textRels, dataRels,
+                           cputype, cpusubtype, outfile)
+  except:
+    quit "nifasm: cannot write " & outfile

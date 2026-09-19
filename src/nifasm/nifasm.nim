@@ -1,5 +1,5 @@
 
-import std / [parseopt, strutils, os]
+import std / [parseopt, strutils, parseutils, os, syncio, assertions]
 import driver
 import image/elf32
 
@@ -62,7 +62,7 @@ proc handleCmdLine() =
   # matter which order the two flags arrive in.
   var stackTopGiven = false
 
-  proc num(val, flag: string): uint32 =
+  proc num(val, flag: string): uint32 {.closure.} =
     ## An address or a size. `0x` for hex, and a K/M/G suffix multiplies — the
     ## spellings a datasheet uses, since that is where the number is read off.
     var t = val.strip()
@@ -73,11 +73,20 @@ proc handleCmdLine() =
       of 'm', 'M': mult = 1024'u64 * 1024; t.setLen t.len - 1
       of 'g', 'G': mult = 1024'u64 * 1024 * 1024; t.setLen t.len - 1
       else: discard
-    var v: uint64
-    try:
-      v = if t.startsWith("0x") or t.startsWith("0X"): fromHex[uint64](t)
-          else: parseBiggestUInt(t)
-    except ValueError:
+    var v = 0'u64
+    var used = 0                        # characters parsed; every one must be
+    if t.startsWith("0x") or t.startsWith("0X"):
+      used = parseHex(t, v)
+      if used <= 2: used = -1           # a bare `0x`
+    else:
+      var b = BiggestUInt(0)
+      when defined(nimony):
+        used = parseBiggestUInt(t, b)   # negative on overflow
+      else:
+        try: used = parseBiggestUInt(t, b)
+        except ValueError: used = -1    # host Nim raises on overflow instead
+      v = uint64(b)
+    if t.len == 0 or used != t.len:
       quit "nifasm: " & flag & ": not a number: " & val
     v *= mult
     if v > 0xFFFF_FFFF'u64: quit "nifasm: " & flag & ": out of range: " & val

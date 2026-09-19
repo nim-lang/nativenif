@@ -14,13 +14,15 @@
 ## listing rows and the gvar/adrp patch sites are carried through. That is why
 ## the trace table is filled at the end rather than where it was reserved.
 
-import std / [streams, os, tables, algorithm, strutils]
+import std / [streams, os, tables, algorithm, strutils, syncio]
 import nifcore
 import "../core" / [context, sem, relocs, buffers, listing]
 import "../x64/relax"                 # the rel32 -> rel8 shrink and the 16-byte pad
 import elf, dwarf, writecommon
 
-proc writeElf*(a: var GenContext; outfile: string) =
+include compat2   # canRaise
+
+proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
   # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT
   # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
   # relays out `.text`, so remap every code byte-offset we still need afterwards:
@@ -109,7 +111,7 @@ proc writeElf*(a: var GenContext; outfile: string) =
     var labelPos = initTable[int, int]()
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
     let hdrBytes = 64 + 56 * 3
-    var rows: seq[(int, string)]
+    var rows = default(seq[(int, string)])
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
         rows.add (0x400000 + hdrBytes + labelPos[sym.offset], a.nameOf(name))
@@ -171,8 +173,8 @@ proc writeElf*(a: var GenContext; outfile: string) =
                (uint32(code[pos+6]) shl 16) or (uint32(code[pos+7]) shl 24)
       if ((lo shr 24) and 0x3F'u32) == 0x39'u32:
         let size = (lo shr 30) and 0x3'u32
-        doAssert (pageOff and ((1'u64 shl size) - 1)) == 0,
-          "gload/gstore: global page-offset not aligned to its access size"
+        if (pageOff and ((1'u64 shl size) - 1)) != 0:
+          quit "nifasm: gload/gstore: global page-offset not aligned to its access size"
         lo = lo or (uint32((pageOff shr size) and 0xFFF) shl 10)
       else:
         lo = lo or (uint32(pageOff and 0xFFF) shl 10)
@@ -268,7 +270,7 @@ proc writeElf*(a: var GenContext; outfile: string) =
   # or a gvar's compile-time value) FIRST, so the data LOAD segment below can size its
   # file/mem extents to cover it. The on-disk image holds those bytes (the rest zero),
   # so the slots start initialized with no entry-time code (correct in a bundle).
-  var bssImage: seq[byte]
+  var bssImage = default(seq[byte])
   if (a.bssInits.len > 0 or a.bssSymInits.len > 0) and bssSize > 0:
     bssImage = newSeq[byte](bssSize.int)
     for it in a.bssInits:
@@ -378,7 +380,8 @@ proc writeElf*(a: var GenContext; outfile: string) =
     while (pos and (pageSize - 1)) != 0:
       f.write 0'u8; inc pos
     let ehFrameOff = pos
-    doAssert ehFrameOff == ehSegOff, "`.eh_frame` file offset disagrees with its PT_LOAD"
+    if ehFrameOff != ehSegOff:
+      quit "nifasm: `.eh_frame` file offset disagrees with its PT_LOAD"
     if ehFrame.len > 0:
       f.writeData(unsafeAddr ehFrame[0], ehFrame.len); pos += ehFrame.len.uint64
     pad8()

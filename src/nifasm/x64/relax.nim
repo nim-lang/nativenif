@@ -22,6 +22,8 @@
 import std / [tables, sets, algorithm, sequtils]
 import "../core" / [buffers, relocs]
 
+include compat2   # getOrQuit on host Nim
+
 proc canUseShortJump(distance: int): bool {.inline.} =
   ## Whether a displacement fits x86's signed 8-bit (rel8) jump form.
   distance >= -128 and distance <= 127
@@ -55,7 +57,7 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind
-  of rkJe: 0x74
+  of rkJe: 0x74'u8
   of rkJne: 0x75
   of rkJg: 0x7F
   of rkJl: 0x7C
@@ -78,20 +80,24 @@ proc emitX64Nops(data: var Bytes; n: int) =
   ## multi-byte NOP forms, up to 9 bytes each). A pad before a loop head is executed
   ## on the fall-in path, so 11 × `0x90` would cost 11 decode slots where two long
   ## NOPs cost two.
-  const Forms: array[1..9, seq[byte]] = [
-    @[0x90'u8],
-    @[0x66'u8, 0x90],
-    @[0x0F'u8, 0x1F, 0x00],
-    @[0x0F'u8, 0x1F, 0x40, 0x00],
-    @[0x0F'u8, 0x1F, 0x44, 0x00, 0x00],
-    @[0x66'u8, 0x0F, 0x1F, 0x44, 0x00, 0x00],
-    @[0x0F'u8, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
-    @[0x0F'u8, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-    @[0x66'u8, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]]
+  # The 1- to 9-byte forms back to back, so the `k`-byte one starts at
+  # `k*(k-1) div 2`. One flat array rather than an array of `seq`s, which is
+  # no compile-time value for Nimony.
+  const Forms = [
+    0x90'u8,
+    0x66'u8, 0x90,
+    0x0F'u8, 0x1F, 0x00,
+    0x0F'u8, 0x1F, 0x40, 0x00,
+    0x0F'u8, 0x1F, 0x44, 0x00, 0x00,
+    0x66'u8, 0x0F, 0x1F, 0x44, 0x00, 0x00,
+    0x0F'u8, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00,
+    0x0F'u8, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66'u8, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]
   var r = n
   while r > 0:
     let k = min(r, 9)
-    for b in Forms[k]: data.add b
+    let start = k * (k - 1) div 2
+    for i in start ..< start + k: data.add Forms[i]
     r -= k
 
 proc alignPointPositions(buf: Buffer; alignLabels: seq[int]): seq[int] =
@@ -114,6 +120,7 @@ proc backwardBranchTargets*(buf: Buffer): seq[int] =
   ## candidates `alignCodeX64` pads to a 16-byte boundary. Collect from the reloc
   ## list right before `shortenX64Jumps` (afterwards the shortened jumps are
   ## patched inline and no longer tracked).
+  result = default(seq[int])
   let lp = buf.labelPositions
   var seen = initHashSet[int]()
   for r in buf.relocs:
@@ -256,12 +263,12 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
     for i in 0 ..< relocs.len:
       savPrefix[i + 1] = savPrefix[i] +
         (if isShort[i]: longSizeOf(relocs[i].kind) - 2 else: 0)
-    proc newPos(p: int): int =
+    proc newPos(p: int): int {.closure.} =
       let below = lowerBound(relocPositions, p)   # # of relocs with position < p
       p - savPrefix[below]
     for i in 0 ..< relocs.len:
       if not isShort[i]: continue
-      let dist = newPos(labelPos[int(relocs[i].target)]) -
+      let dist = newPos(labelPos.getOrQuit(int(relocs[i].target))) -
                  (relocs[i].position - savPrefix[firstAtPos[i]] + 2)   # rel8 measured from 2-byte end
       if not canUseShortJump(dist):
         isShort[i] = false                          # overflow → grow back to long
@@ -293,7 +300,7 @@ proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
       let r = relocs[ri]
       if isShrinkableX64(r.kind) and isShort[ri]:
         let newSelf = result[r.position]
-        let newTgt = result[labelPos[int(r.target)]]
+        let newTgt = result[labelPos.getOrQuit(int(r.target))]
         let disp = newTgt - (newSelf + 2)
         newData.add(if r.kind == rkJmp: 0xEB'u8 else: shortJccOpcode(r.kind))
         newData.add(byte(disp and 0xFF))

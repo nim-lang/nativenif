@@ -13,11 +13,13 @@
 ## the image is laid out, which is why arkham ASKS for them (`(mimg …)`) instead
 ## of computing them. They are patched into fixed-width MOVW/MOVT pairs here.
 
-import std / [tables, strutils]
+import std / [tables, strutils, syncio]
 
 import "../core" / [context, sem, relocs, buffers]
 import "../thumb/board"
 import elf32
+
+include compat2   # getOrQuit on host Nim
 
 proc interruptTableBytes*(a: GenContext): int =
   ## The table's size, which is what every other layout number here is measured
@@ -87,12 +89,12 @@ proc writeCortexMImage*(a: var GenContext; code: seq[byte];
     if stacksEnd > noinitBase or stacksEnd < stacksBase or noinitBase < map.ramBase:
       quit "nifasm: the layout does not fit: " & $a.bssOffset & " bytes of globals, " &
            $a.board.heapSize & " of heap and " & $a.board.slots & " stack slot(s) of " &
-           $a.board.slotSize & " reach 0x" & toHex(stacksEnd, 8) & ", past " &
+           $a.board.slotSize & " reach 0x" & toHex(BiggestInt(stacksEnd), 8) & ", past " &
            (if a.board.noinitSize > 0:
-              "the noinit region at 0x" & toHex(noinitBase, 8) & " which is kept " &
+              "the noinit region at 0x" & toHex(BiggestInt(noinitBase), 8) & " which is kept " &
               "back from the top of the "
             else: "the end of the ") &
-           $map.ramSize & "-byte region at 0x" & toHex(map.ramBase, 8)
+           $map.ramSize & "-byte region at 0x" & toHex(BiggestInt(map.ramBase), 8)
     # This image boots on ITS core's slot, and starts just below the slot's
     # thread-local reservation — which lives at the TOP, so the stack grows DOWN
     # away from it rather than into it.
@@ -121,10 +123,10 @@ proc writeCortexMImage*(a: var GenContext; code: seq[byte];
       case it.sym.kind
       of skProc:
         if not labelPos.hasKey(it.sym.offset): continue
-        targetVaddr = codeBase + uint32(labelPos[it.sym.offset]) + 1'u32
+        targetVaddr = codeBase + uint32(labelPos.getOrQuit(it.sym.offset)) + 1'u32
       of skRodata:
         if not labelPos.hasKey(it.sym.offset): continue
-        targetVaddr = codeBase + uint32(labelPos[it.sym.offset])
+        targetVaddr = codeBase + uint32(labelPos.getOrQuit(it.sym.offset))
       of skGvar:
         targetVaddr = bssVaddr + uint32(it.sym.size)
       else: continue
@@ -137,7 +139,7 @@ proc writeCortexMImage*(a: var GenContext; code: seq[byte];
   # the first deep call frame quietly overwrite a global.
   if bssVaddr + uint32(a.bssOffset) > map.stackTop:
     quit "nifasm: " & $a.bssOffset & " bytes of globals at 0x" &
-         toHex(bssVaddr, 8) & " reach the stack top at 0x" & toHex(map.stackTop, 8)
+         toHex(BiggestInt(bssVaddr), 8) & " reach the stack top at 0x" & toHex(BiggestInt(map.stackTop), 8)
 
   var patched = code
 
@@ -152,17 +154,17 @@ proc writeCortexMImage*(a: var GenContext; code: seq[byte];
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
     for it in a.rodataSymInits:
       if not labelPos.hasKey(it.labelId): continue
-      let sitePos = labelPos[it.labelId] + it.blobOff
+      let sitePos = labelPos.getOrQuit(it.labelId) + it.blobOff
       var targetVaddr = 0'u32
       case it.sym.kind
       of skProc:
         if labelPos.hasKey(it.sym.offset):
           targetVaddr = codeVaddr + uint32(itBytes) +
-                        uint32(labelPos[it.sym.offset]) + 1'u32   # Thumb bit
+                        uint32(labelPos.getOrQuit(it.sym.offset)) + 1'u32   # Thumb bit
       of skRodata:
         if labelPos.hasKey(it.sym.offset):
           targetVaddr = codeVaddr + uint32(itBytes) +
-                        uint32(labelPos[it.sym.offset])
+                        uint32(labelPos.getOrQuit(it.sym.offset))
       of skGvar:
         targetVaddr = bssVaddr + uint32(it.sym.size)
       else: discard
@@ -255,7 +257,7 @@ proc writeCortexMImage*(a: var GenContext; code: seq[byte];
   # here, where both numbers are known.
   if uint32(image.len) > map.flashSize:
     quit "nifasm: the image is " & $image.len & " bytes and the flash region at 0x" &
-         toHex(map.flashBase, 8) & " holds " & $map.flashSize
+         toHex(BiggestInt(map.flashBase), 8) & " holds " & $map.flashSize
 
   var segs = @[elf32.Segment(vaddr: codeVaddr, data: image, memSize: image.len,
                        flags: elf32.PF_R or elf32.PF_W or elf32.PF_X)]

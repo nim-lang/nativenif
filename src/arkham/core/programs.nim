@@ -314,6 +314,9 @@ const LinuxSyscalls* = {
   "mkdirat":    (258, 34),
   "unlinkat":   (263, 35),
   "renameat":   (264, 38),
+  # std/os `setFilePermissions`. Same story: AArch64 only has `fchmodat`.
+  "chmod":      (90,  -1),
+  "fchmodat":   (268, 53),
   # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
   # syscall so a libc-free build links and terminates (it takes no args, so the exit
   # code is whatever is in the syscall's code register — abort is a cold error path).

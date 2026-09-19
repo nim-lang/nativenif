@@ -22,7 +22,7 @@
 ## other; a chip does not, which is why the startup code has to (M6), and why
 ## nothing here relies on it.
 
-import std / [strutils]
+import std / [strutils, syncio]
 
 import "../core" / [context, relocs, buffers]
 import "../avr" / [encoder]

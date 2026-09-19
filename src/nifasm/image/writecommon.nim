@@ -12,6 +12,7 @@
 ## and each writer runs its own layout passes, so each fills the table itself.
 ## `appendTraceTable` reserves the space; `fillTraceTable` writes the bytes.
 
+import std / [syncio]
 import "../core" / [context, relocs, buffers]
 import dwarf, tracetable
 

@@ -28,7 +28,7 @@
 ##  * **`ldi` does not reach r0..r15.** A constant destined for a low register is
 ##    the code generator's problem, not this one's — the encoder asserts it.
 
-import std / [tables, sets]
+import std / [tables, sets, assertions]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
                     tags, model, tagconv, decls, stackslots, relocs, buffers,
@@ -36,6 +36,11 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as avr
 import regs
 import operands
+
+include compat2   # getOrQuit on host Nim
+
+when not defined(nimony):
+  {.pragma: untyped.}   # Nimony: an unchecked template body, so `emitter(…)` can call a parameter
 
 proc genStmtAvr(n: var Cursor; ctx: var GenContext)
 proc genInstAvr(n: var Cursor; ctx: var GenContext)
@@ -132,7 +137,7 @@ proc evictAvr(ctx: var GenContext; r: avr.Register) =
   ## a PAIR. Both halves map to the same name, so the partner is found by name
   ## rather than by arithmetic — the tenant may be either half.
   if r notin ctx.avrRegBindings: return
-  let victim = ctx.avrRegBindings[r]
+  let victim = ctx.avrRegBindings.getOrQuit(r)
   ctx.scope.undefine(ctx.symIdOf(victim))
   var same: seq[avr.Register] = @[]
   for k, v in ctx.avrRegBindings:
@@ -360,7 +365,7 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
   # own `inc n` still lands on operand 0.
   if isEscapedTag(n): inc n
 
-  template regReg(emitter: untyped) =
+  template regReg(emitter: untyped) {.untyped.} =
     ## `(op D S)` on two 8-bit registers. Destructive: D is also the first
     ## source, which is what the machine does and what x86-64's two-operand
     ## spelling already means.
@@ -370,7 +375,7 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
     emitter(ctx.buf.data, regOfAvr(d, "destination", start),
             regOfAvr(s, "source", start))
 
-  template regImm(emitter: untyped; lo, hi: int) =
+  template regImm(emitter: untyped; lo, hi: int) {.untyped.} =
     ## `(op D K)` — an immediate form, and the encoder asserts that D is
     ## r16..r31, since the field is biased and a low register would silently
     ## encode as a high one.
@@ -383,12 +388,12 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
             " needs the constant staged in a high register first", start)
     emitter(ctx.buf.data, dr, immOfAvr(s, "immediate", lo, hi, start))
 
-  template unary(emitter: untyped) =
+  template unary(emitter: untyped) {.untyped.} =
     inc n
     let d = parseDestAvr(n, ctx)
     emitter(ctx.buf.data, regOfAvr(d, "destination", start))
 
-  template plain(emitter: untyped) =
+  template plain(emitter: untyped) {.untyped.} =
     ## `skip n`, NOT `inc n` followed by draining `hasMore`: `inc` steps INTO the
     ## node, and `hasMore` is then relative to the enclosing `(stmts …)` — so the
     ## drain swallowed every statement after this one. It only ever showed up

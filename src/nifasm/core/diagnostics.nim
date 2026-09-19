@@ -18,6 +18,7 @@
 ## `typecheck` — take no context. It is set once per proc, beside the mirror in
 ## `GenContext.lenient` that the instruction handlers read.
 
+import std / [syncio]
 import nifcore, nifcoreparse   # `toString`: the offending subtree, rendered
 import sem
 
@@ -54,8 +55,8 @@ proc infoStr(n: Cursor): string =
   else:
     result = "???"
 
-proc error*(msg: string; n: Cursor) =
-  writeStackTrace()
+proc error*(msg: string; n: Cursor) {.noreturn.} =
+  when not defined(nimony): writeStackTrace()   # Nimony has no `writeStackTrace`
   # `n` may be DRAINED — an error raised after an `into`-bounded scope has consumed
   # all its children (e.g. an `(at base index scratch)` disjointness check fires only
   # after the scratch is parsed) leaves the cursor past its last token, where `.kind`
@@ -72,5 +73,5 @@ proc error*(msg: string; n: Cursor) =
   else:
     quit "[Error] " & msg & inProc
 
-proc typeError*(want, got: Type; n: Cursor) =
+proc typeError*(want, got: Type; n: Cursor) {.noreturn.} =
   error("Type mismatch: expected " & $want & ", got " & $got, n)

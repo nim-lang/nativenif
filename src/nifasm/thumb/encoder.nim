@@ -19,6 +19,7 @@
 ## little-endian 32-bit word. `0xF7FF 0xFFFE` is written `FF F7 FE FF`.
 
 
+import std / [assertions, syncio]
 import ../core/[buffers, relocs]
 import thumbimm
 export thumbimm.encodeModifiedImm, thumbimm.isModifiedImm
@@ -126,7 +127,7 @@ proc emitMovImm32*(dest: var Bytes; rd: Register; value: uint32) =
   if value < 256 and rd.isLow:
     dest.emitNarrow 0x2000'u16 or (reg(rd) shl 8) or uint16(value)
     return
-  var enc: uint32
+  var enc = 0'u32
   if encodeModifiedImm(value, enc):
     let (i, imm3, imm8) = splitImm12(enc)
     dest.emitWide(0xF04F'u16 or (i shl 10), (imm3 shl 12) or (reg(rd) shl 8) or imm8)
@@ -201,7 +202,7 @@ proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint32) =
   if rd == rn and rd.isLow and imm < 256:
     dest.emitNarrow 0x3000'u16 or (reg(rd) shl 8) or uint16(imm)
     return
-  var enc: uint32
+  var enc = 0'u32
   if encodeModifiedImm(imm, enc):
     dest.emitDataImm(OpAdd, rd, rn, enc, false)
     return
@@ -231,7 +232,7 @@ proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint32) =
   if rd == rn and rd.isLow and imm < 256:
     dest.emitNarrow 0x3800'u16 or (reg(rd) shl 8) or uint16(imm)
     return
-  var enc: uint32
+  var enc = 0'u32
   if encodeModifiedImm(imm, enc):
     dest.emitDataImm(OpSub, rd, rn, enc, false)
     return
@@ -346,12 +347,12 @@ proc emitCmpImm*(dest: var Bytes; rn: Register; imm: uint32) =
   if rn.isLow and imm < 256:
     dest.emitNarrow 0x2800'u16 or (reg(rn) shl 8) or uint16(imm)
     return
-  var enc: uint32
+  var enc = 0'u32
   if encodeModifiedImm(imm, enc):
     let (i, imm3, imm8) = splitImm12(enc)
     dest.emitWide(0xF1B0'u16 or (i shl 10) or reg(rn), (imm3 shl 12) or 0x0F00'u16 or imm8)
     return
-  raise newException(ValueError, "thumb2: CMP immediate not encodable: " & $imm)
+  quit("nifasm: thumb2: CMP immediate not encodable: " & $imm)
 
 proc emitTstReg*(dest: var Bytes; rn, rm: Register) =
   if rn.isLow and rm.isLow: dest.emitNarrow 0x4200'u16 or (reg(rm) shl 3) or reg(rn)
@@ -406,7 +407,7 @@ proc emitLoadStoreImm*(dest: var Bytes; rt, rn: Register; offset: int32;
     dest.emitWide(0xF800'u16 or sizeBits or signBit or (if isLoad: 0x0010'u16 else: 0'u16) or reg(rn),
                   (reg(rt) shl 12) or 0x0C00'u16 or uint16(-offset))
   else:
-    raise newException(ValueError, "thumb2: load/store offset out of range: " & $offset)
+    quit("nifasm: thumb2: load/store offset out of range: " & $offset)
 
 proc emitLdr*(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemWord, isLoad = true)
@@ -636,11 +637,11 @@ proc emitVldrVstr*(dest: var Bytes; sd: FloatRegister; rn: Register;
   ## reach is ±1020 bytes and it must be 4-aligned — narrower than the integer
   ## `ldr`'s 4095, and a frame beyond it is an error rather than a wrong address.
   if (offset and 3) != 0:
-    raise newException(ValueError, "thumb2: vldr/vstr offset not word-aligned: " & $offset)
+    quit("nifasm: thumb2: vldr/vstr offset not word-aligned: " & $offset)
   let u = if offset >= 0: 1'u16 else: 0'u16
   let mag = (if offset >= 0: offset else: -offset) shr 2
   if mag > 255:
-    raise newException(ValueError, "thumb2: vldr/vstr offset out of range: " & $offset)
+    quit("nifasm: thumb2: vldr/vstr offset out of range: " & $offset)
   dest.emitWide(0xED00'u16 or (u shl 7) or (fLo(sd) shl 6) or
                 (if isLoad: 0x10'u16 else: 0'u16) or uint16(ord(rn)),
                 (fHi(sd) shl 12) or 0x0A00'u16 or uint16(mag))

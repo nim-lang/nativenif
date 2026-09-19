@@ -25,6 +25,7 @@
 ##  * `adiw`/`sbiw` name only r24, X, Y and Z, with a 6-bit immediate.
 ##  * `movw` names only even registers, and `ldd`/`std` only Y and Z.
 
+import std / [assertions]
 import ../core/[buffers, relocs]
 
 type
@@ -89,7 +90,7 @@ proc invert*(c: Condition): Condition =
 proc flagOf(c: Condition): uint16 =
   ## The SREG bit index a condition tests: C=0, Z=1, N=2, V=3, S=4, H=5, T=6.
   case c
-  of CondEq, CondNe: 1
+  of CondEq, CondNe: 1'u16
   of CondLo, CondSh: 0
   of CondMi, CondPl: 2
   of CondLt, CondGe: 4
@@ -233,7 +234,7 @@ proc ptrNibble(pr: PtrReg): uint16 {.inline.} =
   ## The low nibble selecting the pointer register in the 0x9000-based forms —
   ## plain `ld X`, and the post-increment forms for all three.
   case pr
-  of PX: 0xC
+  of PX: 0xC'u16
   of PY: 0x8
   of PZ: 0x0
 
@@ -249,12 +250,12 @@ proc dispBits(q: int): uint16 {.inline.} =
 proc emitLdd*(dest: var Bytes; rd: Register; pr: PtrReg; q: int) =
   ## LDD rd, Y+q / Z+q — displacement 0..63. X has no displaced form at all.
   assert pr != PX and fitsDisp(q)
-  dest.emit1 0x8000'u16 or dispBits(q) or (r(rd) shl 4) or (if pr == PY: 0x8 else: 0x0)
+  dest.emit1 0x8000'u16 or dispBits(q) or (r(rd) shl 4) or (if pr == PY: 0x8'u16 else: 0x0)
 
 proc emitStd*(dest: var Bytes; pr: PtrReg; q: int; rs: Register) =
   ## STD Y+q, rs / Z+q, rs
   assert pr != PX and fitsDisp(q)
-  dest.emit1 0x8200'u16 or dispBits(q) or (r(rs) shl 4) or (if pr == PY: 0x8 else: 0x0)
+  dest.emit1 0x8200'u16 or dispBits(q) or (r(rs) shl 4) or (if pr == PY: 0x8'u16 else: 0x0)
 
 proc emitLd*(dest: var Bytes; rd: Register; pr: PtrReg) =
   ## LD rd, X|Y|Z.

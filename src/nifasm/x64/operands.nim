@@ -22,6 +22,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as x86
 import regs
 
+include compat2   # getOrQuit on host Nim
+
 type
   Operand* = object
     kind*: OperandKind
@@ -39,6 +41,7 @@ type
                               # ELF backend patches its `lea` against the .bss segment
 
 proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
+  result = default(Operand)
   if n.kind == TagLit:
     let t = n.tag
     if rawTagIsX64Reg(t):
@@ -47,7 +50,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       # Check if this register is bound to a variable
       if result.reg in ctx.regBindings and not lenient():
         error("Register " & $result.reg & " is bound to variable '" &
-              ctx.regBindings[result.reg] & "', use the variable name instead", n)
+              ctx.regBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
       # R11 is the codegen's RESERVED staging bridge — never a syscall/call argument
       # or a callee-saved home. A *raw* `(reg r11)` therefore always means a value or
       # address was left in the bridge as an UNTRACKED, untyped register; the codegen
@@ -69,7 +72,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       # (dot <ptr-var> <fieldname>) for pointer variables
       inc n
 
-      var objType: Type
+      var objType = default(Type)
       var baseReg: x86.Register
       var baseDisp: int32 = 0
       var baseIndex: x86.Register
@@ -182,8 +185,8 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       #   arkham (it owns the scratch). `into` bounds the node so the optional
       #   third operand is read without running into the following sibling.
       into n:
-        var elemType: Type
-        var baseReg: x86.Register
+        var elemType = default(Type)
+        var baseReg = default(x86.Register)
         var baseDisp: int32 = 0
         var baseIndex: x86.Register
         var baseScale: int = 0
@@ -250,7 +253,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         # Optional third operand: an arkham-supplied scratch register for a stride
         # that can't be a SIB scale.
         var hasScratch = false
-        var scratchReg: x86.Register
+        var scratchReg = default(x86.Register)
         if n.hasMore and n.kind == TagLit and rawTagIsX64Reg(n.tag):
           scratchReg = parseRegister(n)
           hasScratch = true
@@ -800,13 +803,14 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
 
 proc parseDest*(n: var Cursor; ctx: var GenContext;
                allowWidthCast = false): Operand =
+  result = default(Operand)
   if n.kind == TagLit and rawTagIsX64Reg(n.tag):
     result.reg = parseRegister(n)
     result.typ = Type(kind: RegisterT, regBits: 64)
     # Check if this register is bound to a variable
     if result.reg in ctx.regBindings and not lenient():
       error("Register " & $result.reg & " is bound to variable '" &
-            ctx.regBindings[result.reg] & "', use the variable name instead", n)
+            ctx.regBindings.getOrQuit(result.reg) & "', use the variable name instead", n)
     if result.reg == x86.R11 and not lenient():   # the reserved staging bridge
       error("raw r11 destination: the staging bridge must be a typed (rebind) binding, " &
             "never a bare (reg)", n)
@@ -959,11 +963,12 @@ proc parseXmmOperand*(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
   ## sees the use); a `Symbol` is resolved to the xmm register its float local is
   ## bound to. This is how a raw use of a value still live in a bound xmm register
   ## becomes a build error instead of a silent clobber.
+  result = default(x86.XmmRegister)
   if isXmmTag(n):
     result = tagToXmm(n.tag)
     if result in ctx.xmmBindings:
       error("Register " & $result & " is bound to variable '" &
-            ctx.xmmBindings[result] & "', use the variable name instead", n)
+            ctx.xmmBindings.getOrQuit(result) & "', use the variable name instead", n)
     inc n
   elif n.kind == Symbol:
     let sym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
@@ -1010,7 +1015,7 @@ proc checkFixedRegFree*(ctx: GenContext; reg: x86.Register; insn: string; n: Cur
   ## sitting in RDX/RCX used to be miscompiled in silence.
   if reg in ctx.regBindings:
     error(insn & " clobbers " & $reg & ", still bound to variable '" &
-          ctx.regBindings[reg] & "' — move/kill it first", n)
+          ctx.regBindings.getOrQuit(reg) & "' — move/kill it first", n)
 
 proc leaRegBase*(n: var Cursor; ctx: var GenContext; baseReg: var x86.Register): bool =
   ## Detect and consume a `lea` base register: a raw `(reg)` tag, or a
