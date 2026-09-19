@@ -102,7 +102,7 @@ const arkhamKnownUnsupported: seq[string] =
   # runtime `(aconstr …)`/`(oconstr …)` constructor as a direct call argument are both
   # handled on x86-64 AND AArch64. No quarantine remains.
   @["eh_onerr",   # `(onerr ACTION FN ARGS…)` is the flag model's checked call:
-                  # ithaqua lowers it and jorogumo has the twin; arkham x64n has no
+                  # the web back end (wasm + JS) lowers it; arkham x64n has no
                   # `onerr` in genStmt2 and asserts. The fixture exists to pin the
                   # JS/wasm pair, not to promise native code for a shape hexer no
                   # longer emits either.
@@ -157,7 +157,7 @@ const arkhamA64Unsupported: seq[string] = @[
   # `(onerr ACTION FN ARGS…)` — the flag model's checked call. Not an a64 gap: NO
   # arkham backend (x64, a64, cortex) lowers `onerr`, and its absence is fine because
   # neither `hexer` nor the `eraiser` emits it into Leng any more — the `onerr` in the
-  # corpus pins ithaqua's and jorogumo's handling, the two backends that carry it for
+  # corpus pins the web back end's handling (wasm + JS), which carries it for
   # hand-written fixtures. See `arkhamKnownUnsupported`.
   "eh_onerr",
   # `bintrin`'s two `Popcount` rows. The `Ctz`/`Clz` rows lower on a64 (and the
@@ -518,13 +518,15 @@ proc buildToolchain() =
   ## for, and the fix is to stop having a build be a side effect of a test.
   exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
   exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
-  # `bin/ithaqua` for the same reason, and for one more: ithaqua compiles
-  # against arkham's `core/` program model without living under it, so a rename
-  # or a signature change in `core/` breaks it and NOTHING ELSE in this repo
-  # notices. That is not hypothetical — it is how ithaqua arrived: a merge left
-  # `typeToSlot` calls passing an argument its callee no longer took, and the
-  # backend simply did not compile.
+  # `bin/ithaqua` and `bin/jorogumo` — the two faces of the web back end — for
+  # the same reason, and for one more: `src/web` compiles against arkham's
+  # `core/` program model without living under it, so a rename or a signature
+  # change in `core/` breaks it and NOTHING ELSE in this repo notices. That is
+  # not hypothetical — it is how ithaqua arrived: a merge left `typeToSlot`
+  # calls passing an argument its callee no longer took, and the backend
+  # simply did not compile.
   exec "nim c --hints:off src/ithaqua/ithaqua.nim"
+  exec "nim c --hints:off src/jorogumo/jorogumo.nim"
 
 proc requiredExe(name, what: string): string =
   ## `findExe` for a runner a suite needs, with one extra job.
@@ -546,88 +548,111 @@ proc requiredExe(name, what: string): string =
          "what this guard exists to prevent. Install it, or unset the variable " &
          "to accept the gap."
 
-const ithaquaUnsupported: seq[string] = @[
-  # Fixtures ithaqua is EXPECTED to refuse, checked as refusals so that the
-  # emit pass over the rest can be an unconditional "must succeed".
+const webUnsupported: seq[string] = @[
+  # Fixtures the web back end is EXPECTED to refuse — on both targets, since
+  # they share one code generator — checked as refusals so that the pass over
+  # the rest can be an unconditional "must succeed".
   #
-  # 1. Target-pinned `(instr …)` rows. wasm has no flags, no register ties and
-  #    no named machine instructions, so these cannot lower — and ithaqua says
-  #    so by name rather than emitting something plausible.
+  # 1. Target-pinned `(instr …)` rows, `{.assembler.}` and `{.naked.}` procs.
+  #    The web targets have no flags, no register ties and no named machine
+  #    instructions, so these cannot lower — and the back end says so by name
+  #    rather than emitting something plausible.
   "a64_vec_instr", "assembler_a64", "assembler_x64", "atomic2",
   "err_flag_outside_asm", "err_flag_value", "err_inout_dest", "err_inout_value",
-  "err_nonflag_cond", "intrinsics", "intrinsics_x64", "naked_stacktrace_x64",
-  "volatile_access",
-  # 2. Not whole programs. The `mod_*` fixtures are foreign helper MODULES that
-  #    other fixtures import; they declare no `exportc "main"`, and ithaqua is
-  #    whole-program — it starts from an entry proc or it has nothing to do.
+  "err_naked_alone", "err_naked_callee", "err_naked_stack", "err_nonflag_cond",
+  "err_unannotated_local", "err_wrong_param_reg",
+  "intrinsics", "intrinsics_x64", "naked_stacktrace_x64", "volatile_access",
+  # 2. Pointer arithmetic, refused by arkham's own rule (`checkArithResultType`).
+  "err_aptr_arith", "err_ptr_arith",
+  # 3. Not whole programs. The `mod_*` fixtures are foreign helper MODULES that
+  #    other fixtures import; they declare no `exportc "main"`, and the back end
+  #    is whole-program — it starts from an entry proc or has nothing to do.
   "mod_clinkage", "mod_glib", "mod_vtab", "mod_xlib",
-  # 3. `ulock_wake` is a Darwin syscall fixture: the syscall has no host import
-  #    to map onto, so the proc has no definition to emit.
-  "ulock_wake",
-  "darwin_varargs",     # a libSystem `{.varargs.}` extern: Darwin-only, see arkhamOsxOnly
-  "darwin_varargs_many",
-  # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
-  #    Each one aborts loudly today; none of them miscompiles.
-  "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
-  "const_rodata_reloc_obj",   # const initializer ithaqua cannot fold
-  "float_const_conv",         # ditto, through a float conversion
-  "float_special_values",     # inf/nan bit patterns squeezed through an int32
-  "mul_overflow",             # an `(i 64)` literal wider than int32
-  "overflow_check",           # `keepovf` operand walk hits a non-tag cursor
+  # 4. Bodyless C externs with no host to bind them outside host-imports mode:
+  #    `ulock` is a Darwin syscall wrapper, the other two libSystem varargs.
+  "ulock_wake", "darwin_varargs", "darwin_varargs_many",
 ]
 
-proc ithaquaTests() =
-  ## ithaqua — the wasm32 back end — over the same hand-written Leng corpus
-  ## arkham runs, plus `wasmenc`'s own encoder tests.
-  ##
-  ## EMIT ONLY — bar one run check at the end, see its comment: each fixture
-  ## must produce a file that starts with the wasm magic, and the
-  ## `ithaquaUnsupported` ones must be refused. Nothing else here RUNS a
-  ## module. That is deliberate — the differential harness that executes
-  ## wasm against the native backend as its oracle lives in nimony
-  ## (`hastur wasmdiff`, see doc/ithaqua.md), where the front end that produces
-  ## realistic input also lives. What this pass buys is the thing nimony's
-  ## harness cannot see: that ithaqua still COMPILES against, and agrees with,
-  ## the `core/` program model in this repo, over 200-odd fixtures, on every
-  ## platform in the matrix.
-  let node = requiredExe("node", "the wasmenc engine checks and the ithaqua run check")
-  # `showProgress`, so `twasmenc`'s own summary line — which says whether the
-  # two engine-judged blocks ran or were skipped for want of node — reaches the
-  # log. Swallowed, the skip it exists to announce would be invisible.
-  exec("nim c -r --hints:off src/ithaqua/twasmenc.nim", showProgress = true)
+const webRunDivergent: seq[string] = @[
+  # Fixtures that generate but whose RUN disagrees with the native oracle.
+  # Each is a named divergence, not a tolerance.
+  "futex_wake",       # a futex/mmap program cannot be served by a web host:
+  "mmap_anon",        # the syscall is a loud trap (`unreachable`), by design
+  "scope_slot_reuse", # reads a dead scope's slot — the answer 7 is arkham's
+                      # stack layout, not a language guarantee
+]
 
-  let ithaqua = ("bin" / "ithaqua").addFileExt(ExeExt)
+proc webTests() =
+  ## The web back end — ONE code generator (`src/web/codegen.nim`), rendered
+  ## as wasm32 by ithaqua and as JavaScript by jorogumo — over the same
+  ## hand-written Leng corpus arkham runs, plus the unit tests of `src/web`.
+  ##
+  ## Every fixture not in `webUnsupported` must produce a module on BOTH
+  ## targets (and the listed ones must be refused by both). With node on
+  ## PATH, each module then RUNS and must agree with the native oracle's
+  ## `.exitcode`/`.output`, bar `webRunDivergent`: the two renderers print one
+  ## tree, and the run is what proves they print it the same way.
+  let node = requiredExe("node", "the web back end's run checks")
+  # `showProgress`, so the unit tests' summary lines — which say whether the
+  # engine-judged blocks ran or were skipped for want of node — reach the log.
+  exec("nim c -r --hints:off src/web/twasmenc.nim", showProgress = true)
+  exec("nim c -r --hints:off src/web/tjsrender.nim", showProgress = true)
+  exec("nim c -r --hints:off src/web/tcodegen.nim", showProgress = true)
+
+  let tools = [("wasm", ("bin" / "ithaqua").addFileExt(ExeExt)),
+               ("js", ("bin" / "jorogumo").addFileExt(ExeExt))]
+  let runner = "src" / "web" / "run_wasm.js"
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   const WasmMagic = "\x00asm\x01\x00\x00\x00"
-  var passed = 0
+  var emitted = 0
+  var ran = 0
   var refused = 0
   var total = 0
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let stem = file.extractFilename.changeFileExt("").changeFileExt("")
     inc total
-    let wasm = workDir / (stem & ".wasm")
-    removeFile wasm
-    let (o, code) = execCmdEx(quoteShell(ithaqua) & " -o:" & quoteShell(wasm) &
-                              " " & quoteShell(file))
-    if stem in ithaquaUnsupported:
-      if code == 0:
-        quit "FAILURE ithaqua: " & file & " is listed in `ithaquaUnsupported` " &
-             "but now compiles. Delete the entry — the list is there to keep " &
-             "the emit pass unconditional, not to hide progress."
-      inc refused
-      continue
-    if code != 0:
-      quit "FAILURE ithaqua (wasm32 codegen) " & file & "\n" & o
-    if not fileExists(wasm):
-      quit "FAILURE ithaqua: " & file & " exited 0 but wrote no module"
-    let bytes = readFile(wasm)
-    if bytes.len < 8 or bytes[0 ..< 8] != WasmMagic:
-      quit "FAILURE ithaqua: " & file & " produced no wasm magic/version header"
-    removeFile wasm
-    inc passed
-  echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
-       refused, " refused as expected)"
+    for (target, tool) in tools:
+      let outFile = workDir / (stem & "." & target)
+      removeFile outFile
+      let (o, code) = execCmdEx(quoteShell(tool) & " -o:" & quoteShell(outFile) &
+                                " " & quoteShell(file))
+      if stem in webUnsupported:
+        if code == 0:
+          quit "FAILURE web (" & target & "): " & file & " is listed in " &
+               "`webUnsupported` but now compiles. Delete the entry — the list " &
+               "is there to keep the pass unconditional, not to hide progress."
+        inc refused
+        continue
+      if code != 0:
+        quit "FAILURE web (" & target & " codegen) " & file & "\n" & o
+      if not fileExists(outFile):
+        quit "FAILURE web (" & target & "): " & file & " exited 0 but wrote nothing"
+      if target == "wasm":
+        let bytes = readFile(outFile)
+        if bytes.len < 8 or bytes[0 ..< 8] != WasmMagic:
+          quit "FAILURE web (wasm): " & file & " produced no wasm magic/version header"
+      inc emitted
+      if node.len > 0 and stem notin webRunDivergent:
+        let cmd = if target == "wasm": quoteShell(node) & " " & quoteShell(runner) &
+                                        " " & quoteShell(outFile)
+                  else: quoteShell(node) & " " & quoteShell(outFile)
+        let (po, pc) = execCmdEx(cmd, options = {})
+        let stemPath = file[0 ..< file.len - ".c.nif".len]
+        let expCode = if fileExists(stemPath & ".exitcode"):
+                        parseInt(readFile(stemPath & ".exitcode").strip) else: 0
+        let expOut = if fileExists(stemPath & ".output"):
+                       readFile(stemPath & ".output").strip else: ""
+        if pc != expCode:
+          quit "FAILURE web (" & target & " run) exitcode " & $expCode &
+               " but got " & $pc & " for " & file & "\n" & po
+        if po.strip != expOut:
+          quit "FAILURE web (" & target & " run) output mismatch for " & file &
+               " (expected:\n" & expOut & "\ngot:\n" & po.strip & "\n)"
+        inc ran
+      removeFile outFile
+  echo emitted, " web modules emitted over ", total, " fixtures x 2 targets (",
+       refused, " refused as expected); ", ran, " of them ran and matched the oracle"
 
 proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
                  runner = ""; label = "") =
@@ -972,9 +997,9 @@ proc arkhamQemuTests() =
 # leaves the next one needing these, and not every suite here can skip.
 buildToolchain()
 
-# ithaqua: host-independent (it emits wasm, it does not run it), so it runs
-# everywhere in the matrix rather than only where the output executes.
-ithaquaTests()
+# The web back end: host-independent (node is the only runner it needs), so
+# it runs everywhere in the matrix rather than only where native output executes.
+webTests()
 
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"

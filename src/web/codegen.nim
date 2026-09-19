@@ -63,7 +63,7 @@ type
     size: int                     ## what it holds, so a plan mismatch is caught
 
   ProcCtx = object
-    jsName: string                ## the IR function name
+    irName: string                ## the IR function name
     symType: Table[string, Cursor] ## local/param name → its Leng type
     locals: Table[string, LocalSlot]
     retType: Cursor
@@ -100,7 +100,7 @@ type
     tableEntries: seq[string]          ## slot i (from 1) → the proc symbol bound there
     pending: seq[(string, Cursor)]     ## reachable procs not yet lowered
     emitted: HashSet[string]
-    jsNameOf: Table[string, string]    ## NIF symbol → IR identifier
+    irNameOf: Table[string, string]    ## NIF symbol → IR identifier
     usedNames: HashSet[string]
     p: ProcCtx                         ## the proc being lowered
     entrySym*: string
@@ -362,7 +362,7 @@ proc tableSlotOf(g: var WebGen; sym: string): uint32 =
   inc g.nextTableSlot
   g.tableSlot[sym] = result
   while g.tableEntries.len <= int(result): g.tableEntries.add ""
-  g.tableEntries[int(result)] = sym         # bound to its JS name at the end
+  g.tableEntries[int(result)] = sym         # bound to its IR name at the end
 
 proc procDeclOf(g: var WebGen; nm: string; found: var bool): Cursor
 proc ensureProc(g: var WebGen; sym: string; decl: Cursor)
@@ -486,7 +486,7 @@ proc isAggregateGlobal(g: var WebGen; nm: string): bool =
 
 proc constScalarBits(g: var WebGen; v: Cursor; ok: var bool): uint64 =
   ## The bit pattern of a compile-time scalar. Addresses resolve to absolute
-  ## numbers because jorogumo owns the layout — this is where a fixup lands.
+  ## numbers because the generator owns the layout — this is where a fixup lands.
   ok = true
   case v.kind
   of IntLit: result = cast[uint64](intVal(v))
@@ -538,7 +538,7 @@ proc constScalarBits(g: var WebGen; v: Cursor; ok: var bool): uint64 =
           result = uint64(procValue(g, symName(t)))
         elif t.kind == Symbol and (ptrTarget or isAggregateGlobal(g, symName(t))):
           # The ADDRESS of a global is a layout-time constant here, since
-          # jorogumo owns the layout. A conv of a scalar global to a NON-pointer
+          # the generator owns the layout. A conv of a scalar global to a NON-pointer
           # type stays a runtime value copy.
           result = uint64(globalAddrOf(g, symName(t)))
         else:
@@ -783,7 +783,7 @@ proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result.staticsDone = initHashSet[string]()
   result.rodataAddr = initTable[string, uint32]()
   result.tableSlot = initTable[string, uint32]()
-  result.jsNameOf = initTable[string, string]()
+  result.irNameOf = initTable[string, string]()
   result.usedNames = initHashSet[string]()
   result.emitted = initHashSet[string]()
   result.p.symType = initTable[string, Cursor]()
@@ -877,14 +877,15 @@ proc litWidth(g: var WebGen; c: Cursor): WidthCode =
   else:
     w
 
-proc jsName(g: var WebGen; sym: string): string =
-  ## A JS identifier for a NIF symbol. NIF names carry dots and module suffixes,
-  ## which are not identifier characters in JS. The mapping is memoized — a
-  ## symbol and every later use of it get the same name — and made INJECTIVE by
-  ## a counter, because two Nim symbols collapsing onto one JS name would be
-  ## silent wrong code. The `n_` prefix keeps every generated name clear of the
-  ## preamble (`JMEM`, `I8`, `EXT`, `D`, …) and of JS reserved words.
-  if g.jsNameOf.hasKey(sym): return g.jsNameOf[sym]
+proc irName(g: var WebGen; sym: string): string =
+  ## The IR name of a NIF symbol — also its JavaScript identifier, so it must
+  ## be one: NIF names carry dots and module suffixes, which are not identifier
+  ## characters in JS. The mapping is memoized — a symbol and every later use
+  ## of it get the same name — and made INJECTIVE by a counter, because two Nim
+  ## symbols collapsing onto one name would be silent wrong code. The `n_`
+  ## prefix keeps every generated name clear of the runtime floor
+  ## (`nim_write`, `errv`, …), of the JS preamble and of JS reserved words.
+  if g.irNameOf.hasKey(sym): return g.irNameOf[sym]
   var base = "n_"
   for ch in sym:
     base.add (if ch in {'a'..'z', 'A'..'Z', '0'..'9', '_'}: ch else: '_')
@@ -894,14 +895,14 @@ proc jsName(g: var WebGen; sym: string): string =
     inc n
     cand = base & "_" & $n
   g.usedNames.incl cand
-  g.jsNameOf[sym] = cand
+  g.irNameOf[sym] = cand
   result = cand
 
 proc tmpName(g: var WebGen): string =
   ## Reserved through the same injective table, so a generated temporary can
   ## never land on a user name.
   inc g.p.tmp
-  jsName(g, "tmp." & $g.p.tmp)
+  irName(g, "tmp." & $g.p.tmp)
 
 proc declType(g: var WebGen; nm: string): Cursor =
   ## The declared type of a global/tvar, as a cursor into its decl.
@@ -921,10 +922,10 @@ proc procBody(decl: Cursor): Cursor
 proc hasBody(decl: Cursor): bool
 
 # ── scalar, pointer, aggregate ───────────────────────────────────────────────
-# What a type IS decides how its value travels. A scalar is a JS local or a
-# frame slot; a pointer is a Number offset into JMEM and can be dereferenced;
-# an aggregate is a LOCATION whose "value" is its address, exactly as in C and
-# in ithaqua. `scalOf` calls pointers AND aggregates `skMem`, so the two are
+# What a type IS decides how its value travels. A scalar is a function local
+# or a frame slot; a pointer is a 32-bit offset into linear memory and can be
+# dereferenced; an aggregate is a LOCATION whose "value" is its address,
+# exactly as in C. `scalOf` calls pointers AND aggregates `skMem`, so the two are
 # told apart by the Leng type tag, never by the slot class.
 
 # ── frame addressing ─────────────────────────────────────────────────────────
@@ -946,14 +947,14 @@ proc takeTemp(g: var WebGen; size: int; what: string = ""): int =
   ## an internal error, reported as a refusal rather than emitting a program
   ## that reads the wrong slot.
   if g.p.tmpAt >= g.p.tmpPlan.len:
-    err g, "internal: unplanned temporary of " & $size & " bytes in `" & g.p.jsName & "`"
+    err g, "internal: unplanned temporary of " & $size & " bytes in `" & g.p.irName & "`"
   if g.p.tmpPlan[g.p.tmpAt].size != size:
     # A short slice of the plan around the divergence names the frame offset
     # that broke, which is far quicker to trace than the raw index.
     var dump = ""
     for q in max(0, g.p.tmpAt - 6) ..< min(g.p.tmpPlan.len, g.p.tmpAt + 3):
       dump.add ' ' & $q & ':' & $g.p.tmpPlan[q].size
-    err g, "internal: temporary plan mismatch in `" & g.p.jsName & "` [" & what &
+    err g, "internal: temporary plan mismatch in `" & g.p.irName & "` [" & what &
            "] (planned " & $g.p.tmpPlan[g.p.tmpAt].size & ", asked " & $size & ")" & dump
   result = g.p.tmpPlan[g.p.tmpAt].off
   inc g.p.tmpAt
@@ -967,7 +968,7 @@ proc genSymAddr(g: var WebGen; c: Cursor) =
     case s.kind
     of lkReg: err g, "the register local `" & nm & "` has no address"
     of lkSlot: slotAddr(g, s.off)
-    of lkPtr: g.outp.symUse jsName(g, nm)
+    of lkPtr: g.outp.symUse irName(g, nm)
   else:
     let si = lookupSym(typeCtx(g), nm)
     case si.cat
@@ -984,8 +985,8 @@ proc genBaseAddr(g: var WebGen; c: Cursor) =
   if isPtrType(g, t): genExpr(g, c) else: genAddr(g, c)
 
 proc scaledIndex(g: var WebGen; idx: Cursor; factor: int) =
-  ## `index * factor` as a Number: adding a BigInt to a Number is a JS type
-  ## error, and an address is always a Number in this value model.
+  ## `index * factor` as a 32-bit offset: an address is always 32 bits in this
+  ## value model, whatever the index's own width.
   let iw = widthOf(exprScal(g, idx))
   if factor == 1:
     g.outp.cvtNode(iw, wU32):
@@ -1116,7 +1117,7 @@ proc genExprCoerced(g: var WebGen; c: Cursor; want: WidthCode) =
 
 proc genSymValue(g: var WebGen; c: Cursor) =
   ## The value a symbol holds. An aggregate's value IS its address; anything
-  ## else is loaded from where it lives — a JS local, a frame slot, a global's
+  ## else is loaded from where it lives — a function local, a frame slot, a global's
   ## static address.
   let nm = symName(c)
   if g.p.locals.hasKey(nm):
@@ -1125,7 +1126,7 @@ proc genSymValue(g: var WebGen; c: Cursor) =
     if isAggType(g, ty) or s.kind == lkPtr:
       genSymAddr(g, c)                    # a location travels as its address
     elif s.kind == lkReg:
-      g.outp.symUse jsName(g, nm)
+      g.outp.symUse irName(g, nm)
     else:
       g.outp.tree HLoad:
         g.outp.width widthOf(scalOf(g, ty))
@@ -1214,7 +1215,7 @@ proc isInheritedPart(g: var WebGen; objTy: Cursor; part: string): bool =
 
 proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
   ## Fill the frame slot at `destOff` from an `oconstr`/`aconstr`, emitting one
-  ## JS comma sequence whose value is the destination address. A nested
+  ## `seq` expression whose value is the destination address. A nested
   ## constructor is filled in place at its field's offset, so a literal costs
   ## one materialization, not one per level.
   var t = c
@@ -1298,8 +1299,8 @@ proc collectNames(c: Cursor; taken: var HashSet[string]) =
 
 proc markTaken(c: Cursor; taken: var HashSet[string]) =
   ## Every name whose address is taken, at any depth. Such a local cannot live
-  ## in a JS `let`: nothing can point at a JS binding, and the point of §2 is
-  ## that a Nim address is a JMEM offset.
+  ## in a function local: nothing can point at one, and a Nim address is an
+  ## offset into linear memory.
   if c.kind != TagLit: return
   if c.exprKind in {AddrC, HaddrC}:
     # Mark EVERY name in the operand, not just a top-level symbol: the base of
@@ -1598,11 +1599,11 @@ proc genTypedBinop(g: var WebGen; c: Cursor) =
   var t = c
   t.into:
     # arkham's shared rule, called rather than restated. `(add (ptr T) p n)`
-    # does not say whether `n` counts bytes or elements, and JS is the one host
-    # where a wrong reading still RUNS — Number + Number gives a Number — so the
-    # twin refuses rather than inventing a semantics. `div`/`mod` are covered
+    # does not say whether `n` counts bytes or elements, and JS is a host where
+    # a wrong reading still RUNS — Number + Number gives a Number — so the web
+    # back end refuses rather than inventing a semantics. `div`/`mod` are covered
     # here too, as the rule intends.
-    checkArithResultType(g.prog, t, "jorogumo")
+    checkArithResultType(g.prog, t, "web back end")
     let w = widthOf(g, t)
     skip t
     g.outp.openTree op
@@ -1642,19 +1643,44 @@ proc genCmp(g: var WebGen; c: Cursor) =
     g.outp.closeTag
     while t.hasMore: skip t
 
+proc sufFloatVal(g: var WebGen; lit: Cursor): float64 =
+  ## The numeric value of a float-suffixed literal: nimony emits a FloatLit,
+  ## an integral IntLit/UIntLit (`1.0'f32` → 1), or a `(neg LIT)` wrapper.
+  case lit.kind
+  of FloatLit: floatVal(lit)
+  of IntLit: float64(intVal(lit))
+  of UIntLit: float64(uintVal(lit))
+  of TagLit:
+    case lit.exprKind
+    of NegC:
+      var t = lit
+      var v = 0.0
+      t.into:
+        if t.kind == TagLit and t.typeKind == FT: skip t   # a typed `neg`
+        v = -sufFloatVal(g, t)
+        while t.hasMore: skip t
+      v
+    of NanC: NaN
+    of InfC: Inf
+    of NeginfC: -Inf
+    else: err g, "bad float literal: " & $lit.exprKind
+  else: err g, "bad float literal: " & $lit.kind
+
 proc genSufLit(g: var WebGen; c: Cursor) =
-  ## `(suf LIT "i8")` — the suffix decides the world: a 64-bit one is a BigInt,
-  ## and its digits go out as text because a u64 does not fit an IntLit token.
+  ## `(suf LIT "i8")` — the suffix names the literal's type, and the value is
+  ## brought to it: a literal wider than its suffix is truncated, as the C
+  ## conversion of the constant would.
   let w = litWidth(g, c)                    # the suffix, not the natural type
   var t = c
   inc t
-  if w in {wI64, wU64}:
-    case t.kind
-    of IntLit: g.outp.bigIntLit $intVal(t)
-    of UIntLit: g.outp.bigIntLit $uintVal(t)
-    else: err g, "unsupported 64-bit literal"
+  if w.isFloat:
+    g.outp.floatLit sufFloatVal(g, t)
   else:
-    genExpr(g, t)
+    case t.kind
+    of IntLit: intLitAs(g, intVal(t), false, w)
+    of UIntLit: intLitAs(g, cast[int64](uintVal(t)), true, w)
+    of CharLit: intLitAs(g, int64(ord(charLit(t))), true, w)
+    else: err g, "unsupported suffixed literal: " & $t.kind
 
 proc genCall(g: var WebGen; c: Cursor; wantValue: bool)
 proc genInstr(g: var WebGen; c: Cursor; wantValue: bool)
@@ -1734,7 +1760,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
     of NilC: g.outp.numLit 0
     of SizeofC, AlignofC:
       # A compile-time constant of the natural int type (typenav's rule), and
-      # jorogumo owns the layout that makes it known: `(sizeof T)` is just the
+      # the generator owns the layout that makes it known: `(sizeof T)` is just the
       # size the loader and the frame plan already agree on.
       var t = c
       t.into:
@@ -1773,7 +1799,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
         while t.hasMore: skip t
     of AndC, OrC:
       # C's `&&`/`||`: short-circuit, no type child, and no narrow-wrap — with
-      # canonical 0/1 operands the JS result is already 0 or 1.
+      # canonical 0/1 operands the result is already 0 or 1.
       let op = if c.exprKind == AndC: LAnd else: LOr
       var t = c
       t.into:
@@ -1875,6 +1901,14 @@ proc procDeclOf(g: var WebGen; nm: string; found: var bool): Cursor =
       result = pi.decl
       found = true
       return
+  # a bodyless `importc` of this module is an extern, not a proc to emit
+  for ex in g.prog.externOrder:
+    var d = ex.decl
+    inc d
+    if d.kind == SymbolDef and symName(d) == nm:
+      result = ex.decl
+      found = true
+      return
   if isForeignSym(g.prog, nm):
     let d = lookupForeignDecl(g.prog, nm, found)
     if found:
@@ -1940,12 +1974,12 @@ proc genCalleeValue(g: var WebGen; target: Cursor) =
     if g.p.locals.hasKey(nm):
       let s = g.p.locals[nm]
       case s.kind
-      of lkReg: g.outp.symUse jsName(g, nm)
+      of lkReg: g.outp.symUse irName(g, nm)
       of lkSlot:
         g.outp.tree HLoad:
           g.outp.width wU32
           slotAddr(g, s.off)
-      of lkPtr: g.outp.symUse jsName(g, nm)
+      of lkPtr: g.outp.symUse irName(g, nm)
     else:
       g.outp.tree HLoad:
         g.outp.width wU32
@@ -2407,7 +2441,7 @@ proc callbackBridge(g: var WebGen; t: Cursor; pt: Cursor) =
   if not found: err g, "unknown callback proc: " & sym
   ensureProc(g, sym, cdecl)
   let w = "__cb" & $g.callbacks.len
-  var call = jsName(g, sym) & "(" & argExprs.join(", ") & ")"
+  var call = irName(g, sym) & "(" & argExprs.join(", ") & ")"
   if retBridge.len > 0: call = retBridge & "(" & call & ")"
   # Rest args so the JS host may pass more (rAF's timestamp) than the Nim proc
   # declares; the extras are simply not forwarded.
@@ -2664,7 +2698,7 @@ proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
       let rt = calleeResultType(g, target)
       let aggRet = not rt.cursorIsNil and isAggType(g, rt)
       g.outp.openTree Call
-      g.outp.symUse jsName(g, nm)
+      g.outp.symUse irName(g, nm)
       # The struct-return destination is the CALLER's planned temporary, and it
       # is reserved before the arguments are walked: `planFrame` reserved it at
       # the call node, and any temporary an argument needs comes after it.
@@ -2680,10 +2714,10 @@ proc genCall(g: var WebGen; c: Cursor; wantValue: bool) =
 # ── statements ───────────────────────────────────────────────────────────────
 
 proc genVar(g: var WebGen; c: Cursor) =
-  ## `(var :name PRAGMAS TYPE INIT?)`. A plain scalar is a JS `let`, which is
-  ## exactly as scoped as the Leng block that declares it. An aggregate or an
-  ## address-taken local has no JS binding to point at: `planFrame` gave it a
-  ## slot, and its initializer becomes a store into that slot.
+  ## `(var :name PRAGMAS TYPE INIT?)`. A plain scalar is a function local,
+  ## declared with the function and assigned here. An aggregate or an
+  ## address-taken local has no local to point at: `planFrame` gave it a slot,
+  ## and its initializer becomes a store into that slot.
   var nm = ""
   var initv: Cursor
   var hasInit = false
@@ -2707,7 +2741,7 @@ proc genVar(g: var WebGen; c: Cursor) =
       let w = widthOf(scalOf(g, g.p.symType[nm]))
       g.outp.tree ExprStmt:
         g.outp.tree Assign:
-          g.outp.symUse jsName(g, nm)
+          g.outp.symUse irName(g, nm)
           g.genExprCoerced(initv, w)
   of lkSlot:
     let ty = g.p.symType[nm]
@@ -2756,7 +2790,7 @@ proc assignTo(g: var WebGen; dst, src: Cursor) =
       g.p.locals[symName(dst)].kind == lkReg:
     let nm = symName(dst)
     g.outp.tree Assign:
-      g.outp.symUse jsName(g, nm)
+      g.outp.symUse irName(g, nm)
       g.genExprCoerced(src, widthOf(scalOf(g, g.p.symType[nm])))
     return
   let ty = lvalueType(g, dst)
@@ -2802,7 +2836,7 @@ proc storeTempTo(g: var WebGen; dst: Cursor; tmp: string; w: WidthCode) =
   if dst.kind == Symbol and g.p.locals.hasKey(symName(dst)) and
       g.p.locals[symName(dst)].kind == lkReg:
     g.outp.tree Assign:
-      g.outp.symUse jsName(g, symName(dst))
+      g.outp.symUse irName(g, symName(dst))
       g.outp.symUse tmp
     return
   let ty = lvalueType(g, dst)
@@ -2897,32 +2931,43 @@ proc ovfTest(g: var WebGen; opKind: LengExpr; sc: Scal; w: WidthCode;
       g.outp.symUse bv
       g.outp.closeTag
   else:
-    # mul: ovf iff a != 0 and r/a != b. ithaqua's `a == -1` guard exists only
-    # because wasm's `div` TRAPS on min/-1; BigInt division is exact — it
-    # hands back 2^63, which is `!= b`, and that is exactly the flag wanted.
+    # mul: ovf iff a != 0 and r/a != b. A signed division of min(i64) by -1
+    # TRAPS in wasm (it has no representable result), so that one case is
+    # decided without dividing: with a == -1 the product overflows exactly when
+    # b is min(i64). BigInt would not trap, but one tree serves both targets.
+    template quotientTest() =
+      g.outp.tree Neq:
+        g.outp.width w
+        g.outp.tree Div:
+          g.outp.width w
+          g.outp.symUse rv
+          g.outp.symUse av
+        g.outp.symUse bv
     g.outp.openTree LAnd
     g.outp.width w
-    g.outp.openTree Neq
-    g.outp.width w
-    g.outp.symUse av
-    g.zeroLit w
-    g.outp.closeTag
-    g.outp.openTree Neq
-    g.outp.width w
-    g.outp.openTree Div
-    g.outp.width w
-    g.outp.symUse rv
-    g.outp.symUse av
-    g.outp.closeTag
-    g.outp.symUse bv
-    g.outp.closeTag
+    g.outp.tree Neq:
+      g.outp.width w
+      g.outp.symUse av
+      g.zeroLit w
+    if sc.signed:
+      g.outp.tree Cond:
+        g.outp.tree Eq:
+          g.outp.width w
+          g.outp.symUse av
+          g.outp.bigIntLit "-1"
+        g.outp.tree Eq:
+          g.outp.width w
+          g.outp.symUse bv
+          g.outp.bigIntLit "-9223372036854775808"
+        quotientTest()
+    else:
+      quotientTest()
     g.outp.closeTag
 
 proc genKeepovf(g: var WebGen; c: Cursor) =
   ## `(keepovf (add|sub|mul Type a b) dst)` — overflow-checked arithmetic:
-  ## `(ovf, dst) = a op b`. JS has no flags register; `ovf` is a preamble
-  ## global, and the wrapped result is the renderer's width-wrap doing what
-  ## the wasm ALU does for free.
+  ## `(ovf, dst) = a op b`. The web targets have no flags register; `ovf` is a
+  ## scalar global, and the wrapped result is the renderer's width-wrap.
   var t = c
   t.into:
     let arith = t
@@ -3076,7 +3121,7 @@ proc caseRangeTest(g: var WebGen; w: WidthCode; scrutinee: string; r: Cursor) =
 proc genCaseBranch(g: var WebGen; w: WidthCode; scrutinee: string;
                    branches: seq[(Cursor, Cursor)]; elseBody: Cursor; i: int) =
   ## The `of` branches from `i` on, as an `if / else if / else` chain. A JS
-  ## `switch` is the obvious spelling but the wrong one: its `break` would
+  ## `switch` (or a wasm `br_table`) is the obvious spelling but the wrong one: its `break` would
   ## capture a `(break)` that belongs to an enclosing loop, and it cannot say
   ## `(range LO HI)` at all.
   var rs: seq[Cursor]
@@ -3150,8 +3195,8 @@ proc genCase(g: var WebGen; c: Cursor) =
 
 
 proc genIf(g: var WebGen; c: Cursor) =
-  ## `(if (elif COND ACTION)* (else ACTION)?)` → a JS `if/else` chain. JS has no
-  ## `elif`, so every branch after the first is `else { if … }`; `open` counts
+  ## `(if (elif COND ACTION)* (else ACTION)?)` → an `if/else` chain. The IR has
+  ## no `elif`, so every branch after the first is `else { if … }`; `open` counts
   ## the trees still waiting for their close, which the buffer unwinds LIFO.
   var open = 0
   var seen = false
@@ -3258,7 +3303,7 @@ proc genStmtList(g: var WebGen; c: Cursor) =
       g.outp.ident join
       g.p.labs.add join
     g.outp.openTree Label
-    g.outp.ident jsName(g, nm)
+    g.outp.ident irName(g, nm)
     g.p.labs.add nm
   var t = c
   t.into:
@@ -3395,7 +3440,7 @@ proc genStmt(g: var WebGen; c: var Cursor) =
     if nm notin g.p.labs:
       err g, "`jmp` to `" & nm & "`, whose block does not enclose this point"
     g.outp.openTree Break
-    g.outp.ident jsName(g, nm)
+    g.outp.ident irName(g, nm)
     g.outp.closeTag
   of CaseS: genCase(g, c)
   of OnerrS: genOnerr(g, c)
@@ -3492,7 +3537,7 @@ proc lowerProc(g: var WebGen; sym: string; decl: Cursor) =
     # targets have no registers to promise, and inventing a calling convention
     # for it is exactly the plausible-but-wrong lowering this generator refuses.
     err g, "`{.naked.}` proc `" & sym & "` has no web calling convention"
-  g.p = ProcCtx(jsName: jsName(g, sym),
+  g.p = ProcCtx(irName: irName(g, sym),
                 symType: initTable[string, Cursor](),
                 locals: initTable[string, LocalSlot]())
   let body = procBody(decl)
@@ -3535,7 +3580,7 @@ proc lowerProc(g: var WebGen; sym: string; decl: Cursor) =
   if g.p.sret:
     g.p.sretName = tmpName(g)
     sigParams.add (g.p.sretName, wU32)
-  for (pn, pt) in params: sigParams.add (jsName(g, pn), paramWidth(g, pt))
+  for (pn, pt) in params: sigParams.add (irName(g, pn), paramWidth(g, pt))
 
   if g.p.frameSize > 0:
     g.p.fp = newTemp(g, wU32)
@@ -3552,7 +3597,7 @@ proc lowerProc(g: var WebGen; sym: string; decl: Cursor) =
           g.outp.tree HStore:
             g.outp.width widthOf(scalOf(g, pt))
             slotAddr(g, sl.off)
-            g.outp.symUse jsName(g, pn)
+            g.outp.symUse irName(g, pn)
 
   if body.kind == TagLit:
     var b = body
@@ -3568,11 +3613,11 @@ proc lowerProc(g: var WebGen; sym: string; decl: Cursor) =
   # inside it would be out of sight the moment the `break` lands.
   var locals: seq[(string, WidthCode)] = @[]
   for nm in g.p.regLocals:
-    locals.add (jsName(g, nm), widthOf(scalOf(g, g.p.symType[nm])))
+    locals.add (irName(g, nm), widthOf(scalOf(g, g.p.symType[nm])))
   for tv in g.p.temps: locals.add tv
   var hasRet = false
   let rw = resultWidth(g, g.p.retType, hasRet)
-  emitFunc(g, g.p.jsName, sigParams, hasRet, rw, locals)
+  emitFunc(g, g.p.irName, sigParams, hasRet, rw, locals)
 
 proc isHostDeclaration(decl: Cursor): bool =
   ## An `importc`/`importcpp`/`importjs` proc is a SIGNATURE only: the host
@@ -3645,12 +3690,12 @@ proc lowerThunk(g: var WebGen; thunk, sym: string; decl: Cursor) =
   if sig.hasRet: g.outp.openTree Return
   else: g.outp.openTree ExprStmt
   g.outp.openTree Call
-  g.outp.symUse jsName(g, sym)
+  g.outp.symUse irName(g, sym)
   for i in 0 ..< sig.params.len: g.outp.symUse ("p" & $i)
   g.outp.closeTag
   g.outp.closeTag
   g.emitted.incl thunk
-  emitFunc(g, jsName(g, thunk), ps, sig.hasRet, sig.ret, [])
+  emitFunc(g, irName(g, thunk), ps, sig.hasRet, sig.ret, [])
 
 proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                target: WebTarget; module: var WebModule;
@@ -3722,7 +3767,7 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   for slot in 1 ..< g.tableEntries.len:
     let sym = g.tableEntries[slot]
     if sym.len > 0 and g.emitted.contains(sym):
-      table.add jsName(g, sym)
+      table.add irName(g, sym)
     elif sym.len > 0 and g.hostImports:
       var found = false
       let decl = procDeclOf(g, sym, found)
@@ -3735,10 +3780,10 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   module = WebModule(imports: g.imports,
                      globals: @[(GlobErrv, wI32), (GlobOvf, wI32)],
                      dataSegs: g.dataSegs, memTop: g.memTop, table: table,
-                     entry: jsName(g, g.entrySym),
+                     entry: irName(g, g.entrySym),
                      entryParams: esig.params, entryHasRet: esig.hasRet,
                      entryRet: esig.ret, callbacks: g.callbacks)
   for (sym, cName) in exportRoots:
     if g.emitted.contains(sym):
-      module.exports.add (cName, jsName(g, sym))
+      module.exports.add (cName, irName(g, sym))
   result = move g.top

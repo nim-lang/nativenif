@@ -797,12 +797,14 @@ proc exprText(c: Cursor; indent: int): string =
         elif w in {wF32, wF64}: bin " % "
         else: wrap "imod(" & ops[0] & ", " & ops[1] & ")"
       of Shl:
-        if is64: "(" & ops[0] & " << BigInt(" & ops[1] & "))"
+        # A 64-bit shift count is taken mod 64, as wasm's `i64.shl` and the
+        # hardware take it; a BigInt shift is exact and would not wrap.
+        if is64: wrap "(" & ops[0] & " << (BigInt(" & ops[1] & ") & 63n))"
         else: wrap "(" & ops[0] & " << " & ops[1] & ")"
       of Shr:
         # `>>>` over uint32; BU64 values are non-negative so BigInt `>>` is
         # already logical.
-        if is64: wrap "(" & ops[0] & " >> BigInt(" & ops[1] & "))"
+        if is64: wrap "(" & ops[0] & " >> (BigInt(" & ops[1] & ") & 63n))"
         elif w in {wU8, wU16, wU32}: wrap "(" & ops[0] & " >>> " & ops[1] & ")"
         else: wrap "(" & ops[0] & " >> " & ops[1] & ")"
       of And: bin " & "

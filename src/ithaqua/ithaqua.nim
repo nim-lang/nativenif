@@ -1,19 +1,21 @@
 #
-#           Ithaqua — Leng → wasm32 code generator
+#           Ithaqua — Leng → wasm32 (the web back end's wasm face)
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
 ## ithaqua translates a Leng `.c.nif` MAIN module into one self-contained
-## `.wasm` binary (whole-program: reachable declarations from every dependent
-## module are pulled in through the embedded-index loader and emitted into the
-## same wasm module — there is no separate link step).
+## `.wasm` binary. It is the wasm renderer of the shared web back end
+## (`src/web`): the same code generator jorogumo drives, encoded as wasm.
+## Whole-program: reachable declarations from every dependent module are
+## pulled in through the embedded-index loader and emitted into the same wasm
+## module — there is no separate link step.
 
 import std / [parseopt, syncio, strutils, envvars]
 import nifcoreparse
 import "../arkham/core"/lengdecl
-import codegen_wasm
+import "../web" / [webnif, codegen, wasmrender]
 
 const
   Version = "0.1.0"
@@ -32,16 +34,13 @@ proc run(input, output: string) =
   # program model loads on demand (same arrangement as arkham).
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  var code: seq[byte]
-  if getEnv("ITHAQUA_HOST_IMPORTS").len > 0:
-    # two passes: discover the bodyless-importc surface, then re-emit with
-    # every discovered name pinned as an env import (the JS bridge contract)
-    var externs: seq[(string, Cursor)] = @[]
-    discard generateWasm(buf, input, tags, collectExterns = true,
-                         externsOut = addr externs)
-    code = generateWasm(buf, input, tags, hostImports = externs)
-  else:
-    code = generateWasm(buf, input, tags)
+  # host-imports mode: a bodyless `importc` proc becomes an `env` import the
+  # page provides (the JS bridge contract) instead of a refusal
+  var m: WebModule
+  var tree = generate(buf, input, tags, wtWasm, m,
+                      hostImports = getEnv("ITHAQUA_HOST_IMPORTS").len > 0)
+  let code = renderWasm(tree, m, ShadowStackSize,
+                        exportAll = getEnv("ITHAQUA_EXPORT_ALL").len > 0)
   var s = newString(code.len)
   for i, b in code: s[i] = char(b)
   writeFile(output, s)
@@ -59,7 +58,12 @@ proc main() =
     of cmdEnd: discard
   if input.len == 0: quit(Usage, QuitSuccess)
   if output.len == 0: output = input & ".wasm"
-  run(input, output)
+  try:
+    run(input, output)
+  except WebGenError as e:
+    quit "ithaqua: " & e.msg & "\n  in " & input, QuitFailure
+  except WasmRenderError as e:
+    quit "ithaqua: " & e.msg & "\n  in " & input, QuitFailure
 
 when isMainModule:
   main()

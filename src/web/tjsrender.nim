@@ -264,7 +264,7 @@ block shift_forms:
         b3.symUse "v"
         b3.numLit 4
   expect "i64 shr widens the count", render(b3),
-         "(x = BigInt.asIntN(64, (v >> BigInt(4))));"
+         "(x = BigInt.asIntN(64, (v >> (BigInt(4) & 63n))));"
 
 block comparisons:
   var b = createTop()
