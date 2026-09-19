@@ -643,7 +643,10 @@ proc webTests() =
                         parseInt(readFile(stemPath & ".exitcode").strip) else: 0
         let expOut = if fileExists(stemPath & ".output"):
                        readFile(stemPath & ".output").strip else: ""
-        if pc != expCode:
+        # `.exitcode` is the POSIX status: the low 8 bits of what the program
+        # passed to exit (`exit(3700)` records 116). Windows reports all 32
+        # bits, so compare the part every host reports.
+        if (pc and 0xFF) != expCode:
           quit "FAILURE web (" & target & " run) exitcode " & $expCode &
                " but got " & $pc & " for " & file & "\n" & po
         if po.strip != expOut:
