@@ -31,7 +31,7 @@
 import std / [tables, sets, assertions, strutils, os, syncio]
 import nifcore, nifcdecl, nifcoreparse
 import "../arkham/core" / [asmslots, programs, typenav]
-import wasmenc
+import "../web"/wasmenc
 
 const
   WasmPtrSize* = 4

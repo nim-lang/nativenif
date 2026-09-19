@@ -1,12 +1,13 @@
 #
-#           Jorogumo — Leng → JavaScript code generator
+#           The web back end — Leng → JavaScript / wasm32
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution, for
 #    details about the copyright.
 ##
-## The tiny jsnif → JavaScript text emitter. No codegen logic lives here: it
-## walks a jsnif `TokenBuf` (§3) and prints it. Correctness rests on two
+## The web IR → JavaScript renderer. No codegen logic lives here: it walks the
+## `(top …)` tree `codegen` produced and prints it, with the host contract
+## (the preamble) in front and the program's start at the end. Correctness rests on two
 ## habits — every operation node carries its own explicit `WidthCode`, and
 ## composite expression forms are parenthesised at emission — so the renderer
 ## needs neither a precedence table nor guesses about what an operand
@@ -29,9 +30,9 @@
 ## expressions as well as statements: an `arrow` body is a statement list
 ## inside an expression and must line up with the statement that holds it.
 
-import std / [strutils]
+import std / [strutils, base64]
 import nifcore
-import jsnif
+import webnif
 
 const
   viewNames*: array[WidthCode, string] = [
@@ -91,7 +92,6 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "    DV = new DataView(JMEM);  // width-2+ heap access: no alignment trap, no vanishing store\n" &
   "const EXT = [];  // extern value table: handle -> real JS value (§6)\n" &
   "const FTAB = []; // function table: slot -> JS function; 0 is the null pointer\n" &
-  "let errv = 0, ovf = 0; // the flags register, as two globals (ithaqua's model)\n" &
   "let JSP = [null];  // the same table, grown by ewrap\n" &
   "function ewrap(v) {\n" &
   "  if (typeof v === \"number\" || typeof v === \"bigint\") return v;\n" &
@@ -190,9 +190,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "  if (f < SP_MIN) throw new Error(\"stack overflow\");\n" &
   "  _SPF.push(SP); SP = f; return f;\n" &
   "}\n" &
-  # `f` (the frame base) is kept in the signature for the call sites that
-  # still pass it; the value that matters for nesting is the parked entry SP.
-  "function leave(f) { SP = _SPF.pop(); }\n" &
+  "function leave() { SP = _SPF.pop(); }\n" &
   # Bit-level reinterpretation (`cast` between a float and an integer of the
   # same size). One scratch cell, read back through the other view; the program
   # is single-threaded and each helper completes before it returns.
@@ -203,7 +201,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "function bitsf64(b) { _CI[0] = b; return _CF[0]; }\n" &
   "function f32bits(x) { _FF[0] = x; return _FI[0]; }\n" &
   "function bitsf32(i) { _FI[0] = i | 0; return _FF[0]; }\n" &
-  # memcpy over the one buffer: the aggregate-assignment and sret primitives.
+  # memcpy over the one buffer (overlap-safe, like wasm's `memory.copy`).
   "function copyMem(d, s, n) { U8.copyWithin(d, s, s + n); }\n" &
   # The string bridge (M7 §6): a Nim `string` crossing an `importjs` splice.
   # The representation is the SSO string of lib/std/system/stringimpl.nim for
@@ -266,13 +264,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "  return new TextDecoder(\"utf-8\").decode(U8.subarray(p, p + n));\n" &
   "}\n" &
   "function memView(p, n) { return U8.subarray(p, p + n); }\n" &
-  # The shadow stack is reused memory, so an uninitialized local would read the
-  # previous frame's bytes; the back end zeroes what Leng leaves undefined.
-  "function zeroMem(d, n) { U8.fill(0, d, d + n); }\n" &
-  # The mem intrinsics Leng emits: ithaqua lowers them to `memory.fill` and a
-  # synthetic byte loop; these are the same three, over the `U8` view.
-  # `memcmp` follows C: the difference of the first differing UNSIGNED byte
-  # pair, 0 when the first n bytes match.
+  # wasm's `memory.fill`.
   "function fillMem(d, v, n) { U8.fill(v, d, d + n); }\n" &
   # The portable bit rows. wasm has i32.ctz/clz/popcount; JS has Math.clz32
   # and nothing else, so the rest are loops spelled the obvious way. The
@@ -285,26 +277,18 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "function ctz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 1n) === 0n) { u >>= 1n; ++n; } return n; }\n" &
   "function clz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 0x8000000000000000n) === 0n) { u <<= 1n; ++n; } return n; }\n" &
   "function popcnt64(x) { let u = BigInt.asUintN(64, x); let n = 0; while (u !== 0n) { u &= u - 1n; ++n; } return n; }\n" &
-  # Aggregate call arguments pass BY REFERENCE TO A FRESH COPY (ithaqua's
-  # genCallArgs): the callee storing through its parameter must not be visible
-  # in the caller's object. Returning the destination makes the copy itself
-  # the argument expression.
-  "function copyAgg(s, d, n) { U8.copyWithin(d, s, s + n); return d; }\n" &
   # Division by zero traps natively (SIGFPE) and on wasm; JS would hand back
   # Infinity->0 or a RangeError with a foreign message. One story for both
   # widths: a named throw — and the helper form means each operand is
   # evaluated exactly once, which a `b === 0 ? ...` ternary would not give.
+  # A float → integer conversion traps when the truncated value does not fit,
+  # and on NaN, exactly as wasm's `trunc` does; `lo`/`hi` are the range of the
+  # 32- or 64-bit conversion the target width goes through.
+  "function ftoi(x, lo, hi) { const t = Math.trunc(x); if (!(t >= lo && t < hi)) throw new Error(\"float conversion out of range\"); return t; }\n" &
   "function idiv(a, b) { if (b === 0) throw new Error(\"division by zero\"); return Math.trunc(a / b); }\n" &
   "function imod(a, b) { if (b === 0) throw new Error(\"division by zero\"); return a % b; }\n" &
   "function idiv64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a / b; }\n" &
   "function imod64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a % b; }\n" &
-  "function memcmp(a, b, n) {\n" &
-  "  for (let i = 0; i < n; i++) {\n" &
-  "    const x = U8[a + i], y = U8[b + i];\n" &
-  "    if (x !== y) return x - y;\n" &
-  "  }\n" &
-  "  return 0;\n" &
-  "}\n" &
   # The allocator is the osalloc CONTRACT (§5): the same shape as wasm's, and
   # bounded by SP_MIN so the heap can never walk into the shadow stack.
   "let heapTop = " & $dataEnd & ";\n" &
@@ -445,7 +429,7 @@ proc nameOf(c: Cursor): string =
   case c.kind
   of Symbol, SymbolDef: symName(c)
   of Ident, StrLit: strVal(c)
-  else: raiseAssert "jsenc: name expected, got " & $c.kind
+  else: raiseAssert "jsrender: name expected, got " & $c.kind
 
 const
   ExternIdentStart = {'a'..'z', 'A'..'Z', '_', '$'}
@@ -526,18 +510,18 @@ proc opWidth(c: Cursor): WidthCode =
   ## where nifcore's own assert would only say "IntLit expected".
   let it = c.firstChild
   if it.kind != IntLit:
-    raiseAssert "jsenc: `" & $jsTagOf(c) & "` carries no width child"
+    raiseAssert "jsrender: `" & $webTagOf(c) & "` carries no width child"
   WidthCode(it.intVal)
 
 proc pairWidths(c: Cursor): (WidthCode, WidthCode) =
   ## The FROM/TO pair of `cvt`/`reint`, with the same naming guard.
   var it = c.firstChild
   if it.kind != IntLit:
-    raiseAssert "jsenc: `" & $jsTagOf(c) & "` carries no width children"
+    raiseAssert "jsrender: `" & $webTagOf(c) & "` carries no width children"
   result[0] = WidthCode(it.intVal)
   skip it
   if it.kind != IntLit:
-    raiseAssert "jsenc: `" & $jsTagOf(c) & "` has no destination width"
+    raiseAssert "jsrender: `" & $webTagOf(c) & "` has no destination width"
   result[1] = WidthCode(it.intVal)
 
 proc operandTexts(c: Cursor; indent: int; w: out WidthCode): seq[string] =
@@ -564,25 +548,23 @@ proc exprText(c: Cursor; indent: int): string =
            else: $v
   of StrLit: return escapeJsString(strVal(c))
   else: discard
-  case jsTagOf(c)
-  of NoJs:
-    raiseAssert "jsenc: not a jsnif node: " & $c.kind
-  of Top, Block, Let, Func, Params, Label, Break, If, Else, While, Try,
-       Except, Finally, Throw, Return, ExprStmt:
-    raiseAssert "jsenc: statement where an expression was expected: " & $jsTagOf(c)
+  case webTagOf(c)
+  of NoTag:
+    raiseAssert "jsrender: not a web IR node: " & $c.kind
+  of Top, Block, Func, Params, Param, Locals, Sig, Label, Break, If, Else,
+     While, Return, ExprStmt, Leave:
+    raiseAssert "jsrender: statement where an expression was expected: " & $webTagOf(c)
   # ── literals that need a tag
   of BigIntLit: result = strVal(c.firstChild) & "n"
   of TrueLit: result = "true"
   of FalseLit: result = "false"
-  of NullLit: result = "null"
-  of UndefLit: result = "undefined"
   of NanLit: result = "NaN"
   of InfLit: result = "Infinity"
   # ── composites
   of Call:
     var it = c.firstChild
     var fn = exprText(it, indent)
-    if jsTagOf(it) == Arrow:
+    if webTagOf(it) == Arrow:
       fn = "(" & fn & ")"                        # an immediately-invoked arrow
                                                  # needs grouping: `(() => {…})(…)`
     skip it
@@ -591,11 +573,6 @@ proc exprText(c: Cursor; indent: int): string =
       args.add exprText(it, indent)
       skip it
     result = fn & "(" & args.join(", ") & ")"
-  of Prop:
-    var it = c.firstChild
-    let obj = exprText(it, indent)
-    skip it
-    result = obj & "." & nameOf(it)
   of Index:
     var it = c.firstChild
     let arr = exprText(it, indent)
@@ -622,22 +599,47 @@ proc exprText(c: Cursor; indent: int): string =
     while it.hasMore:
       parts.add exprText(it, indent)
       skip it
-    doAssert parts.len > 0, "jsenc: empty seq"
+    doAssert parts.len > 0, "jsrender: empty seq"
     result = "(" & parts.join(", ") & ")"
-  of New:
-    # the constructor is the first child but NOT an argument: `new Error(..)`
+  of ICall:
+    # (icall SIG TARGET ARG*) — the function-table slot; JS does not check
+    # the signature, wasm's `call_indirect` does.
     var it = c.firstChild
-    let ctor = exprText(it, indent)
+    skip it                                      # the signature
+    let fn = exprText(it, indent)
     skip it
     var args: seq[string]
     while it.hasMore:
       args.add exprText(it, indent)
       skip it
-    result = "(new " & ctor & "(" & args.join(", ") & "))"
+    result = "FTAB[" & fn & "](" & args.join(", ") & ")"
+  of MemCopy, MemFill, MemGrow, Frame:
+    var args: seq[string]
+    var it = c.firstChild
+    while it.hasMore:
+      args.add exprText(it, indent)
+      skip it
+    let fn = case webTagOf(c)
+             of MemCopy: "copyMem"
+             of MemFill: "fillMem"
+             of MemGrow: "memoryGrow"
+             else: "frame"
+    result = fn & "(" & args.join(", ") & ")"
+  of MemSize: result = "memorySize()"
+  of Unreachable: result = "nim_unreachable()"
+  of Ctz, Clz, Popcnt:
+    let w = opWidth(c)
+    var it = c.firstChild
+    skip it
+    let base = case webTagOf(c)
+               of Ctz: "ctz"
+               of Clz: "clz"
+               else: "popcnt"
+    result = base & (if w.isBig: "64(" else: "32(") & exprText(it, indent) & ")"
   of Arrow:
     var it = c.firstChild
     var ps: seq[string]
-    if jsTagOf(it) == Params:
+    if webTagOf(it) == Params:
       var pit = it.firstChild
       while pit.hasMore:
         ps.add nameOf(pit)
@@ -700,11 +702,18 @@ proc exprText(c: Cursor; indent: int): string =
              else: "BigInt.asUintN(" & $bits & ", ") & s & ")"
       s = "Number(" & s & ")"
     elif toBig and not fromBig:
-      s = (if fromFl: "BigInt(Math.trunc(" & s & "))"
+      s = (if fromFl: s                        # see below: the trapping form
            elif fromW == wU8: "BigInt((" & s & ") & 0xFF)"
            elif fromW == wU16: "BigInt((" & s & ") & 0xFFFF)"
            else: "BigInt(" & s & ")")
-    elif fromFl and not toFl: s = "Math.trunc(" & s & ")"
+    elif fromFl and not toFl:
+      s = case toW
+          of wI8, wI16, wI32: "ftoi(" & s & ", -2147483648, 2147483648)"
+          of wU8, wU16, wU32: "ftoi(" & s & ", 0, 4294967296)"
+          else: s
+    if fromFl and toBig:
+      s = (if toW == wI64: "BigInt(ftoi(" & v & ", -9223372036854775808, 9223372036854775808))"
+           else: "BigInt(ftoi(" & v & ", 0, 18446744073709551616))")
     result = if toW == wF32: "(Math.fround(" & s & "))"
              elif toW == wU64: "(" & s & " & 0xFFFF_FFFF_FFFF_FFFFn)"
              elif toBig or toFl: "(" & s & ")"
@@ -724,7 +733,7 @@ proc exprText(c: Cursor; indent: int): string =
                 else: "f32bits(" & v & ")")
       of wI64, wU64: "bitsf64(" & v & ")"
       of wI32, wU32: "bitsf32(" & v & ")"
-      else: raiseAssert "jsenc: cannot reinterpret " & $fromW & " as " & $toW
+      else: raiseAssert "jsrender: cannot reinterpret " & $fromW & " as " & $toW
   of Raw:
     # (raw NAME TPL ARG*) — NAME is also the `EXT` entry it lowers to, so
     # splicing here yields exactly what codegen would have emitted inline.
@@ -749,10 +758,10 @@ proc exprText(c: Cursor; indent: int): string =
     let is64 = w in {wI64, wU64}
     # arity is verified once here so every branch below stays a single
     # expression — the width-wrap template must compose, not statement.
-    if jsTagOf(c) in {Not, Neg, BNot}:
-      doAssert ops.len == 1, "jsenc: unary op with " & $ops.len & " operands"
+    if webTagOf(c) in {Not, Neg, BNot}:
+      doAssert ops.len == 1, "jsrender: unary op with " & $ops.len & " operands"
     else:
-      doAssert ops.len == 2, "jsenc: binary op with " & $ops.len & " operands"
+      doAssert ops.len == 2, "jsrender: binary op with " & $ops.len & " operands"
     template wrap(s: string): string = wrapNarrow(s, w)
     template bin(op: string): string = wrap("(" & ops[0] & op & ops[1] & ")")
     template cmp(op: string): string =
@@ -762,7 +771,7 @@ proc exprText(c: Cursor; indent: int): string =
       # `--1` even inside outer parens, and that parses as a decrement of a
       # literal — a SyntaxError, not a number.
       wrap("(" & op & "(" & ops[0] & "))")
-    result = case jsTagOf(c)
+    result = case webTagOf(c)
       of Add: bin " + "
       of Sub: bin " - "
       of Mul:
@@ -813,7 +822,7 @@ proc exprText(c: Cursor; indent: int): string =
       of Le: cmp " <= "
       of Gt: cmp " > "
       of Ge: cmp " >= "
-      else: raiseAssert "jsenc: unreachable operation case"
+      else: raiseAssert "jsrender: unreachable operation case"
 
 # ── statements ──────────────────────────────────────────────────────────────
 # `stmtText` renders one statement, possibly multi-line, WITHOUT a trailing
@@ -828,16 +837,15 @@ proc blockText(c: Cursor; indent: int): string =
     skip it
   result.add pad(indent) & "}"
 
-proc blockTextSkip1(c: Cursor; indent: int): string =
-  ## `blockText` for an `except` tree, whose first child is the binding name
-  ## (or `.`), not a statement.
-  result = "{\n"
-  var it = c.sub()
+proc paramName(c: Cursor): string =
+  ## The name of a `(param NAME W)` — or of a bare name, as an arrow's
+  ## parameter list spells it.
+  if webTagOf(c) == Param: nameOf(c.firstChild) else: nameOf(c)
+
+proc paramWidth(c: Cursor): WidthCode =
+  var it = c.firstChild
   skip it
-  while it.hasMore:
-    result.add stmtText(it, indent + 1) & '\n'
-    skip it
-  result.add pad(indent) & "}"
+  WidthCode(it.intVal)
 
 proc paramsText(c: Cursor): string =
   result = "("
@@ -845,39 +853,48 @@ proc paramsText(c: Cursor): string =
   var it = c.sub()
   while it.hasMore:
     if not first: result.add ", "
-    result.add nameOf(it)
+    result.add paramName(it)
     first = false
     skip it
   result.add ")"
 
+proc zeroOf(w: WidthCode): string =
+  ## A fresh local's value: zero in its own numeric world.
+  if w.isBig: "0n" else: "0"
+
 proc stmtText*(c: Cursor; indent: int): string =
   let p = pad(indent)
-  case jsTagOf(c)
-  of NoJs:
-    raiseAssert "jsenc: not a jsnif statement: " & $c.kind
+  case webTagOf(c)
+  of NoTag:
+    raiseAssert "jsrender: not a jsnif statement: " & $c.kind
   of Top:
-    raiseAssert "jsenc: `top` must be emitted via genJs"
+    raiseAssert "jsrender: `top` must be emitted via genJs"
   of Func:
+    # (func NAME PARAMS RET LOCALS STMT*): the widths matter to wasm only; a
+    # JS local needs just its zero, which must be a BigInt for a 64-bit one.
     var it = c.firstChild
     let name = nameOf(it)
     skip it
     let ps = paramsText(it)
     skip it
+    skip it                                      # the result width
     result = p & "function " & name & ps & " {\n"
+    var lets: seq[string] = @[]
+    var li = it.firstChild
+    while li.hasMore:
+      lets.add paramName(li) & " = " & zeroOf(paramWidth(li))
+      skip li
+    skip it
+    if lets.len > 0:
+      result.add pad(indent + 1) & "let " & lets.join(", ") & ";\n"
     while it.hasMore:
       result.add stmtText(it, indent + 1) & '\n'
       skip it
     result.add pad(indent) & "}"
-  of Let:
-    var it = c.firstChild
-    let name = nameOf(it)
-    skip it
-    if it.kind == DotToken:
-      result = p & "let " & name & ";"
-    else:
-      result = p & "let " & name & " = " & exprText(it, indent) & ";"
-  of Params:
-    raiseAssert "jsenc: `params` outside a func/arrow"
+  of Params, Param, Locals, Sig:
+    raiseAssert "jsrender: `" & $webTagOf(c) & "` outside a func"
+  of Leave:
+    result = p & "leave();"
   of Block:
     result = p & blockText(c, indent)
   of Label:
@@ -902,16 +919,16 @@ proc stmtText*(c: Cursor; indent: int): string =
     skip it
     # then-branch: children until an `Else` tree or a trailing dot
     var thenBuf = ""
-    while it.hasMore and jsTagOf(it) != Else:
+    while it.hasMore and webTagOf(it) != Else:
       if it.kind == DotToken: break
       thenBuf.add stmtText(it, indent + 1) & '\n'
       skip it
     result = p & "if (" & cond & ") {\n" & thenBuf & pad(indent) & "}"
-    if it.hasMore and jsTagOf(it) == Else:
+    if it.hasMore and webTagOf(it) == Else:
       # the `else` tree's children ARE its statements
       result.add " else " & blockText(it, indent)
   of Else:
-    raiseAssert "jsenc: `else` outside `if`"
+    raiseAssert "jsrender: `else` outside `if`"
   of While:
     var it = c.firstChild
     let cond = exprText(it, indent)
@@ -921,31 +938,6 @@ proc stmtText*(c: Cursor; indent: int): string =
       result.add stmtText(it, indent + 1) & '\n'
       skip it
     result.add pad(indent) & "}"
-  of Try:
-    result = p & "try {\n"
-    var it = c.firstChild
-    while it.hasMore and jsTagOf(it) notin {Except, Finally}:
-      if it.kind == DotToken: break
-      result.add stmtText(it, indent + 1) & '\n'
-      skip it
-    result.add pad(indent) & "}"
-    while it.hasMore:
-      case jsTagOf(it)
-      of Except:
-        var e = it.firstChild
-        if e.kind == DotToken:
-          result.add " catch " & blockTextSkip1(it, indent)
-        else:
-          result.add " catch (" & nameOf(e) & ") " & blockTextSkip1(it, indent)
-      of Finally:
-        result.add " finally " & blockText(it, indent)
-      else:
-        raiseAssert "jsenc: unexpected child in `try`: " & $jsTagOf(it)
-      skip it
-  of Except, Finally:
-    raiseAssert "jsenc: `" & $jsTagOf(c) & "` outside `try`"
-  of Throw:
-    result = p & "throw " & exprText(c.firstChild, indent) & ";"
   of Return:
     let v = c.firstChild
     result = if not v.hasMore: p & "return;"
@@ -953,14 +945,81 @@ proc stmtText*(c: Cursor; indent: int): string =
   of ExprStmt:
     result = p & exprText(c.firstChild, indent) & ";"
   else:
-    raiseAssert "jsenc: expression where a statement was expected: " & $jsTagOf(c)
+    raiseAssert "jsrender: expression where a statement was expected: " & $webTagOf(c)
 
 proc genJs*(buf: var TokenBuf): string =
   ## Render a whole program: the buffer's root must be a `top` tree. The
   ## preamble is NOT included — the CLI prepends it once per file.
   var c = beginRead(buf)
-  doAssert jsTagOf(c) == Top, "jsenc: genJs expects a `top` root, got " & $jsTagOf(c)
+  doAssert webTagOf(c) == Top, "jsrender: genJs expects a `top` root, got " & $webTagOf(c)
   var it = c.sub()
   while it.hasMore:
     result.add stmtText(it, 0) & '\n'
     skip it
+
+proc dataInitJs*(m: WebModule): string =
+  ## The static image as JS: one `D(base64, address)` call per segment (the
+  ## data section's twin). Base64 because the image is arbitrary bytes and a
+  ## JS string literal is not.
+  result = ""
+  for (at, s) in m.dataSegs:
+    result.add "D(\"" & encode(s) & "\", " & $at & ");\n"
+
+proc renderJs*(tree: var TokenBuf; m: WebModule; memBytes, stackBytes: int;
+               browser = false): string =
+  ## The whole program as one self-contained `.js` file: the host contract,
+  ## the module's globals and static image, the functions, the function table,
+  ## and finally the start — `main`, whose result is the exit code, or, for a
+  ## host-driven library, the module init plus the export surface.
+  result = jsPreamble(memBytes, stackBytes, int m.memTop, browser)
+  if m.globals.len > 0:
+    var gs: seq[string] = @[]
+    for (n, w) in m.globals: gs.add n & " = " & zeroOf(w)
+    result.add "let " & gs.join(", ") & ";\n"
+  result.add dataInitJs(m)
+  result.add genJs(tree)
+  # JS wrappers bridging Nim procs used as `importjs` callbacks; all-scalar
+  # procs need none and pass through as FTAB entries, so this is often empty.
+  for cb in m.callbacks:
+    result.add cb
+  result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
+  for slot in 1 ..< m.table.len:
+    let f = m.table[slot]
+    if f.len > 0:
+      result.add "FTAB[" & $slot & "] = " & f & ";\n"
+    else:
+      # A slot taken for a proc that was never lowered — a bodyless `importc`
+      # used as a value — binds HERE, rather than turning the whole file into
+      # a ReferenceError at load or a TypeError at a call that may never happen.
+      result.add "FTAB[" & $slot & "] = () => { throw new Error(\"unbound function-table slot " &
+        $slot & "\"); };\n"
+  var zeros: seq[string] = @[]
+  for w in m.entryParams: zeros.add zeroOf(w)
+  let entryCall = m.entry & "(" & zeros.join(", ") & ")"
+  if m.exports.len > 0:
+    # A host-driven library (exportc procs, no meaningful main): run the module
+    # init (main drives the ini chain + top level) so globals are live before
+    # the host calls in, expose the exportc procs under their C names, and DO
+    # NOT exit — the host owns the lifecycle.
+    result.add entryCall & ";\n"
+    # node hands the surface to `require`; a browser has no module system in a
+    # classic <script>, so it lands on globalThis.NIF.
+    var ex = (if browser: "globalThis.NIF = {" else: "module.exports = {")
+    for (cName, f) in m.exports:
+      ex &= "\n  " & cName & ": " & f & ","
+    # The host reads results straight out of linear memory. `memory.buffer`
+    # mirrors the wasm export, so the JS engine is a drop-in for the wasm one;
+    # it is a getter because memoryGrow REPLACES JMEM.
+    ex &= "\n  memory: { get buffer(){ return JMEM; } },"
+    # The host-bridge for handles: `__internExt` pushes a real JS object into
+    # the host value table and returns the int32 handle the exported procs take.
+    ex &= "\n  __internExt: ewrap,"
+    if browser:
+      # no fd to write to: buffered stdout/stderr is drained here after a call.
+      ex &= "\n  __takeOutput,"
+    ex &= "\n};\n"
+    result.add ex
+  elif not m.entryHasRet:
+    result.add entryCall & ";\n"
+  else:
+    result.add "nim_exit(Number(" & entryCall & ") | 0);\n"

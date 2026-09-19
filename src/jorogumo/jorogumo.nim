@@ -1,20 +1,20 @@
 #
-#           Jorogumo — Leng → JavaScript code generator
+#           Jorogumo — Leng → JavaScript (the web back end's JS face)
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
 ## jorogumo translates a Leng `.c.nif` MAIN module into one self-contained
-## `.js` program (whole-program, like ithaqua: reachable declarations from
-## every dependent module are pulled in through the embedded-index loader).
+## `.js` program. It is the JavaScript renderer of the shared web back end
+## (`src/web`): the same code generator ithaqua drives, printed as JS.
 ## There is no link step and no host import object — the emitted file runs on
 ## a bare `node file.js`.
 
 import std / [parseopt, strutils]
 import nifcoreparse
 import "../arkham/core" / lengdecl
-import jsenc, codegen_js
+import "../web" / [webnif, codegen, jsrender]
 
 const
   Version = "0.1.0"
@@ -42,12 +42,14 @@ const
     ## memory above 2 GiB would silently alias through the 32-bit window, so
     ## the ceiling is stated, not discovered.
 
-proc generate(input, output: string; memBytes: int; browser: bool) =
-  # One Leng tag pool for the input; `generateJs` builds its output in a buffer
-  # with the jsnif pool. A buffer speaks one dialect, never both.
+proc run(input, output: string; memBytes: int; browser: bool) =
+  # One Leng tag pool for the input; `generate` builds its output in a buffer
+  # with the web IR pool. A buffer speaks one dialect, never both.
   let tags = lengdecl.createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  writeFile output, generateJs(buf, input, tags, memBytes, browser = browser)
+  var m: WebModule
+  var tree = generate(buf, input, tags, wtJs, m)
+  writeFile output, renderJs(tree, m, memBytes, ShadowStackSize, browser = browser)
 
 proc main() =
   var input, output = ""
@@ -74,8 +76,8 @@ proc main() =
   if memBytes <= 0 or memBytes > MaxMemBytes:
     quit "jorogumo: --memory must be in 1.." & $MaxMemBytes & " bytes (2 GiB)\n", QuitFailure
   try:
-    generate(input, output, memBytes, browser)
-  except JsGenError as e:
+    run(input, output, memBytes, browser)
+  except WebGenError as e:
     # One line, not a stack trace: "this construct is not generated yet" is an
     # ordinary answer, and a caller (hastur, jsdiff) reads the exit code.
     quit "jorogumo: " & e.msg & "\n  in " & input, QuitFailure

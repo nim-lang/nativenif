@@ -20,7 +20,7 @@
 import std / [os, osproc, strutils, tables]
 import nifcore, nifcoreparse
 import "../arkham/core" / lengdecl
-import codegen_js, jsenc
+import codegen
 
 proc onlyFilter: string =
   for a in commandLineParams():

@@ -1,31 +1,41 @@
 #
-#           Jorogumo — Leng → JavaScript code generator
+#           The web back end — Leng → JavaScript / wasm32
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## The half of the generator that owns linear memory: it decides where every
-## global and every read-only blob lives and turns compile-time initializers
-## into bytes at those absolute addresses.
+## The ONE code generator of both web targets: Leng in, the web IR of
+## `webnif` out, plus the `WebModule` facts that are not code (the static
+## image, the function table, the host imports, the entry point). `jsrender`
+## prints the result as JavaScript, `wasmrender` as a wasm32 binary; nothing
+## here depends on which of the two runs.
 ##
-## Leng already gives every object an explicit layout, so — exactly as in
-## ithaqua — there are no relocations: an address-valued field of a constant
-## (a string's `data` pointer, a `(addr g)` initializer, a proc symbol in an
-## RTTI method table) is a FIXUP resolved here, while the whole program's
-## layout is in this module's hands. What comes out is a `memTop`, one address
-## per global and a list of `(address, bytes)` segments; `dataInitJs` renders
-## them as loader calls that fill `JMEM` before the program body runs.
+## The generator is whole-program: starting from the entry proc (and every
+## other `exportc` proc of the main module) it pulls every reachable
+## declaration across modules through arkham's lazy foreign-module loader.
 ##
-## Code emission is M4+. This is the ground it stands on.
+## It owns linear memory: it decides where every global and every read-only
+## blob lives and turns compile-time initializers into bytes at those absolute
+## addresses. Leng already gives every object an explicit layout, so there are
+## no relocations: an address-valued field of a constant (a string's `data`
+## pointer, a `(addr g)` initializer, a proc symbol in an RTTI method table) is
+## a FIXUP resolved here, while the whole program's layout is in this module's
+## hands.
+##
+## The value model: a ≤32-bit integer, a pointer and a float are scalars that
+## live in function locals; a 64-bit integer too (a `BigInt` in JavaScript, an
+## `i64` in wasm). An aggregate, and any local whose address is taken, lives in
+## linear memory — a global at its static address, a local in the function's
+## shadow-stack frame — and its "value" is its address, exactly as in C.
 
-import std / [tables, sets, strutils, base64, assertions, algorithm]
+import std / [tables, sets, strutils, assertions, algorithm]
 import nifcore, nifcdecl
-import jsnif, jsenc
+import webnif
 import "../arkham/core" / [asmslots, programs, typenav, typeutil]
 
 const
-  JsPtrSize* = 4
+  WebPtrSize* = 4
   NullGuard* = 1024'u32     ## below this stays untouched, so a null deref
                             ## reads zeros instead of the static data
   ShadowStackSize* = 1 shl 20
@@ -38,9 +48,9 @@ type
     signed*: bool
 
   LocalKind = enum
-    lkReg                         ## a scalar: lives in a JS `let`
+    lkReg                         ## a scalar: lives in a function local
     lkSlot                        ## a value in the frame, at `fp + off`
-    lkPtr                         ## an aggregate PARAM: the JS argument already
+    lkPtr                         ## an aggregate PARAM: the argument already
                                   ## holds its address, so no slot is needed
 
   LocalSlot = object
@@ -53,24 +63,27 @@ type
     size: int                     ## what it holds, so a plan mismatch is caught
 
   ProcCtx = object
-    jsName: string                ## the JS function name
+    jsName: string                ## the IR function name
     symType: Table[string, Cursor] ## local/param name → its Leng type
     locals: Table[string, LocalSlot]
     retType: Cursor
     sret: bool                    ## the result is an aggregate: hidden dest arg
-    sretName: string              ## JS name of that hidden parameter
+    sretName: string              ## IR name of that hidden parameter
     frameSize: int                ## shadow-stack bytes; 0 needs no frame at all
-    fp: string                    ## JS name of the frame base, when frameSize > 0
+    fp: string                    ## IR name of the frame base, when frameSize > 0
     tmpPlan: seq[TempSlot]        ## materializations, in preorder
     tmpAt: int                    ## how many codegen has consumed
     tmp: int                      ## per-proc temporary counter
     labs: seq[string]             ## open `(lab)` label blocks, innermost last
     regLocals: seq[string]        ## `lkReg` locals, in declaration order
+    temps: seq[(string, WidthCode)] ## generator temporaries, declared with the locals
 
-  JsGen* = object
+  WebGen* = object
     prog*: Program
     tags*: TagPool                ## the Leng pool `buf` was parsed with
-    outp*: TokenBuf               ## the jsnif program under construction — its OWN pool
+    outp*: TokenBuf               ## the body of the function being lowered — the
+                                  ## web IR pool, never the Leng one
+    top*: TokenBuf                ## the `(top FUNC*)` program: finished functions
     callTarget: Table[string, CallTarget] ## typenav needs a mutable copy
     globals: Table[string, Cursor]        ## name → gvar/const decl (foreign ones cached on use)
     tvars: Table[string, Cursor]
@@ -84,38 +97,47 @@ type
     allocLog: seq[(uint32, uint32, string)] ## (addr, size, owner) for the overrun check
     tableSlot: Table[string, uint32]   ## proc symbol → function-table index (0 is null)
     nextTableSlot: uint32
-    tableEntries: seq[string]          ## slot i (from 1) → the JS name to bind there
+    tableEntries: seq[string]          ## slot i (from 1) → the proc symbol bound there
     pending: seq[(string, Cursor)]     ## reachable procs not yet lowered
     emitted: HashSet[string]
-    jsNameOf: Table[string, string]    ## NIF symbol → JS identifier
+    jsNameOf: Table[string, string]    ## NIF symbol → IR identifier
     usedNames: HashSet[string]
     p: ProcCtx                         ## the proc being lowered
     entrySym*: string
-    browser: bool                      ## emit for a browser (no Node fs/process):
-                                       ## output to a host sink, nim_exit throws, and
-                                       ## the surface lands on globalThis.NIF, not
-                                       ## module.exports. Default false = Node/CommonJS.
+    target*: WebTarget
+    hostImports*: bool                 ## a bodyless `importc` proc is a host import
+                                       ## (an `env` function the page provides)
+                                       ## instead of a refusal
+    imports*: seq[WebImport]           ## the host floor, then discovered host imports
+    importOf: Table[string, string]    ## importc C name → its import's IR name
+    thunks: seq[(string, string, Cursor)] ## (thunk name, proc sym, proc decl):
+                                       ## closure-signature bridges to lower
+    needMemcmp: bool                   ## the synthetic `memcmp` is referenced
     callbacks: seq[string]             ## JS wrapper functions bridging a JS callback
                                        ## call to a Nim proc whose args/result need
                                        ## the handle/string bridge (emitted at the tail)
 
+  WebTarget* = enum
+    wtJs                               ## JavaScript: `importjs` splices are legal
+    wtWasm                             ## wasm32
+
 type
-  JsGenError* = object of CatchableError
+  WebGenError* = object of CatchableError
     ## A program the generator does not understand. This is an ordinary
     ## failure, not a broken invariant: the CLI reports it as one line and the
     ## coverage harness can ask "can you generate this?" without dying. An
     ## assertion here would be fatal — `--panics` off makes a `Defect`
     ## uncatchable — so a refusal must never be one.
 
-proc err(g: JsGen; msg: string) {.noreturn.} =
-  raise (ref JsGenError)(msg: msg)
+proc err(g: WebGen; msg: string) {.noreturn.} =
+  raise (ref WebGenError)(msg: msg)
 
-proc typeCtx(g: var JsGen): TypeCtx =
+proc typeCtx(g: var WebGen): TypeCtx =
   TypeCtx(prog: addr g.prog, callTarget: addr g.callTarget,
           globals: addr g.globals, tvars: addr g.tvars,
           symType: addr g.p.symType)
 
-proc scalOf(g: var JsGen; t: Cursor): Scal =
+proc scalOf(g: var WebGen; t: Cursor): Scal =
   ## The computation class of a Leng type: how wide and how signed the SOURCE
   ## type is, and whether it travels in memory rather than in a value.
   let s = slotOf(g.prog, t)
@@ -133,25 +155,25 @@ proc scalOf(g: var JsGen; t: Cursor): Scal =
 
 proc alignUp(x: uint32; a: uint32): uint32 = (x + a - 1) and not (a - 1)
 
-proc isPtrType(g: var JsGen; t: Cursor): bool =
+proc isPtrType(g: var WebGen; t: Cursor): bool =
   let r = resolveType(g.prog, t)
   r.kind == TagLit and r.typeKind in {PtrT, AptrT}
 
-proc isNimStringType(g: var JsGen; t: Cursor): bool =
+proc isNimStringType(g: var WebGen; t: Cursor): bool =
   ## A Nim `string` — the `string.0.<system>` symbol (Leng has no builtin type
   ## kind for it). Its value is the 8-byte SSO struct; the splice decodes it to
   ## a JS string (§6). Checked on the type cursor before it is resolved, which
   ## would fold the symbol to its `(object bytes more)` definition and lose the name.
   t.kind == Symbol and symName(t).startsWith("string.0.")
 
-proc isCstringType(g: var JsGen; t: Cursor): bool =
+proc isCstringType(g: var WebGen; t: Cursor): bool =
   ## A `cstring` is `(aptr char)` in Leng — a pointer to NUL-terminated bytes,
   ## NOT a JS handle. It must be recognised before the pointer/handle case,
   ## which isPtrType would otherwise swallow it into.
   t.kind == TagLit and t.typeKind == AptrT and
     (let inner = innerType(g.prog, t); inner.kind == TagLit and inner.typeKind == CT)
 
-proc isProctypeType(g: var JsGen; t: Cursor): bool =
+proc isProctypeType(g: var WebGen; t: Cursor): bool =
   ## A function type — possibly under one `(ptr …)` layer — where a `ref object`
   ## handle would otherwise catch it. In a splice a proctype operand is a Nim
   ## proc handed to a JS API as a callback (rAF, setTimeout, a DOM listener).
@@ -165,7 +187,7 @@ proc isProctypeType(g: var JsGen; t: Cursor): bool =
 type
   JsBridgeKind = enum jbNone, jbString, jbCstring, jbHandle, jbCallback
 
-proc jsBridgeKind(g: var JsGen; t: Cursor): JsBridgeKind =
+proc jsBridgeKind(g: var WebGen; t: Cursor): JsBridgeKind =
   ## How a type crosses an `importjs` splice boundary, in precedence order: a
   ## Nim `string` (decode the SSO struct), a `cstring` (NUL-terminated bytes),
   ## a proctype (a Nim proc used as a JS callback), then any other pointer/ref as
@@ -182,7 +204,10 @@ proc jsBridgeKind(g: var JsGen; t: Cursor): JsBridgeKind =
   elif isPtrType(g, t): jbHandle
   else: jbNone
 
-proc isAggType(g: var JsGen; t: Cursor): bool =
+proc isVoidType(t: Cursor): bool =
+  t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)
+
+proc isAggType(g: var WebGen; t: Cursor): bool =
   ## A DotToken is the ABSENCE of a type — a void result, an elided field type.
   ## It has no size to ask for, so it is not an aggregate. The spelled `(void)`
   ## is the same absence (ithaqua's sret test checks `isVoidType` first for
@@ -192,11 +217,11 @@ proc isAggType(g: var JsGen; t: Cursor): bool =
   if t.kind == TagLit and t.typeKind == VoidT: return false
   scalOf(g, t).kind == skMem
 
-proc byteSize(g: var JsGen; t: Cursor): int =
+proc byteSize(g: var WebGen; t: Cursor): int =
   let (sz, _) = typeSizeAlign(g.prog, t)
   sz
 
-proc byteAlign(g: var JsGen; t: Cursor): int =
+proc byteAlign(g: var WebGen; t: Cursor): int =
   ## A FRAME slot's alignment. `stackSlotAlign` and `typeSizeAlign` differ on
   ## purpose: a 16-byte array is align 8 as a type — its elements are — but
   ## align 16 as a stack slot. Everything here is a stack slot. The floor of 8
@@ -204,17 +229,17 @@ proc byteAlign(g: var JsGen; t: Cursor): int =
   ## target's world of 4-byte scalars.
   max(stackSlotAlign(g.prog, t), 8)
 
-proc elemTypeOf(g: var JsGen; arrType: Cursor): Cursor =
+proc elemTypeOf(g: var WebGen; arrType: Cursor): Cursor =
   innerType(g.prog, resolveType(g.prog, arrType))
 
 
-proc allocStatic(g: var JsGen; size, align: int; tag = ""): uint32 =
+proc allocStatic(g: var WebGen; size, align: int; tag = ""): uint32 =
   g.memTop = alignUp(g.memTop, uint32(max(align, 1)))
   result = g.memTop
   g.memTop += uint32(max(size, 1))
   g.allocLog.add (result, uint32(max(size, 1)), tag)
 
-proc flexPayloadLen(g: var JsGen; initv: Cursor): int =
+proc flexPayloadLen(g: var WebGen; initv: Cursor): int =
   ## Extra bytes a constant initializer stores past its type's fixed size:
   ## the payload of a flexarray tail (a string literal or an array
   ## constructor). +1 for a string's NUL so C-string views stay valid.
@@ -229,7 +254,7 @@ proc flexPayloadLen(g: var JsGen; initv: Cursor): int =
       let arrT = resolveType(g.prog, ac)
       var esz: int
       if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
-        esz = JsPtrSize
+        esz = WebPtrSize
       else:
         let elemT = innerType(g.prog, arrT)
         (esz, _) = typeSizeAlign(g.prog, elemT)
@@ -259,7 +284,7 @@ proc flexPayloadLen(g: var JsGen; initv: Cursor): int =
               let arrT = resolveType(g.prog, ac)
               var esz: int
               if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
-                esz = JsPtrSize
+                esz = WebPtrSize
               else:
                 let elemT = innerType(g.prog, arrT)
                 (esz, _) = typeSizeAlign(g.prog, elemT)
@@ -281,7 +306,7 @@ proc declHasInit(decl: Cursor): bool =
     result = d.hasMore and d.kind != DotToken
     while d.hasMore: skip d
 
-proc globalAddrOf(g: var JsGen; name: string): uint32 =
+proc globalAddrOf(g: var WebGen; name: string): uint32 =
   ## The linear-memory address of a gvar/const — foreign ones included, the
   ## lazy loader resolves their decls and the layout here is whole-program.
   ## The address is keyed by `gvarRefName`: a C-linkage PAIR (the defining
@@ -323,13 +348,13 @@ proc globalAddrOf(g: var JsGen; name: string): uint32 =
   elif si.cat == scTvar and not g.tvars.hasKey(name):
     g.tvars[name] = si.decl
 
-proc strLitAddr(g: var JsGen; s: string): uint32 =
+proc strLitAddr(g: var WebGen; s: string): uint32 =
   if g.rodataAddr.hasKey(s): return g.rodataAddr[s]
   result = allocStatic(g, s.len + 1, 1, tag = "strlit")  # NUL-terminated, like the C backend
   g.rodataAddr[s] = result
   g.dataSegs.add (result, s & '\0')
 
-proc tableSlotOf(g: var JsGen; sym: string): uint32 =
+proc tableSlotOf(g: var WebGen; sym: string): uint32 =
   ## A proc as a VALUE is an index into the function table — the twin of
   ## wasm's funcref table, with 0 reserved for nil.
   if g.tableSlot.hasKey(sym): return g.tableSlot[sym]
@@ -339,10 +364,10 @@ proc tableSlotOf(g: var JsGen; sym: string): uint32 =
   while g.tableEntries.len <= int(result): g.tableEntries.add ""
   g.tableEntries[int(result)] = sym         # bound to its JS name at the end
 
-proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor
-proc ensureProc(g: var JsGen; sym: string; decl: Cursor)
+proc procDeclOf(g: var WebGen; nm: string; found: var bool): Cursor
+proc ensureProc(g: var WebGen; sym: string; decl: Cursor)
 
-proc procValue(g: var JsGen; sym: string): uint32 =
+proc procValue(g: var WebGen; sym: string): uint32 =
   ## A proc as a VALUE: its function-table slot, AND a reachability edge —
   ## ithaqua's `tableSlotOf` resolves through `refProc`, which declares the
   ## body. A slot for a proc nobody lowered would bind the "unbound extern"
@@ -354,7 +379,7 @@ proc procValue(g: var JsGen; sym: string): uint32 =
 
 # ── object offsets ───────────────────────────────────────────────────────────
 
-proc fieldOffsetIn(g: var JsGen; objType: Cursor; field: string;
+proc fieldOffsetIn(g: var WebGen; objType: Cursor; field: string;
                    found: var bool): int =
   ## Byte offset of `field` inside the RESOLVED object type `objType` (own
   ## fields only; the caller walks inheritance). Mirrors `objSizeAlign`.
@@ -406,7 +431,7 @@ proc fieldOffsetIn(g: var JsGen; objType: Cursor; field: string;
         while oc.hasMore: skip oc              # keep the `into` balanced
         return
 
-proc dotOffset(g: var JsGen; baseType: Cursor; field: string; depth: int): int =
+proc dotOffset(g: var WebGen; baseType: Cursor; field: string; depth: int): int =
   ## Offset of `field` accessed at inheritance `depth` (0 = this object; the
   ## base subobject always sits at 0, so depth picks WHICH body declares it).
   var t = resolveType(g.prog, baseType)
@@ -445,7 +470,7 @@ proc putLE(bytes: var string; off: int; v: uint64; width: int) =
     bytes[off + i] = char(x and 0xFF)
     x = x shr 8
 
-proc isAggregateGlobal(g: var JsGen; nm: string): bool =
+proc isAggregateGlobal(g: var WebGen; nm: string): bool =
   ## True when `nm` names a gvar/tvar/const whose DECLARED type is an
   ## aggregate (skMem) — the case where a C cast of the bare symbol means
   ## array decay to its address rather than a value read.
@@ -459,7 +484,7 @@ proc isAggregateGlobal(g: var JsGen; nm: string): bool =
     result = scalOf(g, d).kind == skMem
     while d.hasMore: skip d
 
-proc constScalarBits(g: var JsGen; v: Cursor; ok: var bool): uint64 =
+proc constScalarBits(g: var WebGen; v: Cursor; ok: var bool): uint64 =
   ## The bit pattern of a compile-time scalar. Addresses resolve to absolute
   ## numbers because jorogumo owns the layout — this is where a fixup lands.
   ok = true
@@ -550,7 +575,7 @@ proc constScalarBits(g: var JsGen; v: Cursor; ok: var bool): uint64 =
   else:
     ok = false
 
-proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
+proc serializeConstInto(g: var WebGen; bytes: var string; base: int;
                         typ, v: Cursor) =
   ## Serialize a compile-time aggregate/scalar initializer at `base` in
   ## `bytes`; offsets mirror the runtime layout queries, so a constant and a
@@ -596,7 +621,7 @@ proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
       var esz: int
       if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
         elemT = arrT                           # a method table: the slots ARE pointers
-        esz = JsPtrSize
+        esz = WebPtrSize
       else:
         elemT = innerType(g.prog, arrT)
         (esz, _) = typeSizeAlign(g.prog, elemT)
@@ -607,14 +632,14 @@ proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
         skip t
         inc idx
   elif v.kind == TagLit and v.exprKind == NilC:
-    putLE(bytes, base, 0, JsPtrSize)
+    putLE(bytes, base, 0, WebPtrSize)
   elif v.kind == Symbol and isPtrType(g, rt) and
       lookupSym(typeCtx(g), symName(v)).cat in {scGlobal, scTvar}:
     # Object-file semantics: a symbol written into POINTER-typed data denotes
     # its ADDRESS — what arkham's data section relocates to, and what makes
     # `(gvar p (ptr T) g)` point at `g`. A symbol in non-pointer data is a
     # VALUE copy, a runtime init the `ini` chain owns.
-    putLE(bytes, base, uint64(globalAddrOf(g, symName(v))), JsPtrSize)
+    putLE(bytes, base, uint64(globalAddrOf(g, symName(v))), WebPtrSize)
   else:
     let sc = scalOf(g, rt)
     if sc.kind == skMem:
@@ -626,7 +651,7 @@ proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
       bits = uint64(cast[uint32](float32(cast[float64](bits))))
     putLE(bytes, base, bits, max(sc.bits div 8, 1))
 
-proc staticInit(g: var JsGen; decl: Cursor; typ, initv: var Cursor;
+proc staticInit(g: var WebGen; decl: Cursor; typ, initv: var Cursor;
                 hasInit: var bool): bool =
   ## The initializer of a global DECL, but only when it is genuinely STATIC.
   ## Zero inits need no segment (the buffer starts zeroed) and runtime inits
@@ -675,7 +700,7 @@ proc staticInit(g: var JsGen; decl: Cursor; typ, initv: var Cursor;
   else:
     result = true
 
-proc serializeStatics(g: var JsGen) =
+proc serializeStatics(g: var WebGen) =
   ## Turn every addressed global's static initializer into image segments.
   ## Runs to a fixpoint: serializing one global can name another (`(addr g)`,
   ## a method table), which discovers a new address. `staticsDone` persists
@@ -696,7 +721,7 @@ proc serializeStatics(g: var JsGen) =
       if bytes.len > 0:
         g.dataSegs.add (g.globalAddr[n], bytes)
 
-proc layoutProgram*(g: var JsGen) =
+proc layoutProgram*(g: var WebGen) =
   ## Assign every global and thread-local an address and serialize the statics
   ## known up front; what codegen discovers later is drained before emission.
   var names: seq[string] = @[]
@@ -706,7 +731,7 @@ proc layoutProgram*(g: var JsGen) =
   for n in names: discard globalAddrOf(g, n)
   serializeStatics(g)
 
-proc checkSegments(g: var JsGen) =
+proc checkSegments(g: var WebGen) =
   ## No segment may write past the allocation it was given: an undersized
   ## global silently corrupts its neighbour, which surfaces far away.
   for (at, s) in g.dataSegs:
@@ -725,23 +750,31 @@ proc checkSegments(g: var JsGen) =
       err g, "data segment at " & $at & " (" & $s.len &
         " bytes) overruns `" & tag & "` (" & $sz & " bytes at " & $a & ")"
 
-proc dataInitJs*(g: var JsGen): string =
-  ## The static image as JS: one `D(base64, address)` call per segment (the
-  ## data section's twin). Base64 because the image is arbitrary bytes and a
-  ## JS string literal is not.
-  checkSegments(g)
-  result = ""
-  for (at, s) in g.dataSegs:
-    result.add "D(\"" & encode(s) & "\", " & $at & ");\n"
+const
+  ImpWrite* = "nim_write"   ## the host floor: every program may write and exit
+  ImpExit* = "nim_exit"
+  GlobErrv* = "errv"        ## the flag model's two registers: scalar globals
+  GlobOvf* = "ovf"          ## that no address ever reaches
+  MemcmpFunc = "memcmp_synth" ## the synthetic byte compare (no `n_` prefix:
+                              ## no Nim symbol can land on it)
 
-proc createJsGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  browser = false): JsGen =
+proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                   target = wtJs; hostImports = false): WebGen =
   setTargetWord Wasm32               # the linear-memory model: 4-byte pointers
   result.tags = tags
-  result.browser = browser
+  result.target = target
+  result.hostImports = hostImports
   result.memTop = NullGuard
   result.nextTableSlot = 1           # slot 0 stays the null function pointer
-  result.outp = createTokenBuf(sharedTags = createJsTagPool())
+  let webTags = createWebTagPool()
+  result.top = createTokenBuf(sharedTags = webTags)
+  # the body buffer shares the program's pools: a finished body is appended
+  # to `top` as one bulk copy
+  result.outp = createTokenBuf(sharedPool = result.top.pool, sharedTags = webTags)
+  result.imports = @[
+    WebImport(name: ImpWrite, params: @[wI32, wU32, wI32], hasRet: true, ret: wI32),
+    WebImport(name: ImpExit, params: @[wI32])]
+  result.importOf = initTable[string, string]()
   result.callTarget = initTable[string, CallTarget]()
   result.globals = initTable[string, Cursor]()
   result.tvars = initTable[string, Cursor]()
@@ -763,14 +796,14 @@ proc createJsGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.tvars[name] = decl
 
 # ── code generation ──────────────────────────────────────────────────────────
-## Leng → jsnif. The value model is §1's: a ≤32-bit int or a float is a JS
-## `Number`, a 64-bit int is a `BigInt`, a pointer is a `Number` offset into
-## `JMEM`, and an aggregate lives in linear memory. Anything not yet understood
-## is REFUSED by name — a half-lowered program is worse than no program.
+## Leng → web IR. A scalar travels as a value of its width; a pointer is a
+## 32-bit offset into linear memory, and an aggregate lives in linear memory.
+## Anything not yet understood is REFUSED by name — a half-lowered program is
+## worse than no program.
 
-proc lengType(g: var JsGen; c: Cursor): Cursor = getType(typeCtx(g), c)
+proc lengType(g: var WebGen; c: Cursor): Cursor = getType(typeCtx(g), c)
 
-proc exprScal(g: var JsGen; c: Cursor): Scal = scalOf(g, lengType(g, c))
+proc exprScal(g: var WebGen; c: Cursor): Scal = scalOf(g, lengType(g, c))
 
 proc widthOf(sc: Scal): WidthCode =
   result = case sc.kind
@@ -784,7 +817,7 @@ proc widthOf(sc: Scal): WidthCode =
     of skF64: wF64
     of skMem: wU32               # a pointer is an unsigned offset into the buffer
 
-proc widthOf(g: var JsGen; t: Cursor): WidthCode = widthOf(scalOf(g, t))
+proc widthOf(g: var WebGen; t: Cursor): WidthCode = widthOf(scalOf(g, t))
 
 proc widthBits(w: WidthCode): int =
   case w
@@ -800,7 +833,7 @@ proc unsignedOf(w: WidthCode): WidthCode =
   of wI32: wU32
   else: w
 
-proc sufWidth(g: var JsGen; s: string): WidthCode =
+proc sufWidth(g: var WebGen; s: string): WidthCode =
   ## The width a NIF numeric suffix names. Nifler marks an EXPLICITLY typed
   ## literal (`5'u32`) with a leading `+`, which says nothing about the width.
   ## These are the only widths there are; an unknown suffix is a dialect
@@ -819,7 +852,7 @@ proc sufWidth(g: var JsGen; s: string): WidthCode =
   of "f64": wF64
   else: err g, "unknown numeric suffix: " & s
 
-proc litWidth(g: var JsGen; c: Cursor): WidthCode =
+proc litWidth(g: var WebGen; c: Cursor): WidthCode =
   ## The width of a LITERAL. A bare literal's type is the program's natural int
   ## type — `i32` under Wasm32 — so trusting it would truncate
   ## `(conv (f 64) 9223372036854775808u)` to zero. A literal that does not fit
@@ -844,7 +877,7 @@ proc litWidth(g: var JsGen; c: Cursor): WidthCode =
   else:
     w
 
-proc jsName(g: var JsGen; sym: string): string =
+proc jsName(g: var WebGen; sym: string): string =
   ## A JS identifier for a NIF symbol. NIF names carry dots and module suffixes,
   ## which are not identifier characters in JS. The mapping is memoized — a
   ## symbol and every later use of it get the same name — and made INJECTIVE by
@@ -864,13 +897,13 @@ proc jsName(g: var JsGen; sym: string): string =
   g.jsNameOf[sym] = cand
   result = cand
 
-proc tmpName(g: var JsGen): string =
+proc tmpName(g: var WebGen): string =
   ## Reserved through the same injective table, so a generated temporary can
   ## never land on a user name.
   inc g.p.tmp
   jsName(g, "tmp." & $g.p.tmp)
 
-proc declType(g: var JsGen; nm: string): Cursor =
+proc declType(g: var WebGen; nm: string): Cursor =
   ## The declared type of a global/tvar, as a cursor into its decl.
   let si = lookupSym(typeCtx(g), nm)
   if si.cat notin {scGlobal, scTvar}: err g, "not a global: " & nm
@@ -881,8 +914,8 @@ proc declType(g: var JsGen; nm: string): Cursor =
     result = d
     while d.hasMore: skip d
 
-proc genExpr(g: var JsGen; c: Cursor)
-proc genAddr(g: var JsGen; c: Cursor)
+proc genExpr(g: var WebGen; c: Cursor)
+proc genAddr(g: var WebGen; c: Cursor)
 proc procResultType(decl: Cursor): Cursor
 proc procBody(decl: Cursor): Cursor
 proc hasBody(decl: Cursor): bool
@@ -896,7 +929,7 @@ proc hasBody(decl: Cursor): bool
 
 # ── frame addressing ─────────────────────────────────────────────────────────
 
-proc slotAddr(g: var JsGen; off: int) =
+proc slotAddr(g: var WebGen; off: int) =
   ## `fp + off`, a Number because `fp` is one.
   if g.p.fp.len == 0: err g, "internal: frame slot in a frameless proc"
   g.outp.openTree Add
@@ -905,7 +938,7 @@ proc slotAddr(g: var JsGen; off: int) =
   g.outp.numLit int64(off)
   g.outp.closeTag
 
-proc takeTemp(g: var JsGen; size: int; what: string = ""): int =
+proc takeTemp(g: var WebGen; size: int; what: string = ""): int =
   ## The next planned temporary. `planFrame` walked the same tree in the same
   ## preorder and reserved an offset for every node that must be materialized;
   ## consuming that plan here is what keeps layout and codegen from disagreeing
@@ -925,7 +958,7 @@ proc takeTemp(g: var JsGen; size: int; what: string = ""): int =
   result = g.p.tmpPlan[g.p.tmpAt].off
   inc g.p.tmpAt
 
-proc genSymAddr(g: var JsGen; c: Cursor) =
+proc genSymAddr(g: var WebGen; c: Cursor) =
   ## The address a symbol denotes: a frame slot, the address an aggregate
   ## parameter arrived as, or a global's static address.
   let nm = symName(c)
@@ -944,13 +977,13 @@ proc genSymAddr(g: var JsGen; c: Cursor) =
       g.outp.numLit int64(globalAddrOf(g, nm))
     else: err g, "not addressable: " & nm
 
-proc genBaseAddr(g: var JsGen; c: Cursor) =
+proc genBaseAddr(g: var WebGen; c: Cursor) =
   ## The address a `dot`/`at`/`pat` walks from: a pointer's VALUE is the base,
   ## an aggregate or a local is its location.
   let t = lengType(g, c)
   if isPtrType(g, t): genExpr(g, c) else: genAddr(g, c)
 
-proc scaledIndex(g: var JsGen; idx: Cursor; factor: int) =
+proc scaledIndex(g: var WebGen; idx: Cursor; factor: int) =
   ## `index * factor` as a Number: adding a BigInt to a Number is a JS type
   ## error, and an address is always a Number in this value model.
   let iw = widthOf(exprScal(g, idx))
@@ -965,7 +998,7 @@ proc scaledIndex(g: var JsGen; idx: Cursor; factor: int) =
       genExpr(g, idx)
     g.outp.closeTag
 
-proc genAddr(g: var JsGen; c: Cursor) =
+proc genAddr(g: var WebGen; c: Cursor) =
   ## `(addr X)` and every lvalue base: the byte address X denotes.
   case c.kind
   of Symbol: genSymAddr(g, c)
@@ -1032,9 +1065,48 @@ proc genAddr(g: var JsGen; c: Cursor) =
   else:
     err g, "cannot take the address of this expression"
 
-proc genExprCoerced(g: var JsGen; c: Cursor; want: WidthCode) =
-  ## The one place the two numeric worlds meet: an operand is moved to the
-  ## width its position demands, and only when the widths actually differ.
+proc intLitAs(g: var WebGen; v: int64; unsignedSrc: bool; want: WidthCode) =
+  ## An integer literal emitted straight at the width its position demands —
+  ## Leng's bare literals carry no width, the CONTEXT types them — in the
+  ## canonical form of that width (a u32 is non-negative, an i8 sign-extended).
+  case want
+  of wF32, wF64:
+    g.outp.floatLit(if unsignedSrc: float64(cast[uint64](v)) else: float64(v))
+  of wI64: g.outp.bigIntLit $v
+  of wU64: g.outp.bigIntLit $cast[uint64](v)
+  of wI32: g.outp.numLit int64(cast[int32](v))
+  of wU32: g.outp.numLit int64(cast[uint32](v))
+  of wI16: g.outp.numLit int64(cast[int16](v))
+  of wU16: g.outp.numLit int64(cast[uint16](v))
+  of wI8: g.outp.numLit int64(cast[int8](v))
+  of wU8: g.outp.numLit int64(cast[uint8](v))
+
+proc genExprCoerced(g: var WebGen; c: Cursor; want: WidthCode) =
+  ## The one place the numeric worlds meet: an operand is moved to the width
+  ## its position demands, and only when the widths actually differ. A bare
+  ## literal is emitted at that width directly (C's implicit conversion of a
+  ## constant happens at compile time).
+  case c.kind
+  of IntLit: intLitAs(g, intVal(c), false, want); return
+  of UIntLit: intLitAs(g, cast[int64](uintVal(c)), true, want); return
+  of CharLit: intLitAs(g, int64(ord(charLit(c))), true, want); return
+  of FloatLit:
+    if want.isFloat:
+      g.outp.floatLit floatVal(c)
+      return
+  of TagLit:
+    case c.exprKind
+    of TrueC, FalseC, NilC:
+      intLitAs(g, (if c.exprKind == TrueC: 1 else: 0), false, want)
+      return
+    of ParC:
+      var t = c
+      t.into:
+        genExprCoerced(g, t, want)
+        while t.hasMore: skip t
+      return
+    else: discard
+  else: discard
   let have = litWidth(g, c)
   if have == want:
     genExpr(g, c)
@@ -1042,7 +1114,7 @@ proc genExprCoerced(g: var JsGen; c: Cursor; want: WidthCode) =
     g.outp.cvtNode(have, want):
       genExpr(g, c)
 
-proc genSymValue(g: var JsGen; c: Cursor) =
+proc genSymValue(g: var WebGen; c: Cursor) =
   ## The value a symbol holds. An aggregate's value IS its address; anything
   ## else is loaded from where it lives — a JS local, a frame slot, a global's
   ## static address.
@@ -1074,7 +1146,7 @@ proc genSymValue(g: var JsGen; c: Cursor) =
 
 # ── constructors: materializing an aggregate value ───────────────────────────
 
-proc constrSize(g: var JsGen; c: Cursor): int =
+proc constrSize(g: var WebGen; c: Cursor): int =
   ## The bytes a constructor occupies. The node names its own type, so the size
   ## never depends on what typenav makes of the enclosing expression.
   var t = c
@@ -1083,28 +1155,28 @@ proc constrSize(g: var JsGen; c: Cursor): int =
     while t.hasMore: skip t
   if result <= 0: err g, "constructor of unknown size"
 
-proc copyToSlot(g: var JsGen; dstOff: int; src: Cursor; size: int) =
-  ## `copyMem(fp+dstOff, <src's address>, size)` — an EXPRESSION, so a
+proc copyToSlot(g: var WebGen; dstOff: int; src: Cursor; size: int) =
+  ## `memcopy(fp+dstOff, <src's address>, size)` — an EXPRESSION, so a
   ## constructor fill composes inside a `Seq`.
-  g.outp.openTree Call
-  g.outp.ident "copyMem"
+  g.outp.openTree MemCopy
   slotAddr(g, dstOff)
   genBaseAddr(g, src)
   g.outp.numLit int64(size)
   g.outp.closeTag
 
-proc storeSlot(g: var JsGen; off: int; w: WidthCode; val: Cursor) =
+proc storeSlot(g: var WebGen; off: int; w: WidthCode; val: Cursor) =
   g.outp.openTree HStore
   g.outp.width w
   slotAddr(g, off)
   g.genExprCoerced(val, w)
   g.outp.closeTag
 
-proc zeroSlot(g: var JsGen; off, size: int) =
-  ## `zeroMem(fp+off, size)`, an expression so it composes in a statement.
-  g.outp.openTree Call
-  g.outp.ident "zeroMem"
+proc zeroSlot(g: var WebGen; off, size: int) =
+  ## `memfill(fp+off, 0, size)`: the shadow stack is reused memory, and an
+  ## uninitialized local must read as zero, as a function local does.
+  g.outp.openTree MemFill
   slotAddr(g, off)
+  g.outp.numLit 0
   g.outp.numLit int64(size)
   g.outp.closeTag
 
@@ -1123,7 +1195,7 @@ proc entryIsCtor(kv: Cursor): bool =
   inc t                                    # the value
   t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}
 
-proc isInheritedPart(g: var JsGen; objTy: Cursor; part: string): bool =
+proc isInheritedPart(g: var WebGen; objTy: Cursor; part: string): bool =
   ## Is `part` one of `objTy`'s bases? Only the base chain says which nested
   ## `oconstr` is the inherited part, and guessing would write it at offset 0 of
   ## an object it does not belong to.
@@ -1140,7 +1212,7 @@ proc isInheritedPart(g: var JsGen; objTy: Cursor; part: string): bool =
     if symName(base) == part: return true
     t = resolveType(g.prog, base)
 
-proc genCtorInto(g: var JsGen; destOff: int; c: Cursor) =
+proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
   ## Fill the frame slot at `destOff` from an `oconstr`/`aconstr`, emitting one
   ## JS comma sequence whose value is the destination address. A nested
   ## constructor is filled in place at its field's offset, so a literal costs
@@ -1246,14 +1318,14 @@ proc markTaken(c: Cursor; taken: var HashSet[string]) =
       markTaken(t, taken)
       skip t
 
-proc ctorType(g: var JsGen; c: Cursor): Cursor =
+proc ctorType(g: var WebGen; c: Cursor): Cursor =
   ## The type an `oconstr`/`aconstr` builds.
   var t = c
   t.into:
     result = t
     while t.hasMore: skip t
 
-proc calleeProctype(g: var JsGen; target: Cursor): Cursor =
+proc calleeProctype(g: var WebGen; target: Cursor): Cursor =
   ## The proctype of a callee expression, or a NIL cursor when there is no
   ## proctype to speak of — an unresolvable symbol, a non-function value.
   ## typenav's rule for a call's type is the callee proctype's return child;
@@ -1269,7 +1341,7 @@ proc calleeProctype(g: var JsGen; target: Cursor): Cursor =
     pt = resolveType(g.prog, inner)            # peel `(ptr proctype)`
   if pt.kind == TagLit and pt.typeKind == ProctypeT: result = pt
 
-proc calleeResultType(g: var JsGen; target: Cursor): Cursor =
+proc calleeResultType(g: var WebGen; target: Cursor): Cursor =
   ## The result type from a call TARGET cursor — the same child a call node
   ## opens with. `(onerr ACTION FN ARGS…)` reaches the call through here
   ## because its target is not the first child of the node itself.
@@ -1280,7 +1352,7 @@ proc calleeResultType(g: var JsGen; target: Cursor): Cursor =
       result = pt
       while pt.hasMore: skip pt
 
-proc callResultType(g: var JsGen; c: Cursor): Cursor =
+proc callResultType(g: var WebGen; c: Cursor): Cursor =
   ## The result type of a call node — direct or indirect — by typenav's ONE
   ## rule: the return type of the callee's proctype. `planFrame` and codegen
   ## must agree on which calls carry an sret destination, and deriving both
@@ -1290,7 +1362,7 @@ proc callResultType(g: var JsGen; c: Cursor): Cursor =
     result = calleeResultType(g, t)
     while t.hasMore: skip t
 
-proc callDestSize(g: var JsGen; c: Cursor): (int, int) =
+proc callDestSize(g: var WebGen; c: Cursor): (int, int) =
   ## What the CALLER must reserve for a call's result: (size, align) when the
   ## result is an aggregate (the struct-return slot), (0, 8) otherwise.
   result = (0, 8)
@@ -1305,7 +1377,7 @@ proc aggArgFresh(t: Cursor): bool =
   ## boundary.
   t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, CallC}
 
-proc aggArgDestSize(g: var JsGen; c: Cursor): (int, int) =
+proc aggArgDestSize(g: var WebGen; c: Cursor): (int, int) =
   ## What the CALLER must reserve for an aggregate ARGUMENT: a fresh copy
   ## `(size, align)`, or `(0, 8)` when the argument rides through as it is —
   ## not an aggregate, already fresh, or a type that cannot be resolved. The
@@ -1334,7 +1406,7 @@ proc isHostDeclaration(decl: Cursor): bool
 proc hasPragma(decl: Cursor; want: LengPragma): bool
   ## Forward declaration; defined with the pragma helpers. `genCallFrom` needs
   ## it to route a bodyless `importjs` proc to the splice.
-proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
+proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
   if c.kind != TagLit: return
   if c.stmtKind == VarS:
     var t = c
@@ -1475,7 +1547,7 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
       skip t
       inc idx
 
-proc planFrame(g: var JsGen; body: Cursor; params: seq[(string, Cursor)];
+proc planFrame(g: var WebGen; body: Cursor; params: seq[(string, Cursor)];
                taken: HashSet[string]) =
   ## Give every local its frame slot (or none) and reserve a temporary for
   ## every node that must be materialized: a constructor in value position, and
@@ -1499,7 +1571,7 @@ proc planFrame(g: var JsGen; body: Cursor; params: seq[(string, Cursor)];
   planNode(g, pl, body, true)
   g.p.frameSize = align(pl.off, 16)
 
-proc jsOpOf(k: LengExpr): JsTag =
+proc jsOpOf(k: LengExpr): WebTag =
   case k
   of AddC: Add
   of SubC: Sub
@@ -1515,14 +1587,14 @@ proc jsOpOf(k: LengExpr): JsTag =
   of NeqC: Neq
   of LtC: Lt
   of LeC: Le
-  else: NoJs
+  else: NoTag
 
-proc genTypedBinop(g: var JsGen; c: Cursor) =
+proc genTypedBinop(g: var WebGen; c: Cursor) =
   ## `(add T a b)` — the node carries the type its operands and result share,
   ## which is exactly the WidthCode jsenc demands. Both operands are moved to
   ## it, so a mixed-width Leng operation cannot straddle Number and BigInt.
   let op = jsOpOf(c.exprKind)
-  if op == NoJs: err g, "not a binary operation: " & $c.exprKind
+  if op == NoTag: err g, "not a binary operation: " & $c.exprKind
   var t = c
   t.into:
     # arkham's shared rule, called rather than restated. `(add (ptr T) p n)`
@@ -1541,26 +1613,36 @@ proc genTypedBinop(g: var JsGen; c: Cursor) =
     g.outp.closeTag
     while t.hasMore: skip t
 
-proc genCmp(g: var JsGen; c: Cursor) =
+proc isLiteralish(c: Cursor): bool =
+  c.kind in {IntLit, UIntLit, CharLit, FloatLit} or
+    (c.kind == TagLit and c.exprKind == SufC)
+
+proc genCmp(g: var WebGen; c: Cursor) =
   ## `(lt A B)` and kin. A comparison carries NO type child — the grammar gives
-  ## it only its two operands — so the width jsenc asks for comes from the left
-  ## operand. The renderer compares loosely and applies no narrow-wrap, which is
-  ## right here: a loaded value is already canonical for its type, and `==` is
-  ## the one operator that bridges Number and BigInt by value.
+  ## it only its two operands — so its width comes from a NON-LITERAL operand
+  ## when there is one: bare literals default to the machine word, and a
+  ## suffixed literal's natural type is the bare default too, so typing the
+  ## compare from it would truncate the other side (`BIGLIT <= u64var` became a
+  ## signed 32-bit compare of wrapped halves). Both operands move to that width.
   let op = jsOpOf(c.exprKind)
-  if op == NoJs: err g, "not a comparison: " & $c.exprKind
+  if op == NoTag: err g, "not a comparison: " & $c.exprKind
   var t = c
   t.into:
-    let w = litWidth(g, t)
+    let lhs = t
+    var rhs = t
+    skip rhs
+    let w = if not isLiteralish(lhs): litWidth(g, lhs)
+            elif not isLiteralish(rhs): litWidth(g, rhs)
+            else: litWidth(g, lhs)
     g.outp.openTree op
     g.outp.width w
-    genExpr(g, t)
+    g.genExprCoerced(t, w)
     skip t
-    genExpr(g, t)
+    g.genExprCoerced(t, w)
     g.outp.closeTag
     while t.hasMore: skip t
 
-proc genSufLit(g: var JsGen; c: Cursor) =
+proc genSufLit(g: var WebGen; c: Cursor) =
   ## `(suf LIT "i8")` — the suffix decides the world: a 64-bit one is a BigInt,
   ## and its digits go out as text because a u64 does not fit an IntLit token.
   let w = litWidth(g, c)                    # the suffix, not the natural type
@@ -1574,10 +1656,58 @@ proc genSufLit(g: var JsGen; c: Cursor) =
   else:
     genExpr(g, t)
 
-proc genCall(g: var JsGen; c: Cursor; wantValue: bool)
-proc genInstr(g: var JsGen; c: Cursor; wantValue: bool)
+proc genCall(g: var WebGen; c: Cursor; wantValue: bool)
+proc genInstr(g: var WebGen; c: Cursor; wantValue: bool)
+proc declSignature(g: var WebGen; decl: Cursor): WebImport
 
-proc genExpr(g: var JsGen; c: Cursor) =
+proc proctypeArity(g: var WebGen; t: Cursor): int =
+  ## The parameter count of the proctype a type SYMBOL names, or -1.
+  result = -1
+  if t.kind != Symbol: return
+  var pt = resolveType(g.prog, t)
+  if pt.kind != TagLit or pt.typeKind != ProctypeT: return
+  var b = pt
+  b.into:
+    inc b                                      # name slot (`.`)
+    if b.kind == TagLit and b.typeKind == ParamsT:
+      result = 0
+      var pc = b
+      pc.into:
+        while pc.hasMore: (inc result; skip pc)
+    while b.hasMore: skip b
+
+proc closureThunk(g: var WebGen; c: Cursor): bool =
+  ## `(conv CLOSURE-PROCTYPE p)` of an env-less proc symbol `p`: the value is
+  ## the table slot of a bridge with the closure's signature (`lowerThunk`).
+  ## Detected by arity — the target proctype carries one trailing env param
+  ## the proc's own declaration lacks.
+  result = false
+  var t = c
+  t.into:
+    let dstT = t
+    skip t
+    if t.kind == Symbol and not g.p.locals.hasKey(symName(t)):
+      let opSym = symName(t)
+      if lookupSym(typeCtx(g), opSym).cat == scProc:
+        let dstArity = proctypeArity(g, dstT)
+        var found = false
+        let decl = procDeclOf(g, opSym, found)
+        if dstArity >= 0 and found:
+          let sig = declSignature(g, decl)
+          var declared = sig.params.len
+          var rt = procResultType(decl)
+          if not rt.cursorIsNil and not isVoidType(rt) and isAggType(g, rt):
+            dec declared                         # the hidden sret slot
+          if dstArity == declared + 1:
+            let thunk = opSym & ".cthunk"
+            if not g.tableSlot.hasKey(thunk):
+              ensureProc(g, opSym, decl)
+              g.thunks.add (thunk, opSym, decl)
+            g.outp.numLit int64(tableSlotOf(g, thunk))
+            result = true
+    while t.hasMore: skip t
+
+proc genExpr(g: var WebGen; c: Cursor) =
   case c.kind
   of Symbol: genSymValue(g, c)
   of IntLit:
@@ -1611,8 +1741,8 @@ proc genExpr(g: var JsGen; c: Cursor) =
         let (sz, al) = typeSizeAlign(g.prog, t)
         g.outp.numLit int64(if c.exprKind == SizeofC: sz else: al)
         while t.hasMore: skip t
-    of OvfC: g.outp.ident "ovf"    # the flags register: two preamble globals,
-    of ErrvC: g.outp.ident "errv"  # never addressable (ithaqua's model)
+    of OvfC: g.outp.symUse GlobOvf    # the flags register: two scalar globals,
+    of ErrvC: g.outp.symUse GlobErrv  # never addressable
     of NanC: g.outp.lit NanLit
     of InfC: g.outp.lit InfLit
     of NeginfC:
@@ -1671,6 +1801,7 @@ proc genExpr(g: var JsGen; c: Cursor) =
         # aggregate IS its address, does not move.
         genAddr(g, c)
         return
+      if closureThunk(g, c): return
       var t = c
       t.into:
         let dst = widthOf(g, t)
@@ -1728,7 +1859,7 @@ proc genExpr(g: var JsGen; c: Cursor) =
 
 # ── calls ────────────────────────────────────────────────────────────────────
 
-proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor =
+proc procDeclOf(g: var WebGen; nm: string; found: var bool): Cursor =
   ## The `(proc …)` decl of a symbol: the main module's list, then the lazy
   ## foreign loader — ithaqua's `refProc` pattern. This is what makes the
   ## `ini` chain callable: hexer emits `main` calling `ini.0.<module>` for
@@ -1762,42 +1893,45 @@ proc procResultType(decl: Cursor): Cursor =
     result = d
     while d.hasMore: skip d
 
-proc genSyscall(g: var JsGen; base: string; t: var Cursor; wantValue: bool) =
-  ## The runtime floor, the same two entry points ithaqua imports from `env`:
-  ## write goes to the host, exit leaves. Anything else is refused rather than
-  ## silently doing nothing.
+proc genSyscall(g: var WebGen; base: string; target: Cursor; t: var Cursor;
+                wantValue: bool) =
+  ## The runtime floor, the two host imports every program has: write goes to
+  ## the host, exit leaves. Anything else is a loud runtime trap — never a
+  ## silent no-op, and not a refusal that strands the whole program (the abort
+  ## path, getpid/kill, lands here while the program is already dying).
   case base
   of "write":
+    # The host answers in an i32; the Leng declaration may say `ssize_t`.
+    let rt = calleeResultType(g, target)
+    let rw = if not rt.cursorIsNil and not isVoidType(rt): widthOf(g, rt) else: wI32
+    if wantValue and rw != wI32:
+      g.outp.openTree Cvt
+      g.outp.width wI32
+      g.outp.width rw
     g.outp.openTree Call
-    g.outp.ident "nim_write"
+    g.outp.symUse ImpWrite
     for i in 0 ..< 3:                          # fd, buf, len — all i32-shaped
       g.genExprCoerced(t, if i == 1: wU32 else: wI32)
       skip t
     g.outp.closeTag
+    if wantValue and rw != wI32: g.outp.closeTag
     while t.hasMore: skip t
-    if not wantValue: discard                  # a statement context drops it
   of "exit", "_exit", "exit_group":
+    # exit does not return; the trap after it says so to a host whose
+    # `nim_exit` does (a browser's throws, a wasm engine's may not).
+    g.outp.openTree Seq
     g.outp.openTree Call
-    g.outp.ident "nim_exit"
+    g.outp.symUse ImpExit
     g.genExprCoerced(t, wI32)
     g.outp.closeTag
-    while t.hasMore: skip t
-  of "mmap", "munmap", "mprotect", "futex":
-    # Functional syscalls, not a dying path: a program whose point is to map
-    # memory or wait on a futex CANNOT be served here, and trapping at runtime
-    # would silently change what it does. Refused by name, as planned (M7).
-    err g, "syscall `" & base & "` has no JS host binding (the JS bridge is M7)"
-  else:
-    # ithaqua's ruling, kept: a syscall the target cannot serve is `unreachable`,
-    # a loud runtime trap — not a refusal that strands the whole program, and
-    # never a silent no-op. The abort path (getpid/kill) lands here: the program
-    # is already dying, and a throw is the JS twin of the wasm trap.
-    while t.hasMore: skip t
-    g.outp.openTree Call
-    g.outp.ident "nim_unreachable"
+    g.outp.lit Unreachable
     g.outp.closeTag
+    while t.hasMore: skip t
+  else:
+    while t.hasMore: skip t
+    g.outp.lit Unreachable
 
-proc genCalleeValue(g: var JsGen; target: Cursor) =
+proc genCalleeValue(g: var WebGen; target: Cursor) =
   ## The function-table index a callee expression denotes. A proc VALUE is
   ## the slot number (`genSymValue`'s `scProc` case), so a fn-ptr local,
   ## parameter or global already holds the index — loaded, not called.
@@ -1819,27 +1953,42 @@ proc genCalleeValue(g: var JsGen; target: Cursor) =
   else:
     genExpr(g, target)                          # a cast or a closure-field load
 
-proc genAggArg(g: var JsGen; t: Cursor; sz: int) =
-  ## Pass an aggregate argument BY REFERENCE TO A FRESH COPY — ithaqua's
-  ## `genCallArgs` rule: the callee storing through its parameter must not be
-  ## visible in the caller's object. `copyAgg` returns the destination, so the
-  ## copy IS the argument expression. The temp is taken BEFORE the source is
-  ## walked, exactly the order `planFrame` reserved it in.
+proc genAggArg(g: var WebGen; t: Cursor; sz: int) =
+  ## Pass an aggregate argument BY REFERENCE TO A FRESH COPY: the callee
+  ## storing through its parameter must not be visible in the caller's object.
+  ## `(seq (memcopy D S N) D)` makes the copy itself the argument expression.
+  ## The temp is taken BEFORE the source is walked, exactly the order
+  ## `planFrame` reserved it in.
   let dst = takeTemp(g, sz, "aggArg")
-  g.outp.openTree Call
-  g.outp.ident "copyAgg"
-  genExpr(g, t)
+  g.outp.openTree Seq
+  g.outp.openTree MemCopy
   slotAddr(g, dst)
+  genExpr(g, t)
   g.outp.numLit int64(sz)
   g.outp.closeTag
+  slotAddr(g, dst)
+  g.outp.closeTag
 
-proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
-  ## `(call EXPR ARG*)` dispatching through a fn-ptr VALUE: `FTAB[i](args)`.
-  ## The signature is the callee's PROCTYPE, the same one rule typenav uses
-  ## to type the call — so the sret decision here and `callDestSize`'s plan
-  ## cannot disagree. JS, unlike `call_indirect`, is not signature-strict: a
-  ## closure proctype's trailing env argument lands on a proc that ignores it,
-  ## which is why ithaqua's synthetic thunk needs no twin here.
+proc paramWidth(g: var WebGen; t: Cursor): WidthCode =
+  ## How a parameter of Leng type `t` travels: an aggregate as its address.
+  if isAggType(g, t): wU32 else: widthOf(g, t)
+
+proc resultWidth(g: var WebGen; t: Cursor; hasRet: var bool): WidthCode =
+  ## How a result of Leng type `t` travels. An aggregate result is written
+  ## through the hidden first parameter, and the function hands that address
+  ## back — the value of an aggregate IS its address, so the call's value is
+  ## the result, whichever target renders it.
+  hasRet = not t.cursorIsNil and not isVoidType(t)
+  result = if not hasRet: wI32
+           elif isAggType(g, t): wU32
+           else: widthOf(g, t)
+
+proc genIndirectCall(g: var WebGen; target: Cursor; t: var Cursor) =
+  ## `(call EXPR ARG*)` dispatching through a fn-ptr VALUE: the function-table
+  ## slot it holds. The signature is the callee's PROCTYPE, the same one rule
+  ## typenav uses to type the call — so the sret decision here and
+  ## `callDestSize`'s plan cannot disagree — and it is spelled out in the
+  ## `(sig …)` child: wasm's `call_indirect` checks it against the callee.
   var pt = calleeProctype(g, target)
   if pt.cursorIsNil:
     err g, (if target.kind == Symbol: "indirect call through unknown symbol " &
@@ -1854,86 +2003,112 @@ proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
     retT = pt
     while pt.hasMore: skip pt
   let aggRet = not retT.cursorIsNil and isAggType(g, retT)
-  g.outp.openTree Call
-  g.outp.openTree Index
-  g.outp.ident "FTAB"
-  genCalleeValue(g, target)
-  g.outp.closeTag
-  if aggRet: slotAddr(g, takeTemp(g, byteSize(g, retT), "ind-sret"))
+  var widths: seq[WidthCode] = @[]
+  if aggRet: widths.add wU32
   if paramsT.kind == TagLit:
-    paramsT.into:
-      while paramsT.hasMore:
-        var q = paramsT
-        var w = wU32
-        var agg = false
+    var pc = paramsT
+    pc.into:
+      while pc.hasMore:
+        var q = pc
         q.into:
           inc q                                # name
           skip q                               # pragmas
-          agg = isAggType(g, q)
-          if not agg: w = widthOf(g, q)
+          widths.add paramWidth(g, q)
           while q.hasMore: skip q
-        skip paramsT
-        if t.hasMore:
-          let (csz, _) = aggArgDestSize(g, t)
-          if csz > 0: genAggArg(g, t, csz)
-          elif agg: genExpr(g, t)
-          else: g.genExprCoerced(t, w)
-          skip t
-  # anything past the declared parameters (a closure's env, a varargs tail)
-  # rides along as-is — JS hands extra arguments to whoever is willing, but an
-  # aggregate is still copied: pass-by-value does not depend on the signature
+        skip pc
+  # anything past the declared parameters (a varargs tail) travels at its own
+  # width; the signature says so, and wasm refuses what the callee does not take
+  var extra = t
+  var nDeclared = widths.len - ord(aggRet)
+  var k = 0
+  while extra.hasMore:
+    if k >= nDeclared:
+      let (csz, _) = aggArgDestSize(g, extra)
+      widths.add(if csz > 0: wU32 else: litWidth(g, extra))
+    inc k
+    skip extra
+  var hasRet = false
+  let rw = resultWidth(g, retT, hasRet)
+  g.outp.openTree ICall
+  g.outp.openTree Sig
+  if hasRet: g.outp.width rw else: g.outp.addDotToken
+  for w in widths: g.outp.width w
+  g.outp.closeTag
+  genCalleeValue(g, target)
+  if aggRet: slotAddr(g, takeTemp(g, byteSize(g, retT), "ind-sret"))
+  var i = ord(aggRet)
   while t.hasMore:
     let (csz, _) = aggArgDestSize(g, t)
     if csz > 0: genAggArg(g, t, csz)
-    else: genExpr(g, t)
+    elif isAggType(g, lengType(g, t)): genExpr(g, t)
+    else: g.genExprCoerced(t, widths[i])
     skip t
+    inc i
   g.outp.closeTag
 
-proc emitMemCall(g: var JsGen; fn: string; t: var Cursor) =
-  ## A preamble mem helper, three arguments, each moved to a Number index —
-  ## the same move ithaqua performs by wrapping an `i64` count to `i32`.
-  g.outp.openTree Call
-  g.outp.ident fn
-  g.genExprCoerced(t, wI32)
-  skip t
-  g.genExprCoerced(t, wI32)
-  skip t
-  g.genExprCoerced(t, wI32)
-  skip t
+proc emitMemOp(g: var WebGen; t: var Cursor; widths: array[3, WidthCode]) =
+  ## The three operands of a bulk memory op, each moved to its 32-bit world —
+  ## a `csize_t` count arrives as an i64 on no web target.
+  for w in widths:
+    g.genExprCoerced(t, w)
+    skip t
   while t.hasMore: skip t
-  g.outp.closeTag
 
-proc genMemIntrin(g: var JsGen; name: string; t: var Cursor; wantValue: bool) =
-  ## `memcpy/memmove(dst, src, n)`, `memset(dst, v, n)`, `memcmp(a, b, n)` —
-  ## the bulk ops ithaqua lowers to wasm `memory.copy`/`memory.fill` and a
-  ## synthetic byte loop. The JS twins are preamble helpers over the `U8`
-  ## view; `copyMem` is `copyWithin`, overlap-safe, so BOTH copies take it —
-  ## exactly why wasm's `memory.copy` serves both too.
+proc genMemIntrin(g: var WebGen; name: string; t: var Cursor; wantValue: bool) =
+  ## `memcpy/memmove(dst, src, n)`, `memset(dst, v, n)`, `memcmp(a, b, n)`.
+  ## The copy is overlap-safe, so BOTH copies take it. `memcmp` has no machine
+  ## form on either target: it calls the synthetic byte loop `genMemcmpFunc`
+  ## emits once.
   # The CALLER owns the statement wrapper (`genStmt` wraps a call statement;
-  # an expression context wants a value), so this emits a bare call.
+  # an expression context wants a value), so this emits a bare expression.
   case name
   of "memcpy", "memmove":
     if wantValue: err g, "memcpy result value not modelled"
-    emitMemCall(g, "copyMem", t)
+    g.outp.openTree MemCopy
+    emitMemOp(g, t, [wU32, wU32, wI32])
+    g.outp.closeTag
   of "memset":
     if wantValue: err g, "memset result value not modelled"
-    emitMemCall(g, "fillMem", t)
+    g.outp.openTree MemFill
+    emitMemOp(g, t, [wU32, wI32, wI32])
+    g.outp.closeTag
   of "memcmp":
     # value-returning (C's sign-of-first-difference), so unlike the copies
     # the result IS modelled; as a statement the value simply goes unused.
-    emitMemCall(g, "memcmp", t)
+    g.needMemcmp = true
+    g.outp.openTree Call
+    g.outp.symUse MemcmpFunc
+    emitMemOp(g, t, [wU32, wU32, wI32])
+    g.outp.closeTag
   else:
     err g, "mem intrinsic not supported yet: " & name
 
-proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
+proc newTemp(g: var WebGen; w: WidthCode): string =
+  ## A generator temporary: a local of width `w`, declared with the others.
+  result = tmpName(g)
+  g.p.temps.add (result, w)
+
+template setLocal(g: var WebGen; name: string; body: untyped) =
+  ## `(assign NAME VALUE)` with VALUE built by `body`.
+  g.outp.openTree Assign
+  g.outp.symUse name
+  body
+  g.outp.closeTag
+
+template hloadOf(g: var WebGen; w: WidthCode; name: string) =
+  g.outp.tree HLoad:
+    g.outp.width w
+    g.outp.symUse name
+
+proc genInstr(g: var WebGen; c: Cursor; wantValue: bool) =
   ## `(instr SYM args…)` — an intrinsic/instruction application (nimony
-  ## #2196/#2211). ithaqua's ruling holds: the ATOMICS collapse to plain
-  ## memory ops on a single-threaded target and the memorders are dropped.
-  ## A compound row — one that reads, modifies, stores and maybe returns the
-  ## old value — becomes an immediately-invoked arrow: that is JS for
-  ## ithaqua's scratch locals, it keeps the operand evaluation order the wasm
-  ## path has, and it drops into statement AND expression position alike.
-  ## Rows that JS cannot express at the operand's width stay refusals.
+  ## #2196/#2211), typed exactly like a call. Both web targets are
+  ## single-threaded, so the ATOMICS collapse to plain memory ops and the
+  ## memorders are dropped. A compound row — one that reads, modifies, stores
+  ## and maybe returns the old value — is a `seq` over temporaries: it keeps
+  ## the operand evaluation order and drops into statement AND expression
+  ## position alike. Target-pinned, flag and two-address rows have no web
+  ## equivalent and stay refusals.
   var t = c
   t.into:
     let nm = symName(t)
@@ -1944,7 +2119,7 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
       let w = widthOf(scalOf(g, lengType(g, c)))
       g.outp.tree HLoad:
         g.outp.width w
-        genExpr(g, t)                            # the pointer
+        g.genExprCoerced(t, wU32)                # the pointer
         while t.hasMore: skip t                  # memorder
     of AtomicStoreOp:
       if wantValue: err g, "(instr …) atomic store has no value"
@@ -1953,7 +2128,7 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
       let w = widthOf(scalOf(g, lengType(g, vc)))
       g.outp.tree HStore:
         g.outp.width w
-        genExpr(g, t)                            # pointer
+        g.genExprCoerced(t, wU32)                # pointer
         skip t
         g.genExprCoerced(t, w)                   # value
         while t.hasMore: skip t                  # memorder
@@ -1961,35 +2136,24 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
       # returns the NEW value: load, op, store.
       let w = widthOf(scalOf(g, lengType(g, c)))
       let op = if it.op == AtomicAddFetchOp: Add else: Sub
-      let pv = tmpName(g)
-      let rv = tmpName(g)
-      g.outp.openTree Call
-      g.outp.openTree Arrow
-      g.outp.openTree Params
-      g.outp.closeTag
-      g.outp.tree Let:
-        g.outp.symDef pv
-        genExpr(g, t)                            # pointer
+      let pv = newTemp(g, wU32)
+      let rv = newTemp(g, w)
+      g.outp.openTree Seq
+      g.setLocal pv:
+        g.genExprCoerced(t, wU32)                # pointer
         skip t
-      g.outp.tree Let:
-        g.outp.symDef rv
-        g.outp.openTree op
+      g.setLocal rv:
+        g.outp.tree op:
+          g.outp.width w
+          g.hloadOf(w, pv)
+          g.genExprCoerced(t, w)                 # delta
+          while t.hasMore: skip t                # memorder
+      g.outp.tree HStore:
         g.outp.width w
-        g.outp.tree HLoad:
-          g.outp.width w
-          g.outp.symUse pv
-        g.genExprCoerced(t, w)                   # delta
-        while t.hasMore: skip t                  # memorder
-        g.outp.closeTag
-      g.outp.tree ExprStmt:
-        g.outp.tree HStore:
-          g.outp.width w
-          g.outp.symUse pv
-          g.outp.symUse rv
-      if wantValue:
-        g.outp.tree Return: g.outp.symUse rv
-      g.outp.closeTag                            # Arrow
-      g.outp.closeTag                            # Call
+        g.outp.symUse pv
+        g.outp.symUse rv
+      if wantValue: g.outp.symUse rv
+      g.outp.closeTag
     of AtomicFetchAddOp, AtomicFetchSubOp, AtomicFetchAndOp,
        AtomicFetchOrOp, AtomicFetchXorOp:
       # returns the OLD value.
@@ -2000,75 +2164,52 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
                of AtomicFetchAndOp: And
                of AtomicFetchOrOp: Or
                else: Xor
-      let pv = tmpName(g)
-      let dv = tmpName(g)
-      let ov = tmpName(g)
-      g.outp.openTree Call
-      g.outp.openTree Arrow
-      g.outp.openTree Params
-      g.outp.closeTag
-      g.outp.tree Let:
-        g.outp.symDef pv
-        genExpr(g, t)                            # pointer
+      let pv = newTemp(g, wU32)
+      let dv = newTemp(g, w)
+      let ov = newTemp(g, w)
+      g.outp.openTree Seq
+      g.setLocal pv:
+        g.genExprCoerced(t, wU32)                # pointer
         skip t
-      g.outp.tree Let:
-        g.outp.symDef dv
+      g.setLocal dv:
         g.genExprCoerced(t, w)                   # operand
         skip t
       while t.hasMore: skip t                    # memorder
-      g.outp.tree Let:
-        g.outp.symDef ov
-        g.outp.tree HLoad:
-          g.outp.width w
-          g.outp.symUse pv
-      g.outp.tree ExprStmt:
-        g.outp.tree HStore:
-          g.outp.width w
-          g.outp.symUse pv
-          g.outp.openTree op
+      g.setLocal ov:
+        g.hloadOf(w, pv)
+      g.outp.tree HStore:
+        g.outp.width w
+        g.outp.symUse pv
+        g.outp.tree op:
           g.outp.width w
           g.outp.symUse ov
           g.outp.symUse dv
-          g.outp.closeTag
-      if wantValue:
-        g.outp.tree Return: g.outp.symUse ov
-      g.outp.closeTag                            # Arrow
-      g.outp.closeTag                            # Call
+      if wantValue: g.outp.symUse ov
+      g.outp.closeTag
     of AtomicExchangeOp:
       # (ptr, val, order) → the old value. A single-threaded swap.
       var pT = lengType(g, t)
       let elemT = innerType(g.prog, resolveType(g.prog, pT))
       let w = widthOf(scalOf(g, elemT))
-      let pv = tmpName(g)
-      let vv = tmpName(g)
-      let ov = tmpName(g)
-      g.outp.openTree Call
-      g.outp.openTree Arrow
-      g.outp.openTree Params
-      g.outp.closeTag
-      g.outp.tree Let:
-        g.outp.symDef pv
-        genExpr(g, t)                            # pointer
+      let pv = newTemp(g, wU32)
+      let vv = newTemp(g, w)
+      let ov = newTemp(g, w)
+      g.outp.openTree Seq
+      g.setLocal pv:
+        g.genExprCoerced(t, wU32)                # pointer
         skip t
-      g.outp.tree Let:
-        g.outp.symDef vv
+      g.setLocal vv:
         g.genExprCoerced(t, w)                   # value
         skip t
       while t.hasMore: skip t                    # memorder
-      g.outp.tree Let:
-        g.outp.symDef ov
-        g.outp.tree HLoad:
-          g.outp.width w
-          g.outp.symUse pv
-      g.outp.tree ExprStmt:
-        g.outp.tree HStore:
-          g.outp.width w
-          g.outp.symUse pv
-          g.outp.symUse vv
-      if wantValue:
-        g.outp.tree Return: g.outp.symUse ov
-      g.outp.closeTag                            # Arrow
-      g.outp.closeTag                            # Call
+      g.setLocal ov:
+        g.hloadOf(w, pv)
+      g.outp.tree HStore:
+        g.outp.width w
+        g.outp.symUse pv
+        g.outp.symUse vv
+      if wantValue: g.outp.symUse ov
+      g.outp.closeTag
     of AtomicCompareExchangeOp:
       # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
       # Single-threaded: if *ptr == *expected { *ptr = desired; true }
@@ -2076,95 +2217,70 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
       var pT = lengType(g, t)
       let elemT = innerType(g.prog, resolveType(g.prog, pT))
       let w = widthOf(scalOf(g, elemT))
-      let pv = tmpName(g)
-      let ev = tmpName(g)
-      let dv = tmpName(g)
-      let cv = tmpName(g)
-      let rv = tmpName(g)
-      g.outp.openTree Call
-      g.outp.openTree Arrow
-      g.outp.openTree Params
-      g.outp.closeTag
-      g.outp.tree Let:
-        g.outp.symDef pv
-        genExpr(g, t)                            # ptr
+      let pv = newTemp(g, wU32)
+      let ev = newTemp(g, wU32)
+      let dv = newTemp(g, w)
+      let cv = newTemp(g, w)
+      g.outp.openTree Seq
+      g.setLocal pv:
+        g.genExprCoerced(t, wU32)                # ptr
         skip t
-      g.outp.tree Let:
-        g.outp.symDef ev
-        genExpr(g, t)                            # expected: a POINTER
+      g.setLocal ev:
+        g.genExprCoerced(t, wU32)                # expected: a POINTER
         skip t
-      g.outp.tree Let:
-        g.outp.symDef dv
+      g.setLocal dv:
         g.genExprCoerced(t, w)                   # desired
         skip t
       while t.hasMore: skip t                    # weak + memorders
-      g.outp.tree Let:
-        g.outp.symDef cv
-        g.outp.tree HLoad:
-          g.outp.width w
-          g.outp.symUse pv
-      g.outp.tree Let:
-        g.outp.symDef rv
-        g.outp.numLit 0
-      g.outp.openTree If
-      g.outp.openTree Eq
-      g.outp.width w
-      g.outp.symUse cv
-      g.outp.tree HLoad:
+      g.setLocal cv:
+        g.hloadOf(w, pv)
+      g.outp.openTree Cond
+      g.outp.tree Eq:
         g.outp.width w
-        g.outp.symUse ev
-      g.outp.closeTag
-      g.outp.tree ExprStmt:
+        g.outp.symUse cv
+        g.hloadOf(w, ev)
+      g.outp.tree Seq:
         g.outp.tree HStore:
           g.outp.width w
           g.outp.symUse pv
           g.outp.symUse dv
-      g.outp.tree ExprStmt:
-        g.outp.tree Assign:
-          g.outp.symUse rv
-          g.outp.numLit 1
-      g.outp.openTree Else
-      g.outp.tree ExprStmt:
+        g.outp.lit TrueLit
+      g.outp.tree Seq:
         g.outp.tree HStore:
           g.outp.width w
           g.outp.symUse ev
           g.outp.symUse cv
-      g.outp.closeTag                            # Else
-      g.outp.closeTag                            # If
-      if wantValue:
-        g.outp.tree Return: g.outp.symUse rv
-      g.outp.closeTag                            # Arrow
-      g.outp.closeTag                            # Call
+        g.outp.lit FalseLit
+      g.outp.closeTag                            # Cond
+      g.outp.closeTag                            # Seq
     of CtzOp, ClzOp, PopcountOp:
-      # The portable bit rows — ithaqua's native wasm opcodes. JS has only
-      # Math.clz32; the preamble helpers are the same counts, spelled as
-      # obvious loops. The count comes back a Number and moves to the
-      # declared return width exactly as ithaqua's wrap/extend does.
+      # The portable bit rows: the count, moved to the declared return width.
       # `litWidth` is the suffix-aware width: getType on a `suf` literal
       # reports the inner literal's natural type and would pick the 32-bit
-      # helper for a `(suf … "i64")` operand.
+      # count for a `(suf … "i64")` operand.
       let big = widthBits(litWidth(g, t)) >= 64
-      let fn = (case it.op
-                of CtzOp: (if big: "ctz64" else: "ctz32")
-                of ClzOp: (if big: "clz64" else: "clz32")
-                else: (if big: "popcnt64" else: "popcnt32"))
-      let retBig = scalOf(g, lengType(g, c)).kind == skI64
-      if retBig:
+      let rw = widthOf(scalOf(g, lengType(g, c)))
+      if rw != wI32:
         g.outp.openTree Cvt
         g.outp.width wI32
-        g.outp.width wI64
-      g.outp.openTree Call
-      g.outp.ident fn
-      g.genExprCoerced(t, if big: wI64 else: wI32)
+        g.outp.width rw
+      g.outp.openTree(case it.op
+                      of CtzOp: Ctz
+                      of ClzOp: Clz
+                      else: Popcnt)
+      let ow = if big: wU64 else: wU32
+      g.outp.width ow
+      g.genExprCoerced(t, ow)
       skip t
       while t.hasMore: skip t                    # a trailing operand, drained
-      g.outp.closeTag                            # Call
-      if retBig:
-        g.outp.closeTag                          # Cvt
+      g.outp.closeTag
+      if rw != wI32: g.outp.closeTag
+    of CpuRelaxOp:
+      # A spin-wait hint: a single-threaded target has nobody to wait for.
+      while t.hasMore: skip t
+      g.outp.numLit 0
     else:
-      err g, "(instr …) not lowered by jorogumo: " & $it.op
-
-
+      err g, "(instr …) not lowered by the web back end: " & $it.op
 
 proc importjsTemplate(decl: Cursor): string =
   ## The `{.importjs: "tpl".}` splice template, carried in the proc's pragma
@@ -2185,7 +2301,7 @@ proc importjsTemplate(decl: Cursor): string =
         if a.kind == StrLit: result = strVal(a)
       skip p
 
-proc proctypeSig(g: var JsGen; pt: Cursor): (seq[Cursor], Cursor) =
+proc proctypeSig(g: var WebGen; pt: Cursor): (seq[Cursor], Cursor) =
   ## The parameter types and the return type of a `(proctype NAME PARAMS RET …)`.
   ## Read-only (`sub`): the cursors point into the caller's stable `decl` and are
   ## classified later, so nothing here may consume the tree.
@@ -2203,7 +2319,7 @@ proc proctypeSig(g: var JsGen; pt: Cursor): (seq[Cursor], Cursor) =
   skip p                                     # past PARAMS (a tag or a DotToken)
   (params, p)                                # p is now the RET child
 
-proc operandProcSym(g: var JsGen; t: Cursor): string =
+proc operandProcSym(g: var WebGen; t: Cursor): string =
   ## The proc symbol a callback operand names: a bare proc Symbol, or one under
   ## `(addr …)`/`(haddr …)`. Empty when it is not a direct proc reference — a
   ## stored fn-ptr or a closure literal — which a bridged wrapper cannot target.
@@ -2213,7 +2329,7 @@ proc operandProcSym(g: var JsGen; t: Cursor): string =
   if c.kind == Symbol and lookupSym(typeCtx(g), symName(c)).cat == scProc:
     result = symName(c)
 
-proc callbackBridge(g: var JsGen; t: Cursor; pt: Cursor) =
+proc callbackBridge(g: var WebGen; t: Cursor; pt: Cursor) =
   ## Emit a JS callable for a Nim proc used as an `importjs` callback (rAF,
   ## setTimeout, a DOM listener). The JS host calls it with plain JS values; we
   ## bridge each argument and the result by kind and invoke the Nim proc, which
@@ -2298,7 +2414,7 @@ proc callbackBridge(g: var JsGen; t: Cursor; pt: Cursor) =
   g.callbacks.add "function " & w & "(...a) { return " & call & "; }\n"
   g.outp.ident w
 
-proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
+proc genCallArgs(g: var WebGen; decl: Cursor; t: var Cursor; splice = false) =
   ## Emit each argument from `t`, moved to the width `decl`'s parameter declares
   ## (aggregates travel as the address of a copy). A varargs tail past the
   ## declared parameters rides along, still copied. `t` ends past the last
@@ -2369,7 +2485,55 @@ proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
     else: genExpr(g, t)
     skip t
 
-proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
+proc declSignature(g: var WebGen; decl: Cursor): WebImport =
+  ## The IR signature of a `(proc …)` decl: an aggregate parameter travels as
+  ## its address, an aggregate result through a hidden first parameter whose
+  ## address comes back as the result.
+  var d = decl
+  d.into:
+    inc d                                      # name
+    var rt: Cursor
+    var ps: seq[WidthCode] = @[]
+    if d.kind == TagLit:
+      var pc = d
+      pc.into:
+        while pc.hasMore:
+          var q = pc
+          q.into:
+            inc q                              # name
+            skip q                             # pragmas
+            ps.add paramWidth(g, q)
+            while q.hasMore: skip q
+          skip pc
+    skip d                                     # params
+    rt = d
+    result.ret = resultWidth(g, rt, result.hasRet)
+    if result.hasRet and isAggType(g, rt): result.params.add wU32
+    result.params.add ps
+    while d.hasMore: skip d
+
+proc hostImport(g: var WebGen; sym: string; decl: Cursor): string =
+  ## The host import a bodyless `importc` proc binds to, keyed by its C name:
+  ## several Nim declarations may bind one C function.
+  var icName, ecName = ""
+  var d = decl
+  d.into:
+    inc d                                      # name
+    skip d                                     # params
+    skip d                                     # result
+    parsePragmas(d, icName, ecName)
+    while d.hasMore: skip d
+  if icName.len == 0: icName = sym
+  if g.importOf.hasKey(icName): return g.importOf[icName]
+  var imp = declSignature(g, decl)
+  imp.name = icName
+  if icName in [ImpWrite, ImpExit, GlobErrv, GlobOvf, MemcmpFunc]:
+    err g, "host import `" & icName & "` collides with the runtime floor"
+  g.imports.add imp
+  g.importOf[icName] = icName
+  result = icName
+
+proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
   ## The call lowering, entered with `t` AT the target child and the args
   ## after it; `t` ends past the last argument. `genCall` walks into the call
   ## node and hands over; `genOnerr` starts here directly, because an `onerr`
@@ -2406,61 +2570,54 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
     # `cNameOfAsmName` strips the backtick role tag. ithaqua's twin rule.
     var base = nm
     if ct.asmName.len > 0: base = cNameOfAsmName(ct.asmName)
-    genSyscall(g, base, t, wantValue)
+    genSyscall(g, base, target, t, wantValue)
   elif known and ct.memIntrin.len > 0:
     genMemIntrin(g, ct.memIntrin, t, wantValue)
   elif known and ct.bitBuiltin.len > 0:
-    # ithaqua lowers these to wasm opcodes; the page pair maps onto the
-    # preamble's `memorySize`/`memoryGrow`, the bit-count builtins onto its
-    # count helpers. Anything else is refused by name, never guessed.
+    # The GCC bit builtins are the `instr` bit rows spelled as calls, and the
+    # page pair is the linear memory's own size/grow. GCC returns `int`, so the
+    # count IS the canonical result. Anything else is refused by name.
     case ct.bitBuiltin
     of "__builtin_ctz", "__builtin_clz", "__builtin_popcount",
        "__builtin_ctzll", "__builtin_clzll", "__builtin_popcountll":
-      # ithaqua lowers these to the same wasm opcodes as the instr rows;
-      # the preamble helpers are the JS twins. GCC returns `int`, so the
-      # helper's Number IS the canonical result — no width move, exactly
-      # like ithaqua's `I32WrapI64` on the ll variants.
       let ll = ct.bitBuiltin.endsWith("ll")
-      g.outp.openTree Call
-      g.outp.ident (case ct.bitBuiltin
-                    of "__builtin_ctz", "__builtin_ctzll": (if ll: "ctz64" else: "ctz32")
-                    of "__builtin_clz", "__builtin_clzll": (if ll: "clz64" else: "clz32")
-                    else: (if ll: "popcnt64" else: "popcnt32"))
-      g.genExprCoerced(t, if ll: wI64 else: wI32)
+      g.outp.openTree(case ct.bitBuiltin
+                      of "__builtin_ctz", "__builtin_ctzll": Ctz
+                      of "__builtin_clz", "__builtin_clzll": Clz
+                      else: Popcnt)
+      let ow = if ll: wU64 else: wU32
+      g.outp.width ow
+      g.genExprCoerced(t, ow)
       skip t
       while t.hasMore: skip t
       g.outp.closeTag
     of "__builtin_wasm_memory_size":
-      # () -> pages: the preamble's `memorySize`, wasm `memory.size`'s twin.
-      g.outp.openTree Call
-      g.outp.ident "memorySize"
-      g.outp.closeTag
+      g.outp.lit MemSize
       while t.hasMore: skip t                # zero args, drain defensively
     of "__builtin_wasm_memory_grow":
-      # (delta pages) -> old page count or -1: the preamble reallocates and
-      # copies; offsets survive the move, so the grow is honest, not a stub.
-      g.outp.openTree Call
-      g.outp.ident "memoryGrow"
+      g.outp.openTree MemGrow
       g.genExprCoerced(t, wI32)
       skip t
       while t.hasMore: skip t
       g.outp.closeTag
     else:
-      err g, "bit builtin `" & ct.bitBuiltin & "` has no JS lowering"
+      err g, "bit builtin `" & ct.bitBuiltin & "` has no web lowering"
   elif indirect:
     genIndirectCall(g, target, t)
   else:
     var found = false
     let decl = procDeclOf(g, nm, found)
     if found and not hasBody(decl) and hasPragma(decl, ImportjsP):
+      if g.target != wtJs:
+        err g, "`importjs` proc `" & nm & "` has no wasm lowering"
       # A bodyless `importjs` proc splices its JS template at the call site:
-      # emit `(raw NAME "tpl" ARG…)` and let jsenc substitute the operands. No
-      # function is emitted — the template IS the call, so the NAME is only the
-      # `$1`/`$#` label, never a reference to a lowered proc. The result is
-      # bridged by kind: a JS string becomes a Nim `string` (`jsToNimStr`) or a
-      # `cstring` (`jsToCstr`); a pointer (handle) is a real JS value the splice
-      # produced, so it wraps back into the host table (`ewrap`); scalars pass
-      # through as the splice's own number.
+      # emit `(raw NAME "tpl" ARG…)` and let the renderer substitute the
+      # operands. No function is emitted — the template IS the call, so the
+      # NAME is only the `$1`/`$#` label, never a reference to a lowered proc.
+      # The result is bridged by kind: a JS string becomes a Nim `string`
+      # (`jsToNimStr`) or a `cstring` (`jsToCstr`); a pointer (handle) is a
+      # real JS value the splice produced, so it wraps back into the host
+      # table (`ewrap`); scalars pass through as the splice's own number.
       let rt = calleeResultType(g, target)
       let rbk = if not rt.cursorIsNil: jsBridgeKind(g, rt) else: jbNone
       case rbk
@@ -2475,7 +2632,7 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       of jbNone: discard
       of jbCallback:
         # A splice handing a JS function back to Nim would need the reverse
-        # bridge (a JS callable stored as an FTAB-shaped value); nothing needs
+        # bridge (a JS callable stored as a table-shaped value); nothing needs
         # it yet, and a silent no-wrap would miscompile. Refuse, per the rule.
         err g, "an importjs splice cannot yet return a Nim callback"
       g.outp.openTree Raw
@@ -2486,12 +2643,21 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       if rbk != jbNone: g.outp.closeTag
     elif (known and ct.extern or found and isHostDeclaration(decl)) and
         not (found and hasBody(decl)):
-      # an `importc`/`importcpp` WITH a body is an ordinary definition — the C
+      # An `importc`/`importcpp` WITH a body is an ordinary definition — the C
       # compiler emits bodies for its importcs too; only the bodyless signature
-      # reaches across the M7 bridge. A bodyless importc/importcpp host
-      # declaration must be refused here, not emitted as an empty stub that
-      # silently returns undefined.
-      err g, "extern `" & nm & "` (the JS bridge is M7)"
+      # reaches across to the host. In host-imports mode it becomes an import
+      # the page provides; otherwise it is refused here, not emitted as an
+      # empty stub that silently returns nothing.
+      if not (found and g.hostImports):
+        err g, "extern `" & nm & "` has no host binding (bodyless importc)"
+      let imp = hostImport(g, nm, decl)
+      let rt = calleeResultType(g, target)
+      let aggRet = not rt.cursorIsNil and isAggType(g, rt)
+      g.outp.openTree Call
+      g.outp.symUse imp
+      if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt), "sret"))
+      genCallArgs(g, decl, t)
+      g.outp.closeTag
     else:
       if not found: err g, "no body to call: " & nm
       ensureProc(g, nm, decl)
@@ -2506,14 +2672,14 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       genCallArgs(g, decl, t)
       g.outp.closeTag
 
-proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
+proc genCall(g: var WebGen; c: Cursor; wantValue: bool) =
   var t = c
   t.into:
     genCallFrom(g, t, wantValue)
 
 # ── statements ───────────────────────────────────────────────────────────────
 
-proc genVar(g: var JsGen; c: Cursor) =
+proc genVar(g: var WebGen; c: Cursor) =
   ## `(var :name PRAGMAS TYPE INIT?)`. A plain scalar is a JS `let`, which is
   ## exactly as scoped as the Leng block that declares it. An aggregate or an
   ## address-taken local has no JS binding to point at: `planFrame` gave it a
@@ -2564,7 +2730,7 @@ proc genVar(g: var JsGen; c: Cursor) =
           g.genExprCoerced(initv, w)
   of lkPtr: err g, "internal: `" & nm & "` is a parameter, not a local"
 
-proc lvalueType(g: var JsGen; c: Cursor): Cursor =
+proc lvalueType(g: var WebGen; c: Cursor): Cursor =
   ## The type of the thing an lvalue denotes. Typenav answers the same question
   ## for an lvalue as for an rvalue, so `deref`/`dot`/`at`/`pat` need no case —
   ## but `baseobj` is not in typenav's grammar, so its declared type is read off
@@ -2581,7 +2747,7 @@ proc lvalueType(g: var JsGen; c: Cursor): Cursor =
   else:
     result = lengType(g, c)
 
-proc assignTo(g: var JsGen; dst, src: Cursor) =
+proc assignTo(g: var WebGen; dst, src: Cursor) =
   ## One store, wherever the destination lives. Only a register local has no
   ## address to store through; every other destination — a frame slot, a
   ## global, a field, an element, a `deref` — reduces to an address, and an
@@ -2595,8 +2761,7 @@ proc assignTo(g: var JsGen; dst, src: Cursor) =
     return
   let ty = lvalueType(g, dst)
   if isAggType(g, ty):
-    g.outp.openTree Call
-    g.outp.symUse "copyMem"
+    g.outp.openTree MemCopy
     genAddr(g, dst)
     genExpr(g, src)                            # an aggregate value IS an address
     g.outp.numLit int64(byteSize(g, ty))
@@ -2608,7 +2773,7 @@ proc assignTo(g: var JsGen; dst, src: Cursor) =
       genAddr(g, dst)
       g.genExprCoerced(src, w)
 
-proc genAsgn(g: var JsGen; c: Cursor) =
+proc genAsgn(g: var WebGen; c: Cursor) =
   var t = c
   t.into:
     let dst = t
@@ -2617,20 +2782,20 @@ proc genAsgn(g: var JsGen; c: Cursor) =
       # errv/ovf as destinations → the flag globals, like ithaqua's
       g.outp.tree ExprStmt:
         g.outp.openTree Assign
-        g.outp.ident (if dst.exprKind == OvfC: "ovf" else: "errv")
-        genExpr(g, t)
+        g.outp.symUse(if dst.exprKind == OvfC: GlobOvf else: GlobErrv)
+        g.genExprCoerced(t, wI32)
         g.outp.closeTag
       while t.hasMore: skip t
       return
     g.outp.tree ExprStmt: assignTo(g, dst, t)
     while t.hasMore: skip t
 
-proc zeroLit(g: var JsGen; w: WidthCode) =
+proc zeroLit(g: var WebGen; w: WidthCode) =
   ## A zero in the right world: a 64-bit slot holds a BigInt, and mixing the two
   ## is a JS type error, not a truncation.
   if w in {wI64, wU64}: g.outp.bigIntLit "0" else: g.outp.numLit 0
 
-proc storeTempTo(g: var JsGen; dst: Cursor; tmp: string; w: WidthCode) =
+proc storeTempTo(g: var WebGen; dst: Cursor; tmp: string; w: WidthCode) =
   ## Store a materialized, already-canonical value into an lvalue — the store
   ## half of `assignTo` for the case where the value is a `let`-bound temp
   ## rather than a cursor, so no coercion is needed.
@@ -2648,7 +2813,7 @@ proc storeTempTo(g: var JsGen; dst: Cursor; tmp: string; w: WidthCode) =
     genAddr(g, dst)
     g.outp.symUse tmp
 
-proc ovfTest(g: var JsGen; opKind: LengExpr; sc: Scal; w: WidthCode;
+proc ovfTest(g: var WebGen; opKind: LengExpr; sc: Scal; w: WidthCode;
              av, bv, rv: string) =
   ## The boolean overflow test over the bound temps: operands `av`, `bv` and
   ## the already-wrapped result `rv`.
@@ -2668,7 +2833,7 @@ proc ovfTest(g: var JsGen; opKind: LengExpr; sc: Scal; w: WidthCode;
       g.outp.symUse v
       g.outp.closeTag
     g.outp.openTree Neq
-    g.outp.width w
+    g.outp.width bigW
     cvtTo rv
     g.outp.openTree op
     g.outp.width bigW
@@ -2753,7 +2918,7 @@ proc ovfTest(g: var JsGen; opKind: LengExpr; sc: Scal; w: WidthCode;
     g.outp.closeTag
     g.outp.closeTag
 
-proc genKeepovf(g: var JsGen; c: Cursor) =
+proc genKeepovf(g: var WebGen; c: Cursor) =
   ## `(keepovf (add|sub|mul Type a b) dst)` — overflow-checked arithmetic:
   ## `(ovf, dst) = a op b`. JS has no flags register; `ovf` is a preamble
   ## global, and the wrapped result is the renderer's width-wrap doing what
@@ -2789,25 +2954,25 @@ proc genKeepovf(g: var JsGen; c: Cursor) =
                 else: Mul
     # Bind the operands and the wrapped result: the tests read each operand
     # twice, and the result serves both the test and the store.
-    let av = tmpName(g)
-    let bv = tmpName(g)
-    let rv = tmpName(g)
-    g.outp.tree Let:
-      g.outp.symDef av
-      g.genExprCoerced(lhs, w)
-    g.outp.tree Let:
-      g.outp.symDef bv
-      g.genExprCoerced(rhs, w)
-    g.outp.tree Let:
-      g.outp.symDef rv
-      g.outp.openTree resOp
-      g.outp.width w
-      g.outp.symUse av
-      g.outp.symUse bv
-      g.outp.closeTag
+    let av = newTemp(g, w)
+    let bv = newTemp(g, w)
+    let rv = newTemp(g, w)
+    g.outp.tree ExprStmt:
+      g.setLocal av:
+        g.genExprCoerced(lhs, w)
+    g.outp.tree ExprStmt:
+      g.setLocal bv:
+        g.genExprCoerced(rhs, w)
+    g.outp.tree ExprStmt:
+      g.setLocal rv:
+        g.outp.openTree resOp
+        g.outp.width w
+        g.outp.symUse av
+        g.outp.symUse bv
+        g.outp.closeTag
     g.outp.tree ExprStmt:
       g.outp.openTree Assign
-      g.outp.ident "ovf"
+      g.outp.symUse GlobOvf
       g.outp.openTree Cond
       ovfTest(g, opKind, sc, w, av, bv, rv)
       g.outp.numLit 1
@@ -2817,17 +2982,13 @@ proc genKeepovf(g: var JsGen; c: Cursor) =
     g.outp.tree ExprStmt:
       storeTempTo(g, dst, rv, w)
 
-proc leaveFrame(g: var JsGen) =
+proc leaveFrame(g: var WebGen) =
   ## Pop the shadow stack. Every `return` leaves first, and the epilogue leaves
   ## for the paths that fall off the end, so each path pops exactly once.
   if g.p.frameSize > 0:
-    g.outp.tree ExprStmt:
-      g.outp.openTree Call
-      g.outp.symUse "leave"
-      g.outp.symUse g.p.fp
-      g.outp.closeTag
+    g.outp.lit Leave
 
-proc genRet(g: var JsGen; c: Cursor) =
+proc genRet(g: var WebGen; c: Cursor) =
   var src: Cursor
   var hasVal = false
   var t = c
@@ -2845,8 +3006,7 @@ proc genRet(g: var JsGen; c: Cursor) =
     # The destination is the CALLER's slot, handed in as the hidden first
     # argument, so it outlives this frame and may be returned after the pop.
     g.outp.tree ExprStmt:
-      g.outp.openTree Call
-      g.outp.symUse "copyMem"
+      g.outp.openTree MemCopy
       g.outp.symUse g.p.sretName
       genExpr(g, src)
       g.outp.numLit int64(byteSize(g, g.p.retType))
@@ -2856,22 +3016,23 @@ proc genRet(g: var JsGen; c: Cursor) =
   else:
     # The value may be read out of this very frame, so it is computed before
     # the pop and parked in a binding of its own.
-    let r = tmpName(g)
-    g.outp.tree Let:
-      g.outp.symDef r
-      g.genExprCoerced(src, widthOf(g, g.p.retType))
+    let rw = widthOf(g, g.p.retType)
+    let r = newTemp(g, rw)
+    g.outp.tree ExprStmt:
+      g.setLocal r:
+        g.genExprCoerced(src, rw)
     leaveFrame(g)
     g.outp.tree Return: g.outp.symUse r
 
-proc genStmt(g: var JsGen; c: var Cursor)   # mutually recursive with genCase
+proc genStmt(g: var WebGen; c: var Cursor)   # mutually recursive with genCase
 
-proc widthLit(g: var JsGen; w: WidthCode; v: int64) =
+proc widthLit(g: var WebGen; w: WidthCode; v: int64) =
   ## A constant in the scrutinee's world: BigInt for the 64-bit widths, Number
   ## for the rest, so a comparison never straddles the two.
   if w in {wI64, wU64}: g.outp.bigIntLit $v
   else: g.outp.numLit v
 
-proc caseValue(g: var JsGen; r: Cursor): int64 =
+proc caseValue(g: var WebGen; r: Cursor): int64 =
   ## The literal a case branch selects on. Only numbers and chars are labels;
   ## anything else (a symbol constant, a range of them) is refused rather than
   ## guessed at.
@@ -2881,7 +3042,7 @@ proc caseValue(g: var JsGen; r: Cursor): int64 =
   else:
     err g, "unsupported case label: " & $r.kind
 
-proc caseRangeTest(g: var JsGen; w: WidthCode; scrutinee: string; r: Cursor) =
+proc caseRangeTest(g: var WebGen; w: WidthCode; scrutinee: string; r: Cursor) =
   ## One `BranchRange` — a value, or `(range LO HI)` — as a test on the bound
   ## scrutinee.
   if r.kind == TagLit and r.substructureKind == RangeU:
@@ -2912,7 +3073,7 @@ proc caseRangeTest(g: var JsGen; w: WidthCode; scrutinee: string; r: Cursor) =
     widthLit(g, w, caseValue(g, r))
     g.outp.closeTag
 
-proc genCaseBranch(g: var JsGen; w: WidthCode; scrutinee: string;
+proc genCaseBranch(g: var WebGen; w: WidthCode; scrutinee: string;
                    branches: seq[(Cursor, Cursor)]; elseBody: Cursor; i: int) =
   ## The `of` branches from `i` on, as an `if / else if / else` chain. A JS
   ## `switch` is the obvious spelling but the wrong one: its `break` would
@@ -2947,7 +3108,7 @@ proc genCaseBranch(g: var JsGen; w: WidthCode; scrutinee: string;
     g.outp.closeTag
   g.outp.closeTag
 
-proc genCase(g: var JsGen; c: Cursor) =
+proc genCase(g: var WebGen; c: Cursor) =
   ## `(case E (of (ranges BR+) STMTS)* (else STMTLIST)?)`. The discriminant is
   ## evaluated ONCE into a binding, because every branch tests it.
   var branches: seq[(Cursor, Cursor)]
@@ -2981,14 +3142,14 @@ proc genCase(g: var JsGen; c: Cursor) =
       var eb = elseBody
       genStmt(g, eb)
     return
-  let sw = tmpName(g)
-  g.outp.tree Let:
-    g.outp.symDef sw
-    g.genExprCoerced(scrutinee, w)
+  let sw = newTemp(g, w)
+  g.outp.tree ExprStmt:
+    g.setLocal sw:
+      g.genExprCoerced(scrutinee, w)
   genCaseBranch(g, w, sw, branches, elseBody, 0)
 
 
-proc genIf(g: var JsGen; c: Cursor) =
+proc genIf(g: var WebGen; c: Cursor) =
   ## `(if (elif COND ACTION)* (else ACTION)?)` → a JS `if/else` chain. JS has no
   ## `elif`, so every branch after the first is `else { if … }`; `open` counts
   ## the trees still waiting for their close, which the buffer unwinds LIFO.
@@ -3053,7 +3214,7 @@ proc landingPadLabel(c: Cursor): string =
       skip t
   if arms == 1: result = lab
 
-proc genStmtList(g: var JsGen; c: Cursor) =
+proc genStmtList(g: var WebGen; c: Cursor) =
   ## `(stmts …)` / `(scope …)`: a JS block, wrapped in one labeled block per
   ## `(lab L)` the list declares. `jmp L` lowers to `break L`, and a `break`
   ## resumes right after L's block — which is why the `(lab L)` statement itself
@@ -3144,7 +3305,7 @@ proc genStmtList(g: var JsGen; c: Cursor) =
     g.outp.closeTag
   g.outp.closeTag
 
-proc genOnerr(g: var JsGen; c: Cursor) =
+proc genOnerr(g: var WebGen; c: Cursor) =
   ## `(onerr ACTION FN ARGS…)`: perform the call for effect; if the `errv`
   ## global is set, run the ACTION (typically a `jmp` to the landing pad).
   ## A `.` action means "propagate by hand later". The call is lowered by
@@ -3159,12 +3320,12 @@ proc genOnerr(g: var JsGen; c: Cursor) =
       genCallFrom(g, t, wantValue = false)
     if act.kind != DotToken:
       g.outp.openTree If
-      g.outp.ident "errv"
+      g.outp.symUse GlobErrv
       genStmt(g, act)                          # e.g. `break L`
       g.outp.closeTag
   # `genStmt` skips the statement it dispatched; `into` never leaks.
 
-proc genStmt(g: var JsGen; c: var Cursor) =
+proc genStmt(g: var WebGen; c: var Cursor) =
   if c.kind == DotToken:
     # `.` in a statement list means nothing goes here — `(stmts .)` is a body
     # that is empty, not a statement to lower.
@@ -3183,11 +3344,29 @@ proc genStmt(g: var JsGen; c: var Cursor) =
     t.into:
       genExpr(g, t)                            # the condition
       skip t
-      if t.kind != TagLit or t.stmtKind != StmtsS:
+      if t.kind != TagLit or t.stmtKind notin {StmtsS, ScopeS}:
         err g, "`while` without a statement list"
       genStmt(g, t)
       while t.hasMore: skip t
     g.outp.closeTag
+  of LoopS:
+    # `(loop PRE COND BODY AFTER?)`: PRE runs before every test, so the test
+    # sits inside the loop; AFTER runs once, past it.
+    g.outp.openTree While
+    g.outp.lit TrueLit
+    var t = c
+    t.into:
+      genStmt(g, t)                            # pre-condition block
+      g.outp.tree If:
+        g.outp.tree Not:
+          g.outp.width wI32
+          genExpr(g, t)
+        g.outp.tree Break: discard
+      skip t
+      genStmt(g, t)                            # body
+      g.outp.closeTag                          # While
+      if t.hasMore: genStmt(g, t)              # the `after` part
+      while t.hasMore: skip t
   of BreakS:
     # An unnamed break: the innermost enclosing JS loop, which is the innermost
     # enclosing Leng loop because a `case` became an `if` chain.
@@ -3270,8 +3449,6 @@ proc procBody(decl: Cursor): Cursor =
       result = d
       skip d
 
-proc isVoidType(t: Cursor): bool =
-  t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)
 
 proc hasBody(decl: Cursor): bool =
   ## A bodyless `importc` declaration is a signature only: its body is `(stmts .)`
@@ -3285,19 +3462,36 @@ proc hasBody(decl: Cursor): bool =
       if t.kind != DotToken: result = true
       skip t
 
-proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
+proc emitFunc(g: var WebGen; name: string; params: openArray[(string, WidthCode)];
+              hasRet: bool; ret: WidthCode; locals: openArray[(string, WidthCode)]) =
+  ## `(func NAME PARAMS RET LOCALS BODY*)` into the program: the header from the
+  ## arguments, the body from `g.outp`, which is then reset for the next one.
+  g.top.openTree Func
+  g.top.symDef name
+  g.top.openTree Params
+  for (n, w) in params: g.top.param(n, w)
+  g.top.closeTag
+  if hasRet: g.top.width ret else: g.top.addDotToken
+  g.top.openTree Locals
+  for (n, w) in locals: g.top.param(n, w)
+  g.top.closeTag
+  g.top.addBufferSamePool g.outp
+  g.top.closeTag
+  g.outp = createTokenBuf(sharedPool = g.top.pool, sharedTags = g.top.tags)
+
+proc lowerProc(g: var WebGen; sym: string; decl: Cursor) =
   if g.emitted.containsOrIncl(sym): return
   if hasPragma(decl, AssemblerP):
     # `{.assembler.}` promises a body that maps one-to-one onto machine
-    # instructions in source order. There is no JavaScript that answers that
-    # promise, and lowering the body as ordinary code would silently change what
-    # the program does.
-    err g, "`{.assembler.}` proc `" & sym & "` has no JavaScript lowering"
+    # instructions in source order. No web target answers that promise, and
+    # lowering the body as ordinary code would silently change what the
+    # program does.
+    err g, "`{.assembler.}` proc `" & sym & "` has no web lowering"
   if hasPragma(decl, NakedP):
-    # `{.naked.}` promises the raw register ABI of a machine function. JS has no
-    # registers to promise, and inventing a calling convention for it is exactly
-    # the plausible-but-wrong lowering this generator refuses by rule.
-    err g, "`{.naked.}` proc `" & sym & "` has no JavaScript calling convention"
+    # `{.naked.}` promises the raw register ABI of a machine function. The web
+    # targets have no registers to promise, and inventing a calling convention
+    # for it is exactly the plausible-but-wrong lowering this generator refuses.
+    err g, "`{.naked.}` proc `" & sym & "` has no web calling convention"
   g.p = ProcCtx(jsName: jsName(g, sym),
                 symType: initTable[string, Cursor](),
                 locals: initTable[string, LocalSlot]())
@@ -3317,7 +3511,7 @@ proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
           inc q
           if hasPragmaIn(q, RegisterP):
             # A pinned register is an x86 calling-convention assertion; the
-            # answer to it is a machine register, not a JavaScript argument.
+            # answer to it is a machine register, not a function parameter.
             err g, "`{.register.}` parameter `" & pname & "` in `" & sym & '`'
           skip q                               # pragmas
           ptyp = q
@@ -3331,30 +3525,25 @@ proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
     while t.hasMore: skip t
 
   # An aggregate result is returned through a slot the caller reserves, so the
-  # JS signature gains a hidden first parameter for it.
+  # signature gains a hidden first parameter for it.
   g.p.sret = not g.p.retType.cursorIsNil and isAggType(g, g.p.retType)
   var taken: HashSet[string]
   if body.kind == TagLit: markTaken(body, taken)
   planFrame(g, body, params, taken)
 
-  g.outp.openTree Func
-  g.outp.symDef g.p.jsName
-  g.outp.openTree Params
+  var sigParams: seq[(string, WidthCode)] = @[]
   if g.p.sret:
     g.p.sretName = tmpName(g)
-    g.outp.symDef g.p.sretName
-  for (pn, _) in params: g.outp.symDef jsName(g, pn)
-  g.outp.closeTag
+    sigParams.add (g.p.sretName, wU32)
+  for (pn, pt) in params: sigParams.add (jsName(g, pn), paramWidth(g, pt))
 
   if g.p.frameSize > 0:
-    g.p.fp = tmpName(g)
-    g.outp.tree Let:
-      g.outp.symDef g.p.fp
-      g.outp.openTree Call
-      g.outp.symUse "frame"
-      g.outp.numLit int64(g.p.frameSize)
-      g.outp.closeTag
-    # A scalar parameter whose address is taken arrives in a JS binding, which
+    g.p.fp = newTemp(g, wU32)
+    g.outp.tree ExprStmt:
+      g.setLocal g.p.fp:
+        g.outp.tree Frame:
+          g.outp.numLit int64(g.p.frameSize)
+    # A scalar parameter whose address is taken arrives in a local, which
     # nothing can point at: it is spilled into the slot `addr` answers with.
     for (pn, pt) in params:
       let sl = g.p.locals[pn]
@@ -3365,15 +3554,6 @@ proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
             slotAddr(g, sl.off)
             g.outp.symUse jsName(g, pn)
 
-  # Scalar locals are DECLARED here, at function scope, and assigned where the
-  # `(var)` statement sits. A JS `let` is block-scoped, and a `(lab)`/`jmp` pair
-  # wraps a statement list in a labeled block: a `let` inside it would be out of
-  # sight the moment the `break` lands. wasm locals are function-scoped, which is
-  # what the shadow stack and the label blocks need.
-  for nm in g.p.regLocals:
-    g.outp.tree Let:
-      g.outp.symDef jsName(g, nm)
-      zeroLit(g, widthOf(scalOf(g, g.p.symType[nm])))
   if body.kind == TagLit:
     var b = body
     while b.hasMore: genStmt(g, b)
@@ -3382,7 +3562,17 @@ proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
     # Reached only by a body that falls off its end without a `ret`; the slot
     # is still the answer, whatever it holds.
     g.outp.tree Return: g.outp.symUse g.p.sretName
-  g.outp.closeTag
+
+  # Every local is declared at function scope and starts at zero: a `(lab)`/
+  # `jmp` pair wraps a statement list in a label block, and a local declared
+  # inside it would be out of sight the moment the `break` lands.
+  var locals: seq[(string, WidthCode)] = @[]
+  for nm in g.p.regLocals:
+    locals.add (jsName(g, nm), widthOf(scalOf(g, g.p.symType[nm])))
+  for tv in g.p.temps: locals.add tv
+  var hasRet = false
+  let rw = resultWidth(g, g.p.retType, hasRet)
+  emitFunc(g, g.p.jsName, sigParams, hasRet, rw, locals)
 
 proc isHostDeclaration(decl: Cursor): bool =
   ## An `importc`/`importcpp`/`importjs` proc is a SIGNATURE only: the host
@@ -3391,7 +3581,7 @@ proc isHostDeclaration(decl: Cursor): bool =
   ## is a call to that empty function, not to the host.
   hasPragma(decl, ImportcP) or hasPragma(decl, ImportcppP) or hasPragma(decl, ImportjsP)
 
-proc ensureProc(g: var JsGen; sym: string; decl: Cursor) =
+proc ensureProc(g: var WebGen; sym: string; decl: Cursor) =
   ## Schedule a proc for lowering. An `importc` declaration with no body is not
   ## a definition — the host implements it — so it is never lowered, and a call
   ## to it is refused at the call site (M7 binds those through the bridge).
@@ -3400,10 +3590,74 @@ proc ensureProc(g: var JsGen; sym: string; decl: Cursor) =
     if s[0] == sym: return
   if hasBody(decl) or not isHostDeclaration(decl): g.pending.add (sym, decl)
 
-proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                 memBytes = 64 * 1024 * 1024;
-                 stackBytes = ShadowStackSize; browser = false): string =
-  var g = createJsGen(buf, inputPath, tags, browser)
+proc genMemcmpFunc(g: var WebGen) =
+  ## C's `memcmp` as an ordinary IR function — neither target has a machine
+  ## form for it: the difference of the first differing UNSIGNED byte pair,
+  ## 0 when the first `n` bytes match.
+  let a = "a"
+  let b = "b"
+  let n = "n"
+  let x = "x"
+  let y = "y"
+  template bump(v: string; w: WidthCode; op: WebTag) =
+    g.outp.tree ExprStmt:
+      g.setLocal v:
+        g.outp.tree op:
+          g.outp.width w
+          g.outp.symUse v
+          g.outp.numLit 1
+  g.outp.tree While:
+    g.outp.tree Neq:
+      g.outp.width wI32
+      g.outp.symUse n
+      g.outp.numLit 0
+    g.outp.tree ExprStmt:
+      g.setLocal x: g.hloadOf(wU8, a)
+    g.outp.tree ExprStmt:
+      g.setLocal y: g.hloadOf(wU8, b)
+    g.outp.tree If:
+      g.outp.tree Neq:
+        g.outp.width wI32
+        g.outp.symUse x
+        g.outp.symUse y
+      g.outp.tree Return:
+        g.outp.tree Sub:
+          g.outp.width wI32
+          g.outp.symUse x
+          g.outp.symUse y
+    bump(a, wU32, Add)
+    bump(b, wU32, Add)
+    bump(n, wI32, Sub)
+  g.outp.tree Return: g.outp.numLit 0
+  emitFunc(g, MemcmpFunc, [(a, wU32), (b, wU32), (n, wI32)], true, wI32,
+           [(x, wI32), (y, wI32)])
+
+proc lowerThunk(g: var WebGen; thunk, sym: string; decl: Cursor) =
+  ## A capture-free proc stored in a CLOSURE slot: the closure proctype carries
+  ## a trailing env parameter the proc itself lacks. A C ABI shrugs the extra
+  ## argument off; wasm's `call_indirect` checks the signature and traps. The
+  ## slot therefore holds this bridge, which has the closure's signature, drops
+  ## the env and calls the real proc.
+  let sig = declSignature(g, decl)
+  var ps: seq[(string, WidthCode)] = @[]
+  for i, w in sig.params: ps.add ("p" & $i, w)
+  ps.add ("env", wU32)
+  if sig.hasRet: g.outp.openTree Return
+  else: g.outp.openTree ExprStmt
+  g.outp.openTree Call
+  g.outp.symUse jsName(g, sym)
+  for i in 0 ..< sig.params.len: g.outp.symUse ("p" & $i)
+  g.outp.closeTag
+  g.outp.closeTag
+  g.emitted.incl thunk
+  emitFunc(g, jsName(g, thunk), ps, sig.hasRet, sig.ret, [])
+
+proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+               target: WebTarget; module: var WebModule;
+               hostImports = false): TokenBuf =
+  ## The whole program as web IR (the returned `(top …)` tree) plus the facts
+  ## both renderers need besides code (`module`).
+  var g = createWebGen(buf, inputPath, tags, target, hostImports)
   layoutProgram(g)
   var entryDecl: Cursor
   var haveEntry = false
@@ -3416,14 +3670,12 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       haveEntry = true
       break
   if not haveEntry: err g, "no entry proc (exportc \"main\") in " & inputPath
-  let entryRet = procResultType(entryDecl)
-  g.outp.openTree Top
+  g.top.openTree Top
   ensureProc(g, g.entrySym, entryDecl)
   # Every other exportc proc in the entry module is an external entry point: a
-  # reachability root (so DCE keeps it) and, at the tail, an export the host
-  # calls — the JS twin of ithaqua's exportRoots. A host-driven module (the sumi
-  # engine frame, the ward brain) exposes its whole surface this way; without
-  # this rooting the procs are dead code and vanish.
+  # reachability root (so DCE keeps it) and an export the host calls. A
+  # host-driven module (the sumi engine frame, the ward brain) exposes its
+  # whole surface this way; without this rooting the procs are dead code.
   var exportRoots: seq[(string, string)] = @[]   # (decl symbol, C name)
   for pi in g.prog.procs:
     if pi.isEntry: continue
@@ -3446,69 +3698,47 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   # boundaries: a body addresses a foreign global whose initializer names a
   # proc nobody has reached yet. Run both to the fixpoint.
   var i = 0
+  var th = 0
   while true:
-    while i < g.pending.len:                   # lowering discovers more procs
-      let (sym, decl) = g.pending[i]
-      inc i
-      lowerProc(g, sym, decl)
+    while i < g.pending.len or th < g.thunks.len:
+      if i < g.pending.len:
+        let (sym, decl) = g.pending[i]
+        inc i
+        lowerProc(g, sym, decl)
+      else:
+        let (thunk, sym, decl) = g.thunks[th]
+        inc th
+        lowerThunk(g, thunk, sym, decl)
     serializeStatics(g)
-    if i >= g.pending.len: break
-  g.outp.closeTag
+    if i >= g.pending.len and th >= g.thunks.len: break
+  if g.needMemcmp: genMemcmpFunc(g)
+  g.top.closeTag
+  checkSegments(g)
 
-  result = jsPreamble(memBytes, stackBytes, int g.memTop, browser) & dataInitJs(g)
-  result.add genJs(g.outp)
-  # JS wrappers bridging Nim procs used as `importjs` callbacks (see
-  # `callbackBridge`); all-scalar procs need none and pass through as FTAB
-  # entries, so this is often empty. Function declarations, hoisted like the
-  # lowered procs they call.
-  for cb in g.callbacks:
-    result.add cb
-  result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
+  # The function table: slot → the IR name bound there. A slot taken for a
+  # proc that was never lowered — a bodyless `importc` used as a value — is a
+  # host import in host-imports mode and unbound (a trap when called) otherwise.
+  var table = @[""]
   for slot in 1 ..< g.tableEntries.len:
     let sym = g.tableEntries[slot]
     if sym.len > 0 and g.emitted.contains(sym):
-      result.add "FTAB[" & $slot & "] = " & jsName(g, sym) & ";\n"
+      table.add jsName(g, sym)
+    elif sym.len > 0 and g.hostImports:
+      var found = false
+      let decl = procDeclOf(g, sym, found)
+      table.add(if found and isHostDeclaration(decl) and not hasBody(decl):
+                  hostImport(g, sym, decl)
+                else: "")
     else:
-      # A slot taken for a proc that was never lowered — a bodyless `importc`
-      # used as a value — binds HERE, naming itself, rather than turning the
-      # whole file into a ReferenceError at load or a "not a function"
-      # TypeError at a call that may never happen.
-      result.add "FTAB[" & $slot & "] = () => { throw new Error(\"unbound extern: " & sym & "\"); };\n"
-  # argc/argv/envp reach the host in M6; the exit code is main's, like native's.
-  if exportRoots.len > 0:
-    # A host-driven library (exportc procs, no meaningful main): run the module
-    # init (main drives the ini chain + top level) so globals are live before
-    # the host calls in, expose the exportc procs under their C names, and DO
-    # NOT exit — the host owns the lifecycle. ithaqua exports `_start` + the
-    # roots and lets the host call `_start`; jorogumo runs the init inline at
-    # load, so the host only ever touches the exports.
-    result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
-    # node hands the surface to `require`; a browser has no module system in a
-    # classic <script>, so it lands on globalThis.NIF (a module host can read
-    # the same global, or the file can be `import`ed and read it there too).
-    var ex = (if g.browser: "globalThis.NIF = {" else: "module.exports = {")
-    for (sym, cName) in exportRoots:
-      if g.emitted.contains(sym):
-        ex &= "\n  " & cName & ": " & jsName(g, sym) & ","
-    # The host reads results straight out of linear memory (zero-copy planes,
-    # NUL-terminated strings). `memory.buffer` mirrors the wasm export the host
-    # already uses, so the JS engine is a drop-in for the wasm one; it is a
-    # getter because memoryGrow REPLACES JMEM, and a captured reference would
-    # go stale on the first grow.
-    ex &= "\n  memory: { get buffer(){ return JMEM; } },"
-    # The host-bridge for handles: a host-driven module that talks to a JS API
-    # (WebGPU, DOM) receives real JS objects — a `GPUDevice`, a canvas context —
-    # which are meaningless as bare ints. `__internExt` pushes one into the host
-    # value table and returns the int32 handle the exported procs take; the
-    # `importjs` splice unwraps it back to the object at the boundary. First cut
-    # never releases (plan §6 liveness).
-    ex &= "\n  __internExt: ewrap,"
-    if g.browser:
-      # no fd to write to: buffered stdout/stderr is drained here after a call.
-      ex &= "\n  __takeOutput,"
-    ex &= "\n};\n"
-    result.add ex
-  elif entryRet.kind == DotToken or isVoidType(entryRet):
-    result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
-  else:
-    result.add "nim_exit(Number(" & jsName(g, g.entrySym) & "(0, 0, 0)) | 0);\n"
+      table.add ""
+  let esig = declSignature(g, entryDecl)
+  module = WebModule(imports: g.imports,
+                     globals: @[(GlobErrv, wI32), (GlobOvf, wI32)],
+                     dataSegs: g.dataSegs, memTop: g.memTop, table: table,
+                     entry: jsName(g, g.entrySym),
+                     entryParams: esig.params, entryHasRet: esig.hasRet,
+                     entryRet: esig.ret, callbacks: g.callbacks)
+  for (sym, cName) in exportRoots:
+    if g.emitted.contains(sym):
+      module.exports.add (cName, jsName(g, sym))
+  result = move g.top

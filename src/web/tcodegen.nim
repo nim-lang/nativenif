@@ -6,7 +6,7 @@
 #    details about the copyright.
 ##
 
-## Tests for the static layout and the data image (`codegen_js`): every global
+## Tests for the static layout and the data image (`codegen`): every global
 ## gets an address, a constant's fields land where the layout rules say, an
 ## address-valued field is a fixup resolved at layout time, and the whole image
 ## really is in linear memory — checked by a JS ENGINE reading it back through
@@ -18,7 +18,7 @@
 import std / [os, osproc, strutils, tables]
 import nifcore, nifcoreparse
 import "../arkham/core" / lengdecl
-import codegen_js, jsenc
+import webnif, codegen, jsrender
 
 proc check(label: string; cond: bool; detail = "") =
   if not cond:
@@ -38,7 +38,7 @@ proc must(label: string; cond: bool; detail = "") =
 proc expect(label: string; got, want: string) =
   check label, got == want, "got: " & got & "  want: " & want
 
-proc findAddr(g: JsGen; part: string): uint32 =
+proc findAddr(g: WebGen; part: string): uint32 =
   ## The address of the one global whose name contains `part` — the names in
   ## the fixture carry a trailing `.` that the NIF API completes to the module
   ## suffix, so matching on the whole name would be guessing at that.
@@ -48,7 +48,7 @@ proc findAddr(g: JsGen; part: string): uint32 =
       must "unique " & part, result == 0, "both " & name & " and the previous match"
       result = a
 
-proc segAt(g: JsGen; a: uint32): string =
+proc segAt(g: WebGen; a: uint32): string =
   ## The image bytes that land at `address` `a`.
   result = ""
   for (at, s) in g.dataSegs:
@@ -63,15 +63,15 @@ proc u32at(s: string; off: int): uint32 =
 
 proc fixturePath: string =
   for dir in ["", getCurrentDir() / "fixtures", getAppDir() / "fixtures",
-              getAppDir() / "../fixtures", getAppDir() / "../src/jorogumo/fixtures"]:
+              getAppDir() / "../fixtures", getAppDir() / "../src/web/fixtures"]:
     let p = dir / "tdata1.c.nif"
     if fileExists(p): return p
   quit "tcodegen: fixtures/tdata1.c.nif not found"
 
-let tags = createLengTagPool()   # NOT the jsnif pool: a buffer is Leng-tagged or JS-tagged, never both
+let tags = createLengTagPool()   # NOT the web IR pool: a buffer is Leng-tagged or JS-tagged, never both
 let path = fixturePath()
 var buf = parseFromFile(path, sharedTags = tags)
-var g = createJsGen(buf, path, tags)
+var g = createWebGen(buf, path, tags)
 layoutProgram(g)
 
 check "layout starts above the null guard", g.memTop > NullGuard, $g.memTop
@@ -123,7 +123,7 @@ for i in 0 ..< 8: wide = wide or (uint64(uint8(wideSeg[i])) shl (8 * i))
 expect "i64 initializer", $wide, "4294967296"
 
 # the emitted image is self-describing: one loader call per segment.
-let image = dataInitJs(g)
+let image = dataInitJs(WebModule(dataSegs: g.dataSegs, memTop: g.memTop))
 check "one loader call per segment",
   image.count('\n') == g.dataSegs.len, $g.dataSegs.len
 
