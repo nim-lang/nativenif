@@ -52,16 +52,18 @@ type
   CtlKind = enum ckBlock, ckLabel, ckLoopExit
   Ctl = object
     kind: CtlKind
-    name: string
+    name: SymId
 
   WasmRender = object
     wm: WasmModule
-    funcIdx: Table[string, uint32]
-    sigs: Table[string, FuncSig]
-    globals: Table[string, (uint32, VT)]
+    pool: Pool                     ## the tree's own pool: every name below is
+                                   ## a `SymId` in it, never a rebuilt string
+    funcIdx: Table[SymId, uint32]
+    sigs: Table[SymId, FuncSig]
+    globals: Table[SymId, (uint32, VT)]
     # the function being rendered
-    fname: string
-    locals: Table[string, (uint32, VT)]
+    fname: SymId
+    locals: Table[SymId, (uint32, VT)]
     localTypes: seq[byte]          ## non-parameter locals, in index order
     nparams: int
     body: ByteBuf
@@ -76,7 +78,7 @@ const SpGlobal = 0'u32
 
 proc err(r: WasmRender; msg: string) {.noreturn.} =
   raise (ref WasmRenderError)(msg: "wasm: " & msg &
-    (if r.fname.len > 0: " (in `" & r.fname & "`)" else: ""))
+    (if r.fname != SymId(0): " (in `" & poolSym(r.pool, r.fname) & "`)" else: ""))
 
 proc vtOf(w: WidthCode): VT =
   case w
@@ -94,11 +96,15 @@ proc valType(vt: VT): byte =
 
 # ── small cursor helpers ────────────────────────────────────────────────────
 
-proc nameOf(c: Cursor): string =
+proc nameOf(r: WasmRender; c: Cursor): SymId =
+  ## A name as its POOL ID. An `ident` (the JS bridge's raw names) is interned
+  ## into the same pool, so label and callee lookups are integer compares.
   case c.kind
-  of Symbol, SymbolDef: symName(c)
-  of Ident, StrLit: strVal(c)
+  of Symbol, SymbolDef: symId(c)
+  of Ident, StrLit: r.pool.syms.getOrIncl(strVal(c))
   else: raiseAssert "wasmrender: name expected, got " & $c.kind
+
+proc spell(r: WasmRender; id: SymId): string = poolSym(r.pool, id)
 
 proc widthAt(c: Cursor): WidthCode =
   if c.kind != IntLit: raiseAssert "wasmrender: width expected, got " & $c.kind
@@ -172,18 +178,18 @@ proc typeOf(r: WasmRender; c: Cursor): VT =
   of IntLit, UIntLit, CharLit: return vtI32
   of FloatLit: return vtF64
   of Symbol, Ident:
-    let n = nameOf(c)
+    let n = nameOf(r, c)
     if r.locals.hasKey(n): return r.locals[n][1]
     if r.globals.hasKey(n): return r.globals[n][1]
-    r.err "unknown name `" & n & "`"
+    r.err "unknown name `" & r.spell(n) & "`"
   else: discard
   case webTagOf(c)
   of BigIntLit: vtI64
   of TrueLit, FalseLit: vtI32
   of NanLit, InfLit: vtF64
   of Call:
-    let fn = nameOf(c.sub())
-    if not r.sigs.hasKey(fn): r.err "call of unknown function `" & fn & "`"
+    let fn = nameOf(r, c.sub())
+    if not r.sigs.hasKey(fn): r.err "call of unknown function `" & r.spell(fn) & "`"
     r.sigs[fn].ret
   of ICall: sigOfTree(c.sub()).ret
   of Assign: typeOf(r, c.sub())
@@ -411,7 +417,7 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
     floatConst(r, floatVal(c), want, c)
     return
   of Symbol, Ident:
-    let n = nameOf(c)
+    let n = nameOf(r, c)
     if r.locals.hasKey(n):
       let (i, t) = r.locals[n]
       if want != vtVoid:
@@ -423,7 +429,7 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
         r.op OpGlobalGet; r.u32 i
         adapt(r, t, want, c)
     else:
-      r.err "unknown name `" & n & "`"
+      r.err "unknown name `" & r.spell(n) & "`"
     return
   else: discard
   let tag = webTagOf(c)
@@ -443,11 +449,12 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
   of InfLit: floatConst(r, Inf, want, c)
   of Call:
     var it = c.sub()
-    let fn = nameOf(it)
+    let fn = nameOf(r, it)
     skip it
-    if not r.funcIdx.hasKey(fn): r.err "call of unknown function `" & fn & "`"
+    if not r.funcIdx.hasKey(fn):
+      r.err "call of unknown function `" & r.spell(fn) & "`"
     let sig = r.sigs[fn]
-    genArgs(r, it, sig.params, "the call of `" & fn & "`")
+    genArgs(r, it, sig.params, "the call of `" & r.spell(fn) & "`")
     r.op OpCall
     r.u32 r.funcIdx[fn]
     adapt(r, sig.ret, want, c)
@@ -477,7 +484,7 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
     adapt(r, sig.ret, want, c)
   of Assign:
     var it = c.sub()
-    let n = nameOf(it)
+    let n = nameOf(r, it)
     skip it
     if r.locals.hasKey(n):
       let (i, t) = r.locals[n]
@@ -494,7 +501,7 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
         r.op OpGlobalGet; r.u32 i
         adapt(r, t, want, c)
     else:
-      r.err "assignment to unknown name `" & n & "`"
+      r.err "assignment to unknown name `" & r.spell(n) & "`"
   of Cond:
     var it = c.sub()
     genCond(r, it)
@@ -707,14 +714,15 @@ proc genStmts(r: var WasmRender; it: var Cursor) =
     genStmt(r, it)
     skip it
 
-proc depthOf(r: WasmRender; name: string; unnamed: bool): uint32 =
+proc depthOf(r: WasmRender; name: SymId; unnamed: bool): uint32 =
   ## The `br` depth of the innermost matching control entry.
   for i in countdown(r.ctl.high, 0):
     let e = r.ctl[i]
     if (unnamed and e.kind == ckLoopExit) or
        (not unnamed and e.kind == ckLabel and e.name == name):
       return uint32(r.ctl.high - i)
-  r.err (if unnamed: "`break` outside a loop" else: "`break " & name & "` outside its label")
+  r.err (if unnamed: "`break` outside a loop"
+         else: "`break " & r.spell(name) & "` outside its label")
 
 proc genStmt(r: var WasmRender; c: Cursor) =
   if c.kind == DotToken: return
@@ -727,7 +735,7 @@ proc genStmt(r: var WasmRender; c: Cursor) =
     genStmts(r, it)
   of Label:
     var it = c.sub()
-    let n = nameOf(it)
+    let n = nameOf(r, it)
     skip it
     r.op OpBlock; r.body.add BlockVoid
     r.ctl.add Ctl(kind: ckLabel, name: n)
@@ -737,7 +745,7 @@ proc genStmt(r: var WasmRender; c: Cursor) =
   of Break:
     let it = c.sub()
     let unnamed = not it.hasMore
-    let d = depthOf(r, (if unnamed: "" else: nameOf(it)), unnamed)
+    let d = depthOf(r, (if unnamed: SymId(0) else: nameOf(r, it)), unnamed)
     r.op OpBr
     r.u32 d
   of If:
@@ -790,9 +798,9 @@ proc genStmt(r: var WasmRender; c: Cursor) =
 
 # ── functions and the module ────────────────────────────────────────────────
 
-proc funcHeader(c: Cursor; name: var string; sig: var FuncSig) =
+proc funcHeader(r: WasmRender; c: Cursor; name: var SymId; sig: var FuncSig) =
   var it = c.sub()
-  name = nameOf(it)
+  name = nameOf(r, it)
   skip it
   var ps = it.sub()
   while ps.hasMore:
@@ -805,9 +813,9 @@ proc funcHeader(c: Cursor; name: var string; sig: var FuncSig) =
 
 proc genFunc(r: var WasmRender; c: Cursor) =
   var it = c.sub()
-  r.fname = nameOf(it)
+  r.fname = nameOf(r, it)
   skip it
-  r.locals = initTable[string, (uint32, VT)]()
+  r.locals = initTable[SymId, (uint32, VT)]()
   r.localTypes = @[]
   r.body = ByteBuf()
   r.ctl = @[]
@@ -817,7 +825,7 @@ proc genFunc(r: var WasmRender; c: Cursor) =
   var ps = it.sub()
   while ps.hasMore:
     var p = ps.sub()
-    let n = nameOf(p)
+    let n = nameOf(r, p)
     skip p
     r.locals[n] = (uint32(r.nparams), vtOf(widthAt(p)))
     inc r.nparams
@@ -828,7 +836,7 @@ proc genFunc(r: var WasmRender; c: Cursor) =
   var ls = it.sub()
   while ls.hasMore:
     var p = ls.sub()
-    let n = nameOf(p)
+    let n = nameOf(r, p)
     skip p
     let t = vtOf(widthAt(p))
     r.locals[n] = (newLocal(r, t), t)
@@ -843,7 +851,7 @@ proc genFunc(r: var WasmRender; c: Cursor) =
     if decls.len > 0 and decls[^1][1] == vt: inc decls[^1][0]
     else: decls.add (1'u32, vt)
   r.wm.addCode(decls, r.body.data)
-  r.fname = ""
+  r.fname = SymId(0)
 
 proc sigTypes(sig: FuncSig): (seq[byte], seq[byte]) =
   for p in sig.params: result[0].add valType(p)
@@ -852,24 +860,28 @@ proc sigTypes(sig: FuncSig): (seq[byte], seq[byte]) =
 proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
                  exportAll = false): seq[byte] =
   ## The whole program as one wasm32 module.
-  var r = WasmRender(savedSp: -1, frameTmp: -1)
+  var r = WasmRender(savedSp: -1, frameTmp: -1, pool: tree.pool)
+  # The module's own names arrive as text (a renderer prints them); they are
+  # interned ONCE here, into the tree's pool, and matched as ids from then on.
+  template id(name: string): SymId = r.pool.syms.getOrIncl(name)
   # imports pin the low function indices
   for imp in m.imports:
     var sig = FuncSig(ret: if imp.hasRet: vtOf(imp.ret) else: vtVoid)
     for w in imp.params: sig.params.add vtOf(w)
     let (ps, rs) = sigTypes(sig)
-    r.funcIdx[imp.name] = r.wm.addImportFunc("env", imp.name, r.wm.addFuncType(ps, rs))
-    r.sigs[imp.name] = sig
+    r.funcIdx[id imp.name] = r.wm.addImportFunc("env", imp.name,
+                                                r.wm.addFuncType(ps, rs))
+    r.sigs[id imp.name] = sig
   # every function is declared before any body is rendered: calls go forward
   var root = beginRead(tree)
   if webTagOf(root) != Top: raiseAssert "wasmrender: expects a `top` root"
   var it = root.sub()
-  var order: seq[string] = @[]
+  var order: seq[SymId] = @[]
   while it.hasMore:
     if webTagOf(it) != Func: raiseAssert "wasmrender: `top` holds functions only"
-    var name = ""
+    var name = SymId(0)
     var sig: FuncSig
-    funcHeader(it, name, sig)
+    funcHeader(r, it, name, sig)
     let (ps, rs) = sigTypes(sig)
     r.funcIdx[name] = r.wm.addFunction(r.wm.addFuncType(ps, rs))
     r.sigs[name] = sig
@@ -878,7 +890,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
   # a slot nobody bound traps when called — as a null slot does
   var unbound = -1
   for slot in 1 ..< m.table.len:
-    if m.table[slot].len == 0 or not r.funcIdx.hasKey(m.table[slot]):
+    if m.table[slot].len == 0 or not r.funcIdx.hasKey(id m.table[slot]):
       unbound = int(r.wm.addFunction(r.wm.addFuncType(newSeq[byte](), newSeq[byte]())))
       break
   let startFi = r.wm.addFunction(r.wm.addFuncType(newSeq[byte](), newSeq[byte]()))
@@ -896,7 +908,8 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
     of vtF32: (z.add OpF32Const; z.addF32 0'f32)
     of vtF64: (z.add OpF64Const; z.addF64 0.0)
     else: (z.add OpI32Const; z.addI32 0)
-    r.globals[n] = (r.wm.addGlobal(valType(vtOf(w)), mutable = true, z.data), vtOf(w))
+    r.globals[id n] = (r.wm.addGlobal(valType(vtOf(w)), mutable = true, z.data),
+                       vtOf(w))
   # bodies, in declaration order
   it = root.sub()
   while it.hasMore:
@@ -915,7 +928,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
     of vtF64: (sb.add OpF64Const; sb.addF64 0.0)
     else: (sb.add OpI32Const; sb.addI32 0)
   sb.add OpCall
-  sb.addU32 r.funcIdx[m.entry]
+  sb.addU32 r.funcIdx[id m.entry]
   if m.entryHasRet:
     if m.exports.len > 0:
       sb.add OpDrop
@@ -926,7 +939,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
       of vtF64: sb.add OpI32TruncF64S
       else: discard
       sb.add OpCall
-      sb.addU32 r.funcIdx[m.imports[1].name]   # nim_exit
+      sb.addU32 r.funcIdx[id m.imports[1].name]   # nim_exit
   r.wm.addCode(newSeq[(uint32, byte)](), sb.data)
   # the image
   for (a, s) in m.dataSegs:
@@ -940,7 +953,8 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
     var elems: seq[uint32] = @[]
     for slot in 1 ..< m.table.len:
       let f = m.table[slot]
-      elems.add(if f.len > 0 and r.funcIdx.hasKey(f): r.funcIdx[f] else: uint32(unbound))
+      elems.add(if f.len > 0 and r.funcIdx.hasKey(id f): r.funcIdx[id f]
+                else: uint32(unbound))
     r.wm.addElem(1, elems)
   let pages = (stackTop + uint32(PageSize) - 1) div uint32(PageSize) + 1
   r.wm.addMemory(pages)
@@ -949,8 +963,8 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
   r.wm.addExportTable("table", 0)              # JS bridge: callbacks call back
                                                # into wasm via table.get(slot)
   for (cName, f) in m.exports:
-    r.wm.addExportFunc(cName, r.funcIdx[f])
+    r.wm.addExportFunc(cName, r.funcIdx[id f])
   if exportAll:
     for f in order:
-      r.wm.addExportFunc("dbg$" & f, r.funcIdx[f])
+      r.wm.addExportFunc("dbg$" & r.spell(f), r.funcIdx[f])
   result = encode(r.wm)

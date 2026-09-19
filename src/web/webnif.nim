@@ -174,6 +174,10 @@ proc width*(b: var TokenBuf; w: WidthCode) {.inline.} =
 
 proc symDef*(b: var TokenBuf; name: string) {.inline.} = b.addSymDef name
 proc symUse*(b: var TokenBuf; name: string) {.inline.} = b.addSymUse name
+# The id forms: a name the generator interned ONCE, written without hashing its
+# spelling again. `id` must come from THIS buffer's pool.
+proc symDef*(b: var TokenBuf; id: SymId) {.inline.} = b.addSymDef id
+proc symUse*(b: var TokenBuf; id: SymId) {.inline.} = b.addSymUse id
 proc strLit*(b: var TokenBuf; s: string) {.inline.} = b.addStrLit s
 proc numLit*(b: var TokenBuf; i: int64) {.inline.} = b.addIntLit i
 proc floatLit*(b: var TokenBuf; f: float) {.inline.} = b.addFloatLit f
@@ -208,6 +212,12 @@ proc param*(b: var TokenBuf; name: string; w: WidthCode) =
   ## `(param NAME W)` — a parameter, or a local inside `(locals …)`.
   b.openTree Param
   b.symDef name
+  b.width w
+  b.closeTag
+
+proc param*(b: var TokenBuf; id: SymId; w: WidthCode) =
+  b.openTree Param
+  b.symDef id
   b.width w
   b.closeTag
 

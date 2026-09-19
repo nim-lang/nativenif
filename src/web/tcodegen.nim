@@ -43,8 +43,9 @@ proc findAddr(g: WebGen; part: string): uint32 =
   ## the fixture carry a trailing `.` that the NIF API completes to the module
   ## suffix, so matching on the whole name would be guessing at that.
   result = 0
-  for name, a in g.globalAddr:
-    if name.contains(part):
+  for sym, a in g.globalAddr:
+    let name = poolSym(g.lengPool, sym)   # the layout is keyed by POOL ID; the
+    if name.contains(part):               # spelling is what a test matches on
       must "unique " & part, result == 0, "both " & name & " and the previous match"
       result = a
 
