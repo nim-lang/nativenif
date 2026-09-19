@@ -2336,6 +2336,17 @@ const cortexMUnsupported: seq[string] = @[
   # carries it. See `arkhamKnownUnsupported` and `arkhamA64Unsupported`.
   "eh_onerr",
 
+  # A 12-byte array passed by value. Above Cortex-M's 8-byte by-reference
+  # threshold arkham hands the callee a pointer to the caller's OWN object
+  # instead of to a caller-made copy, so the callee's store is visible to the
+  # caller (exit 0, want 98). x64/a64 pass 12 bytes in registers and never
+  # reach that path. The fixture pins the web back end's copy semantics.
+  "aggarg",
+  # `bintrin` exercises the portable `Ctz`/`Clz`/`Popcount` rows, and this core
+  # refuses `Ctz` by name ("guard the call with a `when`"), as a64 does
+  # `Popcount` (see `arkhamA64Unsupported`).
+  "bintrin",
+
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
   # exclusives have no 64-bit form on this core either — there is no `ldrexd`, and
