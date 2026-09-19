@@ -40,7 +40,7 @@ const
     ## Addresses are Numbers, and the emitted arithmetic stays exact below 2^53
     ## — but `>>> 0` and the stack/heap boundary checks think in uint32. A
     ## memory above 2 GiB would silently alias through the 32-bit window, so
-    ## the ceiling is stated, not discovered.
+    ## the limit is stated, not discovered.
 
 proc run(input, output: string; memBytes: int; browser: bool) =
   # One Leng tag pool for the input; `generate` builds its output in a buffer
