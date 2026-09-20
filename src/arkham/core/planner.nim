@@ -535,7 +535,7 @@ proc getSym(b: var Builder; name: SymId; slot: AsmSlot; props: VarProps): Locati
       var crossed = 0
       for p in b.an.callPositions:
         if p > lo and p <= hi: inc crossed
-      stderr.writeLine "SPILL proc=" & gArkhamCurProc & " var=" & name &
+      stderr.writeLine "SPILL proc=" & gArkhamCurProc & " var=" & b.prog[].spelling(name) &
         " allregs=" & $(AllRegs in props) &
         " crossed=" & $crossed & " weight=" & $vi.weight &
         " span=" & $(hi - lo) &
@@ -639,7 +639,7 @@ proc recordSym(b: var Builder; pos: int; name: SymId; loc: Location) =
   b.plan.symPos[name] = pos
   when defined(arkhamHomeTrace):
     let vi = b.an.vars.getOrDefault(name)
-    stderr.writeLine "HOMETRACE home proc=" & gArkhamCurProc & " name=" & name &
+    stderr.writeLine "HOMETRACE home proc=" & gArkhamCurProc & " name=" & b.prog[].spelling(name) &
       " loc=" & $loc.kind & "/" & (if loc.kind in {InReg, InFReg}: $loc.r else: "-") & " pos=" & $pos & " freeAfter=" & $vi.freeAfter &
       " lastUse=" & $vi.lastUsePos & " declLoopDepth=" & $vi.declLoopDepth
   b.plan.homesDirty = true
@@ -687,7 +687,9 @@ proc addSpillTemp*(plan: var Plan; name: SymId; typ: AsmSlot; isFloat = false) =
   plan.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
   plan.hasStackVars = true                     # see above: the decl is too late to set it
   when defined(arkhamSpillDbg):
-    stderr.writeLine "SPILLTEMP proc=" & gArkhamCurProc & " name=" & name &
+    # `#<id>`: a `Plan` holds no pool, so this one trace names the symbol by its
+    # pool id. Every other line here spells it out.
+    stderr.writeLine "SPILLTEMP proc=" & gArkhamCurProc & " name=#" & $name &
       " float=" & $isFloat
 
 proc demoteToStack(b: var Builder; victim: SymId) =
@@ -722,7 +724,7 @@ proc trySteal(b: var Builder; curName: SymId; curSlot: AsmSlot;
   if bestV == NoSymId:
     when defined(arkhamHomeTrace):
       let vi = b.an.vars.getOrDefault(curName)
-      stderr.writeLine "HOMETRACE nosteal proc=" & gArkhamCurProc & " loser=" & curName &
+      stderr.writeLine "HOMETRACE nosteal proc=" & gArkhamCurProc & " loser=" & b.prog[].spelling(curName) &
         "(w=" & $vi.weight & ",u=" & $vi.usages & ",d=" & $vi.defs &
         ",len=" & $b.rangeLen(curName) & ",dld=" & $vi.declLoopDepth & ")"
     return fallback                          # nothing colder to steal from
@@ -736,10 +738,10 @@ proc trySteal(b: var Builder; curName: SymId; curSlot: AsmSlot;
   # evict the victim to its stack slot; current takes its register
   b.demoteToStack(bestV)
   when defined(arkhamHomeTrace):
-    stderr.writeLine "HOMETRACE steal proc=" & gArkhamCurProc & " thief=" & curName &
+    stderr.writeLine "HOMETRACE steal proc=" & gArkhamCurProc & " thief=" & b.prog[].spelling(curName) &
       "(w=" & $b.weightOf(curName) & ",len=" & $b.rangeLen(curName) & ",dld=" & $b.an.vars.getOrDefault(curName).declLoopDepth &
       ",u=" & $b.an.vars.getOrDefault(curName).usages & ")" &
-      " victim=" & bestV & "(w=" & $b.weightOf(bestV) & ",len=" & $b.rangeLen(bestV) &
+      " victim=" & b.prog[].spelling(bestV) & "(w=" & $b.weightOf(bestV) & ",len=" & $b.rangeLen(bestV) &
       ",u=" & $b.an.vars.getOrDefault(bestV).usages &
       ",dld=" & $b.an.vars.getOrDefault(bestV).declLoopDepth & ")"
   if bestReg in b.md.intCalleeSavedSet: b.plan.usedCallee.incl bestReg
@@ -1014,7 +1016,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
            slot.inRegClass and not slot.isFloat:
           # a register-eligible scalar that ended in memory = a PRESSURE spill
           let svi = b.an.vars.getOrDefault(name)
-          stderr.write "SSASPILL proc=" & gArkhamCurProc & " var=" & name &
+          stderr.write "SSASPILL proc=" & gArkhamCurProc & " var=" & b.prog[].spelling(name) &
             " defs=" & $svi.defs & " uses=" & $svi.usages &
             " init=" & $svi.initClass & " weight=" & $svi.weight &
             " inloop=" & $svi.declInLoop & "\n"

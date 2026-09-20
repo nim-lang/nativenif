@@ -742,8 +742,14 @@ proc analyseParams(c: var Context; params: var Cursor) =
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
+when defined(arkhamPeakLive) or defined(arkhamSSAStats):
+  proc spell(c: Context; s: SymId): string {.inline.} =
+    ## The spelling of a symbol, for a TRACE line. The analyser keys everything
+    ## by pool id; the buffer it walks carries the pool that can spell one.
+    symString(c.buf[].pool, s)
+
 when defined(arkhamPeakLive):
-  proc reportPeakLive(c: Context; pname: string; procStartPos, procEndPos: int) =
+  proc reportPeakLive(c: Context; pname: SymId; procStartPos, procEndPos: int) =
     ## Sweep every named local's coarse live interval and report the maximum number
     ## simultaneously alive — arkham's structural analogue of gcc's register-pressure
     ## count. A value occupies a register/slot over its interval, so the peak is the
@@ -771,8 +777,8 @@ when defined(arkhamPeakLive):
     var liveNames = ""
     for iv in ivs:
       if iv.lo <= peakPt and peakPt <= iv.hi:
-        (if liveNames.len > 0: liveNames.add ' '; liveNames.add iv.name)
-    stderr.write "PEAKLIVE proc=" & pname & " total=" & $ivs.len &
+        (if liveNames.len > 0: liveNames.add ' '; liveNames.add c.spell(iv.name))
+    stderr.write "PEAKLIVE proc=" & c.spell(pname) & " total=" & $ivs.len &
       " peak=" & $peak & " @pos=" & $peakPt & ": " & liveNames & "\n"
     # Per-member detail for the peak set: interval width + def/use counts. A narrow
     # interval that only overlaps `peakPt` by coarse `freeAfter` over-extension hints
@@ -780,7 +786,7 @@ when defined(arkhamPeakLive):
     for iv in ivs:
       if iv.lo <= peakPt and peakPt <= iv.hi:
         let vi = c.res.vars[iv.name]
-        stderr.write "    " & iv.name & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
+        stderr.write "    " & c.spell(iv.name) & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
           $(iv.hi - iv.lo) & " defs=" & $vi.defs & " uses=" & $vi.usages &
           " allregs=" & $(AllRegs in vi.props) & "\n"
     # Cross-call pressure: the max simultaneously-live `allregs=false` intervals — the
@@ -798,8 +804,8 @@ when defined(arkhamPeakLive):
     var ccNames = ""
     for iv in ivs:
       if iv.lo <= ccPt and ccPt <= iv.hi and (AllRegs notin c.res.vars[iv.name].props):
-        (if ccNames.len > 0: ccNames.add ' '; ccNames.add iv.name)
-    stderr.write "  XCALLPEAK proc=" & pname & " crosscall-peak=" & $ccPeak &
+        (if ccNames.len > 0: ccNames.add ' '; ccNames.add c.spell(iv.name))
+    stderr.write "  XCALLPEAK proc=" & c.spell(pname) & " crosscall-peak=" & $ccPeak &
       " @pos=" & $ccPt & ": " & ccNames & "\n"
     # The TRUE callee-saved demand under live-range splitting: max over each individual
     # CALL site of the values live ACROSS that specific call (lo < callPos < hi). A value
@@ -813,7 +819,7 @@ when defined(arkhamPeakLive):
       for iv in ivs:
         if iv.lo < cp and cp < iv.hi: inc cnt    # strictly spans the call → live across it
       if cnt > acrossPeak: (acrossPeak = cnt; acrossCall = cp)
-    stderr.write "  ACROSSCALL proc=" & pname & " max-live-across-one-call=" & $acrossPeak &
+    stderr.write "  ACROSSCALL proc=" & c.spell(pname) & " max-live-across-one-call=" & $acrossPeak &
       " @call=" & $acrossCall & " (ncalls=" & $c.callPositions.len & ")\n"
 
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
@@ -1042,7 +1048,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
           of icAddr: inc nAddrI
           else: discard
     if nLocals > 0:
-      stderr.write "SSASTATS proc=" & pname & " locals=" & $nLocals &
+      stderr.write "SSASTATS proc=" & c.spell(pname) & " locals=" & $nLocals &
         " ssa=" & $nSSA & " (const=" & $nConst & " copy=" & $nCopy &
         " addr=" & $nAddrI & " use1=" & $nSSAUse1 & " inloop=" & $nLoopSSA &
         ") asgn1=" & $nAsgn1 & " birthflip=" & $nBirthFlip & "\n"

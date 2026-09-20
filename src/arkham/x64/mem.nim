@@ -488,8 +488,8 @@ proc emAggrPtrBase(g: var CodeGen; nm: SymId) =
     g.ab.sym nm
   else:
     when defined(arkhamRawBaseDbg):
-      stderr.writeLine "RAWBASE " & g.curProcName & " " & nm &
-        (if loc.kind == InReg: " reg=" & $loc.r & " boundTo=" & g.rb.boundName(loc.r)
+      stderr.writeLine "RAWBASE " & g.curProcName & " " & g.spelling(nm) &
+        (if loc.kind == InReg: " reg=" & $loc.r & " boundTo=" & g.spelling(g.rb.boundName(loc.r))
          else: " loc=" & $loc.kind)
     if loc.kind == InReg:
       g.rawHomeRegs.incl loc.r

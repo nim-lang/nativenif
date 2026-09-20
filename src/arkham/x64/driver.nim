@@ -159,7 +159,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       for p in an.callPositions:
         if allCalls.len > 0: allCalls.add ','
         allCalls.add $p
-      stderr.write "CSPROC proc=" & info.asmName & " calls=" & allCalls & "\n"
+      stderr.write "CSPROC proc=" & g.spelling(info.asmName) & " calls=" & allCalls & "\n"
       for name in g.plan.callerSaveHomes.keys:
         let vi = an.vars.getOrDefault(name)
         var crossed = ""
@@ -168,14 +168,14 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
             if crossed.len > 0: crossed.add ','
             crossed.add $p
         let home = g.plan.homeOfSym(name)
-        stderr.write "CSVAR proc=" & info.asmName & " var=" & name &
+        stderr.write "CSVAR proc=" & g.spelling(info.asmName) & " var=" & g.spelling(name) &
           " reg=" & (if home.kind == InReg: $home.r else: "?" & $home.kind) &
           " liveStart=" & $vi.liveStart & " initEnd=" & $vi.initEndPos &
           " freeAfter=" & $vi.freeAfter & " lastUse=" & $vi.lastUsePos &
           " defs=" & $vi.defs & " weight=" & $vi.weight &
           " init=" & $vi.initClass & " crossed=" & crossed & "\n"
   when defined(arkhamTracePath):
-    stderr.writeLine "[arkham] " & info.asmName & ": NEW"
+    stderr.writeLine "[arkham] " & g.spelling(info.asmName) & ": NEW"
   when defined(arkhamDumpLocs):
     block:
       stderr.writeLine "=== allocValue locs ==="
@@ -217,9 +217,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.emitProcBody(info, an.hasCall)
   when defined(arkhamBridgeDbg):
     stderr.writeLine "BRIDGE tight=" & $tightCompositions & " lastResort=" &
-                     $lastResortTakes & " " & info.asmName
+                     $lastResortTakes & " " & g.spelling(info.asmName)
   when defined(arkhamStagingDbg):
-    stderr.writeLine "STAGING proc=" & info.asmName & " peak=" & $g.stagingPeak &
+    stderr.writeLine "STAGING proc=" & g.spelling(info.asmName) & " peak=" & $g.stagingPeak &
       " leaked=" & $g.stagingLive.len & " at=" & g.stagingPeakWhat
     g.stagingPeak = 0
     g.stagingPeakWhat = ""

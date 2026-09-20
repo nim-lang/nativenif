@@ -36,7 +36,7 @@ from rv32 import nil
 
 proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
-    stderr.writeLine "arkham genProc: " & info.asmName
+    stderr.writeLine "arkham genProc: " & g.spelling(info.asmName)
   if info.isAsm:
     g.genAsmProc(info)
     return

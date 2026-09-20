@@ -866,9 +866,9 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
               if declPos.hasKey(nm): g.condFuse.decl.incl declPos.getOrQuit(nm)
           else:
             when defined(arkhamFuseDbg):
-              if s.len > 0:
-                stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & s &
-                  " pending=" & pendingSym & " count=" & $symCount.getOrDefault(s)
+              if s != NoSymId:
+                stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & g.spelling(s) &
+                  " pending=" & g.spelling(pendingSym) & " count=" & $symCount.getOrDefault(s)
           pendingSym = NoSymId; copyPos.setLen 0; chainDecls.setLen 0
           walk(g, c)                       # the branches themselves still get scanned
           skip c

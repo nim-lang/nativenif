@@ -687,7 +687,7 @@ proc declSpillSlot*(g: var CodeGen; name: SymId; typ: AsmSlot; isFloat: bool) =
   ## declare one where it mints it and the prologue can declare the planner's from the
   ## same rule. The x64 twin.
   when defined(arkhamSpillDbg):
-    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & name &
+    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & g.spelling(name) &
       " float=" & $isFloat
   if isFloat: g.emFloatStackVar(name, typ.size * 8)
   elif g.isWideSlot(typ): g.emWideStackVar(name)

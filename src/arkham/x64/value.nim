@@ -621,7 +621,7 @@ proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location) =
       g.emitValue(ti.inner, d)
       return
   when defined(arkhamDbgSpill):
-    stderr.writeLine "DBG produceIntoMem slot=" & dst.name
+    stderr.writeLine "DBG produceIntoMem slot=" & g.spelling(dst.name)
   if c.kind == TagLit and c.exprKind in {DerefC, DotC, AtC, PatC} and
      lvalHasComputedPart(c):
     # A LOAD into the slot whose ADDRESS is itself computed: the address must be
@@ -2938,7 +2938,7 @@ proc produceIntoFMem*(g: var CodeGen; c: Cursor; dst: Location) =
   ## IS sealed across the recursion (destructive SSE writes the accumulator
   ## before the rhs — see the legacy twin's staging-depth note).
   when defined(arkhamDbgSpill):
-    stderr.writeLine "DBG produceIntoFMem slot=" & dst.name
+    stderr.writeLine "DBG produceIntoFMem slot=" & g.spelling(dst.name)
   let bits = dst.typ.size * 8
   let fs = g.pickFStagingSealed("a spilled float result (deep float nest > staging pool)")
   var d = fregLoc(fs, dst.typ, isTemp = true)
@@ -4031,13 +4031,13 @@ when defined(arkhamCallerSaveDbg):
     ## did not make. `unbound` is the interesting residue: the allocator thinks the
     ## value is live here, the emitter holds no binding for it.
     var saved, nest, unbound = ""
-    var seen = initHashSet[string]()
-    for it in saveSet: (seen.incl it.name; (if saved.len > 0: saved.add ','); saved.add it.name)
-    for it in nested: (seen.incl it.name; (if nest.len > 0: nest.add ','); nest.add it.name)
+    var seen = initHashSet[SymId]()
+    for it in saveSet: (seen.incl it.name; (if saved.len > 0: saved.add ','); saved.add g.spelling(it.name))
+    for it in nested: (seen.incl it.name; (if nest.len > 0: nest.add ','); nest.add g.spelling(it.name))
     for name in g.plan.callerSaveHomes.keys:
       if name notin seen:
         if unbound.len > 0: unbound.add ','
-        unbound.add name
+        unbound.add g.spelling(name)
     stderr.write "CSCALL proc=" & gArkhamCurProc & " pos=" &
       $cursorToPosition(g.buf[], c) & " saved=" & saved & " nested=" & nest &
       " unbound=" & unbound & "\n"

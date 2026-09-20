@@ -437,7 +437,7 @@ proc declSpillSlot*(g: var CodeGen; name: SymId; typ: AsmSlot; isFloat: bool) =
   ## THE single place a spill slot is spelled, so the emitter can declare one where it
   ## mints it and the prologue can declare the planner's from the same rule.
   when defined(arkhamSpillDbg):
-    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & name &
+    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & g.spelling(name) &
       " float=" & $isFloat
   if isFloat:
     g.emFloatStackVar(name, typ.size * 8)
@@ -801,7 +801,7 @@ proc takeTmp*(g: var CodeGen; slot: AsmSlot): Location =
   if r == NoReg:
     let nm = g.mintSpillName("etmp")
     when defined(arkhamTempDbg):
-      stderr.writeLine "ETMP " & g.curProcName & " " & nm & g.tempCensus()
+      stderr.writeLine "ETMP " & g.curProcName & " " & g.spelling(nm) & g.tempCensus()
     g.declSpillSlot(nm, slot, isFloat = false)   # HERE: exhaustion is a statement position
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedRegs.incl r
