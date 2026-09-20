@@ -237,12 +237,13 @@ Everything the assembler still tracks (unwind rows, listing rows, patch sites)
 is carried through it.
 
 **pool** — the interned string/symbol table. A symbol's identity is its pool id
-(`SymId`); names are turned back into strings only at the edges. There are
-three: a diagnostic (`prog.spelling`), a name that is BUILT and then interned
+(`SymId`); names are turned back into strings only at the edges. There are two:
+a diagnostic (`prog.spelling`), and a name that is BUILT and then interned
 (`prog.lengSym` — `csave.` + a local, a synthesized temp, an `.assembler`
-body's pinned local), and the asm buffer, whose own pool is a different symbol
-table (`AsmBuf.translate`, memoized per symbol). A register spelling from
-`{.register: "x0".}` is not a symbol and stays text.
+body's pinned local). The asm buffer is NOT one of them: it shares the input's
+pool (`initAsmBuf`), so a Leng id is already a name in the asm-NIF — the two
+dialects are different languages over one symbol table. A register spelling
+from `{.register: "x0".}` is not a symbol and stays text.
 
 **foreign module** — another module a name refers to. Opened lazily: only the
 embedded index is read up front, and a declaration is parsed when something

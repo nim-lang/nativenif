@@ -345,8 +345,15 @@ type
     startFunc: uint32
 
 proc sigKey(params, results: openArray[byte]): string =
-  ## A dedup key for a functype; `@params`/`@results` stringify unambiguously.
-  result = $(@params) & "->" & $(@results)
+  ## A dedup key for a functype: each group is its length in decimal, then its
+  ## bytes verbatim, which is injective without `$` on a seq. The key never
+  ## leaves this table, so its spelling is free — only the equivalence classes
+  ## it induces are observable.
+  result = $params.len & ":"
+  for b in params: result.add char(b)
+  result.add $results.len
+  result.add ":"
+  for b in results: result.add char(b)
 
 proc addFuncType*(m: var WasmModule; params, results: openArray[byte]): uint32 =
   ## Interns a `(params) -> (results)` signature, returning its type index.
@@ -444,7 +451,7 @@ proc addCode*(m: var WasmModule; localDecls: openArray[(uint32, byte)]; body: op
   ## Adds one function body. `localDecls` are run-length `(count, valtype)`
   ## pairs. `body` is the instruction stream WITHOUT its trailing `end`, which
   ## is appended here. Add these in the same order as the matching `addFunction`.
-  var fn: ByteBuf
+  var fn = default(ByteBuf)
   fn.addU32 uint32(localDecls.len)
   for (count, valType) in localDecls:
     fn.addU32 count
@@ -477,10 +484,10 @@ proc addElem*(m: var WasmModule; tableOffset: int32; funcIdxs: openArray[uint32]
 proc emitSection(dst: var seq[byte]; id: byte; count: uint32; entries: ByteBuf) =
   ## Emits one count-prefixed vector section, skipping it when empty.
   if count == 0'u32: return
-  var content: ByteBuf
+  var content = default(ByteBuf)
   content.addU32 count
   content.add entries.data
-  var sz: ByteBuf
+  var sz = default(ByteBuf)
   sz.addU32 uint32(content.data.len)
   dst.add id
   for x in sz.data: dst.add x
@@ -499,9 +506,9 @@ proc encode*(m: WasmModule): seq[byte] =
   emitSection result, 6'u8, m.globalCount, m.globalSec
   emitSection result, 7'u8, m.exportCount, m.exportSec
   if m.hasStart:
-    var content: ByteBuf
+    var content = default(ByteBuf)
     content.addU32 m.startFunc
-    var sz: ByteBuf
+    var sz = default(ByteBuf)
     sz.addU32 uint32(content.data.len)
     result.add 0x08'u8
     for x in sz.data: result.add x

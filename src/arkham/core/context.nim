@@ -524,16 +524,16 @@ proc newCodeGen*(buf: var TokenBuf; md: MachineDesc;
   checkMachine(md)
   # `entryMd` starts as `md`: a proc is entered the way arkham calls it unless a
   # per-proc setup says otherwise, and every target but Windows/x64 always is.
-  CodeGen(ab: initAsmBuf(renderReg), buf: addr buf, md: md, entryMd: md)
+  # The asm buffer writes into the INPUT's literals pool (`buf.pool`, the pool
+  # `collect` hands the `Program` too), so a Leng `SymId` is already a name in
+  # the asm-NIF: the two dialects share one symbol table.
+  CodeGen(ab: initAsmBuf(renderReg, buf.pool), buf: addr buf, md: md, entryMd: md)
 
 proc adoptProgram*(g: var CodeGen) =
   ## Read the loaded program model into the fields the emitter consults directly.
   ## `collect` is called per target (its flags differ); everything after it is
   ## the same on all three, which is exactly why it belongs here rather than
   ## three times over.
-  # The asm buffer mints its own symbols, so it needs the pool the ids it is
-  # handed come from — this is the one crossing between the two dialects.
-  g.ab.lengPool = g.prog.pool
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
