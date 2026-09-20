@@ -18,7 +18,7 @@
 ## Built as a `nifcore` `TokenBuf` (the flexible NIF API) and serialized with
 ## `toString`.
 
-import std / tables
+import std / [tables, assertions]
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagpool]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
