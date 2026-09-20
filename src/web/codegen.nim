@@ -107,9 +107,8 @@ type
     pending: seq[(SymId, Cursor)]      ## reachable procs not yet lowered
     emitted: HashSet[SymId]
     irNameOf: Table[SymId, SymId]      ## Leng symbol → its name in the IR pool
-    usedNames: HashSet[string]         ## every IR name SPELLING handed out: the
-                                       ## mangling is what can collide, so this
-                                       ## one set really is about text
+    nameCount: int                     ## how many IR names have been minted; the
+                                       ## tail that makes each one unique
     p: ProcCtx                         ## the proc being lowered
     entrySym*: SymId
     target*: WebTarget
@@ -121,7 +120,7 @@ type
     thunks: seq[(SymId, SymId, Cursor)] ## (thunk symbol, proc symbol, decl):
                                        ## closure-signature bridges to lower
     needMemcmp: bool                   ## the synthetic `memcmp` is referenced
-    tmpNames: seq[SymId]               ## `n_tmp_1`, `n_tmp_2`, … minted once and
+    tmpNames: seq[SymId]               ## the per-index temporaries, minted once and
                                        ## REUSED by every proc: a local is scoped
                                        ## to its function on both targets
     impWrite, impExit: SymId           ## the host floor and the flag registers,
@@ -797,7 +796,6 @@ proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result.hostImports = hostImports
   result.memTop = NullGuard
   result.nextTableSlot = 1           # slot 0 stays the null function pointer
-  result.usedNames = initHashSet[string]()
   let webTags = createWebTagPool()
   result.lengPool = buf.pool          # the pool every Leng `SymId` below belongs to
   result.top = createTokenBuf(sharedTags = webTags)
@@ -813,8 +811,6 @@ proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result.globErrv = result.irPool.syms.getOrIncl GlobErrv
   result.globOvf = result.irPool.syms.getOrIncl GlobOvf
   result.memcmpFn = result.irPool.syms.getOrIncl MemcmpFunc
-  for n in [ImpWrite, ImpExit, GlobErrv, GlobOvf, MemcmpFunc]:
-    result.usedNames.incl n           # the runtime floor owns these spellings
   result.importOf = initTable[string, SymId]()
   result.callTarget = initTable[SymId, CallTarget]()
   result.globals = initTable[SymId, Cursor]()
@@ -918,16 +914,16 @@ proc litWidth(g: var WebGen; c: Cursor): WidthCode =
     w
 
 proc freshIrName(g: var WebGen; base: string): SymId =
-  ## A name in the IR pool that nothing else was given. The spelling is what
-  ## can collide — two Nim symbols mangling onto one identifier would be silent
-  ## wrong code — so the counter is driven by `usedNames`, and the result is
-  ## interned ONCE: every later use of it is a pool id, not a string.
-  var cand = base
-  var n = 0
-  while g.usedNames.containsOrIncl(cand):
-    inc n
-    cand = base & "_" & $n
-  result = g.irPool.syms.getOrIncl(cand)
+  ## A name in the IR pool that nothing else was given. The spelling is what can
+  ## collide — two Nim symbols mangling onto one identifier would be silent wrong
+  ## code — so every minted name ends in `_<n>` from a counter that never
+  ## repeats. A name splits at its last underscore into base and count, so two
+  ## of them are equal only if they came from the same mint: nothing has to be
+  ## looked up, and the result is interned ONCE — every later use of it is a
+  ## pool id, not a string. The runtime floor (`nim_write`, `errv`, …) has no
+  ## such tail, so nothing can land on it either.
+  inc g.nameCount
+  result = g.irPool.syms.getOrIncl(base & "_" & $g.nameCount)
 
 proc irName(g: var WebGen; sym: SymId): SymId =
   ## The IR name of a Leng symbol — also its JavaScript identifier, so it must
@@ -944,13 +940,13 @@ proc irName(g: var WebGen; sym: SymId): SymId =
   g.irNameOf[sym] = result
 
 proc tmpName(g: var WebGen): SymId =
-  ## The `n`-th generated name of the proc being lowered, reserved through the
-  ## same set so a temporary can never land on a user name. The names are
-  ## shared across procs — a local belongs to its function, and one spelling
-  ## per index keeps the emitted JavaScript that much smaller.
+  ## The `n`-th generated name of the proc being lowered, minted like any other
+  ## so a temporary can never land on a user name. The names are shared across
+  ## procs — a local belongs to its function, and one name per index keeps the
+  ## emitted JavaScript that much smaller.
   inc g.p.tmp
   while g.tmpNames.len < g.p.tmp:
-    g.tmpNames.add freshIrName(g, "n_tmp_" & $(g.tmpNames.len + 1))
+    g.tmpNames.add freshIrName(g, "n_tmp")
   g.tmpNames[g.p.tmp - 1]
 
 proc declType(g: var WebGen; nm: SymId): Cursor =
