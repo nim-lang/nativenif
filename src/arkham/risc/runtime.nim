@@ -145,7 +145,7 @@ proc semiBlockSlot(g: var CodeGen; idx: int) =
   g.ab.intType(32)
   g.ab.close()
 
-proc emitSemihostExitProc*(g: var CodeGen; asmName: string) =
+proc emitSemihostExitProc*(g: var CodeGen; asmName: SymId) =
   ## `exit(status)` via semihosting SYS_EXIT_EXTENDED, emitted under `asmName`.
   ##
   ## Emitted under two names in a module that imports `exit`: once as the shim
@@ -156,7 +156,7 @@ proc emitSemihostExitProc*(g: var CodeGen; asmName: string) =
     g.ab.symDef asmName
     g.ab.tree NifasmDecl.ParamsD:
       g.ab.tree NifasmDecl.ParamD:
-        g.ab.symDef paramName(0)
+        g.ab.symDef g.paramName(0)
         g.ab.rawReg g.argReg(0)
         g.ab.intType(32)
     g.ab.tree NifasmDecl.ClobberD:
@@ -166,9 +166,9 @@ proc emitSemihostExitProc*(g: var CodeGen; asmName: string) =
       g.semiBlockSlot(1)                          # status
       g.ab.tree SubA64: (g.ab.rawReg SP; g.ab.keyword SsizeX)
       g.ab.tree MovA64: (g.ab.rawReg g.argReg(2); g.ab.intLit AdpStoppedApplicationExit)
-      g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.rawReg g.argReg(2))
-      g.ab.tree MovA64: (g.ab.sym synth("shblk1.0"); g.ab.rawReg g.argReg(0))
-      g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym synth("shblk0.0"))
+      g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk0.0")); g.ab.rawReg g.argReg(2))
+      g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk1.0")); g.ab.rawReg g.argReg(0))
+      g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym g.lengSym(synth("shblk0.0")))
       g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit SemiExitExtended)
       g.emSemihostCall()
       g.ab.keyword RetA64               # unreachable: SYS_EXIT does not return
@@ -190,7 +190,7 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
   ## construction and must not trip `emReg`'s unbound-scratch assertion (which
   ## exists to catch a temp that escaped the binder).
   # `asmName` is `` <cname>`sys.0.<module> `` (see programs.syprocAsmName).
-  let base = cNameOfAsmName(sp.asmName)
+  let base = g.prog.cNameOfAsmName(sp.asmName)
   case base
   of "exit":
     g.emitSemihostExitProc(sp.asmName)
@@ -212,7 +212,7 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
       g.ab.tree NifasmDecl.ParamsD:
         for i, pl in plan.args:
           g.ab.tree NifasmDecl.ParamD:
-            g.ab.symDef paramName(i)
+            g.ab.symDef g.paramName(i)
             if pl.words > 1:
               g.ab.tree RegsD:
                 for k in 0 ..< pl.words: g.ab.rawReg g.md.gprAt(pl, k)
@@ -226,7 +226,7 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
         # A 64-bit result travels in r0:r1 with an EMPTY result slot, as
         # everywhere else on this target — see `emitSignature`.
         if not wideRes:
-          g.ab.symDef synth("ret.0")
+          g.ab.symDef g.lengSym(synth("ret.0"))
           g.ab.rawReg g.argReg(0)
           g.ab.intType(32)
       g.ab.tree NifasmDecl.ClobberD:
@@ -245,8 +245,8 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
         # against a hardware debug probe. Semihosting has ONE console, so the `fd`
         # argument is ignored — stdout and stderr are the same stream here.
         let lHave = g.freshLabel()
-        g.ab.tree MovA64: (g.ab.sym synth("shblk3.0"); g.ab.rawReg g.argReg(1))   # save buf
-        g.ab.tree MovA64: (g.ab.sym synth("shblk4.0"); g.ab.rawReg g.argReg(2))   # save len
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk3.0")); g.ab.rawReg g.argReg(1))   # save buf
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk4.0")); g.ab.rawReg g.argReg(2))   # save len
         g.ab.tree AdrA64: (g.ab.rawReg g.argReg(0); g.ab.sym g.semiTtyHandle)
         g.ab.tree MovA64:
           g.ab.rawReg g.argReg(3)
@@ -254,12 +254,12 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
         g.ab.tree CmpA64: (g.ab.rawReg g.argReg(3); g.ab.intLit 0)
         g.emBr(BneA64, lHave)
         g.ab.tree AdrA64: (g.ab.rawReg g.argReg(3); g.ab.sym g.semiTtyName)
-        g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.rawReg g.argReg(3))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk0.0")); g.ab.rawReg g.argReg(3))
         g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.intLit SemiOpenModeW)
-        g.ab.tree MovA64: (g.ab.sym synth("shblk1.0"); g.ab.rawReg g.argReg(3))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk1.0")); g.ab.rawReg g.argReg(3))
         g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.intLit 3)                # len(":tt")
-        g.ab.tree MovA64: (g.ab.sym synth("shblk2.0"); g.ab.rawReg g.argReg(3))
-        g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym synth("shblk0.0"))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk2.0")); g.ab.rawReg g.argReg(3))
+        g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym g.lengSym(synth("shblk0.0")))
         g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit SemiOpen)
         g.emSemihostCall()
         g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.rawReg g.argReg(0))                  # the handle
@@ -268,17 +268,17 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
           g.ab.tree MemX: g.ab.rawReg g.argReg(0)
           g.ab.rawReg g.argReg(3)
         g.emLab(lHave)
-        g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.rawReg g.argReg(3))   # handle
-        g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.sym synth("shblk3.0"))
-        g.ab.tree MovA64: (g.ab.sym synth("shblk1.0"); g.ab.rawReg g.argReg(3))   # buf
-        g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.sym synth("shblk4.0"))
-        g.ab.tree MovA64: (g.ab.sym synth("shblk2.0"); g.ab.rawReg g.argReg(3))   # len
-        g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym synth("shblk0.0"))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk0.0")); g.ab.rawReg g.argReg(3))   # handle
+        g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.sym g.lengSym(synth("shblk3.0")))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk1.0")); g.ab.rawReg g.argReg(3))   # buf
+        g.ab.tree MovA64: (g.ab.rawReg g.argReg(3); g.ab.sym g.lengSym(synth("shblk4.0")))
+        g.ab.tree MovA64: (g.ab.sym g.lengSym(synth("shblk2.0")); g.ab.rawReg g.argReg(3))   # len
+        g.ab.tree LeaA64: (g.ab.rawReg g.argReg(1); g.ab.sym g.lengSym(synth("shblk0.0")))
         g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit SemiWrite)
         g.emSemihostCall()
         # Semihosting returns the count NOT written; POSIX `write` returns the
         # count written. Converting here keeps every caller ordinary.
-        g.ab.tree MovA64: (g.ab.rawReg g.argReg(2); g.ab.sym synth("shblk4.0"))
+        g.ab.tree MovA64: (g.ab.rawReg g.argReg(2); g.ab.sym g.lengSym(synth("shblk4.0")))
         g.ab.tree Sub3A64: (g.ab.rawReg g.argReg(0); g.ab.rawReg g.argReg(2); g.ab.rawReg g.argReg(0))
         if wideRes:
           # The caller reads r0:r1 raw. The count written is never negative, so

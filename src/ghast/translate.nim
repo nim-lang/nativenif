@@ -66,7 +66,7 @@ type
     ## into, so a `SymId` minted here is valid in every buffer.
     entryPoints, execModes, decorations, types, funcs: TokenBuf
     typeIds, constIds: Table[string, SymId]   ## dedup key -> id
-    syms: Table[string, SymInfo]
+    syms: Table[SymId, SymInfo]     ## Leng symbol -> where its value lives
     caps: HashSet[SpirvOp]
     pool: Pool
 
@@ -222,8 +222,8 @@ proc genBinop(m: var Module; pg: var ProcGen; n: Cursor; op: SpirvOp; dest: var 
 proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: SymId; dest: var Location) =
   ## Translate an expression, binding `dest` to the id of its SSA result value.
   if n.kind == Symbol:
-    let name = symName(n)
-    if name notin pg.syms: err("unknown symbol: " & name)
+    let name = n.symId
+    if name notin pg.syms: err("unknown symbol: " & symName(n))
     let s = pg.syms[name]
     case s.cls
     of scParamValue:
@@ -235,7 +235,7 @@ proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: SymId; dest: v
         pg.funcs.idRef s.id
       dest.s = id
     of scBuffer:
-      err("buffer '" & name & "' used as a scalar value")
+      err("buffer '" & symString(pg.pool, name) & "' used as a scalar value")
   elif n.kind == IntLit:
     if expected == SymId(0): err("integer literal without a type context")
     dest.s = constInt(pg, expected, intVal(n))
@@ -265,10 +265,10 @@ proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: SymId; dest: v
     of PatC, AtC:
       # `buf[idx]` read -> OpAccessChain + OpLoad.
       var c = n
-      var bufName = ""
+      var bufName = SymId(0)
       var idx: Location
       c.into:
-        bufName = symName(c); skip c
+        bufName = c.symId; skip c
         genExpr(m, pg, c, SymId(0), idx); skip c
         while c.hasMore: skip c                  # bound / extra (array `at`) operands
       if bufName notin pg.syms or pg.syms[bufName].cls != scBuffer:
@@ -298,7 +298,7 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
     var c = n
     let v = takeVarDecl(c)
     if v.value.kind != DotToken:
-      let name = symName(v.name)
+      let name = v.name.symId
       if name notin pg.syms: err("local not pre-declared (nested var?)")
       let s = pg.syms[name]
       var val: Location
@@ -312,10 +312,10 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
       if c.kind == TagLit and (c.exprKind == PatC or c.exprKind == AtC):
         # `buf[idx] = rhs` -> OpAccessChain + OpStore.
         var lhs = c
-        var bufName = ""
+        var bufName = SymId(0)
         var idx: Location
         lhs.into:
-          bufName = symName(lhs); skip lhs
+          bufName = lhs.symId; skip lhs
           genExpr(m, pg, lhs, SymId(0), idx); skip lhs
           while lhs.hasMore: skip lhs
         skip c
@@ -330,7 +330,7 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
           pg.funcs.idRef address
           pg.funcs.idRef val.s
       elif c.kind == Symbol:
-        let name = symName(c)
+        let name = c.symId
         if name notin pg.syms: err("assignment to unknown symbol")
         let s = pg.syms[name]
         if s.cls != scLocalPtr: err("assignment to a non-variable")
@@ -371,8 +371,8 @@ proc declareLocals(m: var Module; pg: var ProcGen; body: Cursor) =
       let v = takeVarDecl(vc)
       let typeId = valueType(pg, v.typ)
       let ptrId = ptrType(pg, Function, typeId)
-      let name = symName(v.name)
-      let idSym = mint(pg, name)
+      let name = v.name.symId
+      let idSym = mint(pg, symString(pg.pool, name))
       pg.syms[name] = SymInfo(id: idSym, cls: scLocalPtr, typeId: typeId)
       pg.funcs.def idSym, OpVariable:
         pg.funcs.idRef ptrId
@@ -387,7 +387,7 @@ proc newProcGen(pool: Pool; tags: TagPool): ProcGen =
           funcs: createTokenBuf(32, pool, tags),
           typeIds: initTable[string, SymId](),
           constIds: initTable[string, SymId](),
-          syms: initTable[string, SymInfo](),
+          syms: initTable[SymId, SymInfo](),
           caps: initHashSet[SpirvOp](),
           pool: pool)
 
@@ -427,8 +427,8 @@ proc translateProc(m: var Module; procCursor: Cursor) =
     loopInto pc:
       let pd = takeParamDecl(pc)
       let typeId = valueType(pg, pd.typ)
-      let name = symName(pd.name)
-      let idSym = mint(pg, name)
+      let name = pd.name.symId
+      let idSym = mint(pg, symString(pg.pool, name))
       pg.syms[name] = SymInfo(id: idSym, cls: scParamValue, typeId: typeId)
       paramTypes.add typeId
       paramOrder.add (idSym, typeId)
@@ -502,14 +502,14 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
     pg.decorations.enumOp GlobalInvocationId
 
   # Classify params: the first scalar is the grid index, each pointer a buffer.
-  var indexParam = ""
+  var indexParam = SymId(0)
   var indexType = SymId(0)
   var binding = 0
   if p.params.typeKind == ParamsT:
     var pc = p.params
     loopInto pc:
       let pd = takeParamDecl(pc)
-      let pname = symName(pd.name)
+      let pname = pd.name.symId
       if pd.typ.typeKind == PtrT:
         let elem = valueType(pg, elementType(pd.typ))
         let rta = freshId(m, "rta")
@@ -531,7 +531,7 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
           pg.decorations.idRef st
           pg.decorations.enumOp Block
         let sbPtr = ptrType(pg, StorageBuffer, st)
-        let varId = mint(pg, base(pname) & idSuffix)
+        let varId = mint(pg, base(symString(pg.pool, pname)) & idSuffix)
         pg.types.def varId, OpVariable:
           pg.types.idRef sbPtr
           pg.types.enumOp StorageBuffer
@@ -547,11 +547,11 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
         let elemPtr = ptrType(pg, StorageBuffer, elem)
         pg.syms[pname] = SymInfo(id: varId, cls: scBuffer, typeId: elem, ptrId: elemPtr)
       else:
-        if indexParam.len > 0: err("kernel: more than one scalar parameter")
+        if indexParam != SymId(0): err("kernel: more than one scalar parameter")
         indexParam = pname
         indexType = intType(pg, 32, true)   # index used as a 32-bit int
 
-  if indexParam.len == 0: err("kernel: no grid-index parameter")
+  if indexParam == SymId(0): err("kernel: no grid-index parameter")
 
   pg.entryPoints.instr OpEntryPoint:
     pg.entryPoints.enumOp GLCompute

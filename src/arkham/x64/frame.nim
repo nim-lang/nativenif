@@ -32,7 +32,7 @@ const X64SyscallArgRegs* = [RDI, RSI, RDX, R10, R8, R9]
   ## never has to emit a raw r10 (which its scratch-pool guard forbids).
 
 
-proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc emRegLocalVar*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## Declare `(var :name (reg) type)` and bind `r` to `name` for the rest of its
   ## scope, so subsequent uses emit the typed name instead of `(reg)`.
   ##
@@ -64,7 +64,7 @@ proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.rb.bindLocal(r, name, isPtr)
   g.nameBindTyp[name] = NameBindTyp(isPtr: isPtr, typ: typeCur)
 
-proc emRegAggrPtrVar*(g: var CodeGen; name: string; r: Reg; typeSym: SymId) =
+proc emRegAggrPtrVar*(g: var CodeGen; name: SymId; r: Reg; typeSym: SymId) =
   ## Declare `(var :name (reg) (ptr T))` for a register holding a POINTER to the
   ## aggregate `T`, and bind `r` to `name`. The by-reference aggregate parameter had
   ## no declaration at all: its pointer was `mov`'d into the home register and every
@@ -81,7 +81,7 @@ proc emRegAggrPtrVar*(g: var CodeGen; name: string; r: Reg; typeSym: SymId) =
   g.rb.bindLocal(r, name, isPtr = true)
   g.nameBindTyp[name] = NameBindTyp(aggrSym: typeSym, isPtr: true)
 
-proc emFRegLocalVar*(g: var CodeGen; name: string; f: FReg; bits: int) =
+proc emFRegLocalVar*(g: var CodeGen; name: SymId; f: FReg; bits: int) =
   ## Declare a float register local `(var :name (xmmN) (f B))` and bind xmm `f` to
   ## `name` for the rest of its scope, so subsequent uses emit the typed name instead
   ## of `(xmmN)`. The SIMD twin of `emRegLocalVar`, and now spelled the same way: this
@@ -108,7 +108,7 @@ proc exitScope*(g: var CodeGen) =
   for name in dead.fprs:
     g.ab.tree KillX64: g.ab.sym name
 
-proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
+proc emStackVar*(g: var CodeGen; name: SymId; typeSym: SymId) =
   ## `(var :name (s) typeSym)` — a nifasm-managed aggregate stack slot.
   g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.stackSlots.incl name
@@ -118,7 +118,7 @@ proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.emTypeSym(typeSym)
   g.ab.close()
 
-proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
+proc emByRefPtrStackVar*(g: var CodeGen; name: SymId; typeSym: SymId) =
   ## `(var :name (s) (ptr T))` — the 8-byte slot holding a spilled by-ref
   ## aggregate's incoming pointer. Not `(s) T`: the aggregate itself lives
   ## wherever the caller pointed, and field access loads this pointer first.
@@ -152,14 +152,14 @@ proc emitSyproc*(g: var CodeGen; sp: SyscallProc) =
                 if idx >= X64SyscallArgRegs.len:
                   raiseAssert "arkham x64: syscall with more than 6 arguments"
                 g.ab.tree ParamD:
-                  g.ab.symDef paramName(idx)
+                  g.ab.symDef g.paramName(idx)
                   g.ab.rawReg X64SyscallArgRegs[idx]
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
-          g.ab.symDef synth("ret.0")
+          g.ab.symDef g.lengSym(synth("ret.0"))
           g.ab.rawReg RAX
           g.genTypeBody(c)
       g.ab.tree ClobberD:                        # x86-64 `syscall` destroys rcx, r11
@@ -168,7 +168,7 @@ proc emitSyproc*(g: var CodeGen; sp: SyscallProc) =
       g.ab.intLit sp.sysNr.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
-proc emitWinExtprocDecl*(g: var CodeGen; asmName, extName, dll: string; decl: Cursor;
+proc emitWinExtprocDecl*(g: var CodeGen; asmName: SymId; extName, dll: string; decl: Cursor;
                          tail: openArray[AsmSlot] = []) =
   ## Emit a Windows extern's declaration:
   ## `(extproc :<name>.c.<mod> "<name>" "<dll>" (params (param :pN.0 <reg|s> T)…)
@@ -212,7 +212,7 @@ proc emitWinExtproc*(g: var CodeGen; ex: Extern) =
   g.emitWinExtprocDecl(ex.asmName, ex.extName, ex.dll, ex.decl)
 
 
-proc genType*(g: var CodeGen; name: string; decl: Cursor) =
+proc genType*(g: var CodeGen; name: SymId; decl: Cursor) =
   ## `(type :name <body>)` — nifasm's stack-slot allocator consults it for field
   ## offsets.
   var c = decl
@@ -285,11 +285,11 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
     while c.hasMore:
       let pl = plan.args[pIdx]
       inc pIdx
-      var nm = ""
+      var nm = NoSymId
       var tn = NoTypeSym                      # set → an aggregate param type
       var typeCur = c
       c.into:                                 # (param :name pragmas type)
-        nm = symName(c); inc c
+        nm = c.symId; inc c
         skip c                                # pragmas
         g.symType[nm] = c                     # record the param's type for getType
         typeCur = c
@@ -305,8 +305,8 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         g.emByRefPtrStackVar(nm, tn)
         g.ab.tree MovX64:
           g.emStackMem(nm)
-          g.ab.sym paramName(pl.ord)
-        g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
+          g.ab.sym g.paramName(pl.ord)
+        g.ab.tree KillX64: g.ab.sym g.paramName(pl.ord)
       elif tn != NoTypeSym and loc.kind == NamedStack and not pl.onStack:
         # A register-passed ≤16B by-value aggregate in a `(s)` home: the slot IS the
         # struct, filled from its GPR word(s).
@@ -375,12 +375,12 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
       elif not pl.onStack:                      # register-passed scalar parameter
         let argReg = g.entryMd.gprAt(pl)
         if loc.kind == InReg and loc.r == argReg:
-          g.rb.bindParam(argReg, paramName(pl.ord)) # the signature binds it as `pN.0`
+          g.rb.bindParam(argReg, g.paramName(pl.ord)) # the signature binds it as `pN.0`
           # Record the type so `restoreBindings` can re-establish this name after a
           # DIVERGING call. Without it the param is nameless from the first panic
           # onward and every later read of it emits a raw `(reg)` — `inc.0.nifisob2`
           # reading its `(ptr Cursor)` out of a bare rdi is the canonical case.
-          g.nameBindTyp[paramName(pl.ord)] =
+          g.nameBindTyp[g.paramName(pl.ord)] =
             NameBindTyp(isPtr: isPtrType(resolveType(g.prog, typeCur)), typ: typeCur)
           # An ArgResident param (kept in its arg reg though the proc has calls) is dead
           # after the first call clobbers the reg; record it so `flushArgResidentParams`
@@ -392,8 +392,8 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           # binds argReg to `pN.0`, so the relocation move must *read* it by name (a
           # raw `(reg)` use of a bound register is rejected); the binding is then
           # killed so the now-dead arg register is free.
-          g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(pl.ord))
-          g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
+          g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym g.paramName(pl.ord))
+          g.ab.tree KillX64: g.ab.sym g.paramName(pl.ord)
           # Then DECLARE the home under the param's own name — after the move, never
           # before it (a binding created ahead of its value is the stillborn shape).
           #
@@ -414,10 +414,10 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           g.emTypedStackVar(nm, typeCur)        # (var :nm (s) <param type>)
           g.ab.tree MovX64:
             g.emStackMem(nm)
-            g.ab.sym paramName(pl.ord)
-          g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
+            g.ab.sym g.paramName(pl.ord)
+          g.ab.tree KillX64: g.ab.sym g.paramName(pl.ord)
         else:
-          raiseAssert "arkham x64 v0: spilled / float parameter: " & nm
+          raiseAssert "arkham x64 v0: spilled / float parameter: " & g.spelling(nm)
       # else: stack-passed (7th+) — loaded by emitStackParamLoadsX64.
 
 proc pickStackArgBaseX64*(g: var CodeGen; hasStackParams: bool) =
@@ -533,7 +533,7 @@ proc framePop*(g: var CodeGen) =
     # argument as the kills below — and a raw operand of a bound register is refused.
     for f in Win64EntrySavedXmm:
       let dead = g.rb.takeFBinding(f)
-      if dead.len > 0:
+      if dead != NoSymId:
         g.ab.tree KillX64: g.ab.sym dead
       g.ab.tree MovdquX64:
         g.ab.xmmReg f
@@ -548,7 +548,7 @@ proc framePop*(g: var CodeGen) =
   # can read the name afterwards.
   for i in countdown(g.frameRegs.high, 0):
     let dead = g.rb.takeBinding(g.frameRegs[i])
-    if dead.len > 0:
+    if dead != NoSymId:
       g.ab.tree KillX64: g.ab.sym dead
   for i in countdown(g.frameRegs.high, 0):
     g.ab.tree PopX64: g.ab.rawReg g.frameRegs[i]             # raw pop, reverse order
@@ -567,7 +567,7 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
   # Collect each param's name, aggregate-type-name (if any) and ABI slot, then run
   # THE shared classifier so "which params are stack-passed and at what byte offset"
   # matches the signature, the caller and the allocator exactly.
-  var nms: seq[string] = @[]
+  var nms: seq[SymId] = @[]
   var tns: seq[SymId] = @[]
   var tcurs: seq[Cursor] = @[]
   var slots: seq[AsmSlot] = @[]
@@ -575,11 +575,11 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
     var pc = c
     pc.into:
       while pc.hasMore:
-        var nm = ""
+        var nm = NoSymId
         var tn = NoTypeSym
         var tcur = pc
         pc.into:                              # (param :name pragmas type)
-          nm = symName(pc); inc pc
+          nm = pc.symId; inc pc
           skip pc                             # pragmas
           tcur = pc
           if pc.kind == Symbol and slotOf(g.prog, pc).kind == AMem: tn = pc.symId
@@ -613,7 +613,7 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
         g.emFloatScalarStore(nm, s, bits)
         g.rb.unsealF s
       else:
-        raiseAssert "arkham x64: stack-passed float parameter home " & $loc.kind & ": " & nm
+        raiseAssert "arkham x64: stack-passed float parameter home " & $loc.kind & ": " & g.spelling(nm)
     elif pl.isAgg and not pl.byRef:
       # A by-value aggregate passed entirely on the stack: declare its `(s)` home and
       # copy its eightbytes in from the incoming area `[stackArgBaseReg + byteOff + k*8]`
@@ -687,9 +687,9 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
         g.ab.tree MovX64: (g.emStackMem(loc.ptrName); g.emReg s)
         g.giveBack s
       else:
-        raiseAssert "arkham x64 v0: stack parameter home " & $loc.kind & ": " & nm
+        raiseAssert "arkham x64 v0: stack parameter home " & $loc.kind & ": " & g.spelling(nm)
 
-proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
+proc genTvar*(g: var CodeGen; name: SymId; decl: Cursor) =
   ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset and
   ## honours the optional literal by initializing the block's image.
   var c = decl
@@ -701,7 +701,7 @@ proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
     if c.kind == IntLit:
       g.ab.intLit intVal(c)
     elif c.kind != DotToken:
-      raiseAssert "arkham x64: thread-local initializer must be an integer literal: " & name
+      raiseAssert "arkham x64: thread-local initializer must be an integer literal: " & g.spelling(name)
     g.ab.close()
     while c.hasMore: skip c
 
@@ -731,7 +731,7 @@ proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham x64n: float accumulator source " & $loc.kind
 
-proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
+proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: SymId) =
   ## `dest ← &name` for an aggregate SOURCE that may be a local stack slot, a by-ref
   ## aggregate param (its pointer is already in a register), OR a module-level
   ## global / `const` / threadvar. `locationOfSym` yields NamedStack/InReg for a local
@@ -747,7 +747,7 @@ proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
   of InReg: g.movReg(dest, home.r)
   else: g.emSymAddrByName(dest, name)
 
-proc copyStructThroughPtr*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
+proc copyStructThroughPtr*(g: var CodeGen; srcVar: SymId; typeSym: SymId; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
   ## pointer return). This runs at the `ret` and crosses NO call, so its scratch comes
   ## from the transient staging pool, never a callee-saved survivor (a survivor would

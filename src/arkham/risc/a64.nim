@@ -47,7 +47,7 @@ proc emitAtomicRmw(g: var CodeGen; dst, p, v: Reg; opStr: string;
   # Structured `(loop …)`: nifasm emits the back-edge internally. The exclusive
   # store SUCCEEDS when `st == 0` → the forward `(beq lDone)` leaves the loop.
   g.ab.splice ("(loop (stmts (ldaxr " & old & " " & pS & w & ") ") & update & " " &
-              ("(stlxr " & st & " " & neu & " " & pS & w & ") (cmp " & st & " 0) (beq " & lDone & "))) (lab :" & lDone & ")")
+              ("(stlxr " & st & " " & neu & " " & pS & w & ") (cmp " & st & " 0) (beq " & g.spelling(lDone) & "))) (lab :" & g.spelling(lDone) & ")")
   g.movReg(dst, g.md.atomicScratch[if returnNew: 1 else: 0])
 
 proc emitAtomic*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
@@ -109,10 +109,10 @@ proc emitAtomic*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     # whole protocol: the caller retries against the value it now holds.
     g.ab.splice(
       ("(ldar " & exp & " " & ep & w & ") (loop (stmts (ldaxr " & old & " " & pp & w & ") ") &
-      ("(cmp " & old & " " & exp & ") (bne " & lFail & ") (stlxr " & st & " " & d & " " & pp & w & ") ") &
-      ("(cmp " & st & " 0) (beq " & lSucc & "))) ") &
-      ("(lab :" & lSucc & ") (mov " & ret & " 1) (b " & lDone & ") ") &
-      ("(lab :" & lFail & ") (clrex) (stlr " & old & " " & ep & w & ") (mov " & ret & " 0) (lab :" & lDone & ")"))
+      ("(cmp " & old & " " & exp & ") (bne " & g.spelling(lFail) & ") (stlxr " & st & " " & d & " " & pp & w & ") ") &
+      ("(cmp " & st & " 0) (beq " & g.spelling(lSucc) & "))) ") &
+      ("(lab :" & g.spelling(lSucc) & ") (mov " & ret & " 1) (b " & g.spelling(lDone) & ") ") &
+      ("(lab :" & g.spelling(lFail) & ") (clrex) (stlr " & old & " " & ep & w & ") (mov " & ret & " 0) (lab :" & g.spelling(lDone) & ")"))
   else:
     # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
     # empty, so this is the message that column promises.
@@ -142,14 +142,14 @@ proc emitSyproc*(g: var CodeGen; sp: SyscallProc) =
                 if idx >= g.md.intArgRegs.len:
                   raiseAssert "arkham a64: syscall with too many arguments"
                 g.ab.tree ParamD:
-                  g.ab.symDef paramName(idx)
+                  g.ab.symDef g.paramName(idx)
                   g.ab.rawReg g.md.intArgRegs[idx]
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
-          g.ab.symDef synth("ret.0")
+          g.ab.symDef g.lengSym(synth("ret.0"))
           g.ab.rawReg g.md.intRetReg
           g.genTypeBody(c)
       if sp.sysNrA64 < 0:
@@ -158,7 +158,7 @@ proc emitSyproc*(g: var CodeGen; sp: SyscallProc) =
         # x8 = -1, i.e. a silent ENOSYS that surfaces as `fileExists` always false
         # rather than as a build error. std/posix routes each of these through the
         # `*at`/`*2` form under `linuxA64Raw`; reaching here means one was missed.
-        raiseAssert "arkham a64: no AArch64 syscall for " & sp.asmName
+        raiseAssert "arkham a64: no AArch64 syscall for " & g.spelling(sp.asmName)
       g.ab.intLit sp.sysNrA64.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
@@ -182,8 +182,8 @@ proc rejectReservedPin*(g: var CodeGen; at: Cursor; name: string; r: Reg) =
     lengError at, "`x18` is the platform register and belongs to the OS, not " &
               "to this program", g.asmInfo
 
-proc variadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
-                     fixed: int): string =
+proc variadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
+                     fixed: int): SymId =
   ## The symbol a Darwin call to the `{.varargs.}` extern `asmName` goes through:
   ## the extern's own name with the variadic tail's SHAPE folded in, registered in
   ## `g.variadicExterns` so the driver declares it. Two calls with the same shape
@@ -202,10 +202,10 @@ proc variadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
     var found = -1
     for i, e in g.prog.externOrder:
       if e.asmName == asmName: found = i
-    assert found >= 0, "arkham a64: a variadic call to an unknown extern " & asmName
+    assert found >= 0, "arkham a64: a variadic call to an unknown extern " & g.spelling(asmName)
     g.prog.externOrder[found]
-  result = derivedName(cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
-           thisModuleSuffix(g.prog)
+  result = g.lengSym(derivedName(g.prog.cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
+                     thisModuleSuffix(g.prog))
   for v in g.variadicExterns:
     if v.asmName == result: return
   g.variadicExterns.add VariadicExtern(asmName: result, extName: ex.extName, decl: ex.decl,

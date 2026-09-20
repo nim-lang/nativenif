@@ -187,7 +187,7 @@ proc typeCtx*(g: var CodeGen): TypeCtx {.inline.} =
   TypeCtx(prog: addr g.prog, callTarget: addr g.callTarget,
           globals: addr g.globals, tvars: addr g.tvars, symType: addr g.symType)
 
-proc lookupSym*(g: var CodeGen; nm: string): SymInfo {.inline.} =
+proc lookupSym*(g: var CodeGen; nm: SymId): SymInfo {.inline.} =
   g.typeCtx.lookupSym(nm)
 
 proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
@@ -245,7 +245,7 @@ proc valueSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   let s = g.exprSlot(c)
   if g.slotIsPointer(s): s else: ScalarSlot
 
-proc globalDeclType*(g: var CodeGen; name: string): Cursor =
+proc globalDeclType*(g: var CodeGen; name: SymId): Cursor =
   ## The DECLARED type of a module-level `gvar` / `tvar` / `const` — the third child
   ## of its `SymInfo.decl`, which every global has.
   ##
@@ -257,7 +257,7 @@ proc globalDeclType*(g: var CodeGen; name: string): Cursor =
   ## `exc = nil` (a `ptr Exception` threadvar) a type error.
   let si = g.lookupSym(name)
   assert si.cat in {scGlobal, scTvar},
-         "arkham: globalDeclType of a non-global symbol: " & name
+         "arkham: globalDeclType of a non-global symbol: " & g.spelling(name)
   var d = si.decl
   result = si.decl                              # overwritten below (always present)
   d.into:
@@ -265,7 +265,7 @@ proc globalDeclType*(g: var CodeGen; name: string): Cursor =
     result = d
     while d.hasMore: skip d
 
-proc globalIsGvarSlot*(g: var CodeGen; name: string): bool =
+proc globalIsGvarSlot*(g: var CodeGen; name: SymId): bool =
   ## True when `name` is a real `.bss`/`.data` gvar (nifasm `GvarD`, carrying a
   ## page-offset patch site) — the `gload`/`gstore` fold target — rather than a
   ## read-only `const` blob (`RodataD`), which is a label with no gvar site. Mirrors
@@ -324,7 +324,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   ## i.e. no widening extension is applied (the pre-source-aware behaviour).
   case c.kind
   of Symbol:
-    let nm = symName(c)
+    let nm = c.symId
     let loc = g.plan.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
@@ -464,14 +464,14 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
   let nCur = c                                 # capture the subtree before consuming
   case c.kind
   of Symbol:
-    let nm = symName(c); inc c
+    let nm = c.symId; inc c
     let si = g.lookupSym(nm)
     case si.cat
     of scTvar: result = tvarLoc(nm, slot)
     of scGlobal: result = globLoc(nm, slot)
     of scProc:
       # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
-      raiseAssert "arkham: proc used as an lvalue: " & nm
+      raiseAssert "arkham: proc used as an lvalue: " & g.spelling(nm)
     of scNone:
       let loc = g.plan.homeOfSym(nm)
       case loc.kind
@@ -480,7 +480,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       of InFReg: result = fregLoc(loc.f, slot)
       of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
       of StackPtr: result = stackPtrLoc(loc.ptrName, loc.pointeeType, slot)
-      else: raiseAssert "arkham: symbol is not an lvalue: " & nm
+      else: raiseAssert "arkham: symbol is not an lvalue: " & g.spelling(nm)
   of TagLit:
     case c.exprKind
     of DotC, AtC, DerefC, PatC: (result = memLoc(nCur, slot); skip c)

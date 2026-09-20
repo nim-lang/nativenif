@@ -171,7 +171,7 @@ const CsrMtvec* = 0x305'i64      ## trap vector base + mode
 
 const MtvecVectored* = 1'i64     ## mode 1: cause `c` traps to base + 4*c
 
-proc emitTrapTable(g: var CodeGen; handlers: seq[(int, string)]) =
+proc emitTrapTable(g: var CodeGen; handlers: seq[(int, SymId)]) =
   ## The `mtvec` trampoline table, emitted as ORDINARY CODE under a symbol.
   ##
   ## This is where RISC-V and Cortex-M stop resembling each other. An M-profile
@@ -253,7 +253,7 @@ proc emitInterruptTable*(g: var CodeGen) =
   ## has to be an INSTRUCTION. Which name denotes which cause stays a machine
   ## model question (`machine_rv32.interruptCause`), exactly as it is on
   ## Cortex-M, so the name is resolved here and never reaches nifasm.
-  var handlers: seq[(int, string)] = @[]
+  var handlers: seq[(int, SymId)] = @[]
   for info in g.prog.procs:
     if info.irqName.len == 0: continue
     let cause = machine_rv32.interruptCause(info.irqName)
@@ -267,7 +267,7 @@ proc emitInterruptTable*(g: var CodeGen) =
     for (c, other) in handlers:
       if c == cause:
         quit "arkham rv32: interrupt `" & info.irqName & "` is claimed by both " &
-             other & " and " & info.asmName &
+             g.spelling(other) & " and " & g.spelling(info.asmName) &
              " — a table word holds one jump."
     handlers.add (cause, info.asmName)
   if handlers.len > 0:

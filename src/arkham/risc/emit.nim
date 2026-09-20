@@ -63,7 +63,7 @@ type
     ## already resolved to an address the two halves can be read off.
     off*: int
     case kind*: WideRefKind
-    of wrSlot: name*: string
+    of wrSlot: name*: SymId
     of wrBase: base*: Reg
 
 template WideSlot*(): AsmSlot = AsmSlot(cls: AInt, size: 8, align: 8)
@@ -136,7 +136,7 @@ proc emReg*(g: var CodeGen; r: Reg) {.inline.} =
   ## `rebind`-bound scratch → its checked name (which nifasm type-checks and resolves
   ## back to the register); otherwise the raw `(xN)` tag.
   let nm = g.rb.boundName(r)
-  if nm.len > 0: g.ab.sym nm
+  if nm != NoSymId: g.ab.sym nm
   else:
     # The volatile scratch pool (x9–x15) is the only register class the allocator
     # hands out for arbitrary computed values, and every such hand-out is `bindTemp`'d
@@ -186,7 +186,7 @@ proc emOp*(g: CodeGen; r: Reg): string =
   ## argument register during a call's marshalling — emitted `(uxtb (x0) (x0))`
   ## into a Cortex-M module, where nifasm rightly does not know what `(x0)` is.
   let nm = g.rb.boundName(r)
-  if nm.len > 0: nm
+  if nm != NoSymId: g.spelling(nm)
   else: "(" & g.ab.renderReg(r) & ")"
 
 proc movImm*(g: var CodeGen; d: Reg; v: int64) =
@@ -310,7 +310,7 @@ proc binReg3*(g: var CodeGen; op: RiscInst; d, a, b: Reg; w32 = false) =
 proc binImm3*(g: var CodeGen; op: RiscInst; d, a: Reg; v: int64; w32 = false) =
   g.ab.tree threeOpTag(op, w32): g.emReg d; g.emReg a; g.ab.intLit v
 
-proc emAdr*(g: var CodeGen; d: Reg; sym: string) =
+proc emAdr*(g: var CodeGen; d: Reg; sym: SymId) =
   g.ab.tree AdrA64: g.emReg d; g.ab.sym sym
 
 proc emByteAt*(g: var CodeGen; base, idx: Reg) =
@@ -354,7 +354,7 @@ proc emLoadQwordAt*(g: var CodeGen; dest, base, idx: Reg) =
 proc emStoreQwordAt*(g: var CodeGen; base, idx, src: Reg) =
   g.ab.tree MovA64: (g.emQwordAt(base, idx); g.emReg src)
 
-proc genTlvAddr*(g: var CodeGen; name: string; dest: Reg) =
+proc genTlvAddr*(g: var CodeGen; name: SymId; dest: Reg) =
   ## `dest ← &threadlocal(name)`, which is the SAME `(adr dest sym)` a global's
   ## address is. What differs is what nifasm makes of it, and that follows from
   ## the DECLARATION `genTvar` emitted, not from the reference: a `(tvar …)` on
@@ -402,7 +402,7 @@ proc bindFTmp*(g: var CodeGen; f: FReg; bits: int) =
   ## passes (names replay identically) and the `(rebind …)` tree auto-no-ops in the plan
   ## pass. The binding type `(f bits)` carries the precision so a *named* use recovers
   ## s/d (unlike x64, the arm64 operand encodes precision).
-  let name = g.rb.freshFTmpName()
+  let name = g.rb.freshFTmpName(g.prog.pool)
   g.ab.tree RebindA64:
     g.ab.symDef name
     g.ab.floatType(bits)
@@ -415,7 +415,7 @@ proc unbindFTmp*(g: var CodeGen; f: FReg) =
   ## core's reserve flag (see `unbindTemp`).
   g.pickedFRegs.excl f
   let dead = g.rb.takeFScratch(f)
-  if dead.len > 0:
+  if dead != NoSymId:
     g.ab.tree KillA64: g.ab.sym dead
 
 proc checkFloatWidth*(g: CodeGen; bits: int) =
@@ -438,7 +438,7 @@ proc emFReg*(g: var CodeGen; f: FReg; bits: int) {.inline.} =
   ## keep their structural raw uses.
   g.checkFloatWidth(bits)
   let nm = g.rb.boundFName(f)
-  if nm.len > 0: g.ab.sym nm
+  if nm != NoSymId: g.ab.sym nm
   else:
     assert f notin g.md.floatTempRegs,
       "arkham a64: unbound float scratch-pool register reached emFReg: " & regName(f)
@@ -507,7 +507,7 @@ proc emFStore*(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) = # fstr dD/sD,
     g.ab.tree MemX: g.emReg addrReg          # name when the pointer is a bound temp
     g.emFReg(d, bits)
 
-proc emFieldMem*(g: var CodeGen; base, field: string) =
+proc emFieldMem*(g: var CodeGen; base, field: SymId) =
   ## `(mem (dot base field))` — nifasm resolves the field offset from the
   ## aggregate's type. `base` is a `(s)` stack var.
   g.ab.tree MemX:
@@ -515,7 +515,7 @@ proc emFieldMem*(g: var CodeGen; base, field: string) =
       g.ab.sym base
       g.ab.sym field
 
-proc emAggrElemMem*(g: var CodeGen; base: string; idx: int) =
+proc emAggrElemMem*(g: var CodeGen; base: SymId; idx: int) =
   ## `(mem (at base idx))` — element `idx` of the array stack var `base`; nifasm folds
   ## the constant `idx*elemSize` into the load/store offset and sizes it from the
   ## array's element type (an immediate index needs no stride scratch).
@@ -524,7 +524,7 @@ proc emAggrElemMem*(g: var CodeGen; base: string; idx: int) =
       g.ab.sym base
       g.ab.intLit idx
 
-proc emPtrFieldMem*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; field: string) =
+proc emPtrFieldMem*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; field: SymId) =
   ## `(mem (dot (cast (ptr T) (xN)) field))` — field access through a register
   ## holding a pointer to the aggregate (for >16B by-ref / x8-indirect). The
   ## `cast` types the bare register so nifasm's `dot` can compute the offset.
@@ -535,7 +535,7 @@ proc emPtrFieldMem*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; field: string) 
         g.emReg ptrReg
       g.ab.sym field
 
-proc emAggrFieldMem*(g: var CodeGen; base, field: string) =
+proc emAggrFieldMem*(g: var CodeGen; base, field: SymId) =
   ## Field memory operand for the aggregate named `base`, dispatching on how it
   ## is held: a `(s)` stack struct → direct `(dot …)`; a pointer in a register
   ## (a by-reference param) → through the pointer.
@@ -543,17 +543,17 @@ proc emAggrFieldMem*(g: var CodeGen; base, field: string) =
   case loc.kind
   of NamedStack: g.emFieldMem(base, field)
   of StackPtr:
-    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
+    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & g.spelling(base)
   of InReg:      g.emPtrFieldMem(loc.r, g.varType.getOrQuit(base), field)
   of InRegPair:
-    raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & base
+    raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & g.spelling(base)
   else:
     # a synthetic nifasm `(s)` slot (e.g. an inline-constructor arg temp) is addressed
     # by name like a `NamedStack` var — the allocator just doesn't track it.
     if g.varType.hasKey(base): g.emFieldMem(base, field)
-    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
+    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & g.spelling(base)
 
-proc emAggrDot*(g: var CodeGen; base, field: string) =
+proc emAggrDot*(g: var CodeGen; base, field: SymId) =
   ## The `(dot …)` operand alone (no `mem` wrapper), location-aware — for `lea`
   ## (address-of a field). Stack struct → `(dot var field)`; pointer → cast.
   let loc = g.plan.homeOfSym(base)
@@ -563,7 +563,7 @@ proc emAggrDot*(g: var CodeGen; base, field: string) =
       g.ab.sym base
       g.ab.sym field
   of StackPtr:
-    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
+    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & g.spelling(base)
   of InReg:
     g.ab.tree DotX:
       g.ab.tree CastX:
@@ -571,7 +571,7 @@ proc emAggrDot*(g: var CodeGen; base, field: string) =
         g.emReg loc.r
       g.ab.sym field
   of InRegPair:
-    raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & base
+    raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & g.spelling(base)
   else:
     # a synthetic nifasm `(s)` slot (e.g. an inline-constructor arg temp) is addressed
     # by name like a `NamedStack` var — the allocator just doesn't track it. Mirrors
@@ -580,9 +580,9 @@ proc emAggrDot*(g: var CodeGen; base, field: string) =
       g.ab.tree DotX:
         g.ab.sym base
         g.ab.sym field
-    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
+    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & g.spelling(base)
 
-proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
+proc emStackVar*(g: var CodeGen; name: SymId; typeSym: SymId) =
   ## Declare a nifasm-managed stack slot `(var :name (s) typeSym)`.
   g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
@@ -591,7 +591,7 @@ proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.emTypeSym(typeSym)
   g.ab.close()
 
-proc emScalarStackVar*(g: var CodeGen; name: string) =
+proc emScalarStackVar*(g: var CodeGen; name: SymId) =
   ## Declare a spilled integer/pointer scalar's stack slot `(var :name (s) (i 64))`.
   ## Always 8-byte wide / 8-aligned (arkham keeps scalars 64-bit in registers and
   ## nifasm's `ldr`/`str` need an 8-aligned slot), regardless of the logical width.
@@ -602,7 +602,7 @@ proc emScalarStackVar*(g: var CodeGen; name: string) =
   g.ab.intType(wordBits())
   g.ab.close()
 
-proc emVoidPtrStackVar*(g: var CodeGen; name: string) =
+proc emVoidPtrStackVar*(g: var CodeGen; name: SymId) =
   ## `(var :name (s) (ptr void))` — the 8-byte cell for a spill temp whose VALUE is a
   ## bare `nil`.
   ##
@@ -626,7 +626,7 @@ proc emVoidPtrStackVar*(g: var CodeGen; name: string) =
   g.ab.ptrType: g.ab.voidType()
   g.ab.close()
 
-proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
+proc emFloatStackVar*(g: var CodeGen; name: SymId; bits: int) =
   ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
   ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
   g.checkFloatWidth(bits)
@@ -637,7 +637,7 @@ proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
   g.ab.floatType(bits)
   g.ab.close()
 
-proc emWideStackVar*(g: var CodeGen; name: string) =
+proc emWideStackVar*(g: var CodeGen; name: SymId) =
   ## `(var :name (s) (i 64))` — the eight-byte cell of a 64-bit expression temp.
   ## `emScalarStackVar` declares a slot at the target WORD, which here is four
   ## bytes: the high half would land on whatever slot the allocator put next.
@@ -647,7 +647,7 @@ proc emWideStackVar*(g: var CodeGen; name: string) =
   g.ab.keyword SO
   g.ab.intType(64)
   g.ab.close()
-proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
+proc emTypedStackVar*(g: var CodeGen; name: SymId; t: Cursor) =
   ## The ONE local-variable stack-slot emitter — `(var :name (s) <the value's real
   ## Leng type>)`, dispatching on the value class so callers need no per-form ladder.
   ## Identical in effect to x64's: the slot says what it holds. A scalar's slot still
@@ -677,17 +677,17 @@ proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
     g.ab.floatType(slot.size * 8)             # `(f N)` — typed fp slot
   else:
     var tc = t                                # everything else: its own type
-    if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
+    if tc.kind == Symbol: g.ab.sym tc.symId else: g.genTypeBody(tc)
   g.ab.close()
 
-proc declSpillSlot*(g: var CodeGen; name: string; typ: AsmSlot; isFloat: bool) =
+proc declSpillSlot*(g: var CodeGen; name: SymId; typ: AsmSlot; isFloat: bool) =
   ## Declare one totality spill slot — an `etmp`/`eftmp`/`held` the value core minted
   ## when the register pools ran dry, or a `csave` the planner minted for a
   ## caller-saved home. THE single place a spill slot is spelled, so the emitter can
   ## declare one where it mints it and the prologue can declare the planner's from the
   ## same rule. The x64 twin.
   when defined(arkhamSpillDbg):
-    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & name &
+    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & g.spelling(name) &
       " float=" & $isFloat
   if isFloat: g.emFloatStackVar(name, typ.size * 8)
   elif g.isWideSlot(typ): g.emWideStackVar(name)
@@ -696,12 +696,12 @@ proc declSpillSlot*(g: var CodeGen; name: string; typ: AsmSlot; isFloat: bool) =
     else: g.emTypedStackVar(name, typ.typ)         # `(ptr T)` slot keeps its type
   else: g.emScalarStackVar(name)
 
-proc emScalarLoad*(g: var CodeGen; dest: Reg; name: string) =
+proc emScalarLoad*(g: var CodeGen; dest: Reg; name: SymId) =
   ## `dest ← [slot]` — load a spilled scalar (nifasm resolves the `(s)` var to
   ## `[sp,#off]`).
   g.ab.tree MovA64: (g.emReg dest; g.ab.sym name)
 
-proc emScalarStore*(g: var CodeGen; name: string; src: Reg) =
+proc emScalarStore*(g: var CodeGen; name: SymId; src: Reg) =
   ## `[slot] ← src` — store to a spilled scalar's `(s)` var.
   ##
   ## THE invalidation point for a store: whatever mirrored this slot's old value
@@ -720,7 +720,7 @@ proc emBindType*(g: var CodeGen; typ: AsmSlot) =
     g.ab.intType(wordBits())
   else:
     var tc = typ.typ
-    if tc.kind == Symbol: g.ab.sym symName(tc)
+    if tc.kind == Symbol: g.ab.sym tc.symId
     else: g.genTypeBody(tc)
 
 when defined(arkhamBridgeDbg):
@@ -735,7 +735,7 @@ proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
   ## checker can't see. The binding is recorded as a transient temp; released by
   ## `unbindTemp`.
-  let name = g.rb.freshTmpName()
+  let name = g.rb.freshTmpName(g.prog.pool)
   g.ab.tree RebindA64:
     g.ab.symDef name
     g.emBindType(typ)
@@ -754,14 +754,14 @@ proc unbindTemp*(g: var CodeGen; r: Reg) =
   g.pickedRegs.excl r
   g.lastResortBridges.excl r
   let dead = g.rb.takeScratch(r)
-  if dead.len > 0:
+  if dead != NoSymId:
     g.ab.tree KillA64: g.ab.sym dead
 
-proc emFloatScalarLoad*(g: var CodeGen; dest: FReg; name: string; bits: int) =
+proc emFloatScalarLoad*(g: var CodeGen; dest: FReg; name: SymId; bits: int) =
   ## `dest ← [slot]` — load a spilled float (nifasm resolves the `(s)` var operand).
   g.ab.tree FldrA64: (g.emFReg(dest, bits); g.ab.sym name)
 
-proc emFloatScalarStore*(g: var CodeGen; name: string; src: FReg; bits: int) =
+proc emFloatScalarStore*(g: var CodeGen; name: SymId; src: FReg; bits: int) =
   ## `[slot] ← src` — store to a spilled float's `(s)` var.
   g.killMirrorsOf name                                  # see `emScalarStore`
   g.ab.tree FstrA64: (g.ab.sym name; g.emFReg(src, bits))
@@ -787,7 +787,7 @@ proc extendTo*(g: var CodeGen; dest: Reg; width: int; signed: bool) =
     let down = if signed: "asr" else: "lsr"
     g.ab.splice ("(lsl " & d & " " & $sh & ") (" & down & " " & d & " " & $sh & ")")
 
-proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: string) =
+proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: SymId) =
   ## `dest ← &global` — adrp+add (nifasm resolves the gvar to its `.bss`/`.data`
   ## address). AArch64 has no typed PC-relative memory operand, so a global is
   ## always accessed by first materializing its address. An importc/exportc gvar is
@@ -804,7 +804,7 @@ proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: string) =
   if m != NoReg and m != dest: g.movReg(dest, m)
   else: g.emAdr(dest, asmName)
 
-proc rebindLocalAs*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc rebindLocalAs*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## Re-establish register `r`'s binding to the named local `name`, retyped to
   ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
   ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
@@ -826,7 +826,7 @@ proc rebindTempAs*(g: var CodeGen; r: Reg; typeCur: Cursor) =
   ## `extendTo` has now truncated, and a later `(mov u32dst tmp)` needs the
   ## target width on the name.
   let name = g.rb.boundName(r)
-  if name.len == 0: return
+  if name == NoSymId: return
   let slot = slotOf(g.prog, typeCur)
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindA64:
@@ -897,7 +897,7 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                   skip c                        # pragmas
                   if pl.isFloat:
                     g.ab.tree ParamD:           # a v-register location, see `emitSignature`
-                      g.ab.symDef paramName(pl.ord)
+                      g.ab.symDef g.paramName(pl.ord)
                       if not pl.onStack:
                         g.ab.freg(g.md.floatArgRegs[pl.fpIndex],
                                   floatBitsFor(slotOf(g.prog, c).size))
@@ -909,7 +909,7 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                     # A scalar too wide for one register (`(i 64)` on Cortex-M) takes
                     # the same `(regs …)` form and for the same reason.
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(pl.ord)
+                      g.ab.symDef g.paramName(pl.ord)
                       g.ab.tree RegsD:
                         for k in 0 ..< pl.words: g.ab.rawReg g.md.gprAt(pl, k)
                       if pl.byRef:
@@ -918,7 +918,7 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
                         g.genPointee(c)
                   else:
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(pl.ord)
+                      g.ab.symDef g.paramName(pl.ord)
                       if not pl.onStack: g.ab.rawReg g.md.gprAt(pl)  # raw reg *location*
                       else: g.ab.keyword SO       # 9th+ → stack-passed
                       g.genPointee(c)            # param type BY REFERENCE (named → sym);
@@ -937,11 +937,11 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             # emitSignature): the caller reads the return registers directly.
             skip c
           elif slotOf(g.prog, c).kind == AFloat:
-            g.ab.symDef synth("ret.0")
+            g.ab.symDef g.lengSym(synth("ret.0"))
             g.ab.freg(g.md.floatRetReg, floatBitsFor(slotOf(g.prog, c).size))
             g.genPointee(c)
           else:
-            g.ab.symDef synth("ret.0")
+            g.ab.symDef g.lengSym(synth("ret.0"))
             g.ab.rawReg g.md.intRetReg                     # raw reg *location* of the result
             g.genPointee(c)                     # return type BY REFERENCE (named → sym)
         while c.hasMore: skip c                  # pragmas
@@ -955,7 +955,7 @@ proc genPointee*(g: var CodeGen; c: var Cursor) =
   ## `SmallChunk`/`AvlNode`) and lets nifasm resolve — and auto-import across
   ## modules — the type declaration by name. Mirrors the x64 backend.
   if c.kind == Symbol:
-    g.ab.sym symName(c); inc c
+    g.ab.sym c.symId; inc c
   else:
     g.genTypeBody(c)
 
@@ -1033,15 +1033,15 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
         # and lays the base out first); a `.` means no base. Preserving it lets
         # nifasm compute inherited-field offsets for the `(cast (ptr Derived)
         # x).baseField` idiom.
-        var baseName = ""
-        if c.kind == Symbol: baseName = symName(c)
+        var baseName = NoSymId
+        if c.kind == Symbol: baseName = c.symId
         skip c                              # inheritance slot (`.` or base sym)
         g.ab.objectType:
           # FIRST child, before the base: nifasm reads it off the front and the
           # base slot is optional, so a flag that had to come after would be
           # indistinguishable from a missing base.
           if packed: g.ab.keyword PackedT
-          if baseName.len > 0: g.ab.sym baseName
+          if baseName != NoSymId: g.ab.sym baseName
           while c.hasMore:
             if c.kind == TagLit and c.typeKind == UnionT:
               # An object VARIANT's union part: branches are `(of RANGES BODY)` /
@@ -1068,7 +1068,7 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
 proc genFldDef*(g: var CodeGen; c: var Cursor) =
   ## One `(fld :name pragmas type)` as an asm-NIF field declaration.
   c.into:
-    let fn = symName(c); inc c
+    let fn = c.symId; inc c
     skip c                                  # field pragmas (dropped)
     g.ab.fldDef(fn):
       g.genTypeBody(c)
@@ -1130,15 +1130,15 @@ proc emZeroBytesThroughPtr*(g: var CodeGen; p, z: Reg; n: int) =
   if rem >= 2: (zstore(2); off += 2; rem -= 2)
   if rem >= 1: (zstore(1); off += 1; rem -= 1)
 
-proc freshLabel*(g: var CodeGen): string =
+proc freshLabel*(g: var CodeGen): SymId =
   # Name must be a NIF *symbol* (needs a '.'), but `extractBasename` strips a
   # trailing `.<digits>`, so put the counter *before* the suffix ("L0.0", …)
   # to keep basenames ("L0", "L1") distinct. `SynthMark` keeps them out of the
   # Leng namespace, where a `block L0:` would produce the very same name.
-  result = synth("L") & $g.labelCount & ".0"
+  result = g.lengSym(synth("L") & $g.labelCount & ".0")
   inc g.labelCount
 
-proc emLab*(g: var CodeGen; name: string) =
+proc emLab*(g: var CodeGen; name: SymId) =
   ## THE control-flow invalidation point for the store-forwarding mirrors: what a
   ## register holds at a label does not follow from the instructions above it —
   ## some other path branched here. Hooking it at the label DEFINITION rather
@@ -1148,7 +1148,7 @@ proc emLab*(g: var CodeGen; name: string) =
   g.killAllMirrors()
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
 
-proc emBr*(g: var CodeGen; tag: RiscInst; name: string) =
+proc emBr*(g: var CodeGen; tag: RiscInst; name: SymId) =
   g.ab.tree tag: g.ab.sym name              # (b L) / (beq L) / …
 
 template emitLoop*(g: var CodeGen; body: untyped) =
@@ -1194,11 +1194,11 @@ type AggrEnd* = object
   ## copy, and three is one more bridge than any other step in this emitter wants.
   ## Ported from x86-64, where the same change is what stopped the emit-time staging
   ## pool running dry under `-d:danger`.
-  slot*: string        ## non-empty ⇒ a named stack slot
+  slot*: SymId         ## set ⇒ a named stack slot
   reg*: Reg            ## else, the register holding the aggregate's address
 
-proc slotEnd*(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
-proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: "", reg: r)
+proc slotEnd*(name: SymId): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
+proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: NoSymId, reg: r)
 
 proc bridgeRegs*(g: CodeGen): seq[Reg] {.inline.} =
   ## THE emitter's scratch: every register this back end may take transiently and
@@ -1484,7 +1484,7 @@ proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
     g.ab.tree MovA64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
 
-proc globalAddrSlot*(g: var CodeGen; name: string): AsmSlot =
+proc globalAddrSlot*(g: var CodeGen; name: SymId): AsmSlot =
   ## The slot for an address temp about to hold `&global` / `&threadvar`:
   ## `(ptr <its declared type>)`. The `(mem p)` deref built on that temp then carries
   ## the PRECISE pointee type instead of nifasm's generic `(i 64)` reading — without
@@ -1500,21 +1500,21 @@ proc restoreMemBase*(g: var CodeGen; pos: int) =
     g.plan.planAtEmitTime(pos, g.savedHomes.getOrQuit(pos))
     g.savedHomes.del pos
 
-proc inlineAggrHome*(g: var CodeGen; c: Cursor): string =
+proc inlineAggrHome*(g: var CodeGen; c: Cursor): SymId =
   ## The stack slot standing in for an aggregate CONSTRUCTOR used as an lvalue base —
   ## `[a, b][i]`, which hexer hands over as `(at (aconstr …) i)`. A constructor is a
   ## value, not a location, so there is nothing to address until one exists; this
   ## names the slot that `prematLval` builds it into and `emLvalAddr` then reads.
   ## Keyed on the node's position, so both passes name the same slot without a side
   ## table.
-  synth("lvaltmp") & $g.posOf(c) & ".0"
+  g.lengSym(synth("lvaltmp") & $g.posOf(c) & ".0")
 
 proc emLvalAddr*(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (operand of a `(mem …)`/`(lea
   ## …)`), reading any embedded value register from its pre-allocated `locs`.
   case c.kind
   of Symbol:
-    let nm = symName(c)
+    let nm = c.symId
     let loc = g.plan.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind == NoLoc:                                 # module-level global base
       let planned = g.plan.planned(g.posOf(c))
@@ -1527,7 +1527,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
       inc d; skip d; skip d                               # (gvar …): name, pragmas → type
       g.ab.tree CastX:
         g.ab.ptrType:
-          if d.kind == Symbol: g.ab.sym symName(d)
+          if d.kind == Symbol: g.ab.sym d.symId
           else: g.genTypeBody(d)
         g.emReg baseReg
     elif loc.kind == InReg and g.varType.hasKey(nm):      # by-ref aggregate param (pointer)
@@ -1539,7 +1539,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
         g.ab.ptrType: g.emTypeSym(loc.pointeeType)
         g.emReg g.lvalGlobBase.getOrQuit(g.posOf(c))
     elif loc.kind == InRegPair:
-      raiseAssert "arkham a64n: address of InRegPair local " & nm
+      raiseAssert "arkham a64n: address of InRegPair local " & g.spelling(nm)
     else:                                                 # a `(s)` stack-var base
       g.ab.sym nm
   of TagLit:
@@ -1549,7 +1549,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
         var cc = c
         cc.into:
           g.emLvalAddr(cc); skip cc                       # base
-          g.ab.sym symName(cc); skip cc                   # field name
+          g.ab.sym cc.symId; skip cc                   # field name
           while cc.hasMore: skip cc
     of AtC:
       let atPos = g.posOf(c)
@@ -1572,7 +1572,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
         let pReg = g.plan.planned(g.posOf(cc))
         g.ab.tree CastX:
           g.ab.ptrType:
-            if pointee.kind == Symbol: g.ab.sym symName(pointee)
+            if pointee.kind == Symbol: g.ab.sym pointee.symId
             else: g.genTypeBody(pointee)
           g.emReg pReg.r
         while cc.hasMore: skip cc
@@ -1585,7 +1585,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
           let pReg = g.plan.planned(g.posOf(cc))
           g.ab.tree CastX:
             g.ab.aptrType:
-              if elem.kind == Symbol: g.ab.sym symName(elem)
+              if elem.kind == Symbol: g.ab.sym elem.symId
               else: g.genTypeBody(elem)
             g.emReg pReg.r
           skip cc                                         # past pointer
@@ -1611,7 +1611,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
           dc.into:
             let pReg = g.plan.planned(g.posOf(dc))
             g.ab.tree CastX:
-              g.ab.ptrType: g.ab.sym symName(baseTy)
+              g.ab.ptrType: g.ab.sym baseTy.symId
               g.emReg pReg.r
             while dc.hasMore: skip dc
         else:
@@ -1673,7 +1673,7 @@ proc lateGlobalBase*(g: var CodeGen; c: Cursor): bool =
   ## same reasoning `fieldLocGlob` states on x64, and what design.md means by fixing
   ## it "in the demand of the step that asked" rather than in a bigger pool.
   c.kind == Symbol and
-    g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc and
+    g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind == NoLoc and
     g.plan.planned(g.posOf(c)).kind != InReg
 
 proc lateSpilledBase*(g: var CodeGen; c: Cursor): bool =
@@ -1816,10 +1816,10 @@ proc releaseStaleName*(g: var CodeGen; r: Reg) =
   ## binding so the raw tag is what comes out. The x86-64 twin does the same.
   if r != NoReg:
     let dead = g.rb.takeBinding(r)
-    if dead.len > 0:
+    if dead != NoSymId:
       g.ab.tree KillA64: g.ab.sym dead
 
-proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
+proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: SymId) =
   ## An argument value is about to be MATERIALIZED into argument register `r`. Any
   ## name still bound to `r` is stale — the marshalling overwrites the register —
   ## and `emReg` would then write the new value under that stale name, whose type
@@ -1841,13 +1841,13 @@ proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
   ## never `rb`-bound in the first place.
   if r == NoReg: return
   let bound = g.rb.boundName(r)
-  if bound.len == 0 or bound == valueSym: return
+  if bound == NoSymId or bound == valueSym: return
   if g.rb.isBoundTemp(r):
     g.unbindTemp(r)                                # kills the name, drops the binding
   else:
     g.releaseStaleName(r)                          # a register-homed local, dead at a call
 
-proc releaseArgSpan*(g: var CodeGen; first, words: int; valueSym: string) =
+proc releaseArgSpan*(g: var CodeGen; first, words: int; valueSym: SymId) =
   ## `releaseArgDest` over the `words` consecutive integer argument registers an
   ## aggregate / 64-bit scalar occupies, starting at ABI ordinal `first`.
   for k in 0 ..< words:
@@ -1875,7 +1875,7 @@ proc emByteAtImm*(g: var CodeGen; p: Reg; off: int) =
         g.emReg p
       g.ab.intLit off
 
-proc emWordAtSlot*(g: var CodeGen; name: string; off: int) =
+proc emWordAtSlot*(g: var CodeGen; name: SymId; off: int) =
   ## `(cast (u W) (mem name off))` — the word at byte offset `off` of the NAMED stack
   ## slot `name`. The pointer twin `emWordThroughPtr` needs the slot's ADDRESS in a
   ## register first; this needs no register at all, because nifasm folds `off` into
@@ -1887,7 +1887,7 @@ proc emWordAtSlot*(g: var CodeGen; name: string; off: int) =
       g.ab.sym name
       g.ab.intLit off.int64
 
-proc emByteAtSlot*(g: var CodeGen; name: string; off: int) =
+proc emByteAtSlot*(g: var CodeGen; name: SymId; off: int) =
   ## The byte-granular `emWordAtSlot`, for a copy's sub-word tail.
   g.ab.tree CastX:
     g.ab.uintType(8)
@@ -1896,11 +1896,11 @@ proc emByteAtSlot*(g: var CodeGen; name: string; off: int) =
       g.ab.intLit off.int64
 
 proc emWordAt(g: var CodeGen; e: AggrEnd; idx: int) =
-  if e.slot.len > 0: g.emWordAtSlot(e.slot, idx * wordSize())
+  if e.slot != NoSymId: g.emWordAtSlot(e.slot, idx * wordSize())
   else: g.emWordThroughPtr(e.reg, idx)
 
 proc emByteAt(g: var CodeGen; e: AggrEnd; off: int) =
-  if e.slot.len > 0: g.emByteAtSlot(e.slot, off)
+  if e.slot != NoSymId: g.emByteAtSlot(e.slot, off)
   else: g.emByteAtImm(e.reg, off)
 
 proc copyAggr*(g: var CodeGen; dst, src: AggrEnd; size: int; tmp: Reg) =
@@ -1926,7 +1926,7 @@ proc copyAggr*(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
   ## Both ends are addresses in registers — the historical shape.
   g.copyAggr(regEnd(dst), regEnd(src), size, tmp)
 
-proc emAggrElemAt*(g: var CodeGen; base: string; idx: int) =
+proc emAggrElemAt*(g: var CodeGen; base: SymId; idx: int) =
   ## Bare `(at base idx)` ADDRESS tree (no `(mem …)` wrapper) — what a64's `lea` takes
   ## to compute `&base[idx]`. The element twin of `emAggrDot`.
   g.ab.tree AtX:
@@ -1954,7 +1954,7 @@ proc emPtrElemAt*(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int) =
       g.emReg p
     g.ab.intLit idx.int64
 
-proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: string): AsmSlot =
+proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: SymId): AsmSlot =
   ## The asm slot of `typeSym.field` (so a `Field` destination carries the field's
   ## slot — a nested aggregate field has an `AMem` slot). Resolves the object body
   ## from the type's decl.
@@ -1964,7 +1964,7 @@ proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: string): AsmSlot =
     result = slotOf(g.prog, fieldType(g.prog, d, field))
     while d.hasMore: skip d
 
-proc fieldTypeByName*(g: var CodeGen; typeSym: SymId; field: string): Cursor =
+proc fieldTypeByName*(g: var CodeGen; typeSym: SymId; field: SymId): Cursor =
   ## The declared (nominal) type cursor of `typeSym.field`.
   var d = lookupType(g.prog, typeSym)
   d.into:
@@ -1993,7 +1993,7 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## reserved temp (its computation emits at premat time, dest-threaded).
   case c.kind
   of Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     if home.kind == NoLoc: g.forceRegDest(dest)     # a global/tvar value read
     else: g.resolveDest(dest, home)
   of IntLit: g.resolveDest(dest, immLoc(intVal(c), ScalarSlot))
@@ -2045,11 +2045,11 @@ proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false) =
   ## [base]` reuses the base register as its destination.
   case c.kind
   of Symbol:
-    if g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
+    if g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind == NoLoc:
       let base = g.plan.planned(g.posOf(c))               # the global base temp/survivor
       if addrIntact and base.kind == InReg and base.isTemp and
-         g.lookupSym(symName(c)).cat == scGlobal and
-         g.mirrorAddrStored(base.r, g.prog.gvarRefName(symName(c))):
+         g.lookupSym(c.symId).cat == scGlobal and
+         g.mirrorAddrStored(base.r, g.prog.gvarRefName(c.symId)):
         discard                                          # kept as an address mirror
       else:
         g.freeVal(base)
@@ -2118,7 +2118,7 @@ proc pow2Log*(g: var CodeGen; c: Cursor): int =
   if result < 1 or result > 62: result = -1
 
 proc foldableFloatLeaf*(g: var CodeGen; c: Cursor): bool =
-  c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
+  c.kind == Symbol and g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
 proc mirrorBranch*(t: RiscInst): RiscInst =
   ## The condition that holds for `cmp b, a` given `t` holds for `cmp a, b`.
@@ -2197,7 +2197,7 @@ proc atIndexIsReg*(g: var CodeGen; atNode: Cursor): bool =
     if n.hasMore: result = n.kind notin {IntLit, UIntLit}
     while n.hasMore: skip n
 
-proc slotWide*(name: string; off = 0): WideRef =
+proc slotWide*(name: SymId; off = 0): WideRef =
   WideRef(kind: wrSlot, name: name, off: off)
 
 proc baseWide*(r: Reg; off = 0): WideRef =
@@ -2238,7 +2238,7 @@ proc wideLoad*(g: var CodeGen; d: Reg; w: WideRef; i: int) =
 proc wideStore*(g: var CodeGen; w: WideRef; i: int; s: Reg) =
   g.ab.tree MovA64: (g.emWideWord(w, i); g.emReg s)
 
-proc mintWideSlot*(g: var CodeGen): string =
+proc mintWideSlot*(g: var CodeGen): SymId =
   ## A fresh 8-byte `etmp` slot, declared by the prologue's `spillTemps` loop rather
   ## than here: unlike `takeTmp`'s exhaustion path this one is reached from the
   ## 32-bit targets' wide lowerings, which no corpus on this machine runs, so it

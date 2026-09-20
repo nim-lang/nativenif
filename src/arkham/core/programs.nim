@@ -28,7 +28,8 @@ include compat2   # getOrQuit on host Nim
 
 type
   Extern* = object
-    asmName*, extName*: string
+    asmName*: SymId          ## the asm-NIF symbol the image imports under
+    extName*: string         ## the C symbol the DYNAMIC LOADER resolves (Mach-O `_`-prefixed)
     dll*: string             ## the import library the decl's `(dynlib "…")` pragma names
                              ## (normalized to a `.dll` suffix). REQUIRED on Windows —
                              ## there is no implicit kernel32 fallback; empty on the
@@ -41,7 +42,7 @@ type
                              ## leave this nil — they marshal into raw ABI registers.
 
   CallTarget* = object
-    asmName*: string         ## the asm-NIF symbol to call
+    asmName*: SymId          ## the asm-NIF symbol to call
     extern*: bool            ## true → (extcall), false → (call)
     syscall*: bool           ## true → a Linux syscall: emitted as a `(syproc …)` and
                              ## invoked inline via `(syscall)`/`(svc)` (no libc, no PLT)
@@ -80,7 +81,7 @@ type
                              ## operand: what distinguishes a 32- from a 64-bit form
 
   ProcInfo* = object
-    asmName*: string         ## the proc's asm-NIF name (entry → "main.0")
+    asmName*: SymId          ## the proc's asm-NIF name (entry → `main.0`)
     decl*: Cursor            ## the `(proc …)` declaration
     isEntry*: bool
     isAsm*: bool             ## `(assembler)`: the body is a TRANSLITERATION — every
@@ -101,31 +102,31 @@ type
                              ## body must be one that declares all of them.
 
   SyscallProc* = object
-    asmName*: string         ## the `(syproc …)` symbol name (e.g. "mmap.0")
+    asmName*: SymId          ## the `(syproc …)` symbol name (e.g. `mmap.0`)
     decl*: Cursor            ## the importc proc decl (source of params + return type)
     sysNr*: int              ## x86-64 number
     sysNrA64*: int           ## AArch64 number (`-1` if none on that arch)
 
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
-    callTarget*: Table[string, CallTarget]  ## Leng proc symbol → how to call it
-    instrTarget*: Table[string, InstrTarget] ## Leng proc symbol → which instruction(s)
+    callTarget*: Table[SymId, CallTarget]   ## Leng proc symbol → how to call it
+    instrTarget*: Table[SymId, InstrTarget] ## Leng proc symbol → which instruction(s)
                                             ## an `(instr …)` on it emits
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
-    globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
-    globalOrder*: seq[string]               ## the same names in DECLARATION order. A global's
+    globals*: Table[SymId, Cursor]          ## global (gvar/const) var symbol → its decl cursor
+    globalOrder*: seq[SymId]                ## the same symbols in DECLARATION order. A global's
                                             ## runtime initializer may read another global of
                                             ## the same module (`winlean`'s `dynlib` procs read
                                             ## the library handle a preceding global loaded), so
                                             ## the init proc must run them in source order — a
                                             ## `Table` walk would order them by hash
-    tvars*: Table[string, Cursor]           ## thread-local var name → its decl cursor (macOS TLV)
-    tvarOrder*: seq[string]                 ## the same names in declaration order (see
+    tvars*: Table[SymId, Cursor]            ## thread-local var symbol → its decl cursor (macOS TLV)
+    tvarOrder*: seq[SymId]                  ## the same symbols in declaration order (see
                                             ## `globalOrder`: output must not follow hash order)
     typeDecls*: TypeEnv                     ## resolved type env: main + requested foreign
-    mainTypeList*: seq[(string, Cursor)]    ## main-module types, in declaration order
-    requestedForeign*: seq[(string, Cursor)] ## foreign types referenced (cross-module
+    mainTypeList*: seq[(SymId, Cursor)]     ## main-module types, in declaration order
+    requestedForeign*: seq[(SymId, Cursor)]  ## foreign types referenced (cross-module
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
@@ -134,18 +135,23 @@ type
                                             ## image is single-threaded, so a Nim thread-local
                                             ## is collected as an ordinary `.bss` global —
                                             ## Win64 has no FS-based TLS block to point at.
-    gvarCName*: Table[string, string]       ## importc/exportc gvar/tvar: NIF symbol → bare C
+    gvarCName*: Table[SymId, SymId]         ## importc/exportc gvar/tvar: NIF symbol → bare C
                                             ## name. The bare name lives in nifasm's shared
                                             ## root scope, so an `exportc` definition in one
                                             ## bundled module links to an `importc` reference
                                             ## in another (C-style global linkage). The
                                             ## exporting module emits the slot; importc-only
                                             ## references resolve to it (no local slot).
-    importcOnlyGvars*: HashSet[string]      ## NIF symbols of importc gvars WITHOUT exportc:
+    importcOnlyGvars*: HashSet[SymId]       ## NIF symbols of importc gvars WITHOUT exportc:
                                             ## their slot is provided elsewhere, so genGlobal
                                             ## must not emit a (duplicate) definition.
     # ── cross-module machinery ──
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
+    thisModule*: StrId                      ## `scheme.name` interned once: the module suffix
+                                            ## every symbol of THIS module carries. A
+                                            ## foreign-symbol test is then an integer compare
+                                            ## against the suffix the symbol record holds
+                                            ## (`isForeignSym`), not a string split
     tags: TagPool                           ## shared tag pool for parsing foreign modules
     pool*: Pool                             ## the shared literals pool every input buffer
                                             ## uses (main module and each foreign one, which
@@ -178,6 +184,13 @@ type
                                             ## is materialised only on the MISS path,
                                             ## which has to parse the module suffix and
                                             ## load a foreign module anyway.
+
+proc symModuleId*(p: Pool; id: SymId): StrId {.inline.} =
+  ## The module suffix of a symbol as a POOL ID — `StrId(0)` when the symbol is
+  ## module-less (a local, or one of the bare C-linkage names). This is the whole
+  ## of what a foreign-vs-local question needs, and it is a field of the record
+  ## the pool already holds: no spelling is built and nothing is split.
+  p.sym(id).module
 
 const NoTypeSym* = default(SymId)
   ## "no nominal type": a param/local whose type is an inline structural one (no name
@@ -508,17 +521,17 @@ proc fixedParamCount(decl: Cursor): int =
           inc i
     while c.hasMore: skip c
 
-proc globalsInOrder*(p: Program): seq[(string, Cursor)] =
+proc globalsInOrder*(p: Program): seq[(SymId, Cursor)] =
   ## The module's globals in declaration order. A snapshot, so the caller may grow
   ## the program's tables while it walks them; and ordered, because a `Table` walk
   ## follows the hash function, which is not the same under every compiler.
   result = @[]
-  for nm in p.globalOrder: result.add (nm, p.globals.getOrQuit(nm))
+  for s in p.globalOrder: result.add (s, p.globals.getOrQuit(s))
 
-proc tvarsInOrder*(p: Program): seq[(string, Cursor)] =
+proc tvarsInOrder*(p: Program): seq[(SymId, Cursor)] =
   ## `globalsInOrder` for the thread-locals.
   result = @[]
-  for nm in p.tvarOrder: result.add (nm, p.tvars.getOrQuit(nm))
+  for s in p.tvarOrder: result.add (s, p.tvars.getOrQuit(s))
 
 proc resolveType*(p: var Program; c: Cursor): Cursor
 proc slotOf*(p: var Program; c: Cursor): AsmSlot
@@ -581,6 +594,13 @@ const FullSigAggrByRefThreshold = 16
   ## larger than this travel by reference. Kept here so `isDeclarativeAbi` (which has
   ## no `MachineDesc`) can classify a result the same way the code generator does.
 
+proc spelling*(p: Program; sym: SymId): string {.inline.} =
+  ## The TEXT of a symbol, built from the pool record. Call it where text is what
+  ## is wanted — a diagnostic, a name for the asm buffer's own pool — and nowhere
+  ## else: identity is the id (`SymId`), and comparing spellings is the habit this
+  ## backend moved away from.
+  symString(p.pool, sym)
+
 proc syprocAsmName*(cname, module: string): string =
   ## The asm symbol for the syscall syproc wrapping the C function `cname`:
   ## `` write`sys.0.<module> ``. It must be a proper SELF-MODULE symbol, since
@@ -603,15 +623,23 @@ proc extprocAsmName*(cname, module: string): string =
   ## `` write`c.0.<module> ``, mirroring `syprocAsmName` for the same reasons.
   result = derivedName(cname & ".0", "c") & "." & module
 
-proc cNameOfAsmName*(asmName: string): string =
+proc cNameOfAsmName*(p: Program; asmName: SymId): string =
   ## The C name back out of either of the two above: everything before the
-  ## backtick that introduces the role tag. Returns `asmName` unchanged when
-  ## there is none.
-  result = asmName
-  for i in 0 ..< asmName.len:
-    if asmName[i] == '`':
-      result = substr(asmName, 0, i-1)
+  ## backtick that introduces the role tag. The whole spelling when there is
+  ## none. Text in, text out — this is a question ABOUT the spelling, which is
+  ## why it is one of the few places that materialises one.
+  result = p.spelling(asmName)
+  for i in 0 ..< result.len:
+    if result[i] == '`':
+      result = substr(result, 0, i-1)
       break
+
+proc lengSym*(p: Program; name: string): SymId {.inline.} =
+  ## Intern a SPELLING back into the Leng symbol it names — the inverse of
+  ## `spelling`, and the boundary where a name that was BUILT (`csave.` + a
+  ## local, a synthesized temp) joins the id-keyed world. Interning is
+  ## idempotent, so a spelling the input already carried yields that symbol's id.
+  symId(p.pool, name)
 
 proc thisModuleSuffix*(p: Program): string =
   ## The main module's NIF symbol suffix (e.g. `sysvq0asl`), used to compress
@@ -667,15 +695,16 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## through the import table. The syscall table is x86-64/AArch64 LINUX numbers;
   ## consulting it here would silently turn e.g. an `importc: "read"` into a trap
   ## into the NT kernel with Linux argument registers.
-  result = Program(callTarget: initTable[string, CallTarget](),
+  result = Program(callTarget: initTable[SymId, CallTarget](),
                    typeDecls: initTable[SymId, Cursor](),
-                   globals: initTable[string, Cursor](),
-                   tvars: initTable[string, Cursor](),
+                   globals: initTable[SymId, Cursor](),
+                   tvars: initTable[SymId, Cursor](),
                    loaded: initTable[string, ForeignModule](),
-                   gvarCName: initTable[string, string](),
-                   importcOnlyGvars: initHashSet[string](),
+                   gvarCName: initTable[SymId, SymId](),
+                   importcOnlyGvars: initHashSet[SymId](),
                    scheme: splitModulePath(inputPath), tags: tags,
-                   pool: buf.pool,
+                   pool: buf.pool, thisModule: buf.pool.strings.getOrIncl(
+                     splitModulePath(inputPath).name),
                    darwin: darwin, windows: windows)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
@@ -716,7 +745,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var tc = ct
         tc.into:
           result.typeDecls[tc.symId] = typeStart
-          result.mainTypeList.add (symName(tc), typeStart)   # emitted as text
+          result.mainTypeList.add (tc.symId, typeStart)   # emitted as text
           while tc.hasMore: skip tc           # drain so `into` stays balanced
       skip ct
   # Pass 2: globals, thread-locals and procs.
@@ -737,7 +766,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         # See `x64/mem.emTvarAddr` for how Windows reaches the real per-thread block.
         let isTvar = c.stmtKind == TvarS
         gc.into:
-          let nm = symName(gc); inc gc
+          let nm = gc.symId; inc gc
           if isTvar:
             if not result.tvars.hasKey(nm): result.tvarOrder.add nm
             result.tvars[nm] = gStart            # thread-local (macOS TLV)
@@ -766,15 +795,16 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             # namespace in nifasm would generalize this.) See CLinkageGvars (top-level)
             # and gvarRefName for the cross-module (foreign-reference) resolution.
             if gExportc.len > 0 and gExportc in CLinkageGvars:
-              result.gvarCName[nm] = gExportc & ".0"
+              result.gvarCName[nm] = result.lengSym(gExportc & ".0")
             elif gImportc.len > 0 and gImportc in CLinkageGvars:
-              result.gvarCName[nm] = gImportc & ".0"
+              result.gvarCName[nm] = result.lengSym(gImportc & ".0")
               result.importcOnlyGvars.incl nm
           while gc.hasMore: skip gc           # drain so `into` stays balanced
         skip c
       elif c.stmtKind == ProcS:
         let procStart = c
-        var pname, importcN, exportcN, dllN = ""
+        var pname = default(SymId)
+        var importcN, exportcN, dllN = ""
         var retFloat = false
         var retType: Cursor
         var intrinsic = NoIntrinsicOp
@@ -782,7 +812,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var nakedProc = false
         var irqN = ""
         c.into:
-          pname = symName(c); inc c           # name
+          pname = c.symId; inc c              # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
@@ -818,7 +848,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # Keying on the C `importcN` (not the proc's own `pname`) collapses aliases —
           # e.g. both `die` and `exit` (`importc "exit"`) → one syproc. See
           # `syprocAsmName` for the shape and why it is that shape.
-          let asmN = syprocAsmName(importcN, thisModuleSuffix(result))
+          let asmN = result.lengSym(syprocAsmName(importcN, thisModuleSuffix(result)))
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                                                 retType: retType, sigType: sigType)
@@ -833,7 +863,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # A basename-only `write.0` has one dot, so the render would treat it as
           # module-LOCAL and leave it out of the `.index` — unresolvable when this
           # module is a foreign module of a bundle. See `extprocAsmName`.
-          let asmN = extprocAsmName(importcN, thisModuleSuffix(result))
+          let asmN = result.lengSym(extprocAsmName(importcN, thisModuleSuffix(result)))
           if windows and dllN.len == 0:
             # No implicit import library: a Windows extern must NAME its dll
             # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
@@ -861,7 +891,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # NIF name `pname` so cross-module calls (e.g. `=destroy.2.<mod>`) resolve.
           # (The old `exportcN.len > 0` test wrongly renamed all of them to `main.0`.)
           let entry = exportcN == "main"
-          let asmN = if entry: "main.0" else: pname
+          let asmN = if entry: result.lengSym("main.0") else: pname
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
                                                 # A `stdcall` DEFINITION receives Windows'
@@ -929,48 +959,57 @@ proc lookupType*(p: var Program; id: SymId): Cursor =
     raiseAssert "arkham: type " & name & " not found in module " & s.module
   let d = getDecl(m, name, p.tags, p.pool)
   p.typeDecls[id] = d
-  p.requestedForeign.add (name, d)
+  p.requestedForeign.add (id, d)
   result = d
 
-proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
+proc lookupForeignDecl*(p: var Program; sym: SymId; found: var bool): Cursor =
   ## The top-level declaration (`gvar|var|const|tvar|proc|type :name …`) for a
   ## cross-module symbol, loaded from the owning module's embedded index (same
   ## scheme as `lookupType`). Sets `found=false` for an unqualified name, a
   ## reference to our own module, or a symbol absent from the foreign module —
   ## so a single call classifies "local vs foreign" without a separate probe.
   ## A resolved decl is recorded in `requestedForeign` so nifasm links it.
+  ##
+  ## Keyed by POOL ID: the module suffix is a component the symbol record already
+  ## carries, so the cheap answers ("ours", "module-less") cost an integer compare
+  ## and the spelling is materialised only for the index query, which is text.
   result = default(Cursor)
   found = false
-  let s = splitSymName(name)
-  if s.module == p.scheme.name: return
-  if s.module.len == 0:
+  let module = symModuleId(p.pool, sym)
+  if module == p.thisModule: return
+  if module == StrId(0):
     # A module-less symbol has no owning module to load from and the embedded
     # index never lists single-dot names. Hexer hoists surviving proc-level
     # consts to module-suffixed top-level decls, and the C-linkage gvars
     # resolve through `gvarRefName` — nothing legitimate reaches here.
     return
-  let m = loadModule(p, s.module)
+  let m = loadModule(p, p.pool.strings[module])
+  let name = symString(p.pool, sym)
   if not hasDecl(m, name): return
   result = getDecl(m, name, p.tags, p.pool)
-  p.requestedForeign.add (name, result)
+  p.requestedForeign.add (sym, result)
   found = true
 
-proc gvarAsmName*(p: Program; nifName: string): string {.inline.} =
+proc gvarAsmName*(p: Program; sym: SymId): SymId =
   ## The asm-NIF symbol for a global reference: an importc/exportc gvar uses its
   ## bare C name (shared root-scope linkage across bundled modules); any other
   ## global keeps its fully-qualified NIF name.
-  p.gvarCName.getOrDefault(nifName, nifName)
+  result = p.gvarCName.getOrDefault(sym, NoTypeSym)
+  if result == NoTypeSym: result = sym
 
-proc isForeignSym*(p: Program; name: string): bool =
-  ## True if `name`'s qualified module is a DIFFERENT module than the one being
+proc isForeignSym*(p: Program; sym: SymId): bool =
+  ## True if `sym`'s qualified module is a DIFFERENT module than the one being
   ## compiled (so it must be resolved via its owning module, not the local tables).
-  let s = splitSymName(name)
-  s.module.len > 0 and s.module != p.scheme.name
+  ## Two integer compares: the module suffix is a component of the symbol record,
+  ## and `thisModule` is the same string interned once.
+  let module = symModuleId(p.pool, sym)
+  module != StrId(0) and module != p.thisModule
 
-proc foreignCallTarget*(p: var Program; name: string): CallTarget =
+proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its
   ## declaration from the owning module's embedded index. The asm symbol is the
   ## fully-qualified NIF name; nifasm auto-imports `<module>.asm.nif` and links it.
+  let name = symString(p.pool, sym)
   let s = splitSymName(name)
   assert s.module.len > 0 and s.module != p.scheme.name,
     "arkham: not a foreign proc: " & name
@@ -1006,7 +1045,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
   elif not p.darwin and not p.windows and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
-    result = CallTarget(asmName: syprocAsmName(importcN, s.module), extern: false,
+    result = CallTarget(asmName: p.lengSym(syprocAsmName(importcN, s.module)), extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                         retType: retType, sigType: sigType)
   elif importcN.len > 0:
@@ -1015,23 +1054,23 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     # is the module-qualified name the foreign module's extern decl uses (see
     # the externOrder naming in `collect`).
     p.needsLibSystem = true
-    result = CallTarget(asmName: extprocAsmName(importcN, s.module), extern: true, retFloat: retFloat,
+    result = CallTarget(asmName: p.lengSym(extprocAsmName(importcN, s.module)), extern: true, retFloat: retFloat,
                         retType: retType, sigType: sigType)
   else:
-    result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
+    result = CallTarget(asmName: sym, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,
                         foreignAbi: isWin64AbiProc(p, declCur))
 
-proc instrTargetOf*(p: var Program; name: string): InstrTarget =
+proc instrTargetOf*(p: var Program; sym: SymId): InstrTarget =
   ## The row an `(instr SYM …)` names, resolving across modules. A same-module
   ## symbol was registered by `collect`; a foreign one is loaded from its owning
   ## module's embedded index and classified the SAME way that module's pass 0 did
   ## — the pragma travels with the declaration, so there is nothing to re-derive.
-  if p.instrTarget.hasKey(name): return p.instrTarget.getOrQuit(name)
+  if p.instrTarget.hasKey(sym): return p.instrTarget.getOrQuit(sym)
   var found = false
-  let declCur = lookupForeignDecl(p, name, found)
+  let declCur = lookupForeignDecl(p, sym, found)
   if not found:
-    raiseAssert "arkham: (instr …) on an unknown proc: " & name
+    raiseAssert "arkham: (instr …) on an unknown proc: " & symString(p.pool, sym)
   var d = declCur
   var retType: Cursor
   var importcN, exportcN = ""
@@ -1044,11 +1083,12 @@ proc instrTargetOf*(p: var Program; name: string): InstrTarget =
     parsePragmas(d, importcN, exportcN, op)
     while d.hasMore: skip d                   # body
   if op == NoIntrinsicOp:
-    raiseAssert "arkham: (instr …) on a proc without an instruction/intrinsic pragma: " & name
+    raiseAssert "arkham: (instr …) on a proc without an instruction/intrinsic pragma: " &
+      symString(p.pool, sym)
   result = InstrTarget(op: op, retType: retType, argBits: firstIntParamBits(declCur))
-  p.instrTarget[name] = result
+  p.instrTarget[sym] = result
 
-proc gvarRefName*(p: var Program; nifName: string): string =
+proc gvarRefName*(p: var Program; sym: SymId): SymId =
   ## Like `gvarAsmName`, but also resolves a CLinkage gvar referenced from a
   ## DIFFERENT module than the one that declares it (e.g. `std/posix`'s
   ## `posix_environ {.importc:"nimEnviron".}` read from `std/os`). The per-module
@@ -1056,9 +1096,10 @@ proc gvarRefName*(p: var Program; nifName: string): string =
   ## its raw NIF name and fail to link against the canonical `<cName>.0` slot. We
   ## load the owning module's decl, and if its importc/exportc name is a CLinkage
   ## gvar, map to `<cName>.0` (and cache it).
-  let local = p.gvarCName.getOrDefault(nifName, "")
-  if local.len > 0: return local
-  if isForeignSym(p, nifName):
+  let local = p.gvarCName.getOrDefault(sym, NoTypeSym)
+  if local != NoTypeSym: return local
+  let nifName = symString(p.pool, sym)
+  if isForeignSym(p, sym):
     let s = splitSymName(nifName)
     let m = loadModule(p, s.module)
     if hasDecl(m, nifName):
@@ -1074,10 +1115,10 @@ proc gvarRefName*(p: var Program; nifName: string): string =
         elif importcN.len > 0 and importcN in CLinkageGvars: importcN
         else: ""
       if cname.len > 0:
-        result = cname & ".0"
-        p.gvarCName[nifName] = result           # cache for subsequent refs
+        result = p.lengSym(cname & ".0")
+        p.gvarCName[sym] = result               # cache for subsequent refs
         return
-  result = nifName
+  result = sym
 
 # ── named-type resolution ───────────────────────────────────────────────────
 
@@ -1342,15 +1383,15 @@ proc isCleanSigProc*(p: var Program; decl: Cursor): bool =
         while c.hasMore: skip c
       if not result: return
 
-proc cleanSigProcNames*(p: var Program): HashSet[string] =
-  ## The decl-symbol names of every internal proc with a clean signature
-  ## (`isCleanSigProc`). Keyed by the decl's `SymbolDef` name — the SAME symbol a call
-  ## site names as its target — so the analyser can test a direct callee by name.
-  result = initHashSet[string]()
+proc cleanSigProcs*(p: var Program): HashSet[SymId] =
+  ## Every internal proc with a clean signature (`isCleanSigProc`), as pool ids —
+  ## the decl's `SymbolDef` id, which is the SAME id a call site's target token
+  ## carries, so the analyser tests a direct callee with an integer compare.
+  result = initHashSet[SymId]()
   for pi in p.procs:
     var nc = pi.decl; inc nc                    # (proc → name
     if nc.kind == SymbolDef and isCleanSigProc(p, pi.decl):
-      result.incl symName(nc)
+      result.incl nc.symId
 
 proc declIsNoReturn*(decl: Cursor): bool =
   ## True if the `(proc …)` declaration carries `(attr "noreturn")` — hexer's
@@ -1378,17 +1419,16 @@ proc declIsNoReturn*(decl: Cursor): bool =
     while c.hasMore: skip c                     # body — `into` requires a full drain
 
 proc collectCallees(n: Cursor; seen: var HashSet[SymId];
-                    order: var seq[(SymId, string)]) =
-  ## Every DIRECT call target in the subtree (`(call SYM …)`), deduped. The name
-  ## is captured alongside the id because resolving the declaration needs it —
-  ## once per distinct callee, not once per call site.
+                    order: var seq[SymId]) =
+  ## Every DIRECT call target in the subtree (`(call SYM …)`), deduped — as pool
+  ## ids, which is all the resolution below needs.
   var n = n
   if n.kind != TagLit: return
   if n.stmtKind == CallS:
     let probe = sub(n)                          # read-only peek at the callee
     if probe.hasMore and probe.kind == Symbol:
       let id = probe.symId
-      if not seen.containsOrIncl(id): order.add (id, symName(probe))
+      if not seen.containsOrIncl(id): order.add id
   n.loopInto:
     collectCallees(n, seen, order)
     skip n
@@ -1412,7 +1452,7 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
   ## are ones codegen performs anyway (`foreignCallTarget` at each call site).
   result = initHashSet[SymId]()
   var seen = initHashSet[SymId]()
-  var callees: seq[(SymId, string)] = @[]
+  var callees: seq[SymId] = @[]
   for pi in p.procs:
     if pi.isAsm: continue
     var b = pi.decl
@@ -1423,12 +1463,12 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
   for pi in p.procs:
     var nc = pi.decl; inc nc
     if nc.kind == SymbolDef: localDecl[nc.symId] = pi.decl
-  for (id, name) in callees:
+  for id in callees:
     if localDecl.hasKey(id):
       if declIsNoReturn(localDecl.getOrQuit(id)): result.incl id
-    elif isForeignSym(p, name):
+    elif isForeignSym(p, id):
       var found = false
-      let d = lookupForeignDecl(p, name, found)
+      let d = lookupForeignDecl(p, id, found)
       if found and d.stmtKind == ProcS and declIsNoReturn(d): result.incl id
 
 proc aggrByteSize*(p: var Program; typeSym: SymId): int =
@@ -1440,7 +1480,7 @@ proc aggrByteSize*(p: var Program; typeSym: SymId): int =
 
 # ── structural type navigation (the pieces arkham's `getType` walks) ────────
 
-proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
+proc fieldType*(p: var Program; objType: Cursor; field: SymId): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
   ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
@@ -1451,18 +1491,18 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
     uc.into:
       while uc.hasMore:
         if uc.kind == TagLit and uc.substructureKind == FldU:
-          var fn = ""
+          var fn = NoTypeSym
           var fc = uc
           fc.into:
-            fn = symName(fc); inc fc
+            fn = fc.symId; inc fc
             skip fc                             # field-pragmas
             result = fc; skip fc
             while fc.hasMore: skip fc
           if fn == field: return
         skip uc
-    raiseAssert "arkham: field '" & field & "' not found in union"
+    raiseAssert "arkham: field '" & symString(p.pool, field) & "' not found in union"
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
-    "arkham: field access requires an object type (field " & field &
+    "arkham: field access requires an object type (field " & symString(p.pool, field) &
     ", base resolves to " & toString(objType, includeLineInfo = false) & ")"
   var oc = objType
   var baseType: Cursor
@@ -1485,7 +1525,7 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
                 skip br                        # branch base slot (`.`)
                 while br.hasMore:
                   br.into:                     # (fld :name pragmas type)
-                    let fn = symName(br); inc br
+                    let fn = br.symId; inc br
                     skip br                     # field-pragmas
                     result = br; skip br
                     if fn == field: return
@@ -1493,13 +1533,13 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
         skip oc
       else:
         oc.into:                              # (fld :name pragmas type)
-          let fn = symName(oc); inc oc
+          let fn = oc.symId; inc oc
           skip oc                             # field-pragmas
           result = oc; skip oc                # field type (a copy)
           if fn == field: return
   if hasBase:                                 # not here → look in the inherited base
     return fieldType(p, resolveType(p, baseType), field)
-  raiseAssert "arkham: field '" & field & "' not found"
+  raiseAssert "arkham: field '" & symString(p.pool, field) & "' not found"
 
 proc innerType*(p: var Program; t: Cursor): Cursor =
   ## The element/pointee type of a resolved `(ptr T)` / `(aptr T)` / `(array T …)`
@@ -1565,7 +1605,7 @@ proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
         skip oc
       else:
         oc.into:                              # (fld :name pragmas type)
-          let fn = symName(oc); inc oc
+          let fn = oc.symId; inc oc
           skip oc                             # field-pragmas
           let (fsz, fal) = typeSizeAlign(p, oc)
           skip oc

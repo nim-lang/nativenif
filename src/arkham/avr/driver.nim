@@ -41,12 +41,12 @@ proc rejectForAvr(g: CodeGen) =
   ## a diagnostic rather than a wrong answer, and the gap is wide here.
   if false:
     for name, decl in g.prog.globals:
-      lengError decl, "AVR: the global `" & name & "` is not implemented yet " &
+      lengError decl, "AVR: the global `" & g.spelling(name) & "` is not implemented yet " &
                       "(see M6 in doc/internals/avr.md)", lengInfo(decl)
   if g.prog.tvars.len > 0:
     let tvarDecls = g.prog.tvarsInOrder()
     for (name, decl) in tvarDecls:
-      lengError decl, "AVR has no thread-local storage: `" & name & "`",
+      lengError decl, "AVR has no thread-local storage: `" & g.spelling(name) & "`",
                 lengInfo(decl)
   if g.prog.syscalls.len > 0:
     lengError default(Cursor),

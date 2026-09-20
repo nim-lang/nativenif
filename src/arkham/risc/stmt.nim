@@ -28,7 +28,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let declPos = g.posOf(cc)
-    let nm = symName(cc); inc cc
+    let nm = cc.symId; inc cc
     skip cc                                                  # pragmas
     let declaredCur = cc; skip cc                            # type (`.` when shoggoth omitted it)
     let typeCur = g.declType(declaredCur, cc)                # infer from the initializer
@@ -40,12 +40,12 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
       # spill machinery moves 8 bytes and would silently truncate it. The
       # vectorizer keeps vector live ranges short precisely so this cannot
       # happen; failing loudly beats corrupting the upper lane.
-      lengError c, "128-bit vector local `" & nm & "` did not get a SIMD register home"
+      lengError c, "128-bit vector local `" & g.spelling(nm) & "` did not get a SIMD register home"
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
     of InRegPair:
-      raiseAssert "arkham a64n: InRegPair is a param home, not a local: " & nm
+      raiseAssert "arkham a64n: InRegPair is a param home, not a local: " & g.spelling(nm)
     of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)
     of NamedStack:
       g.emTypedStackVar(nm, typeCur)                         # one route; dispatches on slot class
@@ -63,7 +63,7 @@ proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
     g.ab.tree CmpA64: (g.emReg selReg; g.emReg b)
     g.dropBridge b
 
-proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
+proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: SymId; signed: bool) =
   if c.kind == TagLit and c.substructureKind == RangeU:
     c.into:
       let lo = branchImm(c)
@@ -188,11 +188,11 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       let asgnPos = g.posOf(c)
       if cc.kind == Symbol:
         let lhsCur = cc
-        var dst = g.plan.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc)); skip cc
+        var dst = g.plan.locationOfSym(cc.symId, cursorToPosition(g.buf[], cc)); skip cc
         if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
-        elif dst.kind == InReg and g.varType.hasKey(symName(lhsCur)):
+        elif dst.kind == InReg and g.varType.hasKey(lhsCur.symId):
           # By-ref aggregate param, pointer register-homed: the destination is the
           # POINTEE — reclassify to the `Mem` lvalue form (see the x64 twin).
           dst = memLoc(lhsCur, g.exprSlot(lhsCur))
@@ -266,7 +266,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           g.freeVal(d)
         else: g.movImm(g.md.intRetReg, 0)
         if Freestanding in g.md.caps:
-          g.ab.tree BlA64: g.ab.sym EntryExitShim
+          g.ab.tree BlA64: g.ab.sym g.lengSym(EntryExitShim)
         else:
           g.movImm(R8, LinuxA64ExitNr.int64)
           g.ab.tree SvcA64: g.ab.intLit 0
@@ -280,15 +280,15 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         # settle.
         let canTail = g.retAggrSym == NoTypeSym and TailCall in g.md.caps
         if g.retAggrSym != NoTypeSym:
-          var srcName: string
+          var srcName = NoSymId
           if cc.kind == Symbol:
-            srcName = symName(cc)                          # a named local aggregate
+            srcName = cc.symId                          # a named local aggregate
           else:
             # An inline aggregate VALUE returned by value (`(ret (oconstr …))` /
             # memory lvalue): materialize into a synthetic temp via the general store
             # path (mirrors the aggregate call-argument marshalling), then marshal out.
             let pos = g.posOf(cc)
-            srcName = synth("rettmp") & $pos & ".0"
+            srcName = g.lengSym(synth("rettmp") & $pos & ".0")
             var tcur = cc
             if cc.exprKind in {OconstrC, AconstrC}: inc tcur   # the constructed type
             else: tcur = g.getType(cc)
@@ -349,7 +349,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       if selLoc.kind == InReg: selReg = selLoc.r
       else:
         selBridge = g.takeBridge(selLoc.typ); g.place(selLoc, selBridge); selReg = selBridge
-      var bodies: seq[(string, Cursor)] = @[]
+      var bodies: seq[(SymId, Cursor)] = @[]
       var elseBody = cc
       var hasElse = false
       while cc.hasMore:
@@ -388,12 +388,12 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   of LabS:
     var cc = c
     cc.into:
-      g.emLab(symName(cc)); skip cc
+      g.emLab(cc.symId); skip cc
       while cc.hasMore: skip cc
   of JmpS:
     var cc = c
     cc.into:
-      g.emBr(BA64, symName(cc)); skip cc
+      g.emBr(BA64, cc.symId); skip cc
       while cc.hasMore: skip cc
   of KeepovfS:
     # `(keepovf (op type a b) dest)` — overflow-checked arithmetic store. The nifasm
@@ -433,7 +433,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       skip cc                                               # advance to dest
       if cc.kind != Symbol:
         raiseAssert "arkham a64n: keepovf into a complex lvalue not yet supported"
-      var dst = g.plan.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc))
+      var dst = g.plan.locationOfSym(cc.symId, cursorToPosition(g.buf[], cc))
       if dst.kind == NoLoc:
         var lc = cc
         dst = g.asLoc(lc)
@@ -526,7 +526,7 @@ proc recordVarType*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     if cc.kind == SymbolDef:
-      let nm = symName(cc); inc cc
+      let nm = cc.symId; inc cc
       skip cc
       let typeCur = cc; skip cc                  # type
       g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
@@ -587,7 +587,7 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   if info.isEntry and g.entryExits:              # the entry EXITS (no epilogue)
     g.movImm(g.md.intRetReg, 0)
     if Freestanding in g.md.caps:
-      g.ab.tree BlA64: g.ab.sym EntryExitShim
+      g.ab.tree BlA64: g.ab.sym g.lengSym(EntryExitShim)
     else:
       g.movImm(R8, LinuxA64ExitNr.int64)
       g.ab.tree SvcA64: g.ab.intLit 0

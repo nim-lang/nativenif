@@ -114,7 +114,7 @@ type
     icOther       ## anything else (binop, load, …)
 
   ProcAnalysis* = object
-    vars*: Table[string, VarInfo]
+    vars*: Table[SymId, VarInfo]
     hasCall*: bool              ## a call exists — params cannot stay in clobbered arg
                                 ## regs; AllRegs / ArgResident consult this, and the
                                 ## fp/lr frame decision is this same question
@@ -155,7 +155,7 @@ type
     lo, hi: int                ## token span of the whole loop (the `declLoopDepth`
                                ## back-edge extension for OUTSIDE-declared vars)
     sawCall: bool              ## a real call point occurred within this loop (any depth)
-    usedParams: HashSet[string] ## names of params read within this loop (any depth); on
+    usedParams: HashSet[SymId]  ## params read within this loop (any depth); on
                                ## loop exit, if `sawCall`, each is flagged `usedAfterCall`
 
   ClobberSite = object
@@ -182,7 +182,7 @@ type
                                ## panic path looks worth a register. Uses in here add
                                ## nothing to `weight` (they still count for `usages` and
                                ## liveness — the value is genuinely read on that path).
-    arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
+    arg0Name: SymId            ## the FIRST integer/pointer param (the one homed in
                                ## the return register on AArch64); "" if none / aggregate
     res: ProcAnalysis
     openCalls: seq[int]        ## positions of the `(call …)` nodes currently being walked,
@@ -206,8 +206,8 @@ type
     stmtStart: seq[int]        ## per open scope frame: START position of that same
                                ## statement — `ClobberSite.stmtStart` comes from here
     buf: ptr TokenBuf          ## for cursor → token-position mapping
-    tvars: HashSet[string]     ## thread-local var names: a reference acts like a call
-    cleanCallees: HashSet[string]  ## decl names of procs with a clean signature (all-scalar
+    tvars: HashSet[SymId]      ## thread-local var symbols: a reference acts like a call
+    cleanCallees: HashSet[SymId]   ## procs with a clean signature (all-scalar
                                ## GPR params, non-aggregate return). In a call to one, the
                                ## k-th argument lands in the k-th arg GPR — so a param passed
                                ## at its own index is a self-move. A call to anything else
@@ -319,7 +319,7 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
   let declPos = posOf(c, n)
   n.into:
     assert n.kind == SymbolDef
-    let vn = symName(n); inc n
+    let vn = n.symId; inc n
     skip n                       # pragmas
     skip n                       # type
     let hasValue = n.kind != DotToken
@@ -344,7 +344,7 @@ proc resultSpineWalk(c: var Context; n: var Cursor; onSpine: bool) =
   ## advances `n` past the subtree but records nothing in `vars`.)
   case n.kind
   of Symbol:
-    if c.arg0Name.len > 0 and symName(n) == c.arg0Name and not onSpine:
+    if c.arg0Name != NoSymId and n.symId == c.arg0Name and not onSpine:
       c.res.arg0RetConflict = true
     inc n
   of TagLit:
@@ -382,7 +382,7 @@ proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bo
   var n = n0
   case n.kind
   of Symbol:
-    let an = symName(n)
+    let an = n.symId
     if c.res.vars.hasKey(an) and c.res.vars.getOrQuit(an).paramIdx >= 0:
       if (not cleanCall) or c.res.vars.getOrQuit(an).paramIdx != ordinal:
         c.res.vars.getOrQuit(an).argUnsafe = true
@@ -446,7 +446,7 @@ proc endsDiverging(c: Context; branch: Cursor): bool =
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
-    let vn = symName(n)
+    let vn = n.symId
     if c.res.vars.hasKey(vn):
       let e = addr c.res.vars.getOrQuit(vn)
       if c.inAsgnTarget > 0: inc e.defs
@@ -657,10 +657,10 @@ proc analyse(c: var Context; n: var Cursor) =
         var probe = n
         probe.into:
           if not probe.hasMore: break argWalk
-          let calleeSym = if probe.kind == Symbol: symName(probe) else: ""
-          if calleeSym.len > 0 and c.res.vars.hasKey(calleeSym):
+          let calleeSym = if probe.kind == Symbol: probe.symId else: NoSymId
+          if calleeSym != NoSymId and c.res.vars.hasKey(calleeSym):
             c.res.vars.getOrQuit(calleeSym).argUnsafe = true  # a param used as a call target
-          let cleanCall = calleeSym.len > 0 and calleeSym in c.cleanCallees
+          let cleanCall = calleeSym != NoSymId and calleeSym in c.cleanCallees
           skip probe                                       # past the callee → arguments
           var ordinal = 0
           while probe.hasMore:
@@ -686,7 +686,7 @@ proc analyse(c: var Context; n: var Cursor) =
         dec c.inAsgnTarget
         analyse(c, n)                   # the rvalue
     of RetS:
-      if c.arg0Name.len > 0 and not c.res.arg0RetConflict:
+      if c.arg0Name != NoSymId and not c.res.arg0RetConflict:
         var probe = n                   # read-only spine scan (separate cursor)
         probe.into:
           while probe.hasMore: resultSpineWalk(c, probe, onSpine = true)
@@ -728,7 +728,7 @@ proc analyseParams(c: var Context; params: var Cursor) =
     while params.hasMore:
       params.into:                      # (param …)
         assert params.kind == SymbolDef
-        let vn = symName(params); inc params
+        let vn = params.symId; inc params
         if first:
           c.arg0Name = vn               # the first param — homed in x0 (== ret reg) on a64
           first = false
@@ -742,8 +742,14 @@ proc analyseParams(c: var Context; params: var Cursor) =
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
+when defined(arkhamPeakLive) or defined(arkhamSSAStats):
+  proc spell(c: Context; s: SymId): string {.inline.} =
+    ## The spelling of a symbol, for a TRACE line. The analyser keys everything
+    ## by pool id; the buffer it walks carries the pool that can spell one.
+    symString(c.buf[].pool, s)
+
 when defined(arkhamPeakLive):
-  proc reportPeakLive(c: Context; pname: string; procStartPos, procEndPos: int) =
+  proc reportPeakLive(c: Context; pname: SymId; procStartPos, procEndPos: int) =
     ## Sweep every named local's coarse live interval and report the maximum number
     ## simultaneously alive — arkham's structural analogue of gcc's register-pressure
     ## count. A value occupies a register/slot over its interval, so the peak is the
@@ -751,7 +757,7 @@ when defined(arkhamPeakLive):
     ## high`) span the whole body; others use `[liveStart, freeAfter]` (loop-body
     ## locals have per-iteration lifetime, so the precise interval is exact). Inclusive containment: a value is alive at any
     ## point within its interval. Prints one greppable line per proc to stderr.
-    type Iv = tuple[name: string, lo, hi: int]
+    type Iv = tuple[name: SymId, lo, hi: int]
     var ivs: seq[Iv] = @[]
     for name, vi in c.res.vars:
       var lo, hi: int
@@ -771,8 +777,8 @@ when defined(arkhamPeakLive):
     var liveNames = ""
     for iv in ivs:
       if iv.lo <= peakPt and peakPt <= iv.hi:
-        (if liveNames.len > 0: liveNames.add ' '; liveNames.add iv.name)
-    stderr.write "PEAKLIVE proc=" & pname & " total=" & $ivs.len &
+        (if liveNames.len > 0: liveNames.add ' '; liveNames.add c.spell(iv.name))
+    stderr.write "PEAKLIVE proc=" & c.spell(pname) & " total=" & $ivs.len &
       " peak=" & $peak & " @pos=" & $peakPt & ": " & liveNames & "\n"
     # Per-member detail for the peak set: interval width + def/use counts. A narrow
     # interval that only overlaps `peakPt` by coarse `freeAfter` over-extension hints
@@ -780,7 +786,7 @@ when defined(arkhamPeakLive):
     for iv in ivs:
       if iv.lo <= peakPt and peakPt <= iv.hi:
         let vi = c.res.vars[iv.name]
-        stderr.write "    " & iv.name & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
+        stderr.write "    " & c.spell(iv.name) & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
           $(iv.hi - iv.lo) & " defs=" & $vi.defs & " uses=" & $vi.usages &
           " allregs=" & $(AllRegs in vi.props) & "\n"
     # Cross-call pressure: the max simultaneously-live `allregs=false` intervals — the
@@ -798,8 +804,8 @@ when defined(arkhamPeakLive):
     var ccNames = ""
     for iv in ivs:
       if iv.lo <= ccPt and ccPt <= iv.hi and (AllRegs notin c.res.vars[iv.name].props):
-        (if ccNames.len > 0: ccNames.add ' '; ccNames.add iv.name)
-    stderr.write "  XCALLPEAK proc=" & pname & " crosscall-peak=" & $ccPeak &
+        (if ccNames.len > 0: ccNames.add ' '; ccNames.add c.spell(iv.name))
+    stderr.write "  XCALLPEAK proc=" & c.spell(pname) & " crosscall-peak=" & $ccPeak &
       " @pos=" & $ccPt & ": " & ccNames & "\n"
     # The TRUE callee-saved demand under live-range splitting: max over each individual
     # CALL site of the values live ACROSS that specific call (lo < callPos < hi). A value
@@ -813,12 +819,12 @@ when defined(arkhamPeakLive):
       for iv in ivs:
         if iv.lo < cp and cp < iv.hi: inc cnt    # strictly spans the call → live across it
       if cnt > acrossPeak: (acrossPeak = cnt; acrossCall = cp)
-    stderr.write "  ACROSSCALL proc=" & pname & " max-live-across-one-call=" & $acrossPeak &
+    stderr.write "  ACROSSCALL proc=" & c.spell(pname) & " max-live-across-one-call=" & $acrossPeak &
       " @call=" & $acrossCall & " (ncalls=" & $c.callPositions.len & ")\n"
 
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
-                  tvars: HashSet[string] = initHashSet[string]();
-                  cleanCallees: HashSet[string] = initHashSet[string]();
+                  tvars: HashSet[SymId] = initHashSet[SymId]();
+                  cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
@@ -833,9 +839,9 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     let procStartPos = posOf(c, procDecl)
     var endCur = procDecl; skip endCur
     let procEndPos = posOf(c, endCur)
-  var pname = "?"
+  var pname = NoSymId
   n.into:
-    (if n.kind == SymbolDef: pname = symName(n))
+    (if n.kind == SymbolDef: pname = n.symId)
     inc n                               # name (SymbolDef)
     analyseParams(c, n)                 # params
     skip n                              # return type
@@ -876,7 +882,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     # position, and a call there is after the birth — it must still deny. Only
     # calls strictly INSIDE the initializer (p < initEndPos) are exempt.
     let birthOk = birthFilterEnv.len == 0 or
-                  (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
+                  (birthFilterEnv != "-" and $pname in birthFilterEnv.split(','))
     let lo = if vi.initClass == icCall and birthOk: vi.initEndPos - 1
              else: vi.liveStart
     let hi = if isParam: vi.lastUsePos else: vi.freeAfter
@@ -1042,7 +1048,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
           of icAddr: inc nAddrI
           else: discard
     if nLocals > 0:
-      stderr.write "SSASTATS proc=" & pname & " locals=" & $nLocals &
+      stderr.write "SSASTATS proc=" & c.spell(pname) & " locals=" & $nLocals &
         " ssa=" & $nSSA & " (const=" & $nConst & " copy=" & $nCopy &
         " addr=" & $nAddrI & " use1=" & $nSSAUse1 & " inloop=" & $nLoopSSA &
         ") asgn1=" & $nAsgn1 & " birthflip=" & $nBirthFlip & "\n"

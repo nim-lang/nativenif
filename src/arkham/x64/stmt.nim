@@ -34,7 +34,7 @@ const CaseJmpMinBranches* = 4
   ## dispatch preamble (mov+sub+cmp+ja+imul+lea+add+jmp).
 
 proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {})
-proc condFuseSym(g: CodeGen; c: Cursor): string
+proc condFuseSym(g: CodeGen; c: Cursor): SymId
 
 proc genVarDecl*(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -45,7 +45,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
       # (`scanCondFusions`), so it needs neither a declaration nor a register home.
       while cc.hasMore: skip cc
       return
-    let nm = symName(cc); inc cc
+    let nm = cc.symId; inc cc
     skip cc                                              # pragmas
     let declaredCur = cc; skip cc                        # type (`.` when shoggoth omitted it)
     let typeCur = g.declType(declaredCur, cc)            # infer from the initializer
@@ -81,7 +81,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
         case loc.kind
         of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
         of InRegPair:
-          raiseAssert "arkham x64n: InRegPair is a param home, not a local: " & nm
+          raiseAssert "arkham x64n: InRegPair is a param home, not a local: " & g.spelling(nm)
         of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
         of NamedStack:
           g.emTypedStackVar(nm, typeCur)
@@ -96,7 +96,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
         if loc.kind == InReg:
           let srcSym = copyCastSrcSym(cc)
           if srcSym.kind == Symbol:
-            let sh = g.plan.locationOfSym(symName(srcSym), cursorToPosition(g.buf[], srcSym))
+            let sh = g.plan.locationOfSym(srcSym.symId, cursorToPosition(g.buf[], srcSym))
             if sh.kind == InReg and sh.r == loc.r: skipInit = true
         if not skipInit: g.genStore(cc, loc)   # the one general store path
         if callInit:
@@ -108,7 +108,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
         g.emRegLocalVar(nm, loc.r, typeCur)   # unreachable (callInit implies hasVal)
       while cc.hasMore: skip cc
 
-proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
+proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: SymId; signed: bool) =
   ## One `case` BranchRange against `selReg`; jump to `lBody` on a match. The gate
   ## (`caseRangeModeled`) guarantees small-immediate bounds, so every `cmp` folds the
   ## bound inline (no scratch register — the pure emitter cannot borrow one).
@@ -149,7 +149,7 @@ proc readsReg(g: var CodeGen; n: Cursor; r: Reg): bool =
   ## so scanning the symbols is exact.
   result = false
   if n.kind == Symbol:
-    let l = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+    let l = g.plan.locationOfSym(n.symId, cursorToPosition(g.buf[], n))
     result = l.kind == InReg and l.r == r
   elif n.kind == TagLit:
     var c = n
@@ -380,7 +380,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         # `scanCondFusions` marked this: the bool is read only by the branch that
         # follows, so emit the COMPARE and stop. `emitCond` takes the branch off the
         # flags — no `setcc`, no `and $1`, no `test`. Five instructions become two.
-        let b = symName(cc); skip cc
+        let b = cc.symId; skip cc
         var op = cc
         let ek = op.exprKind
         var aC, bC: Cursor
@@ -394,12 +394,12 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       if asgnPos in g.condFuse.link:
         # A chain LINK: `b2 = b1` or `b2 = not b1`, both single-use. Emits nothing —
         # just move the pending tag to the new name, inverted once per `not`.
-        let b2 = symName(cc); skip cc
+        let b2 = cc.symId; skip cc
         var t = cc
         var negations = 0
         while t.kind == TagLit and t.exprKind == NotC:
           inc t; inc negations
-        let src = symName(t)
+        let src = t.symId
         var tag = g.condFuse.tag.getOrQuit(src)
         for _ in 1 .. negations: tag = invertJcc(tag)
         g.condFuse.tag.del src
@@ -408,11 +408,11 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         return
       if cc.kind == Symbol:
         let lhsCur = cc                                     # for asLoc (global/tvar)
-        var dst = g.plan.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc)); skip cc  # local lvalue; a global → Undef
+        var dst = g.plan.locationOfSym(cc.symId, cursorToPosition(g.buf[], cc)); skip cc  # local lvalue; a global → Undef
         if dst.kind == NoLoc:                               # module-level global / threadvar
           var lc = lhsCur
           dst = g.asLoc(lc)                                 # Glob/Tvar with precise type
-        elif dst.kind == InReg and g.varType.hasKey(symName(lhsCur)):
+        elif dst.kind == InReg and g.varType.hasKey(lhsCur.symId):
           # A by-ref aggregate param whose POINTER is register-homed: the assignment's
           # destination is the pointee, not the pointer. An `InReg` home says nothing
           # about that (its `typ` is the pointer's), so reclassify to the `Mem` lvalue
@@ -446,7 +446,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
     # select on — the answer is in the flags and only `emitCond` knows how to spend it.
     let fusedSym = g.condFuseSym(c)
-    let isFused = fusedSym.len > 0 and g.condFuse.tag.hasKey(fusedSym)
+    let isFused = fusedSym != NoSymId and g.condFuse.tag.hasKey(fusedSym)
     if isFused or not g.tryEmitCmov(c):  # branchless select diamond, else fall through
       let lEnd = g.freshLabel()
       var cc = c
@@ -505,16 +505,16 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       else:
         var tailed = false
         if g.retAggrSym != NoTypeSym:                          # aggregate return
-          var srcName: string
+          var srcName = NoSymId
           if cc.kind == Symbol:
-            srcName = symName(cc)                          # a named local aggregate
+            srcName = cc.symId                          # a named local aggregate
           else:
             # An inline aggregate VALUE returned by value (`$`'s `(ret (oconstr
             # string …))`, or a memory lvalue): materialize it into a synthetic temp
             # via the general store path (mirrors the aggregate call-argument
             # marshalling), then marshal that temp out by the ABI below.
             let pos = cursorToPosition(g.buf[], cc)
-            srcName = synth("rettmp") & $pos & ".0"
+            srcName = g.lengSym(synth("rettmp") & $pos & ".0")
             var tcur = cc
             if cc.exprKind in {OconstrC, AconstrC}: inc tcur   # the constructed type
             else: tcur = g.getType(cc)
@@ -603,7 +603,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         selReg = g.pickStagingSealed("case selector", selLoc.typ)
         g.emitLoadLoc(selLoc, selReg)
         ownSelReg = true
-      var bodies: seq[(string, Cursor)] = @[]
+      var bodies: seq[(SymId, Cursor)] = @[]
       var elseBody = cc
       var hasElse = false
       while cc.hasMore:                                   # emit every of-branch test chain
@@ -650,12 +650,12 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   of LabS:                                                # `(lab :name)` — a goto target
     var cc = c
     cc.into:
-      g.emLab(symName(cc)); skip cc
+      g.emLab(cc.symId); skip cc
       while cc.hasMore: skip cc
   of JmpS:                                                # `(jmp name)` — unconditional goto
     var cc = c
     cc.into:
-      g.emJmp(symName(cc)); skip cc
+      g.emJmp(cc.symId); skip cc
       while cc.hasMore: skip cc
   of KeepovfS:
     # `(keepovf (op type a b) dest)` — an overflow-checked arithmetic store: emit the
@@ -685,7 +685,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       skip cc                                               # advance to dest
       if cc.kind == Symbol:
         let lhsCur = cc
-        var dst = g.plan.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc)); skip cc
+        var dst = g.plan.locationOfSym(cc.symId, cursorToPosition(g.buf[], cc)); skip cc
         if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
@@ -697,10 +697,10 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt " & $c.stmtKind
 
-proc condFuseSym(g: CodeGen; c: Cursor): string =
+proc condFuseSym(g: CodeGen; c: Cursor): SymId =
   ## The bool symbol an `(if …)`'s FIRST branch tests, when that branch's condition is
   ## a bare symbol — the only shape `scanCondFusions` fuses.
-  result = ""
+  result = NoSymId
   if c.kind != TagLit or c.stmtKind != IfS: return
   var cc = c
   cc.into:
@@ -717,7 +717,7 @@ proc condFuseSym(g: CodeGen; c: Cursor): string =
           while t.kind == TagLit and t.exprKind == NotC and guard < 8:
             inc t                       # → the negated operand
             inc guard
-          if t.kind == Symbol: result = symName(t)
+          if t.kind == Symbol: result = t.symId
         while bc.hasMore: skip bc
     while cc.hasMore: skip cc
 
@@ -746,8 +746,8 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
   g.condFuse.resetPlan()
   # Referenced labels first: a `(lab :L)` that some `(jmp L)` targets is a JOIN, so
   # the flags arriving there are whatever the other path left.
-  var jumpTargets = initHashSet[string]()
-  var symCount = initTable[string, int]()
+  var jumpTargets = initHashSet[SymId]()
+  var symCount = initTable[SymId, int]()
     ## Every `Symbol` occurrence in the body, by name. A `SymbolDef` is a different
     ## kind and does not count, so the fusable bool — one `(asgn b …)` target and one
     ## `(elif b …)` condition — is exactly the name with a count of 2. That is a
@@ -761,28 +761,28 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
       if cur.stmtKind == JmpS:
         var jc = cur
         jc.into:
-          if jc.hasMore and jc.kind == Symbol: jumpTargets.incl symName(jc)
+          if jc.hasMore and jc.kind == Symbol: jumpTargets.incl jc.symId
           while jc.hasMore: skip jc
         continue
       var ch = cur
       ch.into:
         while ch.hasMore:
           if ch.kind == TagLit: stack.add ch
-          elif ch.kind == Symbol: inc symCount.mgetOrPut(symName(ch), 0)
+          elif ch.kind == Symbol: inc symCount.mgetOrPut(ch.symId, 0)
           skip ch
 
-  var pendingSym = ""          # a candidate `(asgn b <cmp>)` seen, nothing emitted since
+  var pendingSym = NoSymId          # a candidate `(asgn b <cmp>)` seen, nothing emitted since
   var pendingPos = -1
   var copyPos: seq[int] = @[]  # the chain links behind `pendingSym`
-  var chainDecls: seq[string] = @[]
-  var declPos = initTable[string, int]()
+  var chainDecls: seq[SymId] = @[]
+  var declPos = initTable[SymId, int]()
 
   proc walk(g: var CodeGen; n: Cursor) {.closure.} =
     var c = n
     c.into:
       while c.hasMore:
         if c.kind != TagLit:                 # a bare operand, not a statement
-          pendingSym = ""
+          pendingSym = NoSymId
           skip c
           continue
         let pos = cursorToPosition(g.buf[], c)
@@ -793,17 +793,17 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
           continue
         of LabS:
           var lc = c
-          var nm = ""
+          var nm = NoSymId
           lc.into:
-            if lc.hasMore and lc.kind == Symbol: nm = symName(lc)
+            if lc.hasMore and lc.kind == Symbol: nm = lc.symId
             while lc.hasMore: skip lc
-          if nm in jumpTargets: pendingSym = ""     # a join point: flags are not ours
+          if nm in jumpTargets: pendingSym = NoSymId     # a join point: flags are not ours
           skip c
           continue
         of VarS, ConstS:
           # A value-less declaration emits nothing; one with an initializer does.
           var vc = c
-          var nm = ""
+          var nm = NoSymId
           var symDefPos = -1
           var hasVal = false
           vc.into:
@@ -811,23 +811,23 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
               # The SAME key `genVarDecl` uses: the SymbolDef's position, not the
               # statement's.
               symDefPos = cursorToPosition(g.buf[], vc)
-              nm = (if vc.kind == SymbolDef: symName(vc) else: "")
+              nm = (if vc.kind == SymbolDef: vc.symId else: NoSymId)
               skip vc
             if vc.hasMore: skip vc                  # pragmas
             if vc.hasMore: skip vc                  # type
             hasVal = vc.hasMore and vc.kind != DotToken
             while vc.hasMore: skip vc
-          if hasVal: pendingSym = ""
-          elif nm.len > 0: declPos[nm] = symDefPos
+          if hasVal: pendingSym = NoSymId
+          elif nm != NoSymId: declPos[nm] = symDefPos
           skip c
           continue
         of AsgnS:
           var ac = c
-          var lhs = ""
+          var lhs = NoSymId
           var isCmp = false
-          var copyOf = ""            # rhs is `b` or `(not b)` — a chain LINK
+          var copyOf = NoSymId            # rhs is `b` or `(not b)` — a chain LINK
           ac.into:
-            if ac.hasMore and ac.kind == Symbol: (lhs = symName(ac); skip ac)
+            if ac.hasMore and ac.kind == Symbol: (lhs = ac.symId; skip ac)
             if ac.hasMore:
               if ac.kind == TagLit and ac.exprKind in {EqC, NeqC, LtC, LeC}:
                 var op = ac
@@ -839,13 +839,13 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
                 var guard = 0
                 while t.kind == TagLit and t.exprKind == NotC and guard < 8:
                   inc t; inc guard
-                if t.kind == Symbol: copyOf = symName(t)
+                if t.kind == Symbol: copyOf = t.symId
             while ac.hasMore: skip ac
-          if lhs.len > 0 and isCmp and symCount.getOrDefault(lhs) == 2:
+          if lhs != NoSymId and isCmp and symCount.getOrDefault(lhs) == 2:
             pendingSym = lhs; pendingPos = pos
             copyPos.setLen 0                 # a fresh chain head: drop any aborted chain
             chainDecls = @[lhs]
-          elif lhs.len > 0 and copyOf.len > 0 and copyOf == pendingSym and
+          elif lhs != NoSymId and copyOf != NoSymId and copyOf == pendingSym and
                symCount.getOrDefault(lhs) == 2:
             # `b2 = b1` / `b2 = not b1`, both single-use: the answer is still only in
             # the flags. hexer renames the result bool once per inlined splice, so this
@@ -854,27 +854,27 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
             pendingSym = lhs
             chainDecls.add lhs
           else:
-            pendingSym = ""
+            pendingSym = NoSymId
           skip c
           continue
         of IfS:
           let s = g.condFuseSym(c)
-          if s.len > 0 and s == pendingSym:
+          if s != NoSymId and s == pendingSym:
             g.condFuse.cmp.incl pendingPos
             for p in copyPos: g.condFuse.link.incl p
             for nm in chainDecls:
               if declPos.hasKey(nm): g.condFuse.decl.incl declPos.getOrQuit(nm)
           else:
             when defined(arkhamFuseDbg):
-              if s.len > 0:
-                stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & s &
-                  " pending=" & pendingSym & " count=" & $symCount.getOrDefault(s)
-          pendingSym = ""; copyPos.setLen 0; chainDecls.setLen 0
+              if s != NoSymId:
+                stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & g.spelling(s) &
+                  " pending=" & g.spelling(pendingSym) & " count=" & $symCount.getOrDefault(s)
+          pendingSym = NoSymId; copyPos.setLen 0; chainDecls.setLen 0
           walk(g, c)                       # the branches themselves still get scanned
           skip c
           continue
         else:
-          pendingSym = ""
+          pendingSym = NoSymId
           walk(g, c)
           skip c
 
@@ -911,10 +911,10 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   if g.retIndirect:
     # The hidden result pointer arrives in rdi. Save it into the callee-saved
     # `indirectReg` for the duration of the body. The signature binds rdi to
-    # `paramName(0)`, so it is read by name (a raw `(reg rdi)` use of a bound
+    # `g.paramName(0)`, so it is read by name (a raw `(reg rdi)` use of a bound
     # register is rejected) and the binding killed.
-    g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
-    g.ab.tree KillX64: g.ab.sym paramName(0)
+    g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym g.paramName(0))
+    g.ab.tree KillX64: g.ab.sym g.paramName(0)
     # Name it, for the same reason the relocated parameters above are named: unnamed,
     # it was the last big block of raw register operands (564 of the 742 left after
     # `emitParamMoves` was fixed) — every `(mov (mem (at (cast (aptr (u 64)) (rbx))k))
@@ -922,7 +922,7 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # in the `regHoldsHome` union; only `rawHomeRegs` reserved it. `framePop` kills the
     # binding before the pops (`indirectReg` is RBX, always a frame register here).
     if g.retAggrSym != NoTypeSym:
-      g.emRegAggrPtrVar(synth("retptr.0"), g.indirectReg, g.retAggrSym)
+      g.emRegAggrPtrVar(g.lengSym(synth("retptr.0")), g.indirectReg, g.retAggrSym)
     else:
       g.rawHomeRegs.incl g.indirectReg
   g.emitParamMoves(info.decl)

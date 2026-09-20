@@ -18,7 +18,7 @@
 ## Built as a `nifcore` `TokenBuf` (the flexible NIF API) and serialized with
 ## `toString`.
 
-import std / tables
+import std / [tables, assertions]
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagpool]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
@@ -38,6 +38,10 @@ type
   AsmBuf* = object
     buf: TokenBuf
     ids: Table[string, TagId]   ## spelling → interned tag id (cache)
+    symIds: Table[SymId, SymId] ## LENG symbol id → this buffer's own pool id (cache)
+    lengPool*: Pool             ## the INPUT's literals pool, the one every `SymId` the
+                                ## emitter hands down belongs to. Installed by
+                                ## `adoptProgram`; `translate` is the only reader
     renderReg*: proc (r: Reg): string {.nimcall.}  ## GPR slot → arch spelling shim
     immAnyDest*: bool           ## target carries an immediate into any `mov`
                                 ## destination (x86-64 does, AArch64 does not)
@@ -55,7 +59,8 @@ proc initAsmBuf*(renderReg: proc (r: Reg): string {.nimcall.}): AsmBuf =
   ## overflows the 9-bit tag field (see `nifasm/tagpool`). With a fresh pool the
   ## overflowing spellings would have nowhere to go.
   AsmBuf(buf: createTokenBuf(256, sharedTags = createAsmTagPool()),
-         ids: initTable[string, TagId](), renderReg: renderReg)
+         ids: initTable[string, TagId](), symIds: initTable[SymId, SymId](),
+         renderReg: renderReg)
 
 proc openS(a: var AsmBuf; spelling: string) {.inline.} =
   a.buf.openTag a.ids.mgetOrPut(spelling, a.buf.tags.registerTag(spelling))
@@ -124,6 +129,22 @@ proc xmmReg*(a: var AsmBuf; f: FReg) {.inline.} =
 
 proc sym*(a: var AsmBuf; s: string) {.inline.} = a.buf.addSymUse s     # use
 proc symDef*(a: var AsmBuf; s: string) {.inline.} = a.buf.addSymDef s  # :def
+
+proc translate(a: var AsmBuf; id: SymId): SymId =
+  ## A LENG symbol id, as an id of THIS buffer's own pool. The two pools are
+  ## separate — the asm buffer is a different dialect with a different symbol
+  ## table — so crossing between them is the one place a spelling has to be
+  ## built. Memoized, so that happens once per distinct symbol rather than once
+  ## per mention: this is the whole cost of keeping identity as an id everywhere
+  ## upstream of the emitter.
+  result = a.symIds.getOrDefault(id, default(SymId))
+  if result == default(SymId):
+    assert a.lengPool != nil, "asm buffer has no Leng pool: `adoptProgram` never ran"
+    result = a.buf.pool.symId(symString(a.lengPool, id))
+    a.symIds[id] = result
+
+proc sym*(a: var AsmBuf; id: SymId) {.inline.} = a.buf.addSymUse a.translate(id)
+proc symDef*(a: var AsmBuf; id: SymId) {.inline.} = a.buf.addSymDef a.translate(id)
 proc str*(a: var AsmBuf; s: string) {.inline.} = a.buf.addStrLit s
 proc intLit*(a: var AsmBuf; v: int64) {.inline.} = a.buf.addIntLit v
 proc ident*(a: var AsmBuf; s: string) {.inline.} = a.buf.addIdent s
@@ -152,7 +173,7 @@ template aptrType*(a: var AsmBuf; body: untyped) = a.tree AptrT: body
 template arrayType*(a: var AsmBuf; body: untyped) = a.tree ArrayT: body
 template flexarrayType*(a: var AsmBuf; body: untyped) = a.tree FlexarrayT: body
 template proctypeType*(a: var AsmBuf; body: untyped) = a.tree ProctypeT: body
-template fldDef*(a: var AsmBuf; name: string; body: untyped) =
+template fldDef*(a: var AsmBuf; name: SymId; body: untyped) =
   a.openS($FldT)
   a.symDef name
   body
@@ -188,7 +209,8 @@ proc sideBuf*(a: AsmBuf): AsmBuf =
   ## final once the body has been emitted — into the main buffer, and appends
   ## the body after it.
   AsmBuf(buf: createTokenBuf(256, a.buf.pool, a.buf.tags),
-         ids: a.ids, renderReg: a.renderReg, immAnyDest: a.immAnyDest,
+         ids: a.ids, symIds: a.symIds, lengPool: a.lengPool,
+         renderReg: a.renderReg, immAnyDest: a.immAnyDest,
          arch: a.arch)
 
 proc append*(a: var AsmBuf; other: var AsmBuf) =

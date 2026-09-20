@@ -25,6 +25,7 @@ import nifcore
 import asmslots, machinedesc, planner, programs
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
+import diag                               # `userName`: the spelling a DIAGNOSTIC shows
 
 import regbind
 import "../../nifasm/core/model"         # X64Inst: the fused-compare tag
@@ -103,7 +104,7 @@ type
     decl*: HashSet[int]                      ## the matching `(var :b . bool .)` declarations —
                                              ## nothing reads `b`, so it need not reserve a
                                              ## register either
-    tag*: Table[string, X64Inst]             ## bool symbol → the `jcc` that means "true"
+    tag*: Table[SymId, X64Inst]              ## bool symbol → the `jcc` that means "true"
 
   VariadicExtern* = object
     ## One CALL SHAPE of a `{.varargs.}` extern, declared as an `(extproc …)` of its
@@ -114,7 +115,7 @@ type
     ## Darwin/AArch64 spells the tail as `(s)` stack parameters (Apple passes it on
     ## the stack); Win64 places it positionally, a double in a register position as
     ## its bits in the GPR (`ParamPlace.floatBits`).
-    asmName*: string                         ## the shape's own symbol
+    asmName*: SymId                          ## the shape's own symbol
     extName*: string                         ## the C symbol all shapes import
     dll*: string                             ## Windows: the import library ("" on Darwin)
     decl*: Cursor                            ## the importc decl (fixed parameters)
@@ -133,15 +134,15 @@ type
                                              ## difference is not just the arrival
                                              ## registers: the prologue owes rdi/rsi back.
     prog*: Program                           ## the whole program (cross-module type env)
-    callTarget*: Table[string, CallTarget]
-    globals*: Table[string, Cursor]          ## global var name → its decl cursor
-    tvars*: Table[string, Cursor]            ## thread-local var name → its decl cursor (macOS TLV)
-    tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
+    callTarget*: Table[SymId, CallTarget]
+    globals*: Table[SymId, Cursor]           ## global var symbol → its decl cursor
+    tvars*: Table[SymId, Cursor]             ## thread-local var symbol → its decl cursor (macOS TLV)
+    tvarNames*: HashSet[SymId]               ## tvar symbols, for the per-proc analyser
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
     retIsFloat*: bool                        ## current proc returns a float (in v0)
     retFloatBits*: int                       ## width (32/64) of the float return type
-    rodata*: seq[(string, string)]           ## module-level string literals
+    rodata*: seq[(SymId, string)]            ## module-level string literals
     hasFrame*: bool                          ## current proc needs a stack frame
     frameRegs*: seq[Reg]                     ## callee-saved GPRs the allocator handed out.
                                              ## BlockFrame stores each at its own offset and
@@ -219,8 +220,8 @@ type
                                              ## tail-call from a bare `(call …)` statement: with a
                                              ## result there is still a value to place in the return
                                              ## register after it.
-    loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
-    retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
+    loopEnds*: seq[SymId]                    ## stack of enclosing-loop end labels (for `break`)
+    retLabel2*: SymId                        ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
     retAggrSym*: SymId                       ## POOL ID of the current proc's aggregate return
                                              ## type, `NoTypeSym` when the result is not an
@@ -296,12 +297,12 @@ type
                                               ## consistent as one atomic step (the historic
                                               ## Cat-1 bug source was ad-hoc partial updates).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
-    varType*: Table[string, SymId]           ## aggregate var/param name → the POOL ID of its
+    varType*: Table[SymId, SymId]            ## aggregate var/param → the POOL ID of its
                                              ## nominal type: the key every layout query takes
                                              ## (`aggrLayout`/`aggrByteSize`/`lookupType`), so a
                                              ## lookup here hands one straight on without
                                              ## minting a name
-    stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
+    stackSlots*: HashSet[SymId]              ## symbols declared as a nifasm `(var :name (s) …)`
                                              ## slot, hence addressable straight off rsp. Same
                                              ## lifetime as `varType` (arkham symbol names are
                                              ## module-unique, so it need not be per-proc; and a
@@ -315,8 +316,8 @@ type
                                              ## from a module-level global, which is NOT
                                              ## rsp-relative. A copy that wants the zero-register
                                              ## `(mem (rsp) name off)` form must tell them apart.
-    symType*: Table[string, Cursor]          ## local/param name → its Leng type cursor (for getType)
-    aliasToDecl*: Table[string, string]      ## param ABI alias `pN.0` → the param's own decl
+    symType*: Table[SymId, Cursor]           ## local/param symbol → its Leng type cursor (for getType)
+    aliasToDecl*: Table[SymId, SymId]        ## param ABI alias `pN.0` → the param's own decl
                                              ## name (its `symPos` key). A register-passed
                                              ## param binds its arg reg to the signature alias
                                              ## `pN.0`, which is NOT a `symPos` key; this lets
@@ -330,7 +331,7 @@ type
     condFuse*: CondFusion                    ## x64: the compare-into-branch fusion — its plan
                                              ## (which statement positions to skip) and the
                                              ## pending flags tag. See `CondFusion`.
-    postDivergeBinds*: seq[tuple[r: Reg, name: string]]
+    postDivergeBinds*: seq[tuple[r: Reg, name: SymId]]
                                              ## bindings on CALLER-SAVED registers that
                                              ## `restoreBindings` re-established after a diverging
                                              ## call. Valid only until the next call that actually
@@ -338,7 +339,7 @@ type
                                              ## such call is in the value's range, so killing them
                                              ## there loses nothing and stops a stale name from
                                              ## renaming an ABI result register.
-    nameBindTyp*: Table[string, NameBindTyp] ## the twin of `tmpBindTyp` for NAMED locals and
+    nameBindTyp*: Table[SymId, NameBindTyp]  ## the twin of `tmpBindTyp` for NAMED locals and
                                              ## params: what type to re-emit when a binding has
                                              ## to be re-established. Only consumer so far is
                                              ## `restoreBindingsAfterDiverging`.
@@ -350,7 +351,7 @@ type
                                              ## budget checks read it (`x64/emit.liveStaging`
                                              ## feeding `core/bridges`).
     when defined(arkhamStagingDbg):
-      stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
+      stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given  
                                         ## back, with the label of what asked for each
       stagingPeak*: int                 ## the most that were ever live AT ONCE in this proc
       stagingPeakWhat*: string          ## and which labels those were — the SHAPE to reserve for
@@ -388,7 +389,7 @@ type
                                              ## whole-proc `regHoldsHome` union. x64 only —
                                              ## a64 has not been audited for raw param homes,
                                              ## so it keeps the coarse (safe) filter.
-    argResidentParams*: seq[tuple[r: Reg, name: string]]
+    argResidentParams*: seq[tuple[r: Reg, name: SymId]]
                                              ## x64: (arg register, bound name) for each
                                              ## `ArgResident` param (kept in its incoming reg
                                              ## despite the proc making calls). The binding is
@@ -400,7 +401,7 @@ type
                                              ## name. Only killed if the reg STILL holds `name`
                                              ## (a rebind to a temp already released the param).
     argResidentFlushed*: bool                ## the post-first-call kill above has run
-    cleanSigProcs*: HashSet[string]          ## x64: decl names of clean-signature procs
+    cleanSigProcs*: HashSet[SymId]           ## x64: clean-signature procs
                                              ## (all-scalar-GPR params, non-aggregate result);
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
@@ -471,8 +472,8 @@ type
     # and these two tables are the whole location model. Several Leng names may map
     # to one register — that is the user pinning them together, not a conflict —
     # so `emReg` renders whichever nifasm binding is live there.
-    asmReg*: Table[string, Reg]               ## Leng local/param name → its pinned register
-    asmStack*: HashSet[string]                ## Leng local names pinned to an `(s)` slot
+    asmReg*: Table[SymId, Reg]                ## Leng local/param → its pinned register
+    asmStack*: HashSet[SymId]                 ## Leng locals pinned to an `(s)` slot
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
@@ -511,8 +512,8 @@ type
     ## it closes. Opened at `emitCall` — or EARLIER by a caller that writes an ABI
     ## register for the call itself (the hidden result pointer in rdi), which must
     ## happen after the save or it clobbers the value it was supposed to preserve.
-    saved*: seq[tuple[reg: Reg, name: string]]
-    prevActive*: Table[string, Location]
+    saved*: seq[tuple[reg: Reg, name: SymId]]
+    prevActive*: Table[SymId, Location]
 
 proc newCodeGen*(buf: var TokenBuf; md: MachineDesc;
                  renderReg: proc (r: Reg): string {.nimcall.}): CodeGen =
@@ -530,7 +531,24 @@ proc adoptProgram*(g: var CodeGen) =
   ## `collect` is called per target (its flags differ); everything after it is
   ## the same on all three, which is exactly why it belongs here rather than
   ## three times over.
+  # The asm buffer mints its own symbols, so it needs the pool the ids it is
+  # handed come from — this is the one crossing between the two dialects.
+  g.ab.lengPool = g.prog.pool
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm
+
+proc lengSym*(g: CodeGen; name: string): SymId {.inline.} =
+  ## `programs.lengSym` on the emitter's own program — see there.
+  g.prog.lengSym(name)
+
+proc spelling*(g: CodeGen; sym: SymId): string {.inline.} =
+  ## `programs.spelling` on the emitter's own program — the ONE way an emitter
+  ## turns an id back into text, for a diagnostic or for a name built out of one.
+  g.prog.spelling(sym)
+
+proc userName*(g: CodeGen; sym: SymId): string {.inline.} =
+  ## `diag.userName` for a symbol the emitter holds as an id: the spelling is
+  ## built only because a human is about to read it.
+  userName(g.prog.spelling(sym))

@@ -36,7 +36,7 @@ from rv32 import nil
 
 proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
-    stderr.writeLine "arkham genProc: " & info.asmName
+    stderr.writeLine "arkham genProc: " & g.spelling(info.asmName)
   if info.isAsm:
     g.genAsmProc(info)
     return
@@ -49,7 +49,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     lengError info.decl, "`{.naked.}` requires `{.assembler.}`: without a frame " &
               "the register allocator has nowhere to spill", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
-    g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.cleanSigProcs = cleanSigProcs(g.prog)
     g.noReturnProcs = noReturnProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
@@ -119,7 +119,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # RegisterBindingsMatchLoc breaks.
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
-  g.curProcName = info.asmName            # names the proc in this backend's diagnostics
+  g.curProcName = g.spelling(info.asmName)            # names the proc in this backend's diagnostics
   # Can an address into THIS frame exist at all? Only a stack-homed symbol has one, and
   # a tail call gives the frame back BEFORE it branches. The x64 twin in `driver.nim`
   # spells out why the syntactic `tailCallLeaksFrame` alone is not enough.
@@ -142,7 +142,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                      " lastResort=" & $lastResortTakes &
                      " " & g.curProcName
 
-proc genType*(g: var CodeGen; name: string; decl: Cursor) =
+proc genType*(g: var CodeGen; name: SymId; decl: Cursor) =
   ## Emit `(type :name <translated body>)` — a top-level type definition that
   ## nifasm's stack-slot allocator consults for aggregate field offsets.
   var c = decl
@@ -156,7 +156,7 @@ proc genType*(g: var CodeGen; name: string; decl: Cursor) =
       # sees the body, so it travels as the body's first child.
       g.genTypeBody(c, packed)
 
-proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
+proc genGlobal*(g: var CodeGen; nifName: SymId; decl: Cursor) =
   ## Emit a top-level `const`/`gvar`. A true `const` with a value becomes a
   ## read-only `.text` data blob; a `gvar` with a compile-time-constant SCALAR
   ## initializer is laid out as static `.bss`-image data (so it is correct even for
@@ -179,7 +179,7 @@ proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
     let hasValue = c.hasMore and c.kind != DotToken
     if isConst and hasValue:
       var bytes = ""
-      var relocs: seq[(int, string)] = @[]
+      var relocs: seq[(int, SymId)] = @[]
       constToBytes(g.prog, typeCur, c, bytes, relocs)
       g.ab.tree RodataD:
         g.ab.symDef name
@@ -197,7 +197,7 @@ proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
       g.ab.close()
     while c.hasMore: skip c                   # value (runtime inits done at entry)
 
-proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
+proc genTvar*(g: var CodeGen; name: SymId; decl: Cursor) =
   ## Emit `(tvar :name <type> <intlit>?)` — a thread-local variable. A literal
   ## initializer is baked into the per-thread template dyld copies on first
   ## access; non-literal initializers are unsupported (a thread-local is
@@ -236,7 +236,7 @@ proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
     if c.kind == IntLit:
       g.ab.intLit intVal(c)                   # literal initializer → TLV template
     elif c.kind != DotToken:
-      raiseAssert "arkham: thread-local initializer must be an integer literal: " & name
+      raiseAssert "arkham: thread-local initializer must be an integer literal: " & g.spelling(name)
     g.ab.close()
     while c.hasMore: skip c
 
@@ -277,7 +277,7 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     let tvarDecls = g.prog.tvarsInOrder()
     for (name, decl) in tvarDecls:
       g.genTvar(name, decl)             # one thread here, so each becomes a gvar
-    g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
+    g.emitSemihostExitProc(g.lengSym(EntryExitShim)) # the entry's tail-call target, always
     if g.prog.syscalls.len > 0:
       # The `write` shim's console handle and the `:tt` device name it opens.
       # Emitted whenever any shim is, rather than tracked: one word of .bss and
@@ -373,7 +373,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     let tvarDecls = g.prog.tvarsInOrder()
     for (name, decl) in tvarDecls:
       g.genTvar(name, decl)             # one thread here, so each becomes a gvar
-    g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
+    g.emitSemihostExitProc(g.lengSym(EntryExitShim)) # the entry's tail-call target, always
     if g.prog.syscalls.len > 0:
       g.ab.tree RodataD:
         g.ab.symDef g.semiTtyName

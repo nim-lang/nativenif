@@ -1,0 +1,109 @@
+(.nif27)
+(stmts
+ (proc :ctzIt.0
+  (params
+   (param :x.0 .
+    (u 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "Ctz"))
+  (stmts .))
+ (proc :clzIt.0
+  (params
+   (param :x.0 .
+    (u 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "Clz"))
+  (stmts .))
+ (proc :pcIt.0
+  (params
+   (param :x.0 .
+    (u 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "Popcount"))
+  (stmts .))
+ (proc :ctzL.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (i 32)
+  (pragmas
+   (intrinsic "Ctz"))
+  (stmts .))
+ (proc :clzL.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (i 64)
+  (pragmas
+   (intrinsic "Clz"))
+  (stmts .))
+ (proc :pcL.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (i 32)
+  (pragmas
+   (intrinsic "Popcount"))
+  (stmts .))
+ (proc :bc.0
+  (params
+   (param :x.0 .
+    (u 32))).
+  (pragmas
+   (importc "__builtin_ctz"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :s.0 .
+    (i 64)0)
+   (asgn s.0
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)
+          (add
+           (i 64)s.0
+           (conv
+            (i 64)
+            (instr ctzIt.0
+             (suf 24 "i32"))))
+          (conv
+           (i 64)
+           (instr clzIt.0
+            (suf 65535 "i32"))))
+         (conv
+          (i 64)
+          (instr pcIt.0
+           (suf 255 "i32"))))
+        (conv
+         (i 64)
+         (instr ctzL.0
+          (suf 2147483648 "i64"))))
+       (instr clzL.0
+        (suf 71776119061217280 "i64")))
+      (conv
+       (i 64)
+       (instr pcL.0
+        (suf 1085102592571150095 "i64"))))
+     (conv
+      (i 64)
+      (call bc.0
+       (suf 12 "i32")))))
+   (ret
+    (conv
+     (i 32)s.0)))))

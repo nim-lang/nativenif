@@ -13,6 +13,13 @@ import std / [assertions]
 import nifcore
 import nifcdecl
 
+const NoSymId* = default(SymId)
+  ## "no symbol": an empty slot in a table or a field that names one. `bitabs`
+  ## hands out ids from 1, so 0 is never a real symbol and this cannot collide
+  ## with one — the same reasoning as `programs.NoTypeSym`, which is this value
+  ## under the name the type env uses. It replaces the `""` that stood for
+  ## "nothing here" while these fields were spellings.
+
 type
   AsmTypeKind* = enum
     ABool          # also models CPU flag results
@@ -104,7 +111,7 @@ const
     ## `defaultFloatSlot` — which is reached while classifying types, before any
     ## refusal — yields a well-formed slot rather than a zero-sized one.
   Wasm32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 8, maxFloat: 8)
-    ## wasm32 (ithaqua). A pointer is a 32-bit linear-memory offset, but `i64`
+    ## wasm32 (the web back end). A pointer is a 32-bit linear-memory offset, but `i64`
     ## and `f64` are first-class wasm value types that one "register" — an
     ## unlimited typed local — holds, so unlike `Word32` the scalar and float
     ## bounds stay at 8. Only the pointer narrows.
@@ -229,12 +236,12 @@ proc typeToSlot*(c: Cursor): AsmSlot =
 # keeps only the pure, structural pieces.
 
 type
-  FieldInfo* = tuple[name: string, off, size: int]
+  FieldInfo* = tuple[name: SymId, off, size: int]
 
-proc fieldAtOffset*(lay: seq[FieldInfo]; byteOff: int): string =
+proc fieldAtOffset*(lay: seq[FieldInfo]; byteOff: int): SymId =
   for f in lay:
     if f.off == byteOff: return f.name
-  result = ""
+  result = NoSymId
 
 proc addrSlot*(): AsmSlot {.inline.} =
   ## A slot holding an ADDRESS, at the target's pointer width. Sites that build

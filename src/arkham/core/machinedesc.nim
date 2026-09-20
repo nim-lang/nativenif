@@ -47,6 +47,7 @@ const SynthMark* = "`"
 template synth*(tag: string): string = SynthMark & tag
   ## Spelling of an arkham-minted asm symbol whose name is exactly `tag`.
 
+
 type
   Reg* = enum   ## abstract GPR slot; a backend maps it to a hardware register
     R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15,
@@ -460,7 +461,7 @@ type
     ## of failing.)
     case kind*: FieldBaseKind
     of FbReg: reg*: Reg
-    of FbSlot, FbGlob, FbTvar: sym*: string
+    of FbSlot, FbGlob, FbTvar: sym*: SymId
     of FbLval: lval*: Cursor
 
   Location* = object
@@ -487,9 +488,9 @@ type
       r0*: Reg            ## eightbyte 0 (offset 0)
       r1*: Reg            ## eightbyte 1 (offset 8); `NoReg` if the aggregate is 8 bytes
     of InFReg: f*: FReg
-    of NamedStack, Glob, Tvar: name*: string
+    of NamedStack, Glob, Tvar: name*: SymId
     of StackPtr:
-      ptrName*: string       ## the 8-byte slot holding `&aggregate`
+      ptrName*: SymId        ## the 8-byte slot holding `&aggregate`
       pointeeType*: SymId    ## POOL ID of the pointee's nominal type symbol — the
                              ## identity a `Symbol` token already carries, so nothing
                              ## materialises a string to compare or store one (the
@@ -501,7 +502,7 @@ type
                              ## branches share one field namespace.
     of Mem: cur*: Cursor
     of Field:
-      field*: string         ## the member name
+      field*: SymId          ## the member name
       aggrType*: SymId       ## POOL ID of the enclosing aggregate's nominal type — the
                              ## key the layout API takes, like `StackPtr.pointeeType`
       base*: FieldBase       ## how the aggregate is reached (explicit kind)
@@ -541,13 +542,13 @@ proc pairWord*(loc: Location; i: int): Reg {.inline.} =
   if i == 0: loc.r0 else: loc.r1
 proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
-proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.inline.} =
+proc namedStackLoc*(name: SymId; typ: AsmSlot; spillTemp = false): Location {.inline.} =
   ## `spillTemp` marks a *spill-temp* slot (an `etmp`/`eftmp` synthesized when the
   ## register pool was exhausted) — a value position the emitter must PRODUCE into
   ## (via a staging register), as opposed to a symbol's stack home left in place for
   ## folding. The emitter (`produceIntoMem`) keys on it.
   Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
-proc stackPtrLoc*(name: string; pointeeType: SymId; typ: AsmSlot): Location {.inline.} =
+proc stackPtrLoc*(name: SymId; pointeeType: SymId; typ: AsmSlot): Location {.inline.} =
   ## An 8-byte `(s)` slot holding `&aggregate` — the aggregate itself is elsewhere.
   ## `typ` is the AGGREGATE's slot (what the location's value IS), `pointeeType` the
   ## pool id of its nominal type; the pointer's own 8-byte shape is implied by the kind
@@ -557,22 +558,22 @@ proc stackPtrLoc*(name: string; pointeeType: SymId; typ: AsmSlot): Location {.in
   ## `Symbol` — so an unnamed inline aggregate type, which has no layout to look up,
   ## cannot be smuggled in as a plausible-looking empty name.
   Location(kind: StackPtr, ptrName: name, pointeeType: pointeeType, typ: typ)
-proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+proc globLoc*(name: SymId; typ: AsmSlot): Location {.inline.} =
   Location(kind: Glob, name: name, typ: typ)
-proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+proc tvarLoc*(name: SymId; typ: AsmSlot): Location {.inline.} =
   Location(kind: Tvar, name: name, typ: typ)
 proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
-proc fieldLoc*(aggrType: SymId; field, baseName: string; typ: AsmSlot): Location {.inline.} =
+proc fieldLoc*(aggrType: SymId; field, baseName: SymId; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr base).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
-proc fieldLocReg*(aggrType: SymId; field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
+proc fieldLocReg*(aggrType: SymId; field: SymId; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
   ## param / hidden-result buffer / a nested field's computed address).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbReg, reg: baseReg), typ: typ)
-proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
+proc fieldLocGlob*(aggrType: SymId; field, globName: SymId; typ: AsmSlot;
                    isTvar = false): Location {.inline.} =
   ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
   ## if `isTvar`), whose address is RE-DERIVED into a fresh transient at each field store
@@ -583,7 +584,7 @@ proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
   let base = if isTvar: FieldBase(kind: FbTvar, sym: globName)
              else: FieldBase(kind: FbGlob, sym: globName)
   Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
-proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
+proc fieldLocLval*(aggrType: SymId; field: SymId; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
   ## genConstrIntoLval base — its embedded temps must be pre-materialized).
   Location(kind: Field, aggrType: aggrType, field: field,

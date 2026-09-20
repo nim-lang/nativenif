@@ -34,19 +34,19 @@ type
   SymInfo* = object
     cat*: SymCat
     decl*: Cursor               ## scGlobal/scTvar: the `(gvar|tvar|const :name pragmas type …)`
-    asmName*: string            ## scProc: the asm symbol whose address the proc denotes
+    asmName*: SymId             ## scProc: the asm symbol whose address the proc denotes
 
   TypeCtx* = object
     ## A view over the symbol tables `getType` consults. The fields are `ptr`s
     ## into the owner's storage (the `CodeGen`), so a `TypeCtx` is a cheap handle
     ## both the allocator and the emitter can hold over the same tables.
     prog*: ptr Program                         ## the whole program (cross-module type env)
-    callTarget*: ptr Table[string, CallTarget] ## call name → signature (for a call's result type)
-    globals*: ptr Table[string, Cursor]        ## global var name → its decl cursor
-    tvars*: ptr Table[string, Cursor]          ## thread-local var name → its decl cursor
-    symType*: ptr Table[string, Cursor]        ## local/param name → its Leng type cursor
+    callTarget*: ptr Table[SymId, CallTarget]  ## call symbol → signature (for a call's result type)
+    globals*: ptr Table[SymId, Cursor]         ## global var symbol → its decl cursor
+    tvars*: ptr Table[SymId, Cursor]           ## thread-local var symbol → its decl cursor
+    symType*: ptr Table[SymId, Cursor]         ## local/param symbol → its Leng type cursor
 
-proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
+proc lookupSym*(tc: TypeCtx; nm: SymId): SymInfo =
   ## The one place a module-level symbol resolves to its kind + declaration:
   ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
   ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLoc`/
@@ -64,7 +64,7 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
   let d = lookupForeignDecl(tc.prog[], nm, found)
   if found:
     case d.stmtKind
-    of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
+    of ProcS: return SymInfo(cat: scProc, asmName: nm)  # foreign proc: its own NIF symbol
     of TvarS:
       # A FOREIGN thread-local is classified exactly as its OWNING module
       # classified its own, on every target: `collect` emits a `(tvar …)`
@@ -82,7 +82,7 @@ proc isIndirectCallTarget*(tc: TypeCtx; targetCur: Cursor): bool =
   ## symbol-indirect path). Without this, a bare-Symbol call through a proc-typed
   ## param/local was mis-sent to the foreign-proc resolver (`foreignCallTarget`
   ## asserts "not a foreign proc").
-  targetCur.kind != Symbol or tc.lookupSym(symName(targetCur)).cat == scNone
+  targetCur.kind != Symbol or tc.lookupSym(targetCur.symId).cat == scNone
 
 proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   ## The structural Leng type cursor of expression `c` (arkham's analog of
@@ -92,7 +92,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   ## the single source of truth for "is this float?" — no per-form special cases.
   case c.kind
   of Symbol:
-    let nm = symName(c)
+    let nm = c.symId
     if tc.symType[].hasKey(nm): return tc.symType[].getOrQuit(nm)
     let si = tc.lookupSym(nm)
     case si.cat
@@ -111,7 +111,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
         inc d; skip d                         # name, pragmas
         result = d                            # the declared type (a copy)
         while d.hasMore: skip d
-    of scNone: raiseAssert "arkham: getType — unknown symbol " & nm
+    of scNone: raiseAssert "arkham: getType — unknown symbol " & symString(tc.prog[].pool, nm)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
@@ -127,7 +127,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
         when defined(fieldDebug):
           if not (objTy.kind == TagLit and objTy.typeKind == ObjectT):
             echo "BAD DOT: ", toString(c, includeLineInfo = false)
-        result = fieldType(tc.prog[], objTy, symName(t)); inc t
+        result = fieldType(tc.prog[], objTy, t.symId); inc t
         while t.hasMore: skip t
     of AtC, PatC:
       # `(at array idx)` indexes an array, `(pat ptr idx)` a pointer; either way
@@ -167,7 +167,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
       # but the callee is never a value, so it has no proctype to peel: the row
       # recorded the declared return type directly.
       var t = c; inc t
-      result = instrTargetOf(tc.prog[], symName(t)).retType
+      result = instrTargetOf(tc.prog[], t.symId).retType
     of NilC:
       # `(nil T? X?)`: `T` is the pointer type the nil stands for, and the frontend
       # types every `ptr`/`ref` nil, so honor it; only a nil a later pass

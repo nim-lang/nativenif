@@ -181,7 +181,7 @@ proc genMemIntrinBody*(g: var CodeGen; builtin: string) =
     raiseAssert "arkham x64 v0: unsupported mem intrinsic: " & builtin
   g.unbindTemp(RCX); g.unbindTemp(RDX); g.unbindTemp(RSI)
 
-proc transferAggrWords(g: var CodeGen; varName: string; typeSym: SymId;
+proc transferAggrWords(g: var CodeGen; varName: SymId; typeSym: SymId;
                        regs: openArray[Reg]; toRegs: bool) =
   ## Move an aggregate between memory and the GPRs that carry it, one register per
   ## 8-byte ABI eightbyte (the by-value aggregate ABI). `toRegs` picks the direction
@@ -246,11 +246,11 @@ proc transferAggrWords(g: var CodeGen; varName: string; typeSym: SymId;
         g.emReg regs[i]
   if addrTmp != NoReg: g.giveBack addrTmp
 
-proc structToRegs*(g: var CodeGen; varName: string; typeSym: SymId; regs: openArray[Reg]) =
+proc structToRegs*(g: var CodeGen; varName: SymId; typeSym: SymId; regs: openArray[Reg]) =
   ## aggregate → regs[i] (one GPR per 8-byte word).
   g.transferAggrWords(varName, typeSym, regs, toRegs = true)
 
-proc regsToStruct*(g: var CodeGen; varName: string; typeSym: SymId; regs: openArray[Reg]) =
+proc regsToStruct*(g: var CodeGen; varName: SymId; typeSym: SymId; regs: openArray[Reg]) =
   ## regs[i] → aggregate (one GPR per 8-byte word).
   g.transferAggrWords(varName, typeSym, regs, toRegs = false)
 
@@ -375,7 +375,7 @@ proc emitAtomicInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
       g.unbindTemp(a.r)
 
-proc genAggrCopy*(g: var CodeGen; dstVar, srcVar: string; typeSym: SymId; tmp: Reg) =
+proc genAggrCopy*(g: var CodeGen; dstVar, srcVar: SymId; typeSym: SymId; tmp: Reg) =
   ## Whole-aggregate copy `dstVar ← srcVar`, one FIELD at a time through the allocator-
   ## provided scratch GPR `tmp` (typed per field, so a pointer field keeps `(ptr T)`).
   ## Both operands address by name via emAggrFieldMem (a stack `(s)` slot's dot form,
@@ -409,7 +409,7 @@ proc genAggrCopy*(g: var CodeGen; dstVar, srcVar: string; typeSym: SymId; tmp: R
   if srcR != NoReg: g.giveBack srcR
   if dstR != NoReg: g.giveBack dstR
 
-proc aggrSrcEnd*(g: var CodeGen; name: string; staged: var Reg): AggrEnd =
+proc aggrSrcEnd*(g: var CodeGen; name: SymId; staged: var Reg): AggrEnd =
   ## The copy-source form of the aggregate `name`, and how many registers it costs:
   ##   * an rsp-relative `(s)` slot — an allocator-homed `NamedStack` local OR an emitter-
   ##     synthesized temp (`stackSlots`) — costs NOTHING;
@@ -428,14 +428,14 @@ proc aggrSrcEnd*(g: var CodeGen; name: string; staged: var Reg): AggrEnd =
     return regEnd(staged)
   of InReg: return regEnd(home.r)
   of InRegPair:
-    raiseAssert "arkham x64n: aggrSrcEnd of InRegPair " & name
+    raiseAssert "arkham x64n: aggrSrcEnd of InRegPair " & g.spelling(name)
   else:
     if name in g.stackSlots: return slotEnd(name)
     staged = g.pickStagingSealed("an aggregate-copy source address", AddrSlot)
     g.emSymAddrByName(staged, name)
     return regEnd(staged)
 
-proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
+proc flatCopyToPtr(g: var CodeGen; srcVar: SymId; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]`, through
   ## scratch `tmp`, by the one `copyAggr` (word bulk + byte tail — any size,
   ## layout-agnostic). `srcVar` is a synthetic `(s)` slot at every call site, so the
@@ -450,7 +450,7 @@ proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: 
   g.giveBack sp
   g.unbindTemp(tmp)
 
-proc copyNestedAggrTemp*(g: var CodeGen; tmpName: string; sizeBytes: int; dstPtr: Reg) =
+proc copyNestedAggrTemp*(g: var CodeGen; tmpName: SymId; sizeBytes: int; dstPtr: Reg) =
   ## Copy a `buildNestedAggrTemp` temp into the sub-aggregate at `[dstPtr]`.
   g.bridgeStep("a nested-aggregate temp copy", bdTwoInRegs)
   let scratch = g.pickStagingSealed("a nested-aggregate-field copy word", AddrSlot)
