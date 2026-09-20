@@ -38,6 +38,7 @@
 
 import std / [tables, assertions]
 import machinedesc, asmslots
+import nifcore   # `SymId`: a binding names a symbol by its pool id
 
 include compat2   # getOrQuit on host Nim
 
@@ -49,7 +50,7 @@ type
     MirrorAddr         ## `r` holds `&name` (a global / thread-local / slot address)
 
   Mirror* = object
-    name*: string      ## the symbol whose value/address this register mirrors
+    name*: SymId       ## the symbol whose value/address this register mirrors
     slot*: AsmSlot     ## the width+class it was mirrored at (`MirrorValue`)
     kind*: MirrorKind
 
@@ -83,13 +84,13 @@ type
     ## which is what makes structured control flow a non-issue, since arkham
     ## emits no merge point that is not a label (`emLab`).
     mirror: Table[Reg, Mirror]
-    ofVal: Table[string, Reg]         ## name → the GPR mirroring its value
-    ofAddr: Table[string, Reg]        ## name → the GPR mirroring its address
+    ofVal: Table[SymId, Reg]          ## symbol → the GPR mirroring its value
+    ofAddr: Table[SymId, Reg]         ## symbol → the GPR mirroring its address
     fmirror: Table[FReg, Mirror]      ## the SIMD twin (float values)
-    fofVal: Table[string, FReg]
+    fofVal: Table[SymId, FReg]
 
   RegBind* = object
-    regLocal: Table[Reg, string]      ## reg → the named local/param/temp bound to it
+    regLocal: Table[Reg, SymId]       ## reg → the named local/param/temp bound to it
                                       ## (`emReg` emits the name, not the raw `(reg)`)
     boundTemps: set[Reg]              ## regs whose `regLocal` entry is a transient
                                       ## scratch temp (`bindScratch`), NOT a steal-able
@@ -97,13 +98,13 @@ type
     regBindPtr: set[Reg]              ## regs whose current binding is POINTER-typed:
                                       ## a `(nil)` value only fits such a binding
                                       ## (x64 `emitValue` NilC consults this)
-    fregLocal: Table[FReg, string]    ## the SIMD twin of `regLocal`
+    fregLocal: Table[FReg, SymId]     ## the SIMD twin of `regLocal`
     boundFTmps: set[FReg]             ## the SIMD twin of `boundTemps`
     tmpBindCount: int                 ## per-proc fresh-name counter for `tmpN.0`
     ftmpBindCount: int                ## per-proc fresh-name counter for `ftmpN.0`
-    scopeLocals: seq[seq[tuple[name: string, reg: Reg]]]
+    scopeLocals: seq[seq[tuple[name: SymId, reg: Reg]]]
                                       ## per-scope register locals to `kill` on exit
-    scopeFLocals: seq[seq[tuple[name: string, f: FReg]]]
+    scopeFLocals: seq[seq[tuple[name: SymId, f: FReg]]]
     liveAccums: set[Reg]              ## arg/return regs holding an in-flight expression
                                       ## accumulator (a genInto target that is not a
                                       ## named local, so absent from `regLocal`); a
@@ -119,51 +120,51 @@ type
 # ── the mirror map ──────────────────────────────────────────────────────────
 # Kept ahead of the transitions so each of them can drop what it invalidates.
 
-proc dropMirror*(rb: var RegBind; r: Reg): string {.discardable.} =
+proc dropMirror*(rb: var RegBind; r: Reg): SymId {.discardable.} =
   ## `r` is being written / rebound / handed out: whatever it mirrored is gone,
   ## and so is the binding the mirror was keeping alive. Returns the name whose
-  ## `(kill …)` the caller must emit, "" when `r` held no mirror.
+  ## `(kill …)` the caller must emit, `NoSymId` when `r` held no mirror.
   ##
   ## The three callers that may DISCARD it are the ones that follow with a
   ## `(rebind …)`, which auto-kills the tenant on the nifasm side; every other
   ## caller owes the kill, exactly like `takeBinding`'s result.
-  result = ""
+  result = NoSymId
   let e = rb.m.mirror.getOrDefault(r)
-  if e.name.len > 0:
+  if e.name != NoSymId:
     case e.kind
     of MirrorValue:
       if rb.m.ofVal.getOrDefault(e.name, NoReg) == r: rb.m.ofVal.del e.name
     of MirrorAddr:
       if rb.m.ofAddr.getOrDefault(e.name, NoReg) == r: rb.m.ofAddr.del e.name
     rb.m.mirror.del r
-    result = rb.regLocal.getOrDefault(r, "")
+    result = rb.regLocal.getOrDefault(r, NoSymId)
     rb.regLocal.del r
     rb.regBindPtr.excl r
 
-proc dropFMirror*(rb: var RegBind; f: FReg): string {.discardable.} =
-  result = ""
+proc dropFMirror*(rb: var RegBind; f: FReg): SymId {.discardable.} =
+  result = NoSymId
   let e = rb.m.fmirror.getOrDefault(f)
-  if e.name.len > 0:
+  if e.name != NoSymId:
     if rb.m.fofVal.getOrDefault(e.name, NoFReg) == f: rb.m.fofVal.del e.name
     rb.m.fmirror.del f
-    result = rb.fregLocal.getOrDefault(f, "")
+    result = rb.fregLocal.getOrDefault(f, NoSymId)
     rb.fregLocal.del f
 
-proc dropMirrorsOf*(rb: var RegBind; name: string): tuple[gprs, fprs: seq[string]] {.discardable.} =
+proc dropMirrorsOf*(rb: var RegBind; name: SymId): tuple[gprs, fprs: seq[SymId]] {.discardable.} =
   ## `name` was STORED to (or went out of scope): every register mirroring its
   ## VALUE is stale. Its ADDRESS is not — an object does not move — so `ofAddr`
   ## survives a store and ends only at a register event or a whole-map clear.
-  result = (gprs: newSeq[string](), fprs: newSeq[string]())
+  result = (gprs: newSeq[SymId](), fprs: newSeq[SymId]())
   let r = rb.m.ofVal.getOrDefault(name, NoReg)
   if r != NoReg:
     let dead = rb.dropMirror(r)
-    if dead.len > 0: result.gprs.add dead
+    if dead != NoSymId: result.gprs.add dead
   let f = rb.m.fofVal.getOrDefault(name, NoFReg)
   if f != NoFReg:
     let dead = rb.dropFMirror(f)
-    if dead.len > 0: result.fprs.add dead
+    if dead != NoSymId: result.fprs.add dead
 
-proc takeMirrors*(rb: var RegBind): tuple[gprs, fprs: seq[string]] =
+proc takeMirrors*(rb: var RegBind): tuple[gprs, fprs: seq[SymId]] =
   ## Every mirror dies. The emitters call this at each point where what a use
   ## reads no longer follows from the instructions just emitted: a label
   ## DEFINITION (hence every merge point and every back edge — arkham emits no
@@ -174,18 +175,18 @@ proc takeMirrors*(rb: var RegBind): tuple[gprs, fprs: seq[string]] =
   ##
   ## The kills come out in REGISTER order, not the tables' order: a `Table` walk
   ## follows the hash function, which is not the same under every compiler.
-  result = (gprs: newSeq[string](), fprs: newSeq[string]())
+  result = (gprs: newSeq[SymId](), fprs: newSeq[SymId]())
   for r in low(Reg)..high(Reg):
     if not rb.m.mirror.hasKey(r): continue
-    let nm = rb.regLocal.getOrDefault(r, "")
-    if nm.len > 0:
+    let nm = rb.regLocal.getOrDefault(r, NoSymId)
+    if nm != NoSymId:
       result.gprs.add nm
       rb.regLocal.del r
       rb.regBindPtr.excl r
   for f in low(FReg)..high(FReg):
     if not rb.m.fmirror.hasKey(f): continue
-    let nm = rb.fregLocal.getOrDefault(f, "")
-    if nm.len > 0:
+    let nm = rb.fregLocal.getOrDefault(f, NoSymId)
+    if nm != NoSymId:
       result.fprs.add nm
       rb.fregLocal.del f
   rb.m.mirror.clear()
@@ -203,7 +204,7 @@ proc clearMirrors(rb: var RegBind) =
   rb.m.fmirror.clear()
   rb.m.fofVal.clear()
 
-proc mirrorValue*(rb: var RegBind; r: Reg; name: string; slot: AsmSlot) =
+proc mirrorValue*(rb: var RegBind; r: Reg; name: SymId; slot: AsmSlot) =
   ## `r` still carries the value just stored into `name`'s stack home. The caller
   ## has released `r` — it is allocatable again — but did NOT kill its binding,
   ## which is what keeps the register readable as a typed name and makes any
@@ -214,20 +215,20 @@ proc mirrorValue*(rb: var RegBind; r: Reg; name: string; slot: AsmSlot) =
   ## below are that contract, not a defensive fallback.
   assert not rb.m.mirror.hasKey(r), "arkham: mirrorValue over a live mirror"
   assert rb.regLocal.hasKey(r), "arkham: mirrorValue on an unbound register"
-  assert not rb.m.ofVal.hasKey(name), "arkham: two value mirrors of " & name
+  assert not rb.m.ofVal.hasKey(name), "arkham: two value mirrors of " & $name
   rb.boundTemps.excl r                  # a mirror is not a temp in flight
   rb.m.mirror[r] = Mirror(name: name, slot: slot, kind: MirrorValue)
   rb.m.ofVal[name] = r
 
-proc mirrorFValue*(rb: var RegBind; f: FReg; name: string; slot: AsmSlot) =
+proc mirrorFValue*(rb: var RegBind; f: FReg; name: SymId; slot: AsmSlot) =
   assert not rb.m.fmirror.hasKey(f), "arkham: mirrorFValue over a live mirror"
   assert rb.fregLocal.hasKey(f), "arkham: mirrorFValue on an unbound register"
-  assert not rb.m.fofVal.hasKey(name), "arkham: two value mirrors of " & name
+  assert not rb.m.fofVal.hasKey(name), "arkham: two value mirrors of " & $name
   rb.boundFTmps.excl f
   rb.m.fmirror[f] = Mirror(name: name, slot: slot, kind: MirrorValue)
   rb.m.fofVal[name] = f
 
-proc mirrorAddr*(rb: var RegBind; r: Reg; name: string; slot: AsmSlot) =
+proc mirrorAddr*(rb: var RegBind; r: Reg; name: SymId; slot: AsmSlot) =
   ## `r` still holds `&name` — the materialized address of a global / thread-local
   ## whose access would otherwise re-derive it (`adrp`+`add` on AArch64, a TLV call
   ## for a Darwin thread-local). Unlike a value mirror this survives a STORE to
@@ -235,7 +236,7 @@ proc mirrorAddr*(rb: var RegBind; r: Reg; name: string; slot: AsmSlot) =
   ## ends it.
   assert not rb.m.mirror.hasKey(r), "arkham: mirrorAddr over a live mirror"
   assert rb.regLocal.hasKey(r), "arkham: mirrorAddr on an unbound register"
-  assert not rb.m.ofAddr.hasKey(name), "arkham: two address mirrors of " & name
+  assert not rb.m.ofAddr.hasKey(name), "arkham: two address mirrors of " & $name
   rb.boundTemps.excl r
   rb.m.mirror[r] = Mirror(name: name, slot: slot, kind: MirrorAddr)
   rb.m.ofAddr[name] = r
@@ -248,18 +249,18 @@ proc sameShape(a, b: AsmSlot): bool {.inline.} =
   ## the symbol's own home — so this only ever rejects an unusual consumer.)
   a.cls == b.cls and a.size == b.size
 
-proc valueMirror*(rb: RegBind; name: string; want: AsmSlot): Reg =
+proc valueMirror*(rb: RegBind; name: SymId; want: AsmSlot): Reg =
   ## The GPR still holding `name`'s value, or `NoReg`.
   result = rb.m.ofVal.getOrDefault(name, NoReg)
   if result != NoReg and not sameShape(rb.m.mirror.getOrQuit(result).slot, want):
     result = NoReg
 
-proc fvalueMirror*(rb: RegBind; name: string; want: AsmSlot): FReg =
+proc fvalueMirror*(rb: RegBind; name: SymId; want: AsmSlot): FReg =
   result = rb.m.fofVal.getOrDefault(name, NoFReg)
   if result != NoFReg and not sameShape(rb.m.fmirror.getOrQuit(result).slot, want):
     result = NoFReg
 
-proc addrMirror*(rb: RegBind; name: string): Reg =
+proc addrMirror*(rb: RegBind; name: SymId): Reg =
   rb.m.ofAddr.getOrDefault(name, NoReg)
 
 # `r` carries a mirror binding and NOTHING else: still allocatable (every freeness
@@ -271,20 +272,20 @@ proc mirrorCount*(rb: RegBind): int {.inline.} = rb.m.mirror.len + rb.m.fmirror.
 
 # ── queries ─────────────────────────────────────────────────────────────────
 
-proc boundName*(rb: RegBind; r: Reg): string {.inline.} =
-  ## The name bound to `r`, or "" when `r` is raw.
-  rb.regLocal.getOrDefault(r, "")
+proc boundName*(rb: RegBind; r: Reg): SymId {.inline.} =
+  ## The symbol bound to `r`, or `NoSymId` when `r` is raw.
+  rb.regLocal.getOrDefault(r, NoSymId)
 
 proc isBound*(rb: RegBind; r: Reg): bool {.inline.} = rb.regLocal.hasKey(r)
 proc isBoundTemp*(rb: RegBind; r: Reg): bool {.inline.} = r in rb.boundTemps
 proc isPtrBound*(rb: RegBind; r: Reg): bool {.inline.} = r in rb.regBindPtr
 
-proc boundFName*(rb: RegBind; f: FReg): string {.inline.} =
-  rb.fregLocal.getOrDefault(f, "")
+proc boundFName*(rb: RegBind; f: FReg): SymId {.inline.} =
+  rb.fregLocal.getOrDefault(f, NoSymId)
 
 proc isBoundFTmp*(rb: RegBind; f: FReg): bool {.inline.} = f in rb.boundFTmps
 
-iterator gprBindings*(rb: RegBind): (Reg, string) =
+iterator gprBindings*(rb: RegBind): (Reg, SymId) =
   ## In register order, not `regLocal`'s: callers emit from this walk, and a
   ## `Table` walk follows the hash function, which differs between compilers.
   for r in low(Reg)..high(Reg):
@@ -292,13 +293,15 @@ iterator gprBindings*(rb: RegBind): (Reg, string) =
 
 # ── GPR transitions ─────────────────────────────────────────────────────────
 
-proc freshTmpName*(rb: var RegBind; prefix = "tmp"): string =
-  ## A fresh per-proc scratch-binding name (`tmpN.0`; `fntmp` for an indirect
-  ## call target), in arkham's synthetic namespace (see `SynthMark`).
-  result = synth(prefix) & $rb.tmpBindCount & ".0"
+proc freshTmpName*(rb: var RegBind; pool: Pool; prefix = "tmp"): SymId =
+  ## A fresh per-proc scratch binding (`tmpN.0`; `fntmp` for an indirect call
+  ## target), in arkham's synthetic namespace (see `SynthMark`). The spelling is
+  ## built once and interned: from here on the binding IS the id, like every
+  ## other symbol the emitter handles.
+  result = symId(pool, synth(prefix) & $rb.tmpBindCount & ".0")
   inc rb.tmpBindCount
 
-proc bindScratch*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
+proc bindScratch*(rb: var RegBind; r: Reg; name: SymId; isPtr: bool) =
   ## `r` now carries the transient scratch binding `name` (the caller emitted the
   ## `(rebind …)`, which auto-kills any previous tenant on the nifasm side).
   rb.dropMirror r
@@ -306,9 +309,9 @@ proc bindScratch*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
   rb.boundTemps.incl r
   if isPtr: rb.regBindPtr.incl r else: rb.regBindPtr.excl r
 
-proc takeScratch*(rb: var RegBind; r: Reg): string =
+proc takeScratch*(rb: var RegBind; r: Reg): SymId =
   ## Release a scratch binding made by `bindScratch`: returns the name whose
-  ## `(kill …)` the caller must emit, or "" when `r` carries no temp binding
+  ## `(kill …)` the caller must emit, or `NoSymId` when `r` carries no temp binding
   ## (safe on every `giveBack`, whether or not the reg was a bound temp).
   ##
   ## A MIRROR binding is released here too, and it must be: a mirror is a temp
@@ -317,36 +320,36 @@ proc takeScratch*(rb: var RegBind; r: Reg): string =
   ## tracks and `emReg` would emit it for an unrelated value. The sites that WANT
   ## to leave a mirror behind therefore do not go through `giveBack`; they call
   ## the backend's mirror-release helper instead.
-  result = ""
+  result = NoSymId
   if r in rb.boundTemps or rb.m.mirror.hasKey(r):
-    result = rb.regLocal.getOrDefault(r, "")
+    result = rb.regLocal.getOrDefault(r, NoSymId)
     rb.dropMirror r
     rb.regLocal.del r
     rb.boundTemps.excl r
     rb.regBindPtr.excl r
 
-proc takeBinding*(rb: var RegBind; r: Reg): string =
+proc takeBinding*(rb: var RegBind; r: Reg): SymId =
   ## Remove WHATEVER binding `r` carries (local, param or temp): returns the name
-  ## whose `(kill …)` the caller must emit, or "". Also clears a stale
+  ## whose `(kill …)` the caller must emit, or `NoSymId`. Also clears a stale
   ## `regBindPtr` bit even when no binding exists.
-  result = rb.regLocal.getOrDefault(r, "")
-  if result.len > 0: rb.regLocal.del r
+  result = rb.regLocal.getOrDefault(r, NoSymId)
+  if result != NoSymId: rb.regLocal.del r
   rb.dropMirror r
   rb.boundTemps.excl r
   rb.regBindPtr.excl r
 
-proc takeBindingIf*(rb: var RegBind; r: Reg; name: string): bool =
+proc takeBindingIf*(rb: var RegBind; r: Reg; name: SymId): bool =
   ## Remove `r`'s binding only when it still IS `name` (it may have been rebound
   ## to a later tenant meanwhile, which already released this one). Returns
   ## whether it was removed — the caller emits `(kill name)` on true.
-  result = rb.regLocal.getOrDefault(r, "") == name
+  result = rb.regLocal.getOrDefault(r, NoSymId) == name
   if result:
     rb.regLocal.del r
     rb.dropMirror r
     rb.boundTemps.excl r
     rb.regBindPtr.excl r
 
-proc bindLocal*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
+proc bindLocal*(rb: var RegBind; r: Reg; name: SymId; isPtr: bool) =
   ## `r` becomes the register home of the named local `name` for the current
   ## scope (the caller emitted the `(var :name (reg) T)` decl, after killing the
   ## previous tenant via `takeBinding`).
@@ -358,7 +361,7 @@ proc bindLocal*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
   if isPtr: rb.regBindPtr.incl r else: rb.regBindPtr.excl r
   rb.scopeLocals[^1].add (name: name, reg: r)
 
-proc bindParam*(rb: var RegBind; r: Reg; name: string) =
+proc bindParam*(rb: var RegBind; r: Reg; name: SymId) =
   ## `r` carries the register-resident parameter `name` (bound by the proc
   ## signature itself, so there is no decl to emit and no scope entry — the
   ## binding dies at the param's last use or the first call, not at scope exit).
@@ -368,7 +371,7 @@ proc bindParam*(rb: var RegBind; r: Reg; name: string) =
   rb.boundTemps.excl r
   rb.regBindPtr.excl r
 
-proc rebindLocal*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
+proc rebindLocal*(rb: var RegBind; r: Reg; name: SymId; isPtr: bool) =
   ## Re-establish `r`'s binding to the already-declared local `name` (the caller
   ## emitted the zero-machine-code `(rebind …)`, which auto-kills the transient
   ## tenant). No scope entry — the local's declaring scope already tracks it.
@@ -382,35 +385,35 @@ proc rebindLocal*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
 
 # ── float transitions (the SIMD twins) ──────────────────────────────────────
 
-proc freshFTmpName*(rb: var RegBind): string =
-  result = synth("ftmp") & $rb.ftmpBindCount & ".0"
+proc freshFTmpName*(rb: var RegBind; pool: Pool): SymId =
+  result = symId(pool, synth("ftmp") & $rb.ftmpBindCount & ".0")
   inc rb.ftmpBindCount
 
-proc bindFScratch*(rb: var RegBind; f: FReg; name: string) =
+proc bindFScratch*(rb: var RegBind; f: FReg; name: SymId) =
   rb.dropFMirror f
   rb.fregLocal[f] = name
   rb.boundFTmps.incl f
 
-proc takeFScratch*(rb: var RegBind; f: FReg): string =
-  ## Returns the name to `(kill …)`, or "" when `f` carries no temp binding.
+proc takeFScratch*(rb: var RegBind; f: FReg): SymId =
+  ## Returns the symbol to `(kill …)`, or `NoSymId` when `f` carries no temp binding.
   ## Releases a mirror binding too — see `takeScratch` for why every ordinary
   ## release path must be able to end one.
-  result = ""
+  result = NoSymId
   if f in rb.boundFTmps or rb.m.fmirror.hasKey(f):
-    result = rb.fregLocal.getOrDefault(f, "")
+    result = rb.fregLocal.getOrDefault(f, NoSymId)
     rb.dropFMirror f
     rb.fregLocal.del f
     rb.boundFTmps.excl f
 
-proc takeFBinding*(rb: var RegBind; f: FReg): string =
+proc takeFBinding*(rb: var RegBind; f: FReg): SymId =
   ## The SIMD twin of `takeBinding`: remove WHATEVER binding `f` carries (a float
   ## local or a temp), returning the name whose `(kill …)` the caller must emit.
-  result = rb.fregLocal.getOrDefault(f, "")
+  result = rb.fregLocal.getOrDefault(f, NoSymId)
   rb.dropFMirror f
   rb.fregLocal.del f
   rb.boundFTmps.excl f
 
-proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
+proc bindFLocal*(rb: var RegBind; f: FReg; name: SymId) =
   assert rb.scopeFLocals.len > 0, "arkham: bindFLocal outside any scope"
   rb.dropFMirror f
   rb.dropMirrorsOf name
@@ -418,8 +421,8 @@ proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
   rb.boundFTmps.excl f
   rb.scopeFLocals[^1].add (name: name, f: f)
 
-proc takeFBindingIf(rb: var RegBind; f: FReg; name: string): bool =
-  result = rb.fregLocal.getOrDefault(f, "") == name
+proc takeFBindingIf(rb: var RegBind; f: FReg; name: SymId): bool =
+  result = rb.fregLocal.getOrDefault(f, NoSymId) == name
   if result:
     rb.fregLocal.del f
     rb.dropFMirror f
@@ -431,12 +434,12 @@ proc enterScope*(rb: var RegBind) =
   rb.scopeLocals.add @[]
   rb.scopeFLocals.add @[]
 
-proc exitScope*(rb: var RegBind): tuple[gprs, fprs: seq[string]] =
+proc exitScope*(rb: var RegBind): tuple[gprs, fprs: seq[SymId]] =
   ## Close the current scope: unbind every register local declared in it that is
   ## STILL bound to its register (one whose register was rebound to a later local
   ## was already killed at that rebind). Returns the names whose `(kill …)` the
   ## caller must emit, in declaration order.
-  result = (gprs: newSeq[string](), fprs: newSeq[string]())
+  result = (gprs: newSeq[SymId](), fprs: newSeq[SymId]())
   for it in rb.scopeLocals.pop():
     rb.dropMirrorsOf it.name          # its home is dead; nothing may forward from it
     if rb.takeBindingIf(it.reg, it.name): result.gprs.add it.name

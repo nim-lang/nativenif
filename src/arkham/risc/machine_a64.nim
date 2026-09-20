@@ -13,6 +13,7 @@
 ## `machine`.
 
 import ../core/[machinedesc]
+import nifcore   # `SymId`: a `Location` names symbols by pool id
 export machinedesc
 
 const
@@ -218,6 +219,9 @@ proc regName*(f: FReg): string =
   if f == NoFReg: "<nofreg>" else: "v" & $ord(f)
 
 proc `$`*(loc: Location): string =
+  ## Debug rendering. A symbol shows as `#<id>`: a `Location` names symbols by
+  ## pool id and the spelling lives in the input's pool, which this has no
+  ## handle on — print `prog.spelling(id)` at a site that does.
   case loc.kind
   of Undef: "undef"
   of NoLoc: "noloc"
@@ -227,16 +231,16 @@ proc `$`*(loc: Location): string =
   of InRegPair:
     "{" & regName(loc.r0) & (if loc.r1 != NoReg: "," & regName(loc.r1) else: "") & "}"
   of InFReg: regName(loc.f)
-  of NamedStack: "&" & loc.name
-  of StackPtr: "*" & loc.ptrName
+  of NamedStack: "&#" & $loc.name
+  of StackPtr: "*#" & $loc.ptrName
   of Mem: "[mem]"
   of Field:
     (case loc.base.kind
      of FbReg: "[" & regName(loc.base.reg) & "]"
-     of FbSlot: "&" & loc.base.sym
-     of FbGlob: "@" & loc.base.sym
-     of FbTvar: "%fs:" & loc.base.sym
-     of FbLval: "[lval]") & "." & loc.field
-  of Glob: "@" & loc.name
-  of Tvar: "%fs:" & loc.name
+     of FbSlot: "&#" & $loc.base.sym
+     of FbGlob: "@#" & $loc.base.sym
+     of FbTvar: "%fs:#" & $loc.base.sym
+     of FbLval: "[lval]") & ".#" & $loc.field
+  of Glob: "@#" & $loc.name
+  of Tvar: "%fs:#" & $loc.name
   of Imm: "#" & $loc.ival

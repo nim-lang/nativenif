@@ -45,15 +45,15 @@ proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
     else: inc v                                        # descend to the wrapped value
   case v.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.plan.locationOfSym(symName(v), cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
+  of Symbol: g.plan.locationOfSym(v.symId, cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
   else: false
 
-proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
+proc selectAsgnDstRhs(asgn: Cursor; dstName: var SymId; rhs: var Cursor): bool =
   ## `(asgn DST RHS)` with a symbol DST → its name and the RHS cursor. False for a
   ## complex (memory) lvalue. `sub` reads the children without a leave obligation.
   var a = sub(asgn)
   if a.kind != Symbol: return false
-  dstName = symName(a); skip a
+  dstName = a.symId; skip a
   if not a.hasMore: return false
   rhs = a
   return true
@@ -122,8 +122,8 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
     aC = pc; skip pc
     bC = pc
   if g.isFloatExpr(aC): return false
-  var thenDst = ""
-  var elseDst = ""
+  var thenDst = NoSymId
+  var elseDst = NoSymId
   var thenRhs = default(Cursor)
   var elseRhs = default(Cursor)
   if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false

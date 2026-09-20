@@ -81,7 +81,7 @@ proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
       g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff + b, 1); g.emReg tmp)
     g.dropBridge tmp
 
-proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
+proc aggrWordsToFromRegs(g: var CodeGen; varName: SymId; typeSym: SymId;
                          firstArg: int; toRegs: bool) =
   ## Move a ≤16-byte aggregate between its memory home and x{firstArg+i} (the by-value
   ## aggregate ABI). The whole transfer is positional: the slot's address goes into a
@@ -139,11 +139,11 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
       g.storeAggrTail(baseReg, argReg, byteSize, i * w)
   if bridge != NoReg: g.dropBridge bridge
 
-proc structToRegs*(g: var CodeGen; varName: string; typeSym: SymId; firstArg: int) =
+proc structToRegs*(g: var CodeGen; varName: SymId; typeSym: SymId; firstArg: int) =
   ## Aggregate → x{firstArg+i} (one GPR per 8-byte eightbyte).
   g.aggrWordsToFromRegs(varName, typeSym, firstArg, toRegs = true)
 
-proc regsToStruct*(g: var CodeGen; varName: string; typeSym: SymId; firstArg: int) =
+proc regsToStruct*(g: var CodeGen; varName: SymId; typeSym: SymId; firstArg: int) =
   ## x{firstArg+i} → aggregate (one GPR per 8-byte eightbyte).
   g.aggrWordsToFromRegs(varName, typeSym, firstArg, toRegs = false)
 
@@ -199,7 +199,7 @@ proc takeInstrReg*(g: var CodeGen; slot: AsmSlot; atomic: bool): Location =
   g.pickedRegs.incl b
   result = regLoc(b, slot, isTemp = true)
 
-proc flatCopyToPtr*(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
+proc flatCopyToPtr*(g: var CodeGen; srcVar: SymId; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]` through the
   ## (already bound) word scratch `tmp` — the a64 twin of x64's `flatCopyToPtr`. A flat
   ## word copy is byte-accurate whatever the field layout; a PER-FIELD copy would
@@ -222,7 +222,7 @@ proc regsToStructThroughPtr*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; firstA
   ## (handles packed fields), a trailing PARTIAL eightbyte through `storeAggrTail`. The
   ## through-pointer twin of `regsToStruct` — stores an aggregate call result into a
   ## global.
-  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), "")     # see `aggrWordsToFromRegs`
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), NoSymId)     # see `aggrWordsToFromRegs`
   let byteSize = aggrByteSize(g.prog, typeSym)
   let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
@@ -235,7 +235,7 @@ proc marshalAggrFromAddr*(g: var CodeGen; addrReg: Reg; typeSym: SymId; firstArg
   ## `x{firstArg+i} ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value
   ## ABI argument registers (reverse of `regsToStructThroughPtr`); lets an aggregate CALL
   ## ARGUMENT marshal straight from its address (`aggrAddrInto`) with no copy temp.
-  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), "")     # see `aggrWordsToFromRegs`
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), NoSymId)     # see `aggrWordsToFromRegs`
   let byteSize = aggrByteSize(g.prog, typeSym)
   let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
@@ -273,7 +273,7 @@ proc emitInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   if destSym.kind != Symbol:
     lengError argCurs[0], "the destination of `" & IntrinsicNames[op] & "` must " &
               "be a `var` argument naming a local", lengInfo(c)
-  let home = g.plan.locationOfSym(symName(destSym), g.posOf(destSym))
+  let home = g.plan.locationOfSym(destSym.symId, g.posOf(destSym))
   # The source was already emitted and memo'd by the fused `emitInstr`.
   var src = Location(kind: Undef)
   if row.arity > 1: src = g.plan.planned(g.posOf(argCurs[1]))
@@ -328,7 +328,7 @@ proc wideSymRef*(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
   ## The eight bytes of a 64-bit SYMBOL — a local with a stack home, or a
   ## module-level global whose address has to be materialized.
   scratch = NoReg
-  let home = g.plan.locationOfSym(symName(c), g.posOf(c))
+  let home = g.plan.locationOfSym(c.symId, g.posOf(c))
   case home.kind
   of NamedStack: return slotWide(home.name)
   of NoLoc:
@@ -347,9 +347,9 @@ proc wideSymRef*(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
       scratch = g.takeWideRegs(1, "a 64-bit thread-local address")[0]
       g.genTlvAddr(loc.name, scratch)
       return baseWide(scratch)
-    raiseAssert "arkham cortex-m: 64-bit symbol " & symName(c) & " at " & $loc.kind
+    raiseAssert "arkham cortex-m: 64-bit symbol " & g.spelling(c.symId) & " at " & $loc.kind
   else:
-    raiseAssert "arkham cortex-m: 64-bit local " & symName(c) & " homed in " & $home.kind
+    raiseAssert "arkham cortex-m: 64-bit local " & g.spelling(c.symId) & " homed in " & $home.kind
 
 proc wideFromNarrow*(g: var CodeGen; dst: WideRef; src: Reg; signed: bool) =
   ## Widen a 32-bit value in `src` to the 64-bit value at `dst`: the low word is
@@ -425,7 +425,7 @@ proc wideMul*(g: var CodeGen; dst, a, b: WideRef) =
   g.wideStore(dst, 1, t3)
   g.dropWideRegs(rs)
 
-proc wideArgToStack*(g: var CodeGen; slotName, paramNm: string) =
+proc wideArgToStack*(g: var CodeGen; slotName, paramNm: SymId) =
   ## A 64-bit call argument into the outgoing stack-argument area, word by word
   ## (`(arg name k)` inside a `(mem (sp) …)` yields byte `k * 4` of the slot).
   let src = slotWide(slotName)
@@ -439,7 +439,7 @@ proc wideArgToStack*(g: var CodeGen; slotName, paramNm: string) =
       g.emReg t
   g.dropWideRegs(@[t])
 
-proc wideCopyToAddr*(g: var CodeGen; slotName: string; addrReg: Reg) =
+proc wideCopyToAddr*(g: var CodeGen; slotName: SymId; addrReg: Reg) =
   ## The eight bytes of slot `slotName` to `[addrReg]`.
   g.wideCopy(baseWide(addrReg), slotWide(slotName))
 

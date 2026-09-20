@@ -67,7 +67,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
+proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool)
 proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): X64Inst
 proc emitMemLoad*(g: var CodeGen; c: Cursor; dest: var Location; late = false)
@@ -442,7 +442,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location)
 proc binMemLval(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
 proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
-                  (string, Reg, bool) =
+                  (SymId, Reg, bool) =
   ## Reach the bytes of a NON-LVALUE aggregate call argument `a` of nominal type `tn`,
   ## and describe where they are as `(home, ptrReg, isTvar)`: a named stack slot
   ## (`home`), a pointer already in a register (`ptrReg` — a >16B by-ref param), or a
@@ -450,30 +450,30 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
   ## FS-relative over RIP-relative). An `(oconstr …)`/`(aconstr …)` is BUILT here into a
   ## synthetic slot and reported as that `home`. Shared by the register-passed and the
   ## stack-passed marshalling in `emitCallInner` — only the destination differs.
-  var home = ""
+  var home = NoSymId
   var ptrReg = NoReg
   var isTvar = false
   if a.kind == Symbol:
-    let sloc = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
+    let sloc = g.plan.locationOfSym(a.symId, cursorToPosition(g.buf[], a))
     if sloc.kind in {NamedStack, StackPtr}:
       # By NAME either way: the readers (`transferAggrWords`, `aggrSrcEnd`,
       # `emAggrSrcAddr`, `genAggrCopy`) re-ask the home and load the pointer for a
       # `StackPtr` — this only has to not lose the symbol.
-      home = symName(a)
+      home = a.symId
     elif sloc.kind == InRegPair:
-      home = symName(a)                           # structToRegs reads the pair from the name
+      home = a.symId                           # structToRegs reads the pair from the name
     elif sloc.kind == InReg:
       ptrReg = sloc.r                             # a >16B by-ref param: its pointer is already in a reg
-    elif g.lookupSym(symName(a)).cat == scGlobal:
+    elif g.lookupSym(a.symId).cat == scGlobal:
       discard                                     # a global: read through &global (home == "")
-    elif g.lookupSym(symName(a)).cat == scTvar:
+    elif g.lookupSym(a.symId).cat == scTvar:
       isTvar = true                               # a thread-local: read through &threadvar
     else:
-      raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & symName(a) &
+      raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & g.spelling(a.symId) &
         " (locKind=" & $sloc.kind & ")"
   else:                                           # oconstr/aconstr: build into a temp
     let pos = cursorToPosition(g.buf[], a)
-    home = synth("aggtmp") & $pos & ".0"
+    home = g.lengSym(synth("aggtmp") & $pos & ".0")
     g.emTypedStackVar(home, tcur)
     g.varType[home] = tn
     g.genStore(a, namedStackLoc(home, g.exprSlot(a)))
@@ -561,7 +561,7 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
   for idx in 0 ..< nArgs:
     var aD = regLoc(g.md.intArgRegs[idx], s)
-    g.releaseArgDest(aD.r, (if argCurs[idx].kind == Symbol: symName(argCurs[idx]) else: ""))
+    g.releaseArgDest(aD.r, (if argCurs[idx].kind == Symbol: argCurs[idx].symId else: NoSymId))
     g.emitValue(argCurs[idx], aD)               # → rdi / rsi / rdx
   # rdi (dest ptr) and rax (result/byte) are used RAW by the inline loop; a call-free
   # local the allocator homed in one of them leaves a stale typed name that `emReg`
@@ -582,7 +582,7 @@ proc emitBitBuiltin(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## normal int-arg call), then the inline scan. Result → rax (moved to its
   ## home by emitCall). The legacy twin is `genBitBuiltin`.
   var aD = regLoc(RDI, AsmSlot(cls: AInt, size: 8, align: 8))
-  g.releaseArgDest(aD.r, (if argCurs[0].kind == Symbol: symName(argCurs[0]) else: ""))
+  g.releaseArgDest(aD.r, (if argCurs[0].kind == Symbol: argCurs[0].symId else: NoSymId))
   g.emitValue(argCurs[0], aD)                         # → rdi
   let ar = RDI
   case builtin
@@ -721,7 +721,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     # caller's `freeVal` like any temp). A FIXED destination is served by the
     # very next instruction, so the cheaper unowned read is enough — and it
     # leaves the mirror alive for the reads after this one.
-    let symHome = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let symHome = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     let home = (if dest.kind in {Undef, NeedsReg, RegOrImm}: g.takeForwarded(symHome)
                 else: g.forwardOf(symHome))
     if home.kind != NoLoc:                        # a function-local: its (frozen) home
@@ -753,7 +753,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.forceRegDest(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem(c, dest); return
-      let si = g.lookupSym(symName(c))
+      let si = g.lookupSym(c.symId)
       if si.cat == scProc:                        # a proc as a value → its code pointer
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
         g.ab.tree LeaX64: (g.emReg dest.r; g.ab.sym si.asmName)
@@ -766,7 +766,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem(c, dest); return
-    let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
+    let nm = g.lengSym("msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix)
     # The blob is NUL-TERMINATED. A Leng string literal reaches a call as a bare
     # address, and nothing downstream says whether the callee reads it as a `cstring`
     # (`nimGetProcAddr("WriteFile")`, `nimLoadLibrary("kernel32")`) or as the payload of
@@ -920,10 +920,10 @@ proc prematLval*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
     # allocator and is already bound by the caller — see emitMemLoad / emitAddr.
     let pos = cursorToPosition(g.buf[], c)
     let loc = g.plan.planned(pos)
-    let home = g.plan.homeOfSym(symName(c))
-    if g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:        # a module-level global / threadvar base
+    let home = g.plan.homeOfSym(c.symId)
+    if g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind == NoLoc:        # a module-level global / threadvar base
       if loc.kind == InReg:
-        g.emSymAddrByName(loc.r, symName(c))                # allocator-assigned base reg (glob or tvar)
+        g.emSymAddrByName(loc.r, c.symId)                # allocator-assigned base reg (glob or tvar)
       else:
         # transient base (the allocator reserved nothing): lea &sym into an emit-time
         # staging GPR (R11 bridge), parked in `lvalGlobBase` for `emLvalAddr`, released
@@ -933,7 +933,7 @@ proc prematLval*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
         g.plan.seal s
         g.bindTemp(s, addrSlot())
         g.lvalGlobBase[pos] = s
-        g.emSymAddrByName(s, symName(c))                    # &global (RIP-rel) / &threadvar (FS+off)
+        g.emSymAddrByName(s, c.symId)                    # &global (RIP-rel) / &threadvar (FS+off)
     elif home.kind == StackPtr:
       # spilled by-ref POINTER: load it into emit-time staging, parked in
       # `lvalGlobBase` for `emLvalAddr` (same lifecycle as a transient global base).
@@ -993,7 +993,7 @@ proc prematLval*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
       # temp `aggtmp<pos>` HERE (before the access instruction opens), then address that
       # temp in `emLvalAddr`. Mirrors the aggregate call-arg materialization.
       let pos = cursorToPosition(g.buf[], c)
-      let home = synth("aggtmp") & $pos & ".0"
+      let home = g.lengSym(synth("aggtmp") & $pos & ".0")
       var tcur = c; inc tcur                            # the constructed (array/object) type
       g.emTypedStackVar(home, tcur)
       if tcur.kind == Symbol: g.varType[home] = tcur.symId
@@ -1067,7 +1067,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
       g.prematLval(inner)
       g.ab.tree LeaX64: (g.emReg dest; g.emLvalAddr(inner))
       g.unbindLvalTemps(inner)
-  elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat in {scGlobal, scTvar}:
+  elif lv.kind == Symbol and g.lookupSym(lv.symId).cat in {scGlobal, scTvar}:
     # &global / &threadvar (no stack base / embedded value to materialize).
     if doBind: g.bindTemp(dest, aslot)
     var lc = lv
@@ -1080,7 +1080,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
       g.emTvarAddr(dest, loc.name)
     else: raiseAssert "arkham x64n: &sym resolved to " & $loc.kind
   elif lv.kind == Symbol:                               # a LOCAL aggregate var
-    let home = g.plan.locationOfSym(symName(lv), cursorToPosition(g.buf[], lv))
+    let home = g.plan.locationOfSym(lv.symId, cursorToPosition(g.buf[], lv))
     if doBind: g.bindTemp(dest, aslot)
     case home.kind
     of NamedStack: g.emStackAddr(dest, home.name)       # &local stack slot
@@ -1088,8 +1088,8 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
       g.ab.tree MovX64: (g.emReg dest; g.emStackMem(home.ptrName))  # slot holds &aggregate
     of InReg: g.movReg(dest, home.r)                    # by-ref aggregate param: reg holds &it
     of InRegPair:
-      raiseAssert "arkham x64n: aggrAddr of InRegPair local " & symName(lv)
-    else: raiseAssert "arkham x64n: aggrAddr of local " & symName(lv) & " home " & $home.kind
+      raiseAssert "arkham x64n: aggrAddr of InRegPair local " & g.spelling(lv.symId)
+    else: raiseAssert "arkham x64n: aggrAddr of local " & g.spelling(lv.symId) & " home " & $home.kind
   else:
     if doBind: g.bindTemp(dest, aslot)                  # bind first: a global base leas &g into dest
     var bound: seq[Reg] = @[]
@@ -1101,7 +1101,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
     g.unbindLvalTemps(lv)
     for r in bound: g.unbindTemp(r)
 
-proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
+proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (SymId, int) =
   ## Build an aggregate field/element value `valC` (an inline `(oconstr/aconstr …)`, an
   ## aggregate symbol, or a memory lvalue) — of declared nominal type `fty` — into a
   ## synthetic stack temp through the general `genStore` (which recurses for deeper
@@ -1117,7 +1117,7 @@ proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
     raiseAssert "arkham x64n: nested aggregate field of non-nominal type"
   let ntn = fty.symId
   let pos = cursorToPosition(g.buf[], valC)
-  let tmpName = synth("nctmp") & $pos & ".0"
+  let tmpName = g.lengSym(synth("nctmp") & $pos & ".0")
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore(valC, namedStackLoc(tmpName, g.exprSlot(valC)))    # build (no staging held)
@@ -1268,7 +1268,7 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
   cc.into:
     skip cc                                             # the constructed type
     var posIdx = 0                                      # positional (inherited-base) value index
-    template storeField(field: string; valC: Cursor) =
+    template storeField(field: SymId; valC: Cursor) =
       let fSlot = g.fieldSlotByName(typeSym, field)
       let fdst =
         case base.kind
@@ -1285,7 +1285,7 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
       elif cc.substructureKind == KvU:
         var kv = cc
         kv.into:
-          let field = symName(kv); inc kv
+          let field = kv.symId; inc kv
           storeField(field, kv)
           while kv.hasMore: skip kv                     # optional inherited-depth INTLIT
       else:                                             # leading bare inherited-base value
@@ -1437,7 +1437,7 @@ proc genBaseobj*(g: var CodeGen; c: Cursor; dst: Location) =
     let pos = cursorToPosition(g.buf[], valC)
     let derivedTy = g.getType(valC)
     let derivedTn = derivedTy.symId
-    let dtmp = synth("botmp") & $pos & ".0"
+    let dtmp = g.lengSym(synth("botmp") & $pos & ".0")
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = derivedTn
     g.genStore(valC, namedStackLoc(dtmp, g.exprSlot(valC)))   # build derived (no held temp)
@@ -1535,14 +1535,14 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     if not cursorIsNil(dst.typ.typ) and dst.typ.typ.kind == Symbol:
       tn = dst.typ.typ.symId
     elif rhs.kind == Symbol:
-      tn = g.varType.getOrDefault(symName(rhs), NoTypeSym)
+      tn = g.varType.getOrDefault(rhs.symId, NoTypeSym)
     if tn == NoTypeSym:
       let t = g.getType(rhs)
       if t.kind == Symbol: tn = t.symId
     var dwords: seq[Reg] = @[dst.r0]
     if dst.r1 != NoReg: dwords.add dst.r1
     if rhs.kind == Symbol:
-      g.structToRegs(symName(rhs), tn, dwords)
+      g.structToRegs(rhs.symId, tn, dwords)
     else:
       g.emitLvalue(rhs)
       let srcAddr = g.pickStagingSealed("an InRegPair copy src address", ScalarSlot)
@@ -1552,9 +1552,9 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
       g.giveBack srcAddr
     return
   if rhs.kind == Symbol:
-    let sh = g.plan.homeOfSym(symName(rhs))   # an InRegPair is a whole-proc param home
+    let sh = g.plan.homeOfSym(rhs.symId)   # an InRegPair is a whole-proc param home
     if sh.kind == InRegPair:
-      let tn = g.varType.getOrDefault(symName(rhs))
+      let tn = g.varType.getOrDefault(rhs.symId)
       var words: seq[Reg] = @[sh.r0]
       if sh.r1 != NoReg: words.add sh.r1
       if dst.kind == NamedStack:
@@ -1562,7 +1562,7 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
       else:
         var dstAddr = NoReg
         let dstE = g.aggrDstEnd(dst, dstAddr)
-        if dstE.slot.len > 0:
+        if dstE.slot != NoSymId:
           g.regsToStruct(dstE.slot, tn, words)
         else:
           g.regsToStructThroughPtr(dstE.reg, tn, words)
@@ -1575,7 +1575,7 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   if dst.kind == Mem: g.freeLvalTemps(dst.cur)
   var srcAddr = NoReg
   let srcE =
-    if rhs.kind == Symbol: g.aggrSrcEnd(symName(rhs), srcAddr)
+    if rhs.kind == Symbol: g.aggrSrcEnd(rhs.symId, srcAddr)
     else:
       g.emitLvalue(rhs)                    # pick the src lvalue's embedded values
       srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
@@ -2310,7 +2310,7 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       if reusedLhs or reusedRhs:                         # inherited an operand's binding
         var rtc = resTypeC
         g.bindTemp(rD, slotOf(g.prog, rtc))
-    elif nm.len > 0:
+    elif nm != NoSymId:
       g.rebindLocalAs(nm, rD, resTypeC)
   let rdSeal = not g.plan.isSealed(rD) and not g.rb.isBoundTemp(rD)
   if rdSeal: g.plan.seal {rD}                            # the fold's staging picks stay off rD
@@ -2552,7 +2552,7 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
       stderr.writeLine "R11DBG cmp lhs in " & gArkhamCurProc &
         " isTemp=" & $aLoc.isTemp & " exprKind=" & $aC.exprKind &
         " kind=" & $aC.kind &
-        (if aC.kind == Symbol: " sym=" & symName(aC) else: "")
+        (if aC.kind == Symbol: " sym=" & g.spelling(aC.symId) else: "")
   if rhsMemFold:
     var bBound: seq[Reg] = @[]
     g.bindLvalGlobalBases(bC, bBound)
@@ -2584,7 +2584,7 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   if cmpStaging != NoReg: g.giveBack cmpStaging
   g.freeVal(lD)
 
-proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
+proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
   ## FUSED branch test: jump to `toLabel` when the condition holds
   ## (`whenTrue`) — short-circuit and/or/not, `cmp`/`jcc` relations, `(ovf)`,
   ## or `cmp v, 0` for a plain boolean value. Operand placement inline.
@@ -2706,12 +2706,12 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       return
     let tag = g.emitScalarCmp(aC, bC, ek, whenTrue)
     g.emJcc(tag, toLabel)
-  elif c.kind == Symbol and g.condFuse.tag.hasKey(symName(c)):
+  elif c.kind == Symbol and g.condFuse.tag.hasKey(c.symId):
     # `scanCondFusions` proved this bool has one def and one use, that its defining
     # compare has already run, and that nothing since has emitted a single machine
     # instruction. The flags still hold the answer — take the branch straight off
     # them and never materialize the 0/1 at all.
-    let nm = symName(c)
+    let nm = c.symId
     let tag = g.condFuse.tag.getOrQuit(nm)
     g.emJcc((if whenTrue: tag else: invertJcc(tag)), toLabel)
     g.condFuse.tag.del nm
@@ -2903,7 +2903,7 @@ proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if lv.kind == TagLit and lv.exprKind == DerefC:
       var p = lv; inc p
       if p.kind == Symbol:
-        let home = g.plan.locationOfSym(symName(p), cursorToPosition(g.buf[], p))
+        let home = g.plan.locationOfSym(p.symId, cursorToPosition(g.buf[], p))
         if home.kind == InReg:
           dest = home                                   # the address IS p's register
           return
@@ -2963,7 +2963,7 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
-  let lHome = (if lhsC.kind == Symbol: g.plan.locationOfSym(symName(lhsC), cursorToPosition(g.buf[], lhsC)) else: noLoc)
+  let lHome = (if lhsC.kind == Symbol: g.plan.locationOfSym(lhsC.symId, cursorToPosition(g.buf[], lhsC)) else: noLoc)
   let swap = ek in {AddC, MulC} and g.foldableFloatLeaf(lhsC) and
              not g.foldableFloatLeaf(rhsC) and
              not (dest.kind == InFReg and lHome.kind == InFReg and lHome.f == dest.f)
@@ -3001,10 +3001,10 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   lD.typ = fslot
   g.emitFValue(lhsC, lD)                                 # a → the result xmm
   if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
-  if rhsC.kind == Symbol and g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC)).kind == InFReg:
-    let rHome = g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC))
+  if rhsC.kind == Symbol and g.plan.locationOfSym(rhsC.symId, cursorToPosition(g.buf[], rhsC)).kind == InFReg:
+    let rHome = g.plan.locationOfSym(rhsC.symId, cursorToPosition(g.buf[], rhsC))
     if rHome.f == res.f and
-       not (lhsC.kind == Symbol and symName(lhsC) == symName(rhsC)):
+       not (lhsC.kind == Symbol and lhsC.symId == rhsC.symId):
       raiseAssert "arkham: float operand fold aliases the destination register"
     g.fbin(op32, op64, res.f, rHome.f, bits)             # in-place local fold
   else:
@@ -3130,7 +3130,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # forces a fresh temp (copy-then-narrow, source intact).
   block:
     if inner.kind == Symbol:
-      let sh = g.plan.locationOfSym(symName(inner), cursorToPosition(g.buf[], inner))
+      let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
       var tgc = targetCur
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
         g.forceRegDest(dest)
@@ -3176,7 +3176,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # `(u 8)` local receiving an `(i 64)` value is a narrowing move nifasm rejects,
   # and rightly: the narrowing is the `movzx` that follows, not the move.
   # Zero machine code either way; only the declared type moves.
-  var preRetyped = ""
+  var preRetyped = NoSymId
   if dest.kind == InReg and not dest.isTemp:
     let nm = g.rb.boundName(dest.r)
     var st = g.getType(inner)
@@ -3186,11 +3186,11 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     # lives in an `(i 64)` local retyped the destination to the enum's `(u 16)` and
     # then moved 64 signed bits into it — a mismatch nifasm rejects.
     if inner.kind == Symbol:
-      let sh = g.plan.locationOfSym(symName(inner), cursorToPosition(g.buf[], inner))
+      let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
       if sh.kind == InReg:
         let bt = g.bindTypeOf(sh.r)
         if not cursorIsNil(bt): st = bt
-    if nm.len > 0 and bindTypeDiffers(g.prog, st, targetCur):
+    if nm != NoSymId and bindTypeDiffers(g.prog, st, targetCur):
       g.rebindLocalAs(nm, dest.r, st)
       preRetyped = nm
   var iv = dest                                          # identity: thread dest down
@@ -3244,7 +3244,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.bindTemp(res2.r, reboundAs)
     else:
       let nm = g.rb.boundName(res2.r)                    # the register's named local
-      if nm.len > 0: g.rebindLocalAs(nm, res2.r, targetCur)
+      if nm != NoSymId: g.rebindLocalAs(nm, res2.r, targetCur)
     # And say so in the LOCATION, not only in the binding. They are two records of
     # one fact and the caller reads the Location: `emitBin` binds its result temp
     # at `lDest.typ`, so a cast that left the inner's slot there had the ADD's
@@ -3271,7 +3271,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened (see there). `kindChange` already did it.
   if not kindChange:
-    if preRetyped.len > 0:
+    if preRetyped != NoSymId:
       g.rebindLocalAs(preRetyped, res2.r, targetCur)
     elif res2.isTemp:
       # Same lesson as the `kindChange` branch above: say the target type in the
@@ -3326,11 +3326,11 @@ type
     r: Reg
     f: FReg
     loc: Location
-    name: string
+    name: SymId
     idx, bytes: int              ## the word index; `bytes < 8`: a partial tail
                                  ## (a float: its width)
     isTvar: bool
-    valueSym: string             ## a leaf's own symbol, which may stay bound to `dst`
+    valueSym: SymId              ## a leaf's own symbol, which may stay bound to `dst`
     reads: set[Reg]              ## the registers loading this move reads
     freads: set[FReg]
 
@@ -3363,7 +3363,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   let amd = g.callConvOf(c)
   let foreignCall = amd.positionalArgs
   var argCurs: seq[Cursor] = @[]
-  var fsym = ""
+  var fsym = NoSymId
   var targetCur: Cursor
   var indirect = false
   block:
@@ -3371,12 +3371,12 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
     fc.into:
       targetCur = fc
       indirect = isIndirectCallTarget(g.typeCtx, fc)
-      if not indirect: fsym = symName(fc)
+      if not indirect: fsym = fc.symId
       skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
   var tgt: CallTarget
   var fnptrReg = NoReg
-  var fnTargetName = ""
+  var fnTargetName = NoSymId
   var stagedFnptr = NoReg
   var fnptrLoc = dontCare                            # the held fn-ptr value (freed post-call)
   if indirect:
@@ -3406,10 +3406,10 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       g.emitLoadLoc(fnptrLoc, stagedFnptr)
       fnptrReg = stagedFnptr
     let foreignAbi = isForeignAbiProctype(g.prog, proctype)
-    if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
-      tgt = CallTarget(asmName: symName(targetCur), retType: retType, foreignAbi: foreignAbi)
+    if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == targetCur.symId:
+      tgt = CallTarget(asmName: targetCur.symId, retType: retType, foreignAbi: foreignAbi)
     else:
-      let nm = g.rb.freshTmpName("fntmp")
+      let nm = g.rb.freshTmpName(g.prog.pool, "fntmp")
       g.ab.tree RebindX64:
         g.ab.symDef nm
         var pc = proctype
@@ -3588,19 +3588,19 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
     g.ab.tree MemX:
       g.ab.rawReg RSP
       g.ab.tree ArgX:
-        g.ab.sym paramName(nameIdx)
+        g.ab.sym g.paramName(nameIdx)
         if indexed: g.ab.intLit k.int64
   g.ab.tree PrepareX64:
     g.ab.sym tgt.asmName
     if resultByRef:
       g.ab.tree MovX64:
-        g.ab.tree ArgX: g.ab.sym paramName(0)
+        g.ab.tree ArgX: g.ab.sym g.paramName(0)
         g.emReg amd.intArgRegs[0]
       g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0]
     proc bindArg(g: var CodeGen; dst: Reg; nameIdx, word: int) {.closure.} =
       g.ab.tree MovX64:
         g.ab.tree ArgX:
-          g.ab.sym paramName(nameIdx)
+          g.ab.sym g.paramName(nameIdx)
           if word >= 0: g.ab.intLit word.int64
         g.emReg dst
       g.rb.sealAccum dst; sealedArgs.incl dst
@@ -3656,7 +3656,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
         of msLoc: g.emFloatScalarLoad(m.fdst, m.loc.name, bits)
         else: raiseAssert "arkham x64n: a float argument move from " & $m.kind
         g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
-          g.ab.tree ArgX: g.ab.sym paramName(m.nameIdx)
+          g.ab.tree ArgX: g.ab.sym g.paramName(m.nameIdx)
           g.emFReg m.fdst
         return
       if not (m.kind == msReg and m.r == m.dst):
@@ -3686,7 +3686,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
     proc emitAddrGroup(g: var CodeGen; grp: seq[ArgMove]) {.closure.} =
       ## The words of one argument behind one address: the address is loaded once.
       for m in grp:
-        g.releaseArgDest(m.dst, "")
+        g.releaseArgDest(m.dst, NoSymId)
         g.rb.sealAccum m.dst; sealedArgs.incl m.dst
       let s = g.pickStagingSealed("an aggregate-arg address", AddrSlot)
       g.loadAddr(grp[0], s)
@@ -3702,7 +3702,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       assert aD.kind == p.kind and (aD.kind != InReg or aD.r == p.r) and
              (aD.kind != InFReg or aD.f == p.f),
              "arkham x64n: a call argument moved under its producer"
-      m.valueSym = ""
+      m.valueSym = NoSymId
       m.reads = {}; m.freads = {}
       case p.kind
       of InReg: (m.kind = msReg; m.r = p.r; m.reads = {p.r})
@@ -3855,7 +3855,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
           # In memory already, or BUILT into memory here (a constructor into its
           # synthetic slot) — which is what phase 1 exists for.
           let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
-          let hl = (if home.len > 0 and a.kind == Symbol:
+          let hl = (if home != NoSymId and a.kind == Symbol:
                       g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
                     else: noLoc)
           if ptrReg != NoReg:
@@ -3869,16 +3869,16 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
             var name = home
             if hl.kind == InRegPair:
               # Passed by reference, so it needs an address: a slot of its own.
-              name = synth("pairaddr") & $cursorToPosition(g.buf[], a) & ".0"
+              name = g.lengSym(synth("pairaddr") & $cursorToPosition(g.buf[], a) & ".0")
               g.emTypedStackVar(name, tcur)
               for k in 0 ..< aggrWordCount(g.prog, tn):
                 g.ab.tree MovX64: (g.emWordAtSlot(name, k * 8); g.emReg pairWord(hl, k))
-            elif home.len == 0:
-              name = symName(a)
+            elif home == NoSymId:
+              name = a.symId
             for m in ms.mitems:
               m.name = name; m.isTvar = isTvar
               m.kind =
-                if home.len > 0 or hl.kind == InRegPair:
+                if home != NoSymId or hl.kind == InRegPair:
                   (if pl.byRef: msHomeAddr else: msSlotWord)
                 elif pl.byRef: (if isTvar: msTvarAddr else: msGlobalAddr)
                 else: msGlobalWord
@@ -3957,7 +3957,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
           m.dst = amd.gprAt(pl)
           m.reads = reads[j]
         let leaf = isLeafArg(a)
-        if leaf and leafCore(a).kind == Symbol: m.valueSym = symName(leafCore(a))
+        if leaf and leafCore(a).kind == Symbol: m.valueSym = leafCore(a).symId
         if placeNow(j, m, computes = not leaf):
           # Computed straight into its register — which its own expression may
           # read (`f(addr p.field)` with `p` in rdi: `lea rdi, [rdi+off]`).
@@ -4005,15 +4005,15 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
       if resultIsFloat:
         g.ab.tree (if resSlot.size == 4: MovssX64 else: MovsdX64):
           g.emFReg FloatRet
-          g.ab.tree ResX: g.ab.sym synth("ret.0")
+          g.ab.tree ResX: g.ab.sym g.lengSym(synth("ret.0"))
       else:
         g.ab.tree MovX64:
           g.emReg RAX
-          g.ab.tree ResX: g.ab.sym synth("ret.0")
+          g.ab.tree ResX: g.ab.sym g.lengSym(synth("ret.0"))
   g.rb.unsealAccums(sealedArgs)
   for f in sealedFArgs: g.rb.unsealF f
   if hiddenPtr: g.rb.unsealAccums {amd.intArgRegs[0]}     # the early seal (indirect target)
-  if fnTargetName.len > 0:
+  if fnTargetName != NoSymId:
     g.ab.tree KillX64: g.ab.sym fnTargetName
     discard g.rb.takeBinding(fnptrReg)
   if stagedFnptr != NoReg: g.giveBack stagedFnptr
@@ -4023,7 +4023,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
 
 when defined(arkhamCallerSaveDbg):
   proc csDbgCall(g: var CodeGen; c: Cursor;
-                 saveSet, nested: seq[tuple[reg: Reg, name: string]]) =
+                 saveSet, nested: seq[tuple[reg: Reg, name: SymId]]) =
     ## One `CSCALL` line per emitted call: WHERE the emitter actually saves, in the
     ## same token-position space the analyser measures intervals in. Joined against
     ## the `CSVAR` lines by `scratchpad/csdiff.py`; a call inside a value's interval
@@ -4058,7 +4058,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   ## nothing.
   when defined(arkhamCallerSaveDbg):
     if g.plan.callerSaveHomes.len > 0:
-      var bound, act: seq[tuple[reg: Reg, name: string]] = @[]
+      var bound, act: seq[tuple[reg: Reg, name: SymId]] = @[]
       # `active` comes from the redirect table, NOT from the bindings: a window opened
       # early (the hidden-result-pointer sites) has already released the binding, so
       # the value is covered yet invisible to `callerSaveSetAt`.
@@ -4088,7 +4088,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   # emission order — the other arm of the `if` this `return f(x)` sat in — every
   # register still holds what it held before, and the names must still be there.
   let diverging = g.isDivergingCall(c) or tail
-  var savedBinds: seq[tuple[r: Reg, name: string]] = @[]
+  var savedBinds: seq[tuple[r: Reg, name: SymId]] = @[]
   if diverging: savedBinds = g.namedBindings()
   let w = g.emCallerSaveOpen()
   g.emitCallInner(c, dest, hiddenPtr, tail)
@@ -4123,9 +4123,9 @@ when declared(FldrqOp):
     ## its declaration, so the home lookup here cannot miss.
     if a.kind != Symbol:
       lengError a, "a 128-bit vector operand must be a plain local"
-    let home = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
+    let home = g.plan.locationOfSym(a.symId, cursorToPosition(g.buf[], a))
     if home.kind != InFReg:
-      lengError a, "128-bit vector local `" & symName(a) &
+      lengError a, "128-bit vector local `" & g.spelling(a.symId) &
                 "` has no SIMD register home"
     result = home.f
 
@@ -4322,12 +4322,12 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## own (`atomicRegClaims`) and run a retry loop — none of which the mirror map
   ## models. It clears, like a call.
   g.killAllMirrors()
-  var fsym = ""
+  var fsym = NoSymId
   var argCurs: seq[Cursor] = @[]
   block:
     var fc = c
     fc.into:
-      fsym = symName(fc); skip fc
+      fsym = fc.symId; skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
@@ -4522,7 +4522,7 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     # float local is stack-homed and every read of one is a reload unless the
     # register that stored it still has it (`forwardFOf` turns the `NamedStack`
     # home into that `InFReg` — the arm below it then never runs).
-    let fSymHome = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let fSymHome = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     let home = (if dest.kind != InFReg: g.takeFForwarded(fSymHome)
                 else: g.forwardFOf(fSymHome))
     case home.kind

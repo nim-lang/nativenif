@@ -224,7 +224,7 @@ proc emitInterruptTable*(g: var CodeGen) =
   ## (`machine_cortexm.interruptSlot`), and nifasm's job is to place an address in
   ## a word — so the name is resolved here and never leaves. It is a declaration
   ## and its position in the module carries no meaning.
-  var handlers: seq[(int, string)] = @[]
+  var handlers: seq[(int, SymId)] = @[]
   for info in g.prog.procs:
     if info.irqName.len == 0: continue
     let slot = machine_cortexm.interruptSlot(info.irqName)
@@ -235,7 +235,7 @@ proc emitInterruptTable*(g: var CodeGen) =
     for (s, other) in handlers:
       if s == slot:
         quit "arkham cortex-m: interrupt `" & info.irqName & "` is claimed by " &
-             "both " & other & " and " & info.asmName &
+             "both " & g.spelling(other) & " and " & g.spelling(info.asmName) &
              " — a table word holds one address."
     handlers.add (slot, info.asmName)
   if handlers.len > 0:

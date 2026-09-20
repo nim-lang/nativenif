@@ -41,19 +41,19 @@ proc isFoldableLeaf*(g: var CodeGen; n: Cursor): bool =
   ## or a function-local symbol read (folds as its reg / stack-home operand).
   case n.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
+  of Symbol: g.plan.locationOfSym(n.symId, cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
   else: false
 
 proc symInReg*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
   ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
   ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
   if n.kind != Symbol: return false
-  let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+  let h = g.plan.locationOfSym(n.symId, cursorToPosition(g.buf[], n))
   h.kind == InReg and h.r == reg
 
 proc exprReadsRegImpl(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
-    let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+    let h = g.plan.locationOfSym(n.symId, cursorToPosition(g.buf[], n))
     inc n
     # A pair-homed aggregate (`InRegPair`) is read through BOTH of its words.
     return (h.kind == InReg and h.r == reg) or
@@ -68,7 +68,7 @@ proc exprReadsRegImpl(g: var CodeGen; n: var Cursor; reg: Reg): bool =
 
 proc exprReadsFRegImpl(g: var CodeGen; n: var Cursor; f: FReg): bool =
   if n.kind == Symbol:
-    let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+    let h = g.plan.locationOfSym(n.symId, cursorToPosition(g.buf[], n))
     inc n
     return h.kind == InFReg and h.f == f
   elif n.kind == TagLit:
@@ -98,7 +98,7 @@ proc lvalueGlobalBase*(g: var CodeGen; n: Cursor): bool =
   ## private `lvalueGlobalBase`.)
   var c = n
   case c.kind
-  of Symbol: result = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc
+  of Symbol: result = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind == NoLoc
   of TagLit:
     case c.exprKind
     of DotC, AtC:
@@ -158,25 +158,25 @@ proc subtreeHasCall*(n: Cursor): bool =
 
 # ── caller-save rescue (see `Plan.callerSaveHomes`) ─────────────────────
 
-proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
+proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: SymId]] =
   ## The caller-saved locals currently BOUND to a register — the ones this call is
   ## about to clobber. The trigger is live binding, not the coarse `freeAfter`
   ## interval: a value live across a control-flow merge is still bound at a call in a
   ## predecessor branch, which an interval test under-approximates. The allocator only
   ## hands out a caller-saved home to a value that is valid wherever it is bound, so
   ## "save whenever bound" is always well-defined. Sorted for deterministic output.
-  result = default(seq[tuple[reg: Reg, name: string]])
+  result = default(seq[tuple[reg: Reg, name: SymId]])
   if g.plan.callerSaveHomes.len == 0: return
   for reg, name in g.rb.gprBindings:
     if g.plan.callerSaveHomes.hasKey(name):
       result.add (reg: reg, name: name)
-  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
+  result.sort(proc (a, b: tuple[reg: Reg, name: SymId]): int = cmp(ord(a.reg), ord(b.reg)))
 
-proc callerSaveSlotName*(varName: string): string {.inline.} =
+proc callerSaveSlotName*(g: CodeGen; varName: SymId): SymId {.inline.} =
   ## ONE permanent slot per caller-saved value, declared with the value itself. A
   ## per-call slot inside the call's own `(scope …)` does not work: the call's result
   ## binding is created in that scope and consumed after it closes.
-  "csave." & varName
+  g.lengSym("csave." & g.spelling(varName))
 
 proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
   ## If `c` is `(dot S f)` and `S` is a register-homed ≤16B by-value aggregate
@@ -187,12 +187,12 @@ proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
   var cc = c
   cc.into:
     if cc.kind != Symbol: return
-    let base = symName(cc)
+    let base = cc.symId
     let home = g.plan.homeOfSym(base)
     if home.kind != InRegPair: return
     skip cc
     if cc.kind != Symbol: return
-    let field = symName(cc)
+    let field = cc.symId
     let tn = g.varType.getOrDefault(base, NoTypeSym)
     if tn == NoTypeSym: return
     for f in aggrLayout(g.prog, tn):
@@ -276,7 +276,7 @@ proc addrRootIsOurs(g: var CodeGen; n: Cursor): bool =
       inc c; skip c                         # → past the target type, to the operand
     else: return false
   if c.kind != Symbol: return false
-  g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind != NoLoc
+  g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind != NoLoc
 
 proc tailCallLeaksFrame*(g: var CodeGen; args: openArray[Cursor]): bool =
   ## Would tail-calling with these arguments hand the callee a pointer into the frame
@@ -342,7 +342,7 @@ proc sameTree*(a, b: Cursor): bool =
   of CharLit:           result = charLit(a) == charLit(b)
   else:                 result = true
 
-proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSlot] =
+proc calleeParamSlots*(g: var CodeGen; fsym: SymId; tgt: CallTarget): seq[AsmSlot] =
   ## The DECLARED parameter slots of a call target, from its `(proctype …)`
   ## signature — empty when the target carries none (an indirect call built
   ## without one, an intrinsic).

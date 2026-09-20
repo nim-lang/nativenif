@@ -29,7 +29,7 @@ proc emPair*(g: var CodeGen; r: Reg) =
   ## A whole 16-bit value: the local's name when one lives here, the raw `(rpN)`
   ## otherwise. `movw`, `adiw` and `sbiw` are the instructions that take one.
   let nm = g.rb.boundName(r)
-  if nm.len > 0: g.ab.sym nm
+  if nm != NoSymId: g.ab.sym nm
   else:
     # Legitimately raw: the three bridges, the frame pointer, the ABI argument
     # and return pairs, and `mul`'s fixed r1:r0 — which no value can ever be
@@ -42,7 +42,7 @@ proc emPair*(g: var CodeGen; r: Reg) =
 
 proc emHalf(g: var CodeGen; r: Reg; high: bool) =
   let nm = g.rb.boundName(r)
-  if nm.len > 0:
+  if nm != NoSymId:
     g.ab.tree (if high: HiX else: LoX): g.ab.sym nm
   else:
     g.ab.regNamed (if high: highName(r) else: lowName(r))
@@ -79,19 +79,19 @@ proc emLdi16*(g: var CodeGen; d: Reg; v: int64) =
 # its number, not ours — and the `+1` for the high byte rides in the SAME
 # instruction's displacement field, so both halves are one `ldd`/`std` each.
 
-proc emLoadSlot*(g: var CodeGen; d: Reg; name: string) =
+proc emLoadSlot*(g: var CodeGen; d: Reg; name: SymId) =
   g.ab.tree LdbAvr: (g.emLo d; g.ab.sym name)
   g.ab.tree LdbAvr:
     g.emHi d
     g.ab.tree MemX: (g.ab.sym name; g.ab.intLit 1)
 
-proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
+proc emStoreSlot*(g: var CodeGen; name: SymId; s: Reg) =
   g.ab.tree StbAvr: (g.ab.sym name; g.emLo s)
   g.ab.tree StbAvr:
     g.ab.tree MemX: (g.ab.sym name; g.ab.intLit 1)
     g.emHi s
 
-proc emLoadSlotW*(g: var CodeGen; d: Reg; name: string; width: int; signed: bool) =
+proc emLoadSlotW*(g: var CodeGen; d: Reg; name: SymId; width: int; signed: bool) =
   ## A slot whose width is the LOCAL's, not this machine's. The two-byte form
   ## reads `name+1` as the high half, and for a one-byte local that byte belongs
   ## to whatever the slot manager put next to it — so an `(i 8)` local answered
@@ -108,13 +108,13 @@ proc emLoadSlotW*(g: var CodeGen; d: Reg; name: string; width: int; signed: bool
     g.ab.tree SbrcAvr: (g.emLo d; g.ab.intLit 7)
     g.ab.tree NotAvr: g.emHi d
 
-proc emStoreSlotW*(g: var CodeGen; name: string; s: Reg; width: int) =
+proc emStoreSlotW*(g: var CodeGen; name: SymId; s: Reg; width: int) =
   if width >= 2:
     g.emStoreSlot(name, s)
   else:
     g.ab.tree StbAvr: (g.ab.sym name; g.emLo s)
 
-proc emLeaSlot*(g: var CodeGen; d: Reg; name: string) =
+proc emLeaSlot*(g: var CodeGen; d: Reg; name: SymId) =
   ## The ADDRESS of a frame slot. One asm-NIF node; nifasm turns it into a `movw`
   ## from Y plus the displacement, because that displacement is ITS number.
   ##
@@ -168,12 +168,12 @@ proc emMemNode*(g: var CodeGen; c: Cursor) =
   ## names the field or the index and nothing more.
   case c.kind
   of Symbol:
-    let name = symName(c)
+    let name = c.symId
     let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
     if home.kind == NamedStack: g.ab.sym home.name
     elif home.kind == InReg: g.emPair home.r     # already a pointer VALUE
     else:
-      lengError c, "AVR: `" & name & "` cannot be addressed (" & $home.kind & ")",
+      lengError c, "AVR: `" & g.spelling(name) & "` cannot be addressed (" & $home.kind & ")",
                 lengInfo(c)
   of TagLit:
     case c.exprKind
@@ -184,7 +184,7 @@ proc emMemNode*(g: var CodeGen; c: Cursor) =
         g.emMemNode(b)
         if f.kind != Symbol:
           lengError c, "AVR: a field access needs a field name", lengInfo(c)
-        g.ab.sym symName(f)
+        g.ab.sym f.symId
     of AtC:
       var b = c; inc b
       var i = b; skip i
@@ -204,7 +204,7 @@ proc emMemNode*(g: var CodeGen; c: Cursor) =
   else:
     lengError c, "AVR: not an address expression", lengInfo(c)
 
-proc emStoreField*(g: var CodeGen; slot, field: string; s: Reg; width: int) =
+proc emStoreField*(g: var CodeGen; slot, field: SymId; s: Reg; width: int) =
   ## Store into `slot.field`. Built from PARTS rather than copied from a node: a
   ## constructor's destination is not written anywhere in the input.
   g.ab.tree StbAvr:
@@ -217,7 +217,7 @@ proc emStoreField*(g: var CodeGen; slot, field: string; s: Reg; width: int) =
         g.ab.intLit 1
       g.emHi s
 
-proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
+proc emStoreElem*(g: var CodeGen; slot: SymId; idx: int; s: Reg; width: int) =
   g.ab.tree StbAvr:
     g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
     g.emLo s
@@ -228,14 +228,14 @@ proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
         g.ab.intLit 1
       g.emHi s
 
-proc emLeaField*(g: var CodeGen; d: Reg; slot, field: string) =
+proc emLeaField*(g: var CodeGen; d: Reg; slot, field: SymId) =
   ## The ADDRESS of `slot.field`, built from PARTS for the reason `emStoreField`
   ## is: a constructor's destination is not written anywhere in the input.
   g.ab.tree LeaAvr:
     g.emPair d
     g.ab.tree DotX: (g.ab.sym slot; g.ab.sym field)
 
-proc emLeaElem*(g: var CodeGen; d: Reg; slot: string; idx: int) =
+proc emLeaElem*(g: var CodeGen; d: Reg; slot: SymId; idx: int) =
   g.ab.tree LeaAvr:
     g.emPair d
     g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
@@ -250,7 +250,7 @@ proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
     g.ab.tree LeaAvr: (g.emPair ValueBridge; g.emMemNode node)
     g.emMovw(d, ValueBridge)
 
-proc emLoadByteAt*(g: var CodeGen; d: Reg; lvSlotName: string; off: int) =
+proc emLoadByteAt*(g: var CodeGen; d: Reg; lvSlotName: SymId; off: int) =
   ## ONE byte out of a frame slot, into the low half of `d`. An aggregate copy on
   ## this machine moves bytes: the word is two of them and the odd sizes are
   ## common, so a byte at a time is both simplest and always right.
@@ -258,7 +258,7 @@ proc emLoadByteAt*(g: var CodeGen; d: Reg; lvSlotName: string; off: int) =
     g.emLo d
     g.ab.tree MemX: (g.ab.sym lvSlotName; g.ab.intLit off)
 
-proc emStoreByteAt*(g: var CodeGen; lvSlotName: string; off: int; s: Reg) =
+proc emStoreByteAt*(g: var CodeGen; lvSlotName: SymId; off: int; s: Reg) =
   g.ab.tree StbAvr:
     g.ab.tree MemX: (g.ab.sym lvSlotName; g.ab.intLit off)
     g.emLo s
@@ -442,10 +442,10 @@ proc emCmpImm16*(g: var CodeGen; a: Reg; v: int64): bool =
 
 # ── control flow ────────────────────────────────────────────────────────────
 
-proc emLab*(g: var CodeGen; name: string) =
+proc emLab*(g: var CodeGen; name: SymId) =
   g.ab.tree LabAvr: g.ab.symDef name
 
-proc emJmp*(g: var CodeGen; name: string) =
+proc emJmp*(g: var CodeGen; name: SymId) =
   g.ab.tree BAvr: g.ab.sym name
 
 type
@@ -465,7 +465,7 @@ proc invert*(c: AvrCond): AvrCond =
   of acLo: acHs
   of acHs: acLo
 
-proc emBranch*(g: var CodeGen; cond: AvrCond; target: string) =
+proc emBranch*(g: var CodeGen; cond: AvrCond; target: SymId) =
   ## `blt`/`bge` are the SIGNED pair and `blo`/`bhs` the unsigned one, and they
   ## are different instructions — an unsigned comparison leaves its answer in the
   ## carry and a signed one in S. Picking between them is the caller's job,
@@ -479,9 +479,9 @@ proc emBranch*(g: var CodeGen; cond: AvrCond; target: string) =
           of acHs: BhsAvr
   g.ab.tree t: g.ab.sym target
 
-proc freshLabel*(g: var CodeGen; prefix: string): string =
+proc freshLabel*(g: var CodeGen; prefix: string): SymId =
   inc g.labelCount
-  result = SynthMark & prefix & $g.labelCount & ".0"
+  result = g.lengSym(SynthMark & prefix & $g.labelCount & ".0")
 
 # ── types ───────────────────────────────────────────────────────────────────
 
@@ -551,7 +551,7 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
                         "(see M5 in doc/internals/avr.md)", lengInfo(c)
             var f = c
             f.into:
-              let fname = symName(f); inc f
+              let fname = f.symId; inc f
               skip f                            # the field's pragmas
               g.ab.fldDef fname:
                 g.genTypeBodyAvr(f)
@@ -565,7 +565,7 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
 
 # ── declarations ────────────────────────────────────────────────────────────
 
-proc emRegPairVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc emRegPairVar*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## `(var :name (rpN) T)` — declare a local and bind the PAIR to it, so every
   ## later use spells the name and every half spells `(lo name)`/`(hi name)`.
   ## Evicts the pair's prior tenant — BOTH halves — as every binding does.
@@ -577,7 +577,7 @@ proc emRegPairVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr = false)
 
-proc emRegPtrVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc emRegPtrVar*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## A register holding a POINTER to an aggregate, declared as `(ptr T)` rather
   ## than as the aggregate.
   ##
@@ -596,7 +596,7 @@ proc emRegPtrVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr = true)
 
-proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
+proc emSlotVar*(g: var CodeGen; name: SymId; typeCur: Cursor) =
   ## `(var :name (s) T)` — a frame slot, whose offset nifasm assigns.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -605,7 +605,7 @@ proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
   g.genTypeBodyAvr(tc)
   g.ab.close()
 
-proc genGlobalAvr*(g: var CodeGen; nifName: string; decl: Cursor) =
+proc genGlobalAvr*(g: var CodeGen; nifName: SymId; decl: Cursor) =
   ## A top-level `gvar`/`const`, declared with NO static image.
   ##
   ## That is the AVR-specific part. Everywhere else the initializer is baked into
@@ -628,14 +628,14 @@ proc genGlobalAvr*(g: var CodeGen; nifName: string; decl: Cursor) =
     g.ab.close()
     while c.hasMore: skip c
 
-proc emGlobalAddr*(g: var CodeGen; d: Reg; name: string) =
+proc emGlobalAddr*(g: var CodeGen; d: Reg; name: SymId) =
   ## A global's SRAM address into a pair. Two `ldi`s, patched once the data
   ## block is placed — the address is a final-layout fact, so nifasm carries it
   ## rather than arkham guessing. Spelled `(lea …)` because that is already this
   ## target's "the address of a thing whose offset nifasm assigned".
   g.ab.tree LeaAvr: (g.emPair d; g.ab.sym name)
 
-proc emPtrSlot*(g: var CodeGen; name: string) =
+proc emPtrSlot*(g: var CodeGen; name: SymId) =
   ## A two-byte slot the EMITTER minted for an ADDRESS — the parked hidden
   ## result pointer. Typed `(ptr (void))` rather than `(u 16)` so nifasm knows
   ## what it holds even though the two have the same size here.

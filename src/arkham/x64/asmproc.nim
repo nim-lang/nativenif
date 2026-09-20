@@ -15,7 +15,7 @@
 
 import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [machinedesc, planner, programs, asmbuf,
+import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, asmcommon, 
                     mirrors, regbind]
 import machine as machine_x64
@@ -110,7 +110,7 @@ proc asmOperand*(g: var CodeGen; cur: Cursor) =
   let c = asmAtom(cur)
   case c.kind
   of Symbol:
-    if g.isAsmStackSym(c): g.emStackMem(symName(c))
+    if g.isAsmStackSym(c): g.emStackMem(c.symId)
     else: g.emReg g.asmRegOf(c)
   of IntLit: g.ab.intLit intVal(c)
   of UIntLit: g.ab.intLit cast[int64](uintVal(c))
@@ -134,7 +134,7 @@ proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   if sym.kind != Symbol:
     lengError sym, "the destination of a two-address instruction must be a local " &
               "with a declared location", g.asmInfo
-  let nm = symName(sym)
+  let nm = sym.symId
   if nm in g.asmStack: g.emStackMem(nm)
   else: g.emReg g.asmRegOf(sym)
 
@@ -162,7 +162,7 @@ proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
       # `(add [mem], [mem])` does not exist. Only flagged when BOTH are memory;
       # a memory destination with a register or immediate source is fine.
       var d = argCurs[0]; inc d
-      if d.kind == Symbol and symName(d) in g.asmStack:
+      if d.kind == Symbol and d.symId in g.asmStack:
         lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
                   g.asmInfo
     g.ab.tree tag: (g.asmInoutDest(argCurs[0]); g.asmOperand(argCurs[1]))
@@ -198,7 +198,7 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
       if g.isAsmStackSym(srcC):
         lengError srcC, "a memory-to-memory move needs a scratch register; " &
                   "assign through a `{.register: \"…\".}` local", g.asmInfo
-      let nm = symName(destC)
+      let nm = destC.symId
       case srcC.kind
       of Symbol:
         g.ab.tree MovX64: (g.emStackMem(nm); g.emReg g.asmRegOf(srcC))
@@ -216,7 +216,7 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
     case srcC.kind
     of Symbol:
       if g.isAsmStackSym(srcC):
-        g.ab.tree MovX64: (g.emReg dst; g.emStackMem(symName(srcC)))
+        g.ab.tree MovX64: (g.emReg dst; g.emStackMem(srcC.symId))
       else:
         g.movReg(dst, g.asmRegOf(srcC))
     of IntLit:
@@ -237,11 +237,11 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   ## `(instr SYM X*)` in an `.assembler` body: the operands are already where the
   ## user put them, so this is the row's opcode over `dst` and the operand
   ## registers — the same `emitIntrinsicOps` the allocated path ends in.
-  var fsym = ""
+  var fsym = NoSymId
   var argCurs: seq[Cursor] = @[]
   var fc = c
   fc.into:
-    fsym = symName(fc); skip fc
+    fsym = fc.symId; skip fc
     while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
@@ -292,7 +292,7 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let nameC = cc
-    let nm = symName(cc); inc cc
+    let nm = cc.symId; inc cc
     let loc = g.asmDeclLoc(cc)
     skip cc                                      # pragmas
     let typeCur = cc
@@ -311,13 +311,13 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
       g.asmStack.incl nm
       g.emTypedStackVar(nm, typeCur)
     of aslNone:
-      if isResultName(nm):
+      if g.isResultName(nm):
         # The result is pinned to the ABI return register, derived rather than
         # annotated: Nimony has no syntax for annotating `result`, and the ABI
         # leaves no choice anyway.
         g.asmReg[nm] = g.md.intRetReg
       else:
-        lengError nameC, "`" & userName(nm) & "` needs `{.register: \"…\".}` or `{.stack.}` — an " &
+        lengError nameC, "`" & g.userName(nm) & "` needs `{.register: \"…\".}` or `{.stack.}` — an " &
                   "`.assembler` proc declares every location", g.asmInfo
     if hasInit:
       # `var r {.register: "rax".} = x` is an assignment like any other.
@@ -339,7 +339,7 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
         case initC.kind
         of Symbol:
           if g.isAsmStackSym(initC):
-            g.ab.tree MovX64: (g.emReg g.asmReg.getOrQuit(nm); g.emStackMem(symName(initC)))
+            g.ab.tree MovX64: (g.emReg g.asmReg.getOrQuit(nm); g.emStackMem(initC.symId))
           else:
             g.movReg(g.asmReg.getOrQuit(nm), g.asmRegOf(initC))
         of IntLit: g.movImm(g.asmReg.getOrQuit(nm), intVal(initC))
@@ -472,19 +472,19 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   of LabS:
     var cc = c
     cc.into:
-      g.emLab(symName(cc)); skip cc
+      g.emLab(cc.symId); skip cc
       while cc.hasMore: skip cc
   of JmpS:
     var cc = c
     cc.into:
-      g.emJmp(symName(cc)); skip cc
+      g.emJmp(cc.symId); skip cc
       while cc.hasMore: skip cc
   of RetS:
     var cc = c
     cc.into:
       if cc.hasMore and cc.kind != DotToken:
         if g.isAsmStackSym(cc):
-          g.ab.tree MovX64: (g.emReg g.md.intRetReg; g.emStackMem(symName(cc)))
+          g.ab.tree MovX64: (g.emReg g.md.intRetReg; g.emStackMem(cc.symId))
         else:
           g.movReg(g.md.intRetReg, g.asmRegOf(cc))  # a no-op when already pinned there
         skip cc
@@ -527,7 +527,7 @@ proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
           var nameC = pc
           pc.into:                               # (param :nm pragmas type)
             nameC = pc
-            let nm = symName(pc); inc pc
+            let nm = pc.symId; inc pc
             let loc = g.asmDeclLoc(pc)
             skip pc                              # pragmas
             g.symType[nm] = pc
@@ -538,19 +538,19 @@ proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
             let abiReg = g.md.intArgRegs[ord]
             case loc.kind
             of aslNone:
-              lengError nameC, "parameter `" & userName(nm) & "` needs `{.register: \"" &
+              lengError nameC, "parameter `" & g.userName(nm) & "` needs `{.register: \"" &
                         x64RegName(abiReg) & "\".}` — an `.assembler` proc's " &
                         "annotations ARE its ABI", g.asmInfo
             of aslStack:
-              lengError nameC, "parameter `" & userName(nm) & "` arrives in " &
+              lengError nameC, "parameter `" & g.userName(nm) & "` arrives in " &
                         x64RegName(abiReg) & ", so it cannot be `{.stack.}`", g.asmInfo
             of aslReg:
               if loc.r != abiReg:
-                lengError nameC, "parameter `" & userName(nm) & "` is passed in " &
+                lengError nameC, "parameter `" & g.userName(nm) & "` is passed in " &
                           x64RegName(abiReg) & " by the C ABI, but is pinned to " &
                           x64RegName(loc.r), g.asmInfo
             g.asmReg[nm] = abiReg
-            g.rb.bindParam(abiReg, paramName(ord))
+            g.rb.bindParam(abiReg, g.paramName(ord))
             used.incl abiReg
             while pc.hasMore: skip pc
           inc ord

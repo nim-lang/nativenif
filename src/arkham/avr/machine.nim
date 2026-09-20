@@ -32,6 +32,7 @@
 ##    candidates for anything else.
 
 import ../core/[machinedesc]
+import nifcore   # `SymId`: a `Location` names symbols by pool id
 export machinedesc
 
 const
@@ -217,6 +218,7 @@ proc lowName*(r: Reg): string =
 proc highName*(r: Reg): string = "r" & $(2 * ord(r) + 1)
 
 proc `$`*(loc: Location): string =
+  ## Debug rendering; a symbol shows as `#<id>` (no pool here — see the a64 twin).
   case loc.kind
   of Undef: "undef"
   of NoLoc: "noloc"
@@ -226,16 +228,16 @@ proc `$`*(loc: Location): string =
   of InRegPair:
     "{" & regName(loc.r0) & (if loc.r1 != NoReg: "," & regName(loc.r1) else: "") & "}"
   of InFReg: "<nofloat>"
-  of NamedStack: "&" & loc.name
-  of StackPtr: "*" & loc.ptrName
+  of NamedStack: "&#" & $loc.name
+  of StackPtr: "*#" & $loc.ptrName
   of Mem: "[mem]"
   of Field:
     (case loc.base.kind
      of FbReg: "[" & regName(loc.base.reg) & "]"
-     of FbSlot: "&" & loc.base.sym
-     of FbGlob: "@" & loc.base.sym
-     of FbTvar: "%tvar:" & loc.base.sym
-     of FbLval: "[lval]") & "." & loc.field
-  of Glob: "@" & loc.name
-  of Tvar: "%tvar:" & loc.name
+     of FbSlot: "&#" & $loc.base.sym
+     of FbGlob: "@#" & $loc.base.sym
+     of FbTvar: "%tvar:#" & $loc.base.sym
+     of FbLval: "[lval]") & ".#" & $loc.field
+  of Glob: "@#" & $loc.name
+  of Tvar: "%tvar:#" & $loc.name
   of Imm: "#" & $loc.ival

@@ -45,16 +45,16 @@ import emit
 proc emitValue(g: var CodeGen; c: Cursor; dst: Reg)
 proc genStmt(g: var CodeGen; c: Cursor)
 proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
-              aggrDst = "")
+              aggrDst = NoSymId)
 
 
-var gRetAggrSlot = ""
+var gRetAggrSlot = NoSymId
   ## The frame slot holding this proc's hidden result pointer, or empty. A
   ## module-level `var` rather than a `CodeGen` field: `CodeGen` is shared with
   ## three other backends that have no such thing, and arkham compiles one proc
   ## at a time — the reasoning `gArkhamCurProc` already rests on.
 
-template retAggrSlot(g: CodeGen): string = gRetAggrSlot
+template retAggrSlot(g: CodeGen): SymId = gRetAggrSlot
 
 proc refuse(c: Cursor; what: string) {.noreturn.} =
   lengError c, "AVR: " & what & " is not implemented yet " &
@@ -91,13 +91,13 @@ proc refuseAggr(g: var CodeGen; c: Cursor; what: string) =
               "returning one are not implemented yet (see M5 in " &
               "doc/internals/avr.md)", lengInfo(c)
 
-proc mintSlot(g: var CodeGen; c: Cursor): string =
+proc mintSlot(g: var CodeGen; c: Cursor): SymId =
   ## A frame slot for one parked operand. Declared where it is used: nifasm
   ## assigns the offset, and `(scope …)` is not needed because these never
   ## outlive the expression that minted them — the next one reuses the space only
   ## if the assembler chooses to, and correctness does not depend on it.
   inc g.emitTmpSpills
-  result = SynthMark & "etmp" & $g.emitTmpSpills & ".0"
+  result = g.lengSym(SynthMark & "etmp" & $g.emitTmpSpills & ".0")
   g.ab.open NifasmDecl.VarD
   g.ab.symDef result
   g.ab.keyword SO
@@ -116,7 +116,7 @@ type
     kind: BKind
     imm: int64
     r: Reg
-    slot: string
+    slot: SymId
 
 proc classifyB(g: var CodeGen; c: Cursor; dst: Reg): BPlan =
   ## Decide where the second operand will come from, and PARK it now if that
@@ -134,7 +134,7 @@ proc classifyB(g: var CodeGen; c: Cursor; dst: Reg): BPlan =
   of CharLit:
     return BPlan(kind: bkImm, imm: int64(ord(charLit(c))))
   of Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     if home.kind == InReg and home.r != dst:
       return BPlan(kind: bkReg, r: home.r)
     if home.kind == NamedStack:
@@ -229,7 +229,7 @@ proc emitCmpFlags(g: var CodeGen; c: Cursor; dst: Reg): AvrCond =
     g.emCmp16(dst, br)
   result = cond
 
-proc emitCond(g: var CodeGen; c: Cursor; target: string; whenTrue: bool) =
+proc emitCond(g: var CodeGen; c: Cursor; target: SymId; whenTrue: bool) =
   ## Branch to `target` when `c` is true (or false), WITHOUT materializing a
   ## bool. A comparison lands straight in the flags, which is the one fusion this
   ## core does keep: it is not an optimization here but the natural shape, since
@@ -282,7 +282,7 @@ type
   Lval = object
     kind: LvalKind
     r: Reg
-    slot: string
+    slot: SymId
     off: int
     node: Cursor
     width: int
@@ -361,17 +361,17 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
   ## an inner ROW, and falling back to `emitValue` there would LOAD the row's
   ## first word and use it as a pointer.
   if c.kind == Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     if home.kind == NamedStack:
       g.emLeaSlot(dst, home.name)
       return
     if home.kind == InReg:
       g.emMovw(dst, home.r)                 # already a pointer VALUE
       return
-    if home.kind == NoLoc and g.prog.globals.hasKey(symName(c)):
-      g.emGlobalAddr(dst, g.prog.gvarAsmName(symName(c)))
+    if home.kind == NoLoc and g.prog.globals.hasKey(c.symId):
+      g.emGlobalAddr(dst, g.prog.gvarAsmName(c.symId))
       return
-    refuse(c, "the address of `" & symName(c) & "`")
+    refuse(c, "the address of `" & g.spelling(c.symId) & "`")
   if c.kind == TagLit:
     case c.exprKind
     of DotC:
@@ -391,16 +391,16 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
     else: discard
   g.emitValue(c, dst)
 
-proc mintCtorSlot(g: var CodeGen; c: Cursor): string
-proc mintAggrSlot(g: var CodeGen; size: int): string
+proc mintCtorSlot(g: var CodeGen; c: Cursor): SymId
+proc mintAggrSlot(g: var CodeGen; size: int): SymId
 proc aggrSize(g: var CodeGen; c: Cursor): int
 proc isAggrCall(g: var CodeGen; c: Cursor): bool
-proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string)
+proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId)
 
 proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
   case c.kind
   of Symbol:
-    let name = symName(c)
+    let name = c.symId
     let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
     case home.kind
     of InReg:
@@ -412,7 +412,7 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
     of NamedStack: Lval(kind: lvSlot, slot: home.name)
     else:
       if not g.prog.globals.hasKey(name):
-        refuse(c, "a store to `" & name & "`, whose location is " & $home.kind)
+        refuse(c, "a store to `" & g.spelling(name) & "`, whose location is " & $home.kind)
       g.emGlobalAddr(scratch, g.prog.gvarAsmName(name))
       Lval(kind: lvPtr, r: scratch, off: 0, width: g.accessWidth(c))
   of TagLit:
@@ -504,12 +504,12 @@ proc emitAggrCopy(g: var CodeGen; dst, src: Lval; size: int) =
     g.emitByteLoad(src, off, into)
     g.emitByteStore(dst, off, into)
 
-proc mintAggrSlot(g: var CodeGen; size: int): string =
+proc mintAggrSlot(g: var CodeGen; size: int): SymId =
   ## A frame slot sized to hold an aggregate, declared as an ARRAY OF BYTES: what
   ## is wanted is `size` bytes, and repeating the type would make this a second
   ## place the layout has to agree.
   inc g.emitTmpSpills
-  result = SynthMark & "eagg" & $g.emitTmpSpills & ".0"
+  result = g.lengSym(SynthMark & "eagg" & $g.emitTmpSpills & ".0")
   g.ab.open NifasmDecl.VarD
   g.ab.symDef result
   g.ab.keyword SO
@@ -518,7 +518,7 @@ proc mintAggrSlot(g: var CodeGen; size: int): string =
     g.ab.intLit size
   g.ab.close()
 
-proc mintCtorSlot(g: var CodeGen; c: Cursor): string =
+proc mintCtorSlot(g: var CodeGen; c: Cursor): SymId =
   ## A frame slot for a CONSTRUCTOR's result, declared with the constructor's own
   ## type rather than as bytes.
   ##
@@ -526,7 +526,7 @@ proc mintCtorSlot(g: var CodeGen; c: Cursor): string =
   ## filled in by `(dot slot f)` and `(at slot i)`, and nifasm scales an index by
   ## the ELEMENT — so a byte-array slot made `(at slot 1)` mean byte 1.
   inc g.emitTmpSpills
-  result = SynthMark & "ector" & $g.emitTmpSpills & ".0"
+  result = g.lengSym(SynthMark & "ector" & $g.emitTmpSpills & ".0")
   var tc = c; inc tc                        # into the constructor, at its type
   g.ab.open NifasmDecl.VarD
   g.ab.symDef result
@@ -550,8 +550,8 @@ proc isAggrCall(g: var CodeGen; c: Cursor): bool =
   if c.kind != TagLit or c.exprKind != CallC: return false
   var f = c; inc f
   if f.kind != Symbol: return false
-  let target = g.callTarget.getOrDefault(symName(f))
-  if target.asmName.len == 0: return false
+  let target = g.callTarget.getOrDefault(f.symId)
+  if target.asmName == NoSymId: return false
   var rtc = target.retType
   result = not cursorIsNil(rtc) and rtc.kind != DotToken and
            not (rtc.kind == TagLit and rtc.typeKind == VoidT) and
@@ -656,7 +656,7 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
   of UIntLit: g.emLdi16(dst, cast[int64](uintVal(c)))
   of CharLit: g.emLdi16(dst, int64(ord(charLit(c))))
   of Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     case home.kind
     of InReg: g.emMovw(dst, home.r)
     of NamedStack:
@@ -665,9 +665,9 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     else:
       # A GLOBAL. Its address is a pair of `ldi`s, so a read is that plus one
       # load — there is no absolute operand this backend folds it into.
-      let name = symName(c)
+      let name = c.symId
       if not g.prog.globals.hasKey(name):
-        refuse(c, "a read of `" & name & "`, whose location is " & $home.kind)
+        refuse(c, "a read of `" & g.spelling(name) & "`, whose location is " & $home.kind)
       g.emGlobalAddr(dst, g.prog.gvarAsmName(name))
       g.emLoadPtr(dst, dst, 0, g.accessWidth(c))
   of StrLit:
@@ -769,7 +769,7 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
 # ── calls ───────────────────────────────────────────────────────────────────
 
 proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
-              aggrDst = "") =
+              aggrDst = NoSymId) =
   ## `aggrDst` names the frame slot an AGGREGATE result must be written into.
   ## This target's aggregate convention is by-REFERENCE at every size: an
   ## aggregate argument is a pointer to a copy the caller made, and an aggregate
@@ -787,7 +787,7 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
   inc f
   if f.kind != Symbol:
     refuse(c, "an indirect call")
-  let callee = symName(f)
+  let callee = f.symId
   var args: seq[Cursor] = @[]
   var a = c
   # `into`, not `inc`: after `inc` a cursor's `hasMore` is relative to the
@@ -799,11 +799,11 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
       args.add a
       skip a
   let target = g.callTarget.getOrDefault(callee)
-  if target.asmName.len == 0:
-    refuse(c, "a call to `" & callee & "`, which is not a known proc")
+  if target.asmName == NoSymId:
+    refuse(c, "a call to `" & g.spelling(callee) & "`, which is not a known proc")
   if target.extern or target.syscall or target.memIntrin.len > 0 or
      target.bitBuiltin.len > 0:
-    refuse(c, "a call to `" & callee & "`: externs, syscalls and inlined " &
+    refuse(c, "a call to `" & g.spelling(callee) & "`: externs, syscalls and inlined " &
               "intrinsics have no meaning on a bare-metal target")
 
   var rtc = target.retType
@@ -813,8 +813,8 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
   let retsAggr = not cursorIsNil(rtc) and rtc.kind != DotToken and
                  not (rtc.kind == TagLit and rtc.typeKind == VoidT) and
                  slotOf(g.prog, rtc).cls == AMem
-  if retsAggr and aggrDst.len == 0:
-    refuse(c, "the result of `" & callee & "`, which is an aggregate, used " &
+  if retsAggr and aggrDst == NoSymId:
+    refuse(c, "the result of `" & g.spelling(callee) & "`, which is an aggregate, used " &
               "somewhere with no place to put it")
   let shift = if retsAggr: 1 else: 0
   # Past the argument pairs, the rest go in a block in THIS frame and its address
@@ -826,8 +826,8 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
   # evaluating a later one may use the pairs. A register argument parks in a slot
   # of its own; an overflow argument's park IS its word of the block, which is in
   # this frame and nothing later touches.
-  var slots = newSeq[string](args.len)
-  var blockSlot = ""
+  var slots = newSeq[SymId](args.len)
+  var blockSlot = NoSymId
   if overflow: blockSlot = g.mintAggrSlot(2 * (args.len + shift - regCount))
   for i in 0 ..< args.len:
     if g.exprSlot(args[i]).cls == AMem:
@@ -861,18 +861,18 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
   if retsAggr:
     g.emLeaSlot(ValueBridge, aggrDst)
     g.ab.tree MovwAvr:
-      g.ab.tree ArgX: g.ab.sym paramName(0)
+      g.ab.tree ArgX: g.ab.sym g.paramName(0)
       g.emPair ValueBridge
   for i in 0 ..< args.len:
     if i + shift >= regCount: continue
     g.emLoadSlot(ValueBridge, slots[i])
     g.ab.tree MovwAvr:
-      g.ab.tree ArgX: g.ab.sym paramName(i + shift)
+      g.ab.tree ArgX: g.ab.sym g.paramName(i + shift)
       g.emPair ValueBridge
   if overflow:
     g.emLeaSlot(ValueBridge, blockSlot)
     g.ab.tree MovwAvr:
-      g.ab.tree ArgX: g.ab.sym paramName(regCount)
+      g.ab.tree ArgX: g.ab.sym g.paramName(regCount)
       g.emPair ValueBridge
   g.ab.keyword CallAvr
   # The result is bound whether or not the caller wants it: nifasm checks that
@@ -883,30 +883,30 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
   elif not cursorIsNil(target.retType) and target.retType.typeKind != VoidT:
     g.ab.tree MovwAvr:
       (if wantResult: g.emPair dst else: g.emPair ValueBridge)
-      g.ab.tree ResX: g.ab.sym synth("ret.0")
+      g.ab.tree ResX: g.ab.sym g.lengSym(synth("ret.0"))
   elif wantResult:
-    refuse(c, "using the result of `" & callee & "`, which returns nothing")
+    refuse(c, "using the result of `" & g.spelling(callee) & "`, which returns nothing")
   g.ab.close()
 
 
 # ── statements ──────────────────────────────────────────────────────────────
 
-proc storeToSym(g: var CodeGen; name: string; pos: int; src: Reg) =
+proc storeToSym(g: var CodeGen; name: SymId; pos: int; src: Reg) =
   let home = g.plan.locationOfSym(name, pos)
   case home.kind
   of InReg: g.emMovw(home.r, src)
   of NamedStack: g.emStoreSlot(home.name, src)
   else:
-    raiseAssert "arkham avr: `" & name & "` has no storage (" & $home.kind & ")"
+    raiseAssert "arkham avr: `" & g.spelling(name) & "` has no storage (" & $home.kind & ")"
 
-proc destOfSym(g: var CodeGen; name: string; pos: int): Reg =
+proc destOfSym(g: var CodeGen; name: SymId; pos: int): Reg =
   ## Where to COMPUTE a value that is about to become `name`. A register-homed
   ## local is computed in place; a memory-homed one goes through the value
   ## bridge, which is what that bridge is for.
   let home = g.plan.locationOfSym(name, pos)
   if home.kind == InReg: home.r else: ValueBridge
 
-proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
+proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
   ## `(oconstr T (kv f v)…)` / `(aconstr T v…)` into a frame slot, one field or
   ## element at a time.
   ##
@@ -924,7 +924,7 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
         inc kv
         if kv.kind != Symbol:
           refuse(kv, "an object constructor without a field name")
-        let fieldName = symName(kv)
+        let fieldName = kv.symId
         skip kv                                  # the field name
         if g.exprSlot(kv).cls == AMem:
           # A NESTED aggregate — a struct inside a struct, or a constructor for
@@ -989,12 +989,12 @@ proc emGlobalInits(g: var CodeGen) =
       var tc = typeCur
       let sl = slotOf(g.prog, tc)
       if sl.cls == AMem:
-        lengError decl, "AVR: the global `" & nifName & "` is an aggregate — " &
+        lengError decl, "AVR: the global `" & g.spelling(nifName) & "` is an aggregate — " &
                   "its initial image would have to travel in flash and be " &
                   "copied into SRAM at startup, which is M6 in " &
                   "doc/internals/avr.md", lengInfo(decl)
       if sl.size > 2:
-        lengError decl, "AVR: the global `" & nifName & "` is " & $sl.size &
+        lengError decl, "AVR: the global `" & g.spelling(nifName) & "` is " & $sl.size &
                   " bytes; a value here is 16 bits (see M5 in " &
                   "doc/internals/avr.md)", lengInfo(decl)
       let asmName = g.prog.gvarAsmName(nifName)
@@ -1010,19 +1010,19 @@ proc emGlobalInits(g: var CodeGen) =
 proc genVarDecl(g: var CodeGen; c: Cursor) =
   var v = c
   inc v                                   # into `(var …)`, at the name
-  let name = symName(v)
+  let name = v.symId
   let pos = cursorToPosition(g.buf[], v)
   inc v
   skip v                                  # the var's pragmas
   let typeCur = v
   skip v                                  # the type
-  g.checkWidth(typeCur, "the local `" & name & "`")
+  g.checkWidth(typeCur, "the local `" & g.spelling(name) & "`")
   let home = g.plan.locationOfSym(name, pos)
   case home.kind
   of InReg: g.emRegPairVar(name, home.r, typeCur)
   of NamedStack: g.emSlotVar(home.name, typeCur)
   else:
-    lengError c, "AVR: the local `" & name & "` was given no storage",
+    lengError c, "AVR: the local `" & g.spelling(name) & "` was given no storage",
               lengInfo(c)
   if v.hasMore and v.kind != DotToken:
     if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}) and
@@ -1055,11 +1055,11 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
   skip rhs
   if g.tryAggrAssign(lhs, rhs): return
   if lhs.kind == Symbol and
-     g.plan.locationOfSym(symName(lhs), cursorToPosition(g.buf[], lhs)).kind !=
+     g.plan.locationOfSym(lhs.symId, cursorToPosition(g.buf[], lhs)).kind !=
        NoLoc:
     # A LOCAL, kept separate because it needs no address at all. A GLOBAL falls
     # through to the address path below.
-    let name = symName(lhs)
+    let name = lhs.symId
     let pos = cursorToPosition(g.buf[], lhs)
     let dst = g.destOfSym(name, pos)
     g.emitValue(rhs, dst)
@@ -1098,7 +1098,7 @@ proc genRet(g: var CodeGen; c: Cursor) =
     if g.exprSlot(v).cls == AMem:
       # An aggregate result is written through the hidden pointer the caller
       # supplied, which the prologue parked in `retAggrSlot`.
-      if g.retAggrSlot.len == 0:
+      if g.retAggrSlot == NoSymId:
         refuse(v, "an aggregate return from a proc with no hidden result pointer")
       let size = g.aggrSize(v)
       let srcLv = g.emitLval(v, ValueBridge)
@@ -1251,10 +1251,10 @@ proc genStmt(g: var CodeGen; c: Cursor) =
       g.emitValue(v, ValueBridge)
   of LabS:
     var v = c; inc v
-    g.emLab(symName(v))
+    g.emLab(v.symId)
   of JmpS:
     var v = c; inc v
-    g.emJmp(symName(v))
+    g.emJmp(v.symId)
   else:
     refuse(c, "the statement `" & $c.stmtKind & "`")
 
@@ -1309,7 +1309,7 @@ proc emEntrySetup(g: var CodeGen) =
   g.ab.tree OutbAvr: (g.ab.intLit SphIo; g.ab.regNamed "r20")
   g.ab.tree XorAvr: (g.ab.regNamed "r1"; g.ab.regNamed "r1")
 
-proc collectParams(g: var CodeGen; decl: Cursor): seq[tuple[name: string; typ: Cursor]] =
+proc collectParams(g: var CodeGen; decl: Cursor): seq[tuple[name: SymId; typ: Cursor]] =
   result = @[]
   var c = decl
   inc c; inc c                 # into `(proc …)`, past the name, at `(params …)`
@@ -1319,7 +1319,7 @@ proc collectParams(g: var CodeGen; decl: Cursor): seq[tuple[name: string; typ: C
     while p.hasMore:
       var d = p
       d.into:
-        let nm = symName(d)
+        let nm = d.symId
         inc d
         skip d                 # the param's pragmas
         result.add (nm, d)
@@ -1331,7 +1331,7 @@ proc recordVarType(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     if cc.kind == SymbolDef:
-      let nm = symName(cc); inc cc
+      let nm = cc.symId; inc cc
       skip cc                                    # pragmas
       let typeCur = cc; skip cc
       g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
@@ -1374,13 +1374,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
       skip pc                             # pragmas
       if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
       while pc.hasMore: skip pc
-  g.curProcName = info.asmName
+  g.curProcName = g.spelling(info.asmName)
   g.isEntryProc = info.isEntry
   g.rb.resetProc()
   g.loopEnds = @[]
   g.emitTmpSpills = 0
   g.labelCount = 0
-  g.retLabel2 = SynthMark & "epi.0"
+  g.retLabel2 = g.lengSym(SynthMark & "epi.0")
   g.retLabelUsed2 = false
 
   let an = analyseProc(g.buf[], info.decl)
@@ -1395,7 +1395,7 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
                        (rt.kind == TagLit and rt.typeKind == VoidT))
   var rtc0 = rt
   let retsAggr = hasResult and slotOf(g.prog, rtc0).cls == AMem
-  gRetAggrSlot = ""
+  gRetAggrSlot = NoSymId
   let shift = if retsAggr: 1 else: 0
   # More parameters than argument pairs: the last pair brings the address of the
   # caller's overflow block, and parameter `i` past `regCount` is its word
@@ -1412,13 +1412,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
       # The hidden result pointer, first. Its TYPE is a pointer, not the
       # aggregate — what arrives in the pair is an address.
       g.ab.tree NifasmDecl.ParamD:
-        g.ab.symDef paramName(0)
+        g.ab.symDef g.paramName(0)
         g.ab.rawReg g.md.intArgRegs[0]
         g.ab.ptrType: g.ab.voidType()
     for i in 0 ..< params.len:
       if inBlock(i): continue
       g.ab.tree NifasmDecl.ParamD:
-        g.ab.symDef paramName(i + shift)
+        g.ab.symDef g.paramName(i + shift)
         g.ab.rawReg g.md.intArgRegs[i + shift]
         var ptc0 = params[i].typ
         if slotOf(g.prog, ptc0).cls == AMem:
@@ -1432,13 +1432,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
           g.genTypeBodyAvr(tc)
     if overflow:
       g.ab.tree NifasmDecl.ParamD:              # the address of the caller's block
-        g.ab.symDef paramName(regCount)
+        g.ab.symDef g.paramName(regCount)
         g.ab.rawReg blockReg
         g.ab.ptrType: g.ab.voidType()
   if hasResult and not retsAggr:
-    g.checkWidth(rt, "the result of `" & info.asmName & "`")
+    g.checkWidth(rt, "the result of `" & g.spelling(info.asmName) & "`")
     g.ab.tree NifasmDecl.ResultD:
-      g.ab.symDef synth("ret.0")
+      g.ab.symDef g.lengSym(synth("ret.0"))
       g.ab.rawReg g.md.intRetReg
       var tc = rt
       g.genTypeBodyAvr(tc)
@@ -1453,28 +1453,28 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   swap(g.ab, side)
   g.rb.enterScope()
 
-  if retsAggr: g.rb.bindParam(g.md.intArgRegs[0], paramName(0))
+  if retsAggr: g.rb.bindParam(g.md.intArgRegs[0], g.paramName(0))
   for i in 0 ..< params.len:
     if not inBlock(i):
-      g.rb.bindParam(g.md.intArgRegs[i + shift], paramName(i + shift))
-  var blockSlot = ""
+      g.rb.bindParam(g.md.intArgRegs[i + shift], g.paramName(i + shift))
+  var blockSlot = NoSymId
   if overflow:
     # The block's address is needed once per overflow parameter and its pair is
     # an ordinary volatile, so it is parked like the hidden result pointer.
-    g.rb.bindParam(blockReg, paramName(regCount))
-    blockSlot = SynthMark & "argblk.0"
+    g.rb.bindParam(blockReg, g.paramName(regCount))
+    blockSlot = g.lengSym(SynthMark & "argblk.0")
     g.emPtrSlot blockSlot
     g.emStoreSlot(blockSlot, blockReg)
-    g.ab.tree KillAvr: g.ab.sym paramName(regCount)
+    g.ab.tree KillAvr: g.ab.sym g.paramName(regCount)
     discard g.rb.takeBinding(blockReg)
   if retsAggr:
     # Park the hidden pointer for the proc's lifetime: it is needed at every
     # `ret`, and the first argument pair is caller-saved and also the first
     # argument of any call the body makes.
-    gRetAggrSlot = SynthMark & "retp.0"
+    gRetAggrSlot = g.lengSym(SynthMark & "retp.0")
     g.emPtrSlot gRetAggrSlot
     g.emStoreSlot(gRetAggrSlot, g.md.intArgRegs[0])
-    g.ab.tree KillAvr: g.ab.sym paramName(0)
+    g.ab.tree KillAvr: g.ab.sym g.paramName(0)
     discard g.rb.takeBinding(g.md.intArgRegs[0])
   for i in 0 ..< params.len:
     let nm = params[i].name
@@ -1506,13 +1506,13 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
       # and `(dot w f)` against it is not an operand this machine has. Refused by
       # name rather than silently staged: the staging would have to happen inside
       # a memory operand, which is not a place instructions can be emitted.
-      lengError info.decl, "AVR: the aggregate parameter `" & nm &
+      lengError info.decl, "AVR: the aggregate parameter `" & g.spelling(nm) &
                 "` is passed by REFERENCE and the allocator homed the pointer " &
                 "in " & $home.kind & "; only X, Y and Z can address memory on " &
                 "this machine (see M5 in doc/internals/avr.md)",
                 lengInfo(info.decl)
     else:
-      g.checkWidth(params[i].typ, "the parameter `" & nm & "`")
+      g.checkWidth(params[i].typ, "the parameter `" & g.spelling(nm) & "`")
       case home.kind
       of InReg:
         g.emRegPairVar(nm, home.r, params[i].typ)  # kills `pN.0` when it IS this pair
@@ -1522,10 +1522,10 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
         g.emSlotVar(home.name, params[i].typ)
         g.emStoreSlotW(home.name, src, slotOf(g.prog, ptc0).size)
       else:
-        lengError info.decl, "AVR: the parameter `" & nm & "` was given no storage",
+        lengError info.decl, "AVR: the parameter `" & g.spelling(nm) & "` was given no storage",
                   lengInfo(info.decl)
-    if g.rb.boundName(src) == paramName(i + shift):
-      g.ab.tree KillAvr: g.ab.sym paramName(i + shift)
+    if g.rb.boundName(src) == g.paramName(i + shift):
+      g.ab.tree KillAvr: g.ab.sym g.paramName(i + shift)
       discard g.rb.takeBinding(src)
 
   if info.isEntry: g.emGlobalInits()

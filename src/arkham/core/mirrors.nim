@@ -35,7 +35,7 @@ let forwardingOff* = existsEnv("ARKHAM_NO_FORWARD")
   ## set, no mirror is ever created and every read of a memory-homed value goes
   ## back to its slot.
 
-proc emKill(g: var CodeGen; name: string) {.inline.} =
+proc emKill(g: var CodeGen; name: SymId) {.inline.} =
   ## `(kill name)`. `KillX64` and `KillA64` are two spellings of ONE tag id, so
   ## the tree is identical on both targets and this needs no arch dispatch.
   g.ab.tree KillX64: g.ab.sym name
@@ -43,13 +43,13 @@ proc emKill(g: var CodeGen; name: string) {.inline.} =
 proc killMirror*(g: var CodeGen; r: Reg) =
   ## Retire `r`'s mirror and kill the binding it was keeping alive.
   let dead = g.rb.dropMirror(r)
-  if dead.len > 0: g.emKill dead
+  if dead != NoSymId: g.emKill dead
 
 proc killFMirror(g: var CodeGen; f: FReg) =
   let dead = g.rb.dropFMirror(f)
-  if dead.len > 0: g.emKill dead
+  if dead != NoSymId: g.emKill dead
 
-proc killMirrorsOf*(g: var CodeGen; name: string) =
+proc killMirrorsOf*(g: var CodeGen; name: SymId) =
   ## `name` has been STORED to: whatever mirrored its value is stale now.
   let dead = g.rb.dropMirrorsOf(name)
   for nm in dead.gprs: g.emKill nm
@@ -82,7 +82,7 @@ proc mirrorableFReg(g: CodeGen; f: FReg): bool {.inline.} =
   ## The SIMD twin: `emFReg` carries the same assert for `floatTempRegs`.
   f in g.md.floatTempRegs
 
-proc mayMirror(g: CodeGen; name: string): bool =
+proc mayMirror(g: CodeGen; name: SymId): bool =
   ## May the value of the memory-homed `name` be forwarded from a register?
   ##
   ## Not when its ADDRESS IS TAKEN: a store through any pointer, and any callee
@@ -94,7 +94,7 @@ proc mayMirror(g: CodeGen; name: string): bool =
   ## Not inside an open caller-save window either: there the authority on where a
   ## value is, is `callerSaveActive` (its save slot), and a second answer to the
   ## same question is how that mechanism's parallel-copy hazard would come back.
-  name.len > 0 and not forwardingOff and
+  name != NoSymId and not forwardingOff and
   name notin g.plan.aliasable and g.plan.callerSaveActive.len == 0
 
 proc forwardOf*(g: CodeGen; home: Location): Location =
@@ -181,7 +181,7 @@ proc mirrorStored*(g: var CodeGen; r: Reg; dst: Location): bool =
   g.rb.mirrorValue(r, dst.name, bt)
   true
 
-proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: string): bool =
+proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: SymId): bool =
   ## `r` holds `&asmName` and is being released with the address still in it.
   ## Keep it: on AArch64 a global's address costs `adrp`+`add` EVERY time it is
   ## needed (there is no PC-relative memory operand), so the second access to the
@@ -196,7 +196,7 @@ proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: string): bool =
   ## registers were provably only READ (see `freeLvalTemps`'s `addrIntact`): the
   ## load form `mov base, [base]` reuses the base register as its destination,
   ## and a mirror created there would name the loaded value.
-  if forwardingOff or asmName.len == 0: return false
+  if forwardingOff or asmName == NoSymId: return false
   if not g.mirrorableReg(r) or not g.rb.isBoundTemp(r): return false
   if g.rb.addrMirror(asmName) != NoReg: return false     # already mirrored elsewhere
   g.pickedRegs.excl r
@@ -216,13 +216,13 @@ proc mirrorFStored*(g: var CodeGen; f: FReg; dst: Location): bool =
   g.rb.mirrorFValue(f, dst.name, dst.typ)
   true
 
-proc paramName*(idx: int): string {.inline.} =
+proc paramName*(g: CodeGen; idx: int): SymId {.inline.} =
   ## The asm-NIF symbol for positional call parameter `idx`. nifasm scopes a
   ## symbol by its full name, so the ordinal has to live in the *name*: `p.0`
   ## and `p.1` are two names for the same thing to a reader and buy nothing
   ## here, whereas `pN.0` is unambiguous. `SynthMark` keeps the whole family out
   ## of the Leng namespace — see its doc comment for the bug that proved it must.
-  result = synth("p") & $idx & ".0"
+  result = g.lengSym(synth("p") & $idx & ".0")
 
 proc operandInReg(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident
@@ -233,5 +233,5 @@ proc operandInReg(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## expression is materialized into a fresh scratch (never a live local's home).
   result = false
   if operand.kind == Symbol:
-    let loc = g.plan.locationOfSym(symName(operand), cursorToPosition(g.buf[], operand))
+    let loc = g.plan.locationOfSym(operand.symId, cursorToPosition(g.buf[], operand))
     result = loc.kind == InReg and loc.r == dest

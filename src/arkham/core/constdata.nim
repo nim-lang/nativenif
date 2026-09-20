@@ -121,16 +121,16 @@ proc isConstScalarInit*(c: Cursor): bool =
   of TagLit: v.exprKind in {TrueC, FalseC, NilC}
   else: false
 
-proc constAddrSym(c: Cursor): string =
+proc constAddrSym(c: Cursor): SymId =
   ## If `c` is a static-ADDRESS initializer — a bare symbol naming a proc or
   ## global (a link-time constant address), possibly wrapped in the same
-  ## conv/cast/par peels as `isConstScalarInit` — return that symbol's name; else
-  ## "". A function-pointer hook (`var gExitFlush = nimNoopFlush`) is the canonical
+  ## conv/cast/par peels as `isConstScalarInit` — return that symbol; else
+  ## `NoSymId`. A function-pointer hook (`var gExitFlush = nimNoopFlush`) is the canonical
   ## case. The backend `genGlobal` emits it as the gvar's value and nifasm bakes
   ## the resolved address into the `.bss` slot (see nifasm `bssSymInits`), so it is
   ## correct even for a FOREIGN module's gvar in a bundle whose entry-time
   ## initializer code never runs — unlike the runtime `(asgn)` path.
-  result = ""
+  result = NoSymId
   var v = c
   while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
     if v.exprKind in {CastC, ConvC}: (inc v; skip v)
@@ -144,7 +144,7 @@ proc constAddrSym(c: Cursor): string =
     while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
       if v.exprKind in {CastC, ConvC}: (inc v; skip v)
       else: inc v
-  if v.kind == Symbol: result = symName(v)
+  if v.kind == Symbol: result = v.symId
 
 proc isStaticConstInit(c: Cursor): bool =
   ## Whether an initializer is a compile-time constant that `constToBytes` can lay
@@ -157,7 +157,7 @@ proc isStaticConstInit(c: Cursor): bool =
   ## an ordinary statement. `genGlobal` rejects a violation rather than guessing.
   if c.kind == StrLit: return true
   if isConstScalarInit(c): return true
-  if constAddrSym(c).len > 0: return true
+  if constAddrSym(c) != NoSymId: return true
   if c.kind == TagLit and c.exprKind in {AconstrC, OconstrC}:
     result = true
     var vc = c
@@ -190,11 +190,11 @@ proc constScalarBits(p: var Program; typ, val: Cursor): uint64 =
     result = uint64(cast[uint32](float32(cast[float64](result))))
 
 proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
-                   relocs: var seq[(int, string)]) =
+                   relocs: var seq[(int, SymId)]) =
   ## Append the in-memory bytes of constant `val` (of Leng type `typ`) to `buf`.
   ## A pointer/proc field whose value is a *symbol address* (e.g. a vtable/RTTI
   ## const pointing at another const or a proc — `(cast (ptr …) Foo.0.vt)`) cannot
-  ## be baked at compile time; record `(blob-offset, symbol-name)` in `relocs` and
+  ## be baked at compile time; record `(blob-offset, symbol)` in `relocs` and
   ## reserve one WORD of placeholder bytes. The backend emits these as `(reloc off sym)`
   ## children of the `(rodata …)` blob and nifasm bakes the resolved address into
   ## `.text` in `writeElf`. `relocs` offsets are relative to the blob start, so the
@@ -207,7 +207,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     appendLE(buf, constScalarBits(p, rt, val), sz)
   of PtrT, AptrT, ProctypeT:
     let addrSym = constAddrSym(val)
-    if addrSym.len > 0:
+    if addrSym != NoSymId:
       relocs.add (buf.len, addrSym)          # link-time address (baked by nifasm)
       for i in 0 ..< wordSize(): buf.add '\0'  # placeholder for the address
     else:
@@ -323,7 +323,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
   else:
     raiseAssert "arkham const: unsupported const type " & $rt.typeKind
 
-proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValue: bool) =
+proc genGlobalInitValue*(g: var CodeGen; name: SymId; typ, val: Cursor; hasValue: bool) =
   ## Emit a gvar's initial VALUE into the open `(gvar :name <type> …)` as STATIC
   ## data: nifasm prefills the (writable) slot from the on-disk image, so the value
   ## is there before any code runs — correct for a foreign module's gvar in a bundle
@@ -343,11 +343,11 @@ proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValu
     g.ab.intLit cast[int64](constScalarBits(g.prog, typ, val))
   else:
     let addrSym = constAddrSym(val)
-    if addrSym.len > 0:
+    if addrSym != NoSymId:
       g.ab.sym addrSym
     elif isStaticConstInit(val):
       var bytes = ""
-      var relocs: seq[(int, string)] = @[]
+      var relocs: seq[(int, SymId)] = @[]
       constToBytes(g.prog, typ, val, bytes, relocs)
       g.ab.str bytes
       for (off, sym) in relocs:
@@ -355,6 +355,6 @@ proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValu
           g.ab.intLit off
           g.ab.sym sym
     else:
-      lengError val, "the initializer of the global `" & name & "` is not a compile-time " &
+      lengError val, "the initializer of the global `" & g.spelling(name) & "` is not a compile-time " &
         "constant. Runtime initialization belongs in the module\'s init proc as an " &
         "assignment, which is where hexer lowers it"

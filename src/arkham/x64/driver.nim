@@ -28,7 +28,7 @@ proc recordVarType(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     if cc.kind == SymbolDef:
-      let nm = symName(cc); inc cc
+      let nm = cc.symId; inc cc
       skip cc                                    # pragmas
       let typeCur = cc; skip cc                  # type
       g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
@@ -85,7 +85,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
   # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
   if not g.cleanSigComputed:                   # compute the clean-signature set once
-    g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.cleanSigProcs = cleanSigProcs(g.prog)
     g.noReturnProcs = noReturnProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
@@ -135,7 +135,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.emitTmpSpills = 0
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.entryMd,
                         g.typeCtx, preseal)
-  g.curProcName = info.asmName
+  g.curProcName = g.spelling(info.asmName)
   # Can an address into THIS frame exist at all? Only a stack-homed symbol has one —
   # a spilled scalar, an aggregate, an address-taken local (`AddrTaken` spills by
   # construction). With every value in a register the frame holds nothing the program
@@ -206,11 +206,11 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.savedHomes.clear()
   g.lvalStride.clear(); g.lvalStrideBorrowed.clear()
   g.noFoldPos = -1
-  g.curProcName = info.asmName
+  g.curProcName = g.spelling(info.asmName)
   when defined(arkhamDbgProc):
     block:
       var pc = info.decl; inc pc
-      stderr.writeLine "DBG emit proc " & symName(pc)
+      stderr.writeLine "DBG emit proc " & g.spelling(pc.symId)
   when defined(arkhamBridgeDbg):
     tightCompositions = 0
     lastResortTakes = 0
@@ -225,7 +225,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.stagingPeakWhat = ""
     g.stagingLive.setLen 0
 
-proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
+proc genGlobal*(g: var CodeGen; nifName: SymId; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
   ## initializer is run at program entry by `emitGlobalInits`.
   # An importc-WITHOUT-exportc gvar names an external (its slot is an `exportc`
@@ -246,7 +246,7 @@ proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
       # A true `const`: a read-only data blob in `.text` (no `.bss`, no entry-time
       # init — emitGlobalInits skips ConstS).
       var bytes = ""
-      var relocs: seq[(int, string)] = @[]
+      var relocs: seq[(int, SymId)] = @[]
       constToBytes(g.prog, typeCur, c, bytes, relocs)
       g.ab.tree RodataD:
         g.ab.symDef name

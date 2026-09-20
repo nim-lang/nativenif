@@ -209,7 +209,7 @@ proc bindLvalGlobalBases*(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   if c.kind == Symbol:
     let loc = g.plan.planned(g.posOf(c))
     if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
-       g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
+       g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind == NoLoc:
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
   elif c.kind == TagLit and c.exprKind in {AtC, DotC, DerefC, PatC}:
@@ -264,7 +264,7 @@ proc emitAtomicInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
       g.unbindTemp(a.r)
 
-proc emLvalFieldMem*(g: var CodeGen; lhs: Cursor; field: string) =
+proc emLvalFieldMem*(g: var CodeGen; lhs: Cursor; field: SymId) =
   g.ab.tree MemX:
     g.ab.tree DotX:
       g.emLvalAddr(lhs)
@@ -348,7 +348,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
   ## the BASE of an enclosing indexed access (one index register per operand).
   case n.kind
   of Symbol:
-    let nm = symName(n)
+    let nm = n.symId
     if g.plan.locationOfSym(nm, cursorToPosition(g.buf[], n)).kind == NoLoc:         # a module-level global aggregate base
       let pos = g.posOf(n)
       if globBase.kind == InReg:
@@ -449,11 +449,11 @@ proc retypeBinDest*(g: var CodeGen; rD: Reg; resTypeC: Cursor;
       if inheritedOperand:                               # inherited an operand's binding
         var rtc = resTypeC
         g.bindTemp(rD, slotOf(g.prog, rtc))
-    elif nm.len > 0:
+    elif nm != NoSymId:
       g.rebindLocalAs(nm, rD, resTypeC)
 
 proc reReprCast*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor;
-                 isCast: bool; preRetyped: string) =
+                 isCast: bool; preRetyped: SymId) =
   ## Convert the INNER value now held in register `res.r` into the cast's TARGET
   ## representation, in place: the pointer-kind rebind, the `extendTo` shift pair
   ## that IS the widening/narrowing, and the binding retype that records the new
@@ -481,7 +481,7 @@ proc reReprCast*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor
       g.rebindTempAs(res.r, targetCur)
     else:
       let nm = g.rb.boundName(res.r)
-      if nm.len > 0: g.rebindLocalAs(nm, res.r, targetCur)
+      if nm != NoSymId: g.rebindLocalAs(nm, res.r, targetCur)
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
     if ptrTarget and not srcPtr and srcW < 64 and
@@ -500,7 +500,7 @@ proc reReprCast*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened. `kindChange` already did it.
   if not kindChange:
-    if preRetyped.len > 0:
+    if preRetyped != NoSymId:
       g.rebindLocalAs(preRetyped, res.r, targetCur)
     elif res.isTemp:
       if g.rb.isBoundTemp(res.r): g.rebindTempAs(res.r, targetCur)
@@ -551,7 +551,7 @@ proc takeWideRegs*(g: var CodeGen; n: int; what: string): seq[Reg] =
       g.bindTemp(r, ScalarSlot)
     result.add r
 
-proc wideArgTruncated*(g: var CodeGen; slotName: string; dest: Reg) =
+proc wideArgTruncated*(g: var CodeGen; slotName: SymId; dest: Reg) =
   ## A 64-bit argument passed to a NARROWER declared parameter: the low word,
   ## which is the truncation C performs and Leng's front end relies on
   ## (`exit(x + y)` where `x`/`y` are `int64` and `exit` takes a `cint`).

@@ -15,7 +15,7 @@
 import std / [tables, sets, strutils]
 
 import nifcore, nifcdecl
-import machinedesc, programs
+import asmslots, machinedesc, programs
 import context
 import diag
 
@@ -41,7 +41,7 @@ type
     ## node travels along so a rejection points at the annotation the user wrote
     ## rather than at the declaration that carries it.
     kind*: AsmDeclKind
-    name*: string
+    name*: string           ## `{.register: "x0".}` — a REGISTER spelling, not a symbol
     at*: Cursor
 
 proc asmDeclSpec*(prag: Cursor): AsmDeclSpec =
@@ -64,11 +64,11 @@ proc asmDeclSpec*(prag: Cursor): AsmDeclSpec =
         skip p
       else: skip p
 
-proc isResultName*(nm: string): bool {.inline.} =
+proc isResultName*(g: CodeGen; nm: SymId): bool {.inline.} =
   ## Nimony names a routine's implicit result `result.<n>[.<module>]`. It is the one
   ## local a user cannot annotate — `result` is not a declaration they write — so
   ## `.assembler` pins it to the ABI return register instead of demanding a pragma.
-  nm.startsWith("result.")
+  g.spelling(nm).startsWith("result.")
 
 proc asmAtom*(c: Cursor): Cursor =
   ## Peel the type-only wrappers the front end puts around a literal: `result = 100`
@@ -111,7 +111,7 @@ proc asmNoteInfo*(g: var CodeGen; c: Cursor) {.inline.} =
   if li.len > 0: g.asmInfo = li
 
 proc isAsmStackSym*(g: CodeGen; c: Cursor): bool {.inline.} =
-  c.kind == Symbol and symName(c) in g.asmStack
+  c.kind == Symbol and c.symId in g.asmStack
 
 proc asmRegOf*(g: var CodeGen; c: Cursor): Reg =
   ## The register an operand names. `.assembler` operands must be ATOMS, so this is
@@ -119,12 +119,12 @@ proc asmRegOf*(g: var CodeGen; c: Cursor): Reg =
   if c.kind != Symbol:
     lengError c, "an `.assembler` operand must be a variable or a literal, not " &
               "a computed expression", g.asmInfo
-  let nm = symName(c)
+  let nm = c.symId
   if nm in g.asmStack:
-    lengError c, "`" & userName(nm) & "` lives on the stack; this operand needs a register",
+    lengError c, "`" & g.userName(nm) & "` lives on the stack; this operand needs a register",
               g.asmInfo
   if not g.asmReg.hasKey(nm):
-    lengError c, "`" & userName(nm) & "` has no declared location — every local in an " &
+    lengError c, "`" & g.userName(nm) & "` has no declared location — every local in an " &
               "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
   result = g.asmReg.getOrQuit(nm)
 
@@ -133,8 +133,8 @@ proc instrOpAt*(g: var CodeGen; c: Cursor): IntrinsicOp =
   result = NoIntrinsicOp
   if c.kind != TagLit or c.exprKind != InstrC: return
   var fc = c
-  var sym = ""
+  var sym = NoSymId
   fc.into:
-    sym = symName(fc); skip fc
+    sym = fc.symId; skip fc
     while fc.hasMore: skip fc
   result = instrTargetOf(g.prog, sym).op

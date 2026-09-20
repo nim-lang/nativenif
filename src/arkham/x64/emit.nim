@@ -76,7 +76,7 @@ type AggrEnd* = object
   ## unconditionally. That last tier is what exhausted the emit-time staging pool under
   ## `-d:danger` (every volatile hosting a call-free local), and it is now rare rather
   ## than universal.
-  slot*: string        ## non-empty ⇒ an rsp-relative named slot
+  slot*: SymId         ## set ⇒ an rsp-relative named slot
   reg*: Reg            ## else, the register holding the aggregate's address
 
 template AddrSlot*(): AsmSlot = addrSlot()
@@ -92,8 +92,8 @@ template AddrSlot*(): AsmSlot = addrSlot()
   ## element type at the point of the actual load/store.
 
 
-proc slotEnd*(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
-proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: "", reg: r)
+proc slotEnd*(name: SymId): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
+proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: NoSymId, reg: r)
 
 proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false)
 proc genUnionBody*(g: var CodeGen; c: var Cursor; packed = false)
@@ -178,7 +178,7 @@ proc emFReg*(g: var CodeGen; f: FReg) {.inline.} =
   ## past the binder. The xmm0–7 arg/return/staging registers have structural raw
   ## uses (ABI float args, the float return, a spill's transient `pickFStaging`).
   let nm = g.rb.boundFName(f)
-  if nm.len > 0: g.ab.sym nm
+  if nm != NoSymId: g.ab.sym nm
   else:
     assert f notin g.md.floatTempRegs,
       "arkham x64: unbound float scratch-pool register reached emFReg: xmm" & $ord(f)
@@ -190,7 +190,7 @@ proc bindFTmp*(g: var CodeGen; f: FReg) =
   ## a raw `(xmmN)`. The SIMD twin of `bindTemp`.
   ## The precision is a generic `(f 64)` — the operand carries no width to nifasm (the
   ## instruction tag selects movss/movsd), so the binding type is just a placeholder.
-  let name = g.rb.freshFTmpName()
+  let name = g.rb.freshFTmpName(g.prog.pool)
   g.ab.tree RebindX64:
     g.ab.symDef name
     g.ab.floatType(64)
@@ -203,7 +203,7 @@ proc unbindFTmp*(g: var CodeGen; f: FReg) =
   ## core's reserve flag (see `unbindTemp`).
   g.pickedFRegs.excl f
   let dead = g.rb.takeFScratch(f)
-  if dead.len > 0:
+  if dead != NoSymId:
     g.ab.tree KillX64: g.ab.sym dead
 
 proc fmovF*(g: var CodeGen; d, s: FReg; bits: int) =                # movss/movsd d, s
@@ -220,13 +220,13 @@ proc emFcvt*(g: var CodeGen; d, s: FReg; dstBits, srcBits: int) =   # precision 
   let op = if dstBits == 32: Cvtsd2ssX64 else: Cvtss2sdX64
   g.ab.tree op: g.emFReg d; g.emFReg s
 
-proc emFloatScalarLoad*(g: var CodeGen; dest: FReg; name: string; bits: int) =
+proc emFloatScalarLoad*(g: var CodeGen; dest: FReg; name: SymId; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
     g.emFReg dest
     g.ab.tree MemX: g.ab.sym name
 
-proc emFloatScalarStore*(g: var CodeGen; name: string; src: FReg; bits: int) =
+proc emFloatScalarStore*(g: var CodeGen; name: SymId; src: FReg; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
     g.ab.tree MemX: g.ab.sym name
@@ -257,7 +257,7 @@ proc flushArgResidentParams*(g: var CodeGen) =
       g.ab.tree KillX64: g.ab.sym name
   g.argResidentParams.setLen 0
 
-proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
+proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: SymId) =
   ## An argument value is about to be MATERIALIZED into argument register `r`. Any name
   ## still bound to `r` is stale — the marshalling overwrites the register — and `emReg`
   ## would write the new value under that stale name, whose type generally does not admit
@@ -281,7 +281,7 @@ proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
   ## bound name either, which is what makes killing it before `emitValue` safe. Skipped
   ## when the value IS that symbol, which legitimately reads through the name.
   let bound = g.rb.boundName(r)
-  if bound.len == 0 or bound == valueSym: return
+  if bound == NoSymId or bound == valueSym: return
   if g.rb.isBoundTemp(r):
     g.unbindTemp(r)                                 # kills the name, drops the binding
     return
@@ -292,7 +292,7 @@ proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
       return
   g.releaseStaleName(r)                             # a register-homed local, dead at a call
 
-proc emLab*(g: var CodeGen; name: string) =
+proc emLab*(g: var CodeGen; name: SymId) =
   ## THE control-flow invalidation point for the store-forwarding mirrors. What a
   ## register holds at a label does not follow from the instructions above it —
   ## some other path jumped here — so every mirror dies. Hooking it at the label
@@ -303,10 +303,10 @@ proc emLab*(g: var CodeGen; name: string) =
   g.killAllMirrors()
   g.ab.tree LabX64: g.ab.symDef name
 
-proc emJmp*(g: var CodeGen; name: string) =
+proc emJmp*(g: var CodeGen; name: SymId) =
   g.ab.tree JmpX64: g.ab.sym name
 
-proc emJcc*(g: var CodeGen; tag: X64Inst; name: string) =
+proc emJcc*(g: var CodeGen; tag: X64Inst; name: SymId) =
   g.ab.tree tag: g.ab.sym name
 
 template emitLoop*(g: var CodeGen; body: untyped) =
@@ -323,8 +323,8 @@ template emitLoop*(g: var CodeGen; body: untyped) =
     g.ab.tree StmtsX64:
       body
 
-proc freshLabel*(g: var CodeGen): string =
-  result = synth("L") & $g.labelCount & ".0"
+proc freshLabel*(g: var CodeGen): SymId =
+  result = g.lengSym(synth("L") & $g.labelCount & ".0")
   inc g.labelCount
 
 proc binArithOp*(c: Cursor): tuple[op: X64Inst, isBin: bool] =
@@ -350,7 +350,7 @@ proc isDivergingCall*(g: CodeGen; c: Cursor): bool =
   inc fc                                     # → the callee
   result = fc.kind == Symbol and fc.symId in g.noReturnProcs
 
-proc namedBindings*(g: CodeGen): seq[tuple[r: Reg, name: string]] =
+proc namedBindings*(g: CodeGen): seq[tuple[r: Reg, name: SymId]] =
   ## Every NAMED local/param binding (not a transient `bindTemp` scratch — that one
   ## belongs to an expression the diverging call is not inside of, and its
   ## `unbindTemp` is the emitter's own business).
@@ -359,7 +359,7 @@ proc namedBindings*(g: CodeGen): seq[tuple[r: Reg, name: string]] =
     if not g.rb.isBoundTemp(r) and g.nameBindTyp.hasKey(nm):
       result.add (r: r, name: nm)
 
-proc restoreBindings*(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
+proc restoreBindings*(g: var CodeGen; saved: seq[tuple[r: Reg, name: SymId]]) =
   for it in saved:
     if g.rb.isBound(it.r): continue           # still ours, or legitimately re-let
     let bt = g.nameBindTyp.getOrQuit(it.name)
@@ -385,7 +385,7 @@ proc restoreBindings*(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
       # live range, so killing it at the next one costs nothing.
       g.postDivergeBinds.add it
 
-proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
+proc emTypedStackVar*(g: var CodeGen; name: SymId; t: Cursor) =
   ## `(var :name (s) T)` with `T` the value's actual Leng type. Use this (not the
   ## generic `(i 64)` slot) for a homed/spilled scalar whose type matters to
   ## nifasm — e.g. a pointer param that the body later derefs, where an `(i 64)`
@@ -406,11 +406,11 @@ proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
   else:
     g.ab.keyword SO                           # ordinary 8-granular slot → `(s)`
   var tc = t
-  if tc.kind == Symbol: g.ab.sym symName(tc)
+  if tc.kind == Symbol: g.ab.sym tc.symId
   else: g.genTypeBody(tc)
   g.ab.close()
 
-proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
+proc emFloatStackVar*(g: var CodeGen; name: SymId; bits: int) =
   g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -418,7 +418,7 @@ proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
   g.ab.floatType(bits)
   g.ab.close()
 
-proc emScalarStackVar*(g: var CodeGen; name: string) =
+proc emScalarStackVar*(g: var CodeGen; name: SymId) =
   ## `(var :name (s) (i 64))` — a spilled/address-taken scalar's 8-byte slot.
   g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.stackSlots.incl name
@@ -428,7 +428,7 @@ proc emScalarStackVar*(g: var CodeGen; name: string) =
   g.ab.intType(64)
   g.ab.close()
 
-proc declSpillSlot*(g: var CodeGen; name: string; typ: AsmSlot; isFloat: bool) =
+proc declSpillSlot*(g: var CodeGen; name: SymId; typ: AsmSlot; isFloat: bool) =
   ## Declare one totality spill slot — an `etmp`/`eftmp`/`held` the value core minted
   ## when the register pools ran dry, or a `csave` the planner minted for a
   ## caller-saved home. A pointer slot keeps its precise `(ptr T)` type so a later
@@ -457,7 +457,7 @@ proc emBindType*(g: var CodeGen; typ: AsmSlot) =
     g.ab.intType(64)
   else:
     var tc = typ.typ
-    if tc.kind == Symbol: g.ab.sym symName(tc)
+    if tc.kind == Symbol: g.ab.sym tc.symId
     else: g.genTypeBody(tc)
 
 proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
@@ -465,7 +465,7 @@ proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## later `emReg r` emits a checked symbol rather than a raw `(reg)` the binding
   ## checker can't see. The binding is recorded as a temp, not a named local.
   ## Released by `unbindTemp`.
-  let name = g.rb.freshTmpName()
+  let name = g.rb.freshTmpName(g.prog.pool)
   g.ab.tree RebindX64:
     g.ab.symDef name
     g.emBindType(typ)
@@ -483,7 +483,7 @@ proc unbindTemp*(g: var CodeGen; r: Reg) =
   ## core's reserve flag, so every legacy release site frees a `takeTmp` pick.
   g.pickedRegs.excl r
   let dead = g.rb.takeScratch(r)
-  if dead.len > 0:
+  if dead != NoSymId:
     g.ab.tree KillX64: g.ab.sym dead
 
 proc releaseAsMirror*(g: var CodeGen; r: Reg; dst: Location): bool =
@@ -496,13 +496,13 @@ proc releaseAsMirror*(g: var CodeGen; r: Reg; dst: Location): bool =
 proc releaseFAsMirror*(g: var CodeGen; f: FReg; dst: Location): bool {.inline.} =
   g.mirrorFStored(f, dst)
 
-proc emStackMem*(g: var CodeGen; name: string) =       # (mem name)
+proc emStackMem*(g: var CodeGen; name: SymId) =       # (mem name)
   ## The slot symbol carries its own rsp displacement, so the frame base is
   ## implicit — the same spelling both Arm backends use.
   g.ab.tree MemX:
     g.ab.sym name
 
-proc emFieldMem*(g: var CodeGen; base, field: string) =   # (mem (dot base field))
+proc emFieldMem*(g: var CodeGen; base, field: SymId) =   # (mem (dot base field))
   # A sub-word field (e.g. a `cint`) is fine: nifasm sizes the `(mem (dot …))` access
   # from the field's declared type (a 4-byte mov for a 32-bit field, sign/zero-extended
   # on load). A field-by-field aggregate copy (copyStructThroughPtr / genConstr)
@@ -513,7 +513,7 @@ proc emFieldMem*(g: var CodeGen; base, field: string) =   # (mem (dot base field
       g.ab.sym base
       g.ab.sym field
 
-proc emAggrElemMem*(g: var CodeGen; base: string; idx: int) =  # (mem (at base idx))
+proc emAggrElemMem*(g: var CodeGen; base: SymId; idx: int) =  # (mem (at base idx))
   ## Element `idx` of the stack array `base`; nifasm folds the constant `idx*elemSize`
   ## into the displacement (an immediate index needs no stride scratch) and sizes the
   ## access from the array's element type.
@@ -560,7 +560,7 @@ proc releaseStaleName*(g: var CodeGen; r: Reg) =
   ## drop it so `emReg` falls back to the raw `(reg)` tag (untyped scratch).
   if r != NoReg:
     let dead = g.rb.takeBinding(r)               # also clears a stale pointer-typed bit
-    if dead.len > 0:
+    if dead != NoSymId:
       g.ab.tree KillX64: g.ab.sym dead
 
 proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
@@ -717,7 +717,7 @@ proc stagingCensus*(g: var CodeGen; avoid: Reg): string =
     stderr.writeLine "=== bind/seal sites of occupied registers ==="
     for r in g.md.intTempRegs:
       stderr.writeLine "--- pool " & $r & ": picked=" & $(r in g.pickedRegs) &
-        " bound=" & g.rb.boundName(r) & " site:"
+        " bound=" & g.spelling(g.rb.boundName(r)) & " site:"
       stderr.writeLine dbgRegSite.getOrDefault(ord(r), "  <no record>")
     for r in StagingCandidates:
       if g.plan.isSealed(r) or g.rb.isBoundTemp(r):
@@ -731,10 +731,10 @@ proc stagingCensus*(g: var CodeGen; avoid: Reg): string =
   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     result.add "\n    " & $r & ": "
     if r == avoid: result.add "avoid"
-    elif g.plan.isSealed(r): result.add "sealed (" & g.rb.boundName(r) & ")"
+    elif g.plan.isSealed(r): result.add "sealed (" & g.spelling(g.rb.boundName(r)) & ")"
     elif g.rb.isAccum(r): result.add "liveAccum"
-    elif g.rb.isBoundTemp(r): result.add "boundTemp " & g.rb.boundName(r)
-    elif g.regHoldsLiveLocal(r): result.add "live local " & g.rb.boundName(r)
+    elif g.rb.isBoundTemp(r): result.add "boundTemp " & g.spelling(g.rb.boundName(r))
+    elif g.regHoldsLiveLocal(r): result.add "live local " & g.spelling(g.rb.boundName(r))
     else: result.add "FREE (unreachable)"
   for r in g.md.intCalleeSaved:               # the callee-saved backstop's view
     result.add "\n    " & $r & ": "
@@ -742,7 +742,7 @@ proc stagingCensus*(g: var CodeGen; avoid: Reg): string =
     elif r in g.pickedRegs: result.add "picked"
     elif g.plan.isSealed(r): result.add "sealed"
     elif g.rb.isAccum(r): result.add "liveAccum"
-    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.rb.isBound(r): result.add "bound " & g.spelling(g.rb.boundName(r))
     elif g.regHoldsHome(r) or g.regHoldsLiveLocal(r): result.add "home"
     else: result.add "FREE (unreachable)"
 
@@ -914,7 +914,7 @@ proc forceRegDest*(g: var CodeGen; dest: var Location) =
     dest = g.takeTmp(if dest.typ.size > 0: dest.typ else: ScalarSlot)
   else: discard
 
-proc rebindLocalAs*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc rebindLocalAs*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## Re-establish register `r`'s binding to the named local `name`, retyped to
   ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
   ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
@@ -944,7 +944,7 @@ proc bindTypeOf*(g: var CodeGen; r: Reg): Cursor =
     if g.tmpBindTyp.hasKey(r): result = g.tmpBindTyp.getOrQuit(r).typ
   else:
     let nm = g.rb.boundName(r)
-    if nm.len > 0 and g.nameBindTyp.hasKey(nm):
+    if nm != NoSymId and g.nameBindTyp.hasKey(nm):
       let bt = g.nameBindTyp.getOrQuit(nm)
       if bt.aggrSym == NoTypeSym: result = bt.typ
 
@@ -955,7 +955,7 @@ proc rebindTempAs*(g: var CodeGen; r: Reg; typeCur: Cursor) =
   ## `extendTo` has now truncated, and a later `(mov u32dst tmp)` needs the
   ## target width on the name.
   let name = g.rb.boundName(r)
-  if name.len == 0: return
+  if name == NoSymId: return
   let slot = slotOf(g.prog, typeCur)
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindX64:
@@ -1077,7 +1077,7 @@ proc dropStaleBinding*(g: var CodeGen; r: Reg) =
   ## parked by the caller-save window that opens first; this only surrenders the
   ## name of a value that is already dead.
   let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
+  if dead != NoSymId:
     g.ab.tree KillX64: g.ab.sym dead
 
 proc indirectRetType*(g: var CodeGen; gvarDecl: Cursor): Cursor =
@@ -1107,7 +1107,7 @@ proc genPointee*(g: var CodeGen; c: var Cursor) =
   ## self-referential types (a `(ptr T)` field inside `T`) and lets nifasm
   ## resolve — and auto-import across modules — the type declaration by name.
   if c.kind == Symbol:
-    g.ab.sym symName(c); inc c
+    g.ab.sym c.symId; inc c
   else:
     g.genTypeBody(c)
 
@@ -1126,7 +1126,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
   ## signature must state where WINDOWS puts the arguments. See `isForeignAbiProctype`.
   ##
   ## A >16B by-ref aggregate RETURN is modelled as a synthetic leading pointer
-  ## param `paramName(0)` in rdi — chibicc's hidden return pointer (`push_args`'s
+  ## param `g.paramName(0)` in rdi — chibicc's hidden return pointer (`push_args`'s
   ## `gp++`). Real params then shift to rsi… naturally; the result slot stays empty
   ## (the value travels through the pointer, not rax).
   var retC = c
@@ -1145,7 +1145,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
   g.ab.tree ParamsD:
     if retByRef:                                # synthetic hidden result pointer in rdi
       g.ab.tree ParamD:
-        g.ab.symDef paramName(0)
+        g.ab.symDef g.paramName(0)
         g.ab.rawReg amd.intArgRegs[0]
         g.ab.ptrType:
           var rc = retC
@@ -1174,12 +1174,12 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
               # the body reads the xmm raw (`emitParamMoves`), and a call site assigns
               # it with `(movsd (arg pN) …)`.
               g.ab.tree ParamD:
-                g.ab.symDef paramName(pl.ord)
+                g.ab.symDef g.paramName(pl.ord)
                 if not pl.onStack: g.ab.xmmReg amd.floatArgRegs[pl.fpIndex]
                 else: g.ab.keyword SO           # 9th+ float: stack-passed
                 if byRef: g.genPointee(c) else: g.genTypeBody(c)
             elif pl.isAgg:
-              # An aggregate param. Its NAME is `paramName(pl.ord)`; the body never
+              # An aggregate param. Its NAME is `g.paramName(pl.ord)`; the body never
               # reads it by name (the prologue moves it into a stack home / pointer
               # reg raw), so it is emitted with the `(regs …)` location, which nifasm
               # treats as ABI-only — NOT bound — so a raw `(reg)` consumption stays
@@ -1187,7 +1187,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
               # ≤16B by-value aggregate spans `pl.words` consecutive GPRs (one per
               # eightbyte). `(arg pN k)` at a call site selects word k.
               g.ab.tree ParamD:
-                g.ab.symDef paramName(pl.ord)
+                g.ab.symDef g.paramName(pl.ord)
                 if not pl.onStack:
                   g.ab.tree RegsD:
                     for k in 0 ..< pl.words: g.ab.rawReg amd.gprAt(pl, k)
@@ -1200,7 +1200,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
                   if byRef: g.genPointee(c) else: g.genTypeBody(c)
             else:
               g.ab.tree ParamD:
-                g.ab.symDef paramName(pl.ord)
+                g.ab.symDef g.paramName(pl.ord)
                 if not pl.onStack: g.ab.rawReg amd.gprAt(pl)
                 else: g.ab.keyword SO           # past the arg registers → stack-passed
                 if byRef: g.genPointee(c) else: g.genTypeBody(c)
@@ -1211,7 +1211,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
         # Leng types — an aggregate is its one word (or the pointer to its copy).
         let pl = plan.args[fixedSlots.len + k]
         g.ab.tree ParamD:
-          g.ab.symDef paramName(pl.ord)
+          g.ab.symDef g.paramName(pl.ord)
           if pl.onStack: g.ab.keyword SO
           elif pl.isFloat: g.ab.xmmReg amd.floatArgRegs[pl.fpIndex]
           elif pl.isAgg:
@@ -1232,7 +1232,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
         # `(result :ret.0 (xmm0) (f N))`: the caller binds it with
         # `(movsd (xmm0) (res ret.0))` right after the call, the twin of the
         # rax announcement for a scalar.
-        g.ab.symDef synth("ret.0")
+        g.ab.symDef g.lengSym(synth("ret.0"))
         g.ab.xmmReg FloatRet
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
       elif rs.kind == AMem:
@@ -1241,7 +1241,7 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
         # reads those raw after the call — no `(res ret.0)` binding to declare here.
         skip c
       else:
-        g.ab.symDef synth("ret.0")
+        g.ab.symDef g.lengSym(synth("ret.0"))
         g.ab.rawReg RAX
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
   result = incomingGprs(amd, plan)
@@ -1342,15 +1342,15 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
         # it and lays the base out first); a `.` means no base. Keeping the base
         # lets nifasm compute inherited-field offsets — the `(cast (ptr Derived)
         # x).baseField` idiom (Nim's allocator) depends on it.
-        var baseName = ""
-        if c.kind == Symbol: baseName = symName(c)
+        var baseName = NoSymId
+        if c.kind == Symbol: baseName = c.symId
         skip c                                # inheritance slot (`.` or base sym)
         g.ab.objectType:
           # FIRST child, before the base: nifasm reads it off the front and the
           # base slot is optional, so a flag that had to come after would be
           # indistinguishable from a missing base.
           if packed: g.ab.keyword PackedT
-          if baseName.len > 0: g.ab.sym baseName
+          if baseName != NoSymId: g.ab.sym baseName
           while c.hasMore:
             if c.kind == TagLit and c.typeKind == UnionT:
               # An object VARIANT's union part. Each branch is `(of RANGES BODY)` /
@@ -1392,7 +1392,7 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
 proc genFldDef*(g: var CodeGen; c: var Cursor) =
   ## One `(fld :name pragmas type)` as an asm-NIF field declaration.
   c.into:
-    let fn = symName(c); inc c
+    let fn = c.symId; inc c
     skip c                                    # field pragmas (dropped)
     g.ab.fldDef(fn):
       g.genTypeBody(c)
@@ -1551,7 +1551,7 @@ proc proctypeOfTarget*(g: var CodeGen; targetCur: Cursor): Cursor =
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham x64n: indirect call target is not a proctype"
 
-proc directCallTarget*(g: var CodeGen; fsym: string): CallTarget =
+proc directCallTarget*(g: var CodeGen; fsym: SymId): CallTarget =
   ## What a DIRECT call to `fsym` reaches — an arkham proc, an extern, a syscall, a
   ## mem intrinsic, or a proc-typed global/threadvar called through — memoized in
   ## `g.callTarget`.
@@ -1571,8 +1571,8 @@ proc directCallTarget*(g: var CodeGen; fsym: string): CallTarget =
       g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
   g.callTarget.getOrQuit(fsym)
 
-proc winVariadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlot];
-                        fixed: int): string =
+proc winVariadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
+                        fixed: int): SymId =
   ## The symbol a Win64 call to the `{.varargs.}` extern `asmName` goes through: a
   ## declaration of this call's SHAPE (see `VariadicExtern`), registered for the
   ## driver to emit. The tail's positions follow the convention, so the shape is
@@ -1587,9 +1587,9 @@ proc winVariadicTarget*(g: var CodeGen; asmName: string; slots: openArray[AsmSlo
   var ex = default(Extern)
   for e in g.prog.externOrder:
     if e.asmName == asmName: ex = e
-  assert ex.asmName.len > 0, "arkham win_x64: a variadic call to an unknown extern " & asmName
-  result = derivedName(cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
-           thisModuleSuffix(g.prog)
+  assert ex.asmName != NoSymId, "arkham win_x64: a variadic call to an unknown extern " & g.spelling(asmName)
+  result = g.lengSym(derivedName(g.prog.cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
+                     thisModuleSuffix(g.prog))
   for v in g.variadicExterns:
     if v.asmName == result: return
   g.variadicExterns.add VariadicExtern(asmName: result, extName: ex.extName, dll: ex.dll,
@@ -1605,7 +1605,7 @@ proc callConvOf*(g: var CodeGen; call: Cursor): MachineDesc =
   if isIndirectCallTarget(g.typeCtx, target):
     if isForeignAbiProctype(g.prog, g.proctypeOfTarget(target)): win64Machine else: g.md
   else:
-    let tgt = g.directCallTarget(symName(target))
+    let tgt = g.directCallTarget(target.symId)
     if tgt.foreignAbi or (tgt.extern and g.prog.windows): win64Machine else: g.md
 
 proc transparentCastInner*(g: var CodeGen; c: Cursor; home: Location): tuple[hit: bool, inner: Cursor] =
@@ -1861,7 +1861,7 @@ proc freeExpr*(g: var CodeGen; c: Cursor) =
   let l = g.plan.planned(pos)
   if l.kind == InReg and l.isTemp: g.unbindTemp(l.r)
 
-proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: string): AsmSlot =
+proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: SymId): AsmSlot =
   ## The asm slot of `typeSym.field` — so an aggregate-copy scratch can be typed to
   ## match the field (nifasm is strict: a `(ptr T)` field can't move through an
   ## `(i 64)` register). Resolves the object body from the type's decl like aggrLayout.
@@ -1871,7 +1871,7 @@ proc fieldSlotByName*(g: var CodeGen; typeSym: SymId; field: string): AsmSlot =
     result = slotOf(g.prog, fieldType(g.prog, d, field))
     while d.hasMore: skip d
 
-proc emWordAtSlot*(g: var CodeGen; name: string; off: int) =
+proc emWordAtSlot*(g: var CodeGen; name: SymId; off: int) =
   ## `(cast (u 64) (mem name off))` — the eightbyte at byte offset `off` of the
   ## NAMED stack slot `name`, typed as a raw word. The pointer twin `emWordThroughPtr`
   ## needs the slot's ADDRESS in a register first; this needs no register at all,
@@ -1883,7 +1883,7 @@ proc emWordAtSlot*(g: var CodeGen; name: string; off: int) =
       g.ab.sym name
       g.ab.intLit off.int64
 
-proc emByteAtSlot*(g: var CodeGen; name: string; off: int) =
+proc emByteAtSlot*(g: var CodeGen; name: SymId; off: int) =
   ## The byte-granular `emWordAtSlot`, for a copy's sub-word tail.
   g.ab.tree CastX:
     g.ab.uintType(8)
@@ -1891,7 +1891,7 @@ proc emByteAtSlot*(g: var CodeGen; name: string; off: int) =
       g.ab.sym name
       g.ab.intLit off.int64
 
-proc fieldTypeByName*(g: var CodeGen; typeSym: SymId; field: string): Cursor =
+proc fieldTypeByName*(g: var CodeGen; typeSym: SymId; field: SymId): Cursor =
   ## The declared (nominal) type cursor of `typeSym.field` — resolves the object body
   ## from the type's decl like `fieldSlotByName`.
   var d = lookupType(g.prog, typeSym)
@@ -1918,12 +1918,12 @@ proc dstAggrInfo*(g: var CodeGen; dst: Location): (bool, int) =
   else: (false, 0)
 
 proc foldableFloatLeaf*(g: var CodeGen; c: Cursor): bool =
-  c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
+  c.kind == Symbol and g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
-proc emCallerSaveStore(g: var CodeGen; varName: string) =
+proc emCallerSaveStore(g: var CodeGen; varName: SymId) =
   ## Save a caller-saved value into its permanent slot, then release the register.
   g.ab.tree MovX64:                                  # (mov (mem (rsp) slot) name)
-    g.emStackMem(callerSaveSlotName(varName))
+    g.emStackMem(g.callerSaveSlotName(varName))
     g.ab.sym varName
   # Then RELEASE the register. The home is an argument register, and marshalling is
   # about to write it; nifasm rejects a write to a register that still carries a live
@@ -1933,13 +1933,13 @@ proc emCallerSaveStore(g: var CodeGen; varName: string) =
   g.ab.tree KillX64: g.ab.sym varName
   discard g.rb.takeBinding(g.plan.homeOfSym(varName).r)
 
-proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
+proc emCallerSaveRestore(g: var CodeGen; slotName, varName: SymId; r: Reg) =
   ## Reload a caller-saved value after the call. The call CLOBBERS every volatile, and
   ## nifasm drops the bindings of clobbered registers with it — so the name is no longer
   ## a legal destination and must be re-bound first (same register, same type it was
   ## declared with) before the reload can name it.
   let dead = g.rb.takeBinding(r)                     # whatever the call left there
-  if dead.len > 0 and dead != varName:
+  if dead != NoSymId and dead != varName:
     g.ab.tree KillX64: g.ab.sym dead
   var isPtr = false
   g.ab.tree RebindX64:
@@ -1976,7 +1976,7 @@ proc emCallerSaveOpen*(g: var CodeGen): CallerSaveWindow =
   for it in result.saved: g.emCallerSaveStore(it.name)
   for i, it in result.saved:
     g.plan.callerSaveActive[it.name] =
-      Location(kind: NamedStack, name: callerSaveSlotName(it.name), typ: types[i])
+      Location(kind: NamedStack, name: g.callerSaveSlotName(it.name), typ: types[i])
 
 proc emCallerSaveClose*(g: var CodeGen; w: CallerSaveWindow; dest: Location) =
   if w.saved.len == 0: return
@@ -1986,7 +1986,7 @@ proc emCallerSaveClose*(g: var CodeGen; w: CallerSaveWindow; dest: Location) =
     # restoring would clobber the result. Unreachable for a valid caller-saved value
     # (single-def, never born from a call), kept as a guard.
     if dest.kind == InReg and dest.r == it.reg: continue
-    g.emCallerSaveRestore(callerSaveSlotName(it.name), it.name, it.reg)
+    g.emCallerSaveRestore(g.callerSaveSlotName(it.name), it.name, it.reg)
 
 proc takeInstrReg*(g: var CodeGen; slot: AsmSlot): Location =
   ## A register an `(instr …)` operand or result MUST have (no memory form).
@@ -2031,7 +2031,7 @@ proc instrOperandInPlace*(g: var CodeGen; a: Cursor; avoid: set[Reg]): Location 
   ## release loops below are for.
   result = Location(kind: Undef)
   if a.kind != Symbol: return
-  let home = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
+  let home = g.plan.locationOfSym(a.symId, cursorToPosition(g.buf[], a))
   if home.kind == InReg and home.r notin avoid:
     result = home
 
@@ -2050,7 +2050,7 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## (its own computation emits at premat time, dest-threaded).
   case c.kind
   of Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = g.plan.locationOfSym(c.symId, cursorToPosition(g.buf[], c))
     if home.kind == NoLoc: g.forceRegDest(dest)     # a global/tvar value read
     elif home.kind in {NamedStack, Mem} and dest.kind in {NeedsReg, RegOrImm} and
          g.tempPoolDry():

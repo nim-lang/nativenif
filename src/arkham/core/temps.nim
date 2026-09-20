@@ -19,7 +19,8 @@ import std / syncio
 import std / [strutils, os]
 
 
-import machinedesc, planner
+import nifcore
+import asmslots, machinedesc, planner
 import regbind, context
 
 
@@ -80,7 +81,7 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ##  2. a RELOCATED param's home was left unbound on purpose, "for the epilogue
   ##     pops" — and a nimony `var T` is a plain `(ptr T)`, so that was MOST pointer
   ##     params (`emRegLocalVar` in `emitParamMoves`; `framePop` kills before popping);
-  ##  3. the hidden indirect-result pointer (`synth("retptr.0")`);
+  ##  3. the hidden indirect-result pointer (`g.lengSym(synth("retptr.0"))`);
   ##  4. a DIVERGING call's marshalling `(kill …)`s a still-live home, because `rb` is
   ##     linear and cannot say "this path is not taken" (`restoreBindings`).
   ##
@@ -166,7 +167,7 @@ proc tempCensus*(g: var CodeGen): string =
     if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
     elif g.plan.isSealed(r): result.add "sealed (in-flight call)"
     elif g.rb.isAccum(r): result.add "liveAccum"
-    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.rb.isBound(r): result.add "bound " & g.spelling(g.rb.boundName(r))
     elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
     else: result.add "FREE (unreachable)"
   for r in g.md.intCalleeSaved:
@@ -174,7 +175,7 @@ proc tempCensus*(g: var CodeGen): string =
     if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
     elif g.plan.isSealed(r): result.add "sealed (in-flight call)"
     elif g.rb.isAccum(r): result.add "liveAccum"
-    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.rb.isBound(r): result.add "bound " & g.spelling(g.rb.boundName(r))
     elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
     else: result.add "FREE (unreachable)"
 
@@ -242,7 +243,7 @@ proc pickFTempReg*(g: var CodeGen): FReg =
   ## callee-saved float pool (empty on x86-64 SysV).
   for f in g.md.floatTempRegs:
     if f notin g.pickedFRegs and not g.rb.isSealedF(f) and
-       (g.rb.boundFName(f).len == 0 or g.rb.isFMirror(f)) and
+       (g.rb.boundFName(f) == NoSymId or g.rb.isFMirror(f)) and
        not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
       if f in g.md.floatCalleeSavedSet: g.plan.usedCalleeF.incl f
       return f
@@ -260,12 +261,12 @@ proc pickHeldReg*(g: var CodeGen): Reg =
       return r
   NoReg
 
-proc mintSpillName*(g: var CodeGen; prefix: string): string =
+proc mintSpillName*(g: var CodeGen; prefix: string): SymId =
   ## A fresh emit-time spill-slot name (`etmp`/`eftmp`/`held` + counter). The
   ## backend declares the `(var :name (s) T)` inline at first use — mid-body
   ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
   ## that) — and flags `plan.hasStackVars` so the frame `sub` is emitted when the
   ## prologue is finalized.
-  result = synth(prefix) & $g.emitTmpSpills & ".0"
+  result = g.lengSym(synth(prefix) & $g.emitTmpSpills & ".0")
   inc g.emitTmpSpills
   g.plan.hasStackVars = true

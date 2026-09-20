@@ -25,7 +25,7 @@ import machine_a64 as machine
 from machine_cortexm import nil
 import emit, mem, aggr, value
 
-proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
+proc wideParamToHome(g: var CodeGen; nm: SymId; firstArg: int)
 
 proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.}
 
@@ -153,7 +153,7 @@ proc killFrameRegLocals(g: var CodeGen) =
   for r in (if g.md.frameStyle == PairFrame: g.frameSaves else: g.frameRegs):
     if r == g.md.linkReg or r == g.md.framePtrReg: continue   # never allocated, never bound
     let dead = g.rb.takeBinding(r)
-    if dead.len > 0:
+    if dead != NoSymId:
       g.ab.tree KillA64: g.ab.sym dead
 
 proc framePushBytes(g: CodeGen): int =
@@ -164,7 +164,7 @@ proc framePushBytes(g: CodeGen): int =
   elif g.md.frameStyle == BlockFrame: g.framePushBytesBlock
   else: 16 * (g.frameSaves.len div 2 + g.frameFRegs.len div 2)
 
-proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
+proc emByRefPtrStackVar*(g: var CodeGen; name: SymId; typeSym: SymId) =
   ## `(var :name (s) (ptr T))` — the 8-byte slot holding a spilled by-ref
   ## aggregate's incoming pointer.
   g.plan.hasStackVars = true
@@ -174,7 +174,7 @@ proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.ab.ptrType: g.emTypeSym(typeSym)
   g.ab.close()
 
-proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+proc emRegLocalVar*(g: var CodeGen; name: SymId; r: Reg; typeCur: Cursor) =
   ## `(var :name (reg) type)` + bind `r` to `name` for its scope. arkham keeps
   ## scalars 64-bit in registers (width/signedness via explicit extends), so an
   ## int/uint/bool/char local is declared `(i 64)`; a pointer keeps `(ptr T)`.
@@ -200,7 +200,7 @@ proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr)
 
-proc emFRegLocalVar*(g: var CodeGen; name: string; f: FReg; bits: int) =
+proc emFRegLocalVar*(g: var CodeGen; name: SymId; f: FReg; bits: int) =
   ## Declare a float register local `(var :name (dN|sN) (f B))` and bind v-register
   ## `f` to `name` for the rest of its scope, so subsequent uses emit the typed name
   ## instead of a raw `(dN)`/`(sN)`. The SIMD twin of `emRegLocalVar`, and now spelled
@@ -378,7 +378,7 @@ proc emLeaIncomingArg(g: var CodeGen; dest: Reg; byteOff: int) =
   else:
     g.ab.tree LeaA64: (g.emReg dest; g.emIncomingArgMem(NoReg, byteOff))
 
-proc bridgeStackParam(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSlot) =
+proc bridgeStackParam(g: var CodeGen; slotName: SymId; byteOff: int; typ: AsmSlot) =
   ## `[slotName] <- [fp + StackArgFpBias + byteOff]`, through a transient GPR: AArch64 has
   ## no memory-to-memory move, so a stack-passed parameter whose home is a stack slot
   ## has to be bridged. The bridge is BOUND (`bindTemp`) for its two instructions —
@@ -449,11 +449,11 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
     while c.hasMore:
       let pl = plan.args[pIdx]
       inc pIdx
-      var nm = ""
+      var nm = NoSymId
       var tn = NoTypeSym
       var typeCur: Cursor
       c.into:                                 # (param :name pragmas type)
-        nm = symName(c); inc c
+        nm = c.symId; inc c
         skip c                                # pragmas
         typeCur = c
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = c.symId
@@ -480,7 +480,7 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
           g.emFloatScalarStore(nm, f, bits)
         else:
           raiseAssert "arkham risc: stack-passed float parameter home " & $loc.kind &
-                      ": " & nm
+                      ": " & g.spelling(nm)
         g.dropFBridge()
         continue
       if g.isWideType(typeCur):
@@ -488,7 +488,7 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
         # the slot the allocator gave it (a scalar wider than a register never
         # gets a register home).
         if loc.kind != NamedStack:
-          raiseAssert "arkham cortex-m: stack-passed 64-bit parameter " & nm &
+          raiseAssert "arkham cortex-m: stack-passed 64-bit parameter " & g.spelling(nm) &
                       " homed in " & $loc.kind
         g.emTypedStackVar(nm, typeCur)
         let b = g.takeBridge()
@@ -562,7 +562,7 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
           g.dropBridge a
         else:
           raiseAssert "arkham a64: stack-passed by-value aggregate home " &
-                      $loc.kind & ": " & nm & " in " & g.curProcName
+                      $loc.kind & ": " & g.spelling(nm) & " in " & g.curProcName
         continue
       case loc.kind
       of InReg:
@@ -581,7 +581,7 @@ proc emitStackParamLoads*(g: var CodeGen; decl: Cursor) =
         g.emByRefPtrStackVar(nm, tn)
         g.bridgeStackParam(loc.ptrName, pl.byteOff, ScalarSlot)  # the eightbyte IS the pointer
       else:
-        raiseAssert "arkham a64: stack parameter home " & $loc.kind & ": " & nm
+        raiseAssert "arkham a64: stack parameter home " & $loc.kind & ": " & g.spelling(nm)
 
 proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
   ## Move each parameter from its incoming ABI register to the home the
@@ -600,11 +600,11 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
     while c.hasMore:
       let pl = plan.args[pIdx]
       inc pIdx
-      var nm = ""
+      var nm = NoSymId
       var tn = NoTypeSym
       var typeCur: Cursor
       c.into:                                 # (param :name pragmas type)
-        nm = symName(c); inc c
+        nm = c.symId; inc c
         skip c                                # pragmas
         typeCur = c
         g.symType[nm] = typeCur               # record the param's type for getType
@@ -685,7 +685,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # registers the shared `CallPlan` assigned. A stack-PASSED one is left
         # to `emitStackParamLoads`, which is where the incoming area is legible.
         if loc.kind != NamedStack:
-          raiseAssert "arkham cortex-m: 64-bit parameter " & nm & " homed in " &
+          raiseAssert "arkham cortex-m: 64-bit parameter " & g.spelling(nm) & " homed in " &
                       $loc.kind
         if not pl.onStack:
           g.emTypedStackVar(nm, typeCur)
@@ -712,7 +712,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         case loc.kind
         of InReg:
           g.movReg(loc.r, g.md.gprAt(pl))
-        else: raiseAssert "arkham v1: stack-resident parameter: " & nm
+        else: raiseAssert "arkham v1: stack-resident parameter: " & g.spelling(nm)
 
 proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = []) =
   ## Emit the proc's `(params)/(result)/(clobber)`: the ABI stated explicitly —
@@ -768,7 +768,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
                   # nifasm binds no AArch64 param, so the body reads it raw
                   # (`emitParamMoves`); a call site assigns it with `(fmov (arg pN) …)`.
                   g.ab.tree ParamD:
-                    g.ab.symDef paramName(pl.ord)
+                    g.ab.symDef g.paramName(pl.ord)
                     if not pl.onStack:
                       g.ab.freg(g.md.floatArgRegs[pl.fpIndex], floatBitsFor(slotOf(g.prog, c).size))
                     else: g.ab.keyword SO       # 9th+ float: stack-passed
@@ -780,7 +780,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
                   # of their own, so the param is ABI-only and the body reads
                   # `(arg pN k)`.
                   g.ab.tree ParamD:
-                    g.ab.symDef paramName(pl.ord)
+                    g.ab.symDef g.paramName(pl.ord)
                     if pl.onStack:
                       g.ab.keyword SO
                     else:
@@ -798,7 +798,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
                     # by-value one occupies its eightbytes (`(s) T`). The plan's skip rule:
                     # a later smaller param can still take a free register.
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(pl.ord)
+                      g.ab.symDef g.paramName(pl.ord)
                       g.ab.keyword SO
                       if pl.byRef:
                         g.ab.ptrType: g.genTypeBody(c)
@@ -806,7 +806,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
                         g.genTypeBody(c)
                   else:
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(pl.ord)
+                      g.ab.symDef g.paramName(pl.ord)
                       g.ab.tree RegsD:
                         for k in 0 ..< pl.words: g.ab.rawReg g.md.gprAt(pl, k)
                       if pl.byRef:
@@ -815,7 +815,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
                         g.genTypeBody(c)
                 else:
                   g.ab.tree ParamD:
-                    g.ab.symDef paramName(pl.ord)
+                    g.ab.symDef g.paramName(pl.ord)
                     if not pl.onStack:
                       g.ab.rawReg g.md.gprAt(pl)   # x0–x7: raw reg *location*
                     else:
@@ -827,7 +827,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
             # aggregate's words, a larger aggregate's pointer — all 8-byte slotted.
             let pl = plan.args[fixedSlots.len + k]
             g.ab.tree ParamD:
-              g.ab.symDef paramName(pl.ord)
+              g.ab.symDef g.paramName(pl.ord)
               g.ab.keyword SO
               if pl.isFloat: g.ab.floatType(64)
               elif pl.isAgg and not pl.byRef:
@@ -844,7 +844,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
             # `(result :ret.0 (d0|s0) (f N))`: the caller binds it with
             # `(fmov (d0) (res ret.0))` right after the call, the twin of the x0
             # announcement for a scalar.
-            g.ab.symDef synth("ret.0")
+            g.ab.symDef g.lengSym(synth("ret.0"))
             g.ab.freg(g.md.floatRetReg, floatBitsFor(rs.size))
             g.genTypeBody(c)
           elif g.isWideSlot(rs):
@@ -860,7 +860,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
             # `(res ret.0)` binding to declare here (mirrors the x64 rax:rdx result).
             skip c
           else:
-            g.ab.symDef synth("ret.0")
+            g.ab.symDef g.lengSym(synth("ret.0"))
             g.ab.rawReg g.md.intRetReg                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
@@ -886,7 +886,7 @@ proc storeFReg(g: var CodeGen; dst: Location; src: FReg; bits: int) =
     g.unbindLvalTemps(dst.cur)
   else: raiseAssert "arkham a64n: storeFReg dst " & $dst.kind
 
-proc copyStructThroughPtr*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrReg: Reg) =
+proc copyStructThroughPtr*(g: var CodeGen; srcVar: SymId; typeSym: SymId; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
   ## pointer return). This runs at the `ret` and crosses NO call, so both scratch
   ## registers it needs — the source address and the word-transfer temp — come from the
@@ -907,7 +907,7 @@ proc copyStructThroughPtr*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrRe
 proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.} =
   g.isWideSlot(slotOf(g.prog, t))
 
-proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int) =
+proc wideParamToHome(g: var CodeGen; nm: SymId; firstArg: int) =
   ## The callee side: the two incoming argument registers into the parameter's
   ## stack home. (Its slot was declared by the caller of this proc.)
   let home = slotWide(nm)

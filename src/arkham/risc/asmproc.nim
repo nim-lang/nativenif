@@ -179,7 +179,7 @@ proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
 proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {})
 proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
 
-proc emAsmSlot(g: var CodeGen; name: string) {.inline.} =
+proc emAsmSlot(g: var CodeGen; name: SymId) {.inline.} =
   ## A `{.stack.}` local as an OPERAND. On Arm a frame slot is addressed by its
   ## own symbol — `(mov t.0 (r2))` stores, `(mov (r2) t.0)` loads — which is what
   ## every hand-written body in this back end already does.
@@ -206,17 +206,17 @@ proc asmAddrOf(g: var CodeGen; dst: Reg; c: Cursor) =
   if sym.kind != Symbol:
     lengError c, "`addr` in an `.assembler` body takes a `{.stack.}` local or a " &
               "global, not a computed lvalue", g.asmInfo
-  let nm = symName(sym)
+  let nm = sym.symId
   if nm in g.asmStack:
     g.ab.tree LeaA64: (g.emReg dst; g.emAsmSlot(nm))
   elif g.asmReg.hasKey(nm):
-    lengError sym, "`" & userName(nm) & "` lives in a register, which has no " &
+    lengError sym, "`" & g.userName(nm) & "` lives in a register, which has no " &
               "address — give it `{.stack.}` if something must point at it",
               g.asmInfo
   elif g.prog.globals.hasKey(nm) or isForeignSym(g.prog, nm):
     g.emAdr(dst, g.prog.gvarRefName(nm))
   else:
-    lengError sym, "`" & userName(nm) & "` is neither a local of this proc nor a " &
+    lengError sym, "`" & g.userName(nm) & "` is neither a local of this proc nor a " &
               "global, so it has no address to take", g.asmInfo
 
 proc asmScanLocs*(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
@@ -249,7 +249,7 @@ proc asmOperand*(g: var CodeGen; cur: Cursor) =
   let c = asmAtom(cur)
   case c.kind
   of Symbol:
-    if g.isAsmStackSym(c): g.emAsmSlot(symName(c))
+    if g.isAsmStackSym(c): g.emAsmSlot(c.symId)
     else: g.emReg g.asmRegOf(c)
   of IntLit: g.ab.intLit intVal(c)
   of UIntLit: g.ab.intLit cast[int64](uintVal(c))
@@ -271,12 +271,12 @@ proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   if sym.kind != Symbol:
     lengError sym, "the destination of a two-address instruction must be a local " &
               "with a declared location", g.asmInfo
-  let nm = symName(sym)
+  let nm = sym.symId
   if nm in g.asmStack:
     # Arm is a load/store machine: `(add t.0 (r1))` where `t.0` is a frame slot
     # is not an instruction, and letting nifasm fold it would need the very
     # scratch register this mode refuses to invent.
-    lengError sym, "`" & userName(nm) & "` lives on the stack, and Arm arithmetic " &
+    lengError sym, "`" & g.userName(nm) & "` lives on the stack, and Arm arithmetic " &
               "reads and writes registers only — load it into a " &
               "`{.register: \"…\".}` local first", g.asmInfo
   g.emReg g.asmRegOf(sym)
@@ -375,7 +375,7 @@ proc asmFlagInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   g.ab.tree CmpA64: (g.asmOperand(argCurs[0]); g.asmOperand(argCurs[1]))
   g.asmFlagsFresh = true
 
-proc asmStore(g: var CodeGen; nm: string; srcC: Cursor) =
+proc asmStore(g: var CodeGen; nm: SymId; srcC: Cursor) =
   ## `slot = <atom>`. Memory on both sides would take a scratch register no one
   ## declared — the one thing this mode will not invent.
   g.asmFlagsFresh = false
@@ -398,7 +398,7 @@ proc asmLoad(g: var CodeGen; dst: Reg; srcC: Cursor) =
   case srcC.kind
   of Symbol:
     if g.isAsmStackSym(srcC):
-      g.ab.tree MovA64: (g.emReg dst; g.emAsmSlot(symName(srcC)))
+      g.ab.tree MovA64: (g.emReg dst; g.emAsmSlot(srcC.symId))
     else:
       g.asmMovReg(dst, g.asmRegOf(srcC))
   of IntLit: g.movImm(dst, intVal(srcC))
@@ -415,7 +415,7 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
     skip cc
     let srcC = asmAtom(cc)
     if g.isAsmStackSym(destC):
-      g.asmStore(symName(destC), srcC)
+      g.asmStore(destC.symId, srcC)
       skip cc
       while cc.hasMore: skip cc
       return
@@ -439,11 +439,11 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   ## `(instr SYM X*)` in an `.assembler` body: the operands are already where the
   ## user put them, so this is the row's opcode over `dst` and the operand
   ## registers — no placement, no freeing, none of `emitInstr`'s machinery.
-  var fsym = ""
+  var fsym = NoSymId
   var argCurs: seq[Cursor] = @[]
   var fc = c
   fc.into:
-    fsym = symName(fc); skip fc
+    fsym = fc.symId; skip fc
     while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
@@ -504,7 +504,7 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let nameC = cc
-    let nm = symName(cc); inc cc
+    let nm = cc.symId; inc cc
     let loc = g.asmDeclLoc(cc)
     skip cc                                      # pragmas
     let typeCur = cc
@@ -526,20 +526,20 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
         # refuses on this target (`checkRegWidthM`) — refuses rather than
         # truncating. Saying so here names the local instead of pointing at a
         # `(mov …)` the user did not write.
-        lengError nameC, "`" & userName(nm) & "` is " & $s.size & " bytes, and a " &
+        lengError nameC, "`" & g.userName(nm) & "` is " & $s.size & " bytes, and a " &
                   g.md.targetName & " `.assembler` body moves one " &
                   $wordSize() & "-byte word at a time — " &
                   "declare the halves", g.asmInfo
       g.asmStack.incl nm
       g.emTypedStackVar(nm, typeCur)
     of aslNone:
-      if isResultName(nm):
+      if g.isResultName(nm):
         # The result is pinned to the ABI return register, derived rather than
         # annotated: Nimony has no syntax for annotating `result`, and the ABI
         # leaves no choice anyway.
         g.asmReg[nm] = g.md.intRetReg
       else:
-        lengError nameC, "`" & userName(nm) & "` needs `{.register: \"…\".}` or " &
+        lengError nameC, "`" & g.userName(nm) & "` needs `{.register: \"…\".}` or " &
                   "`{.stack.}` — an `.assembler` proc declares every location",
                   g.asmInfo
     if hasInit:
@@ -728,19 +728,19 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     g.asmFlagsFresh = false
     var cc = c
     cc.into:
-      g.emLab(symName(cc)); skip cc
+      g.emLab(cc.symId); skip cc
       while cc.hasMore: skip cc
   of JmpS:
     var cc = c
     cc.into:
-      g.emBr(BA64, symName(cc)); skip cc
+      g.emBr(BA64, cc.symId); skip cc
       while cc.hasMore: skip cc
   of RetS:
     var cc = c
     cc.into:
       if cc.hasMore and cc.kind != DotToken:
         if g.isAsmStackSym(cc):
-          g.ab.tree MovA64: (g.emReg g.md.intRetReg; g.emAsmSlot(symName(cc)))
+          g.ab.tree MovA64: (g.emReg g.md.intRetReg; g.emAsmSlot(cc.symId))
         else:
           g.asmMovReg(g.md.intRetReg, g.asmRegOf(cc))  # a no-op when already pinned there
         skip cc
@@ -779,35 +779,35 @@ proc asmCheckAbi(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
       var nameC = pc
       pc.into:                                   # (param :nm pragmas type)
         nameC = pc
-        let nm = symName(pc); inc pc
+        let nm = pc.symId; inc pc
         let loc = g.asmDeclLoc(pc)
         skip pc                                  # pragmas
         g.symType[nm] = pc
         if pl.onStack:
-          lengError nameC, "parameter `" & userName(nm) & "` is passed on the " &
+          lengError nameC, "parameter `" & g.userName(nm) & "` is passed on the " &
                     "stack by this target's ABI, and an `.assembler` body names " &
                     "registers", g.asmInfo
         if pl.isFloat:
-          lengError nameC, "parameter `" & userName(nm) & "` is passed in a " &
+          lengError nameC, "parameter `" & g.userName(nm) & "` is passed in a " &
                     "floating-point register, which this mode cannot name yet",
                     g.asmInfo
         if pl.words != 1 or pl.isAgg:
-          lengError nameC, "parameter `" & userName(nm) & "` spans " & $pl.words &
+          lengError nameC, "parameter `" & g.userName(nm) & "` spans " & $pl.words &
                     " registers on this target; an `.assembler` parameter must " &
                     "be one word", g.asmInfo
         let abiReg = g.md.gprAt(pl)
         case loc.kind
         of aslNone:
-          lengError nameC, "parameter `" & userName(nm) & "` needs `{.register: \"" &
+          lengError nameC, "parameter `" & g.userName(nm) & "` needs `{.register: \"" &
                     g.ab.renderReg(abiReg) &
                     "\".}` — an `.assembler` proc's annotations ARE its ABI", g.asmInfo
         of aslStack:
-          lengError nameC, "parameter `" & userName(nm) & "` arrives in " &
+          lengError nameC, "parameter `" & g.userName(nm) & "` arrives in " &
                     g.ab.renderReg(abiReg) &
                     ", so it cannot be `{.stack.}`", g.asmInfo
         of aslReg:
           if loc.r != abiReg:
-            lengError nameC, "parameter `" & userName(nm) & "` is passed in " &
+            lengError nameC, "parameter `" & g.userName(nm) & "` is passed in " &
                       g.ab.renderReg(abiReg) &
                       " by this target's ABI, but is pinned to " &
                       g.ab.renderReg(loc.r),
@@ -820,7 +820,7 @@ proc asmCheckAbi(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
         # register is the identity in this mode, so the honest answer is to leave
         # it raw and let both names mean the machine register they name.
         if not (abiReg == retReg):
-          g.rb.bindParam(abiReg, paramName(pl.ord))
+          g.rb.bindParam(abiReg, g.paramName(pl.ord))
         while pc.hasMore: skip pc
       inc ord
 
