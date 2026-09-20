@@ -1,8 +1,8 @@
 # The web back end — Leng → wasm32 and JavaScript
 
 The web back end translates a Leng `.c.nif` main module into one
-self-contained program for a web host: a `.wasm` binary (**ithaqua**) or a
-`.js` file (**jorogumo**). Both are the same back end. There is ONE code
+self-contained program for a web host: `jorogumo w` writes a `.wasm` binary,
+`jorogumo j` a `.js` file. One tool, one back end. There is ONE code
 generator, which lowers Leng to a typed tree, the *web IR*, and two
 renderers that print that tree. Nothing target-specific is decided while
 Leng is lowered, so a construct either works on both targets or on neither.
@@ -12,8 +12,8 @@ can serve.
 ```
 nimony front/middle end        backend
 nifler → nimsem → hexer → dce ─┬→ arkham → nifasm → ELF/Mach-O/PE
-        (.c.nif, Leng)         └→ src/web/codegen → web IR ─┬→ wasmrender → .wasm  (ithaqua)
-                                                            └→ jsrender   → .js    (jorogumo)
+        (.c.nif, Leng)         └→ src/web/codegen → web IR ─┬→ wasmrender → .wasm  (jorogumo w)
+                                                            └→ jsrender   → .js    (jorogumo j)
 ```
 
 It is whole-program. Starting from the entry proc (and every other
@@ -33,8 +33,7 @@ repository.
 | `src/web/wasmrender.nim` | web IR → wasm32, through `wasmenc` |
 | `src/web/wasmenc.nim` | the wasm binary encoder (LEB128, sections) |
 | `src/web/jsrender.nim` | web IR → JavaScript text, with the JS host preamble |
-| `src/ithaqua/ithaqua.nim` | the wasm CLI: `generate(…, wtWasm)` + `renderWasm` |
-| `src/jorogumo/jorogumo.nim` | the JS CLI: `generate(…, wtJs)` + `renderJs` |
+| `src/jorogumo/jorogumo.nim` | the CLI: `w` is `generate(…, wtWasm)` + `renderWasm`, `j` is `generate(…, wtJs)` + `renderJs` |
 
 The target's width facts come from arkham's `setTargetWord Wasm32`, set once
 before anything is parsed. `Wasm32` narrows the pointer and Leng's platform
@@ -111,7 +110,7 @@ meaningful (`write`, `exit`), and trap loudly otherwise.
   and hands its result to `nim_exit` as the exit code, the same as a native
   program. If the module has exports, `_start` is only the module init: it
   runs `main` and does not exit. In host-imports mode
-  (`ITHAQUA_HOST_IMPORTS=1`), a bodyless `importc` proc becomes an `env`
+  (`--host-imports`), a bodyless `importc` proc becomes an `env`
   import under its C name, so a host page can provide bridge functions
   (fetch, WebSocket, GPU calls) that the back end knows nothing about.
 - **JavaScript**: one file for `node`, or for a browser with
@@ -135,7 +134,7 @@ targets are single-threaded:
 
 ## Debugging
 
-- `ITHAQUA_EXPORT_ALL=1` exports every function as `dbg$<name>`, so a host
+- `jorogumo w --export-all` exports every function as `dbg$<name>`, so a host
   script can drive internals directly with crafted memory.
 - The JS output is readable: every function of the IR is a `function` of
   the same name, which is the quickest way to see what the tree says.
@@ -158,6 +157,10 @@ The differential harness in nimony (`hastur wasmdiff`) covers realistic
 programs. Each fixture is the same source pushed through the native backend
 (the oracle) and through `nimony w`/`nimony j`, requiring byte-identical
 stdout and matching exit codes.
+
+The driver side in nimony still spawns a tool called `ithaqua`; it pins this
+repository by commit, so nothing breaks until that pin moves and the two
+commands become `jorogumo w` / `jorogumo j`.
 
 ## Non-goals
 

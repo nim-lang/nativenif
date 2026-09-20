@@ -13,8 +13,8 @@ nimony's [doc/leng-spec.md](https://github.com/nim-lang/nimony/blob/master/doc/i
 ```
 foo.c.nif  --[ arkham ]-->  foo.asm.nif  --[ nifasm ]-->  foo (executable)
   Leng     \                 typed asm-NIF
-            `-[ web codegen ]-> web IR -+-[ ithaqua ]-->  foo.wasm
-                                        `-[ jorogumo ]->  foo.js
+            `-[ jorogumo ]->  web IR -+-[ w ]->  foo.wasm
+                                      `-[ j ]->  foo.js
 ```
 
 * **`src/arkham`** — the code generator: Leng in, typed asm-NIF out. Simple
@@ -26,10 +26,10 @@ foo.c.nif  --[ arkham ]-->  foo.asm.nif  --[ nifasm ]-->  foo (executable)
   [doc/nifasm.md](doc/nifasm.md).
 * **`src/web`** — the web back end: ONE code generator from Leng to a typed
   tree (the web IR), and two renderers of that tree — wasm32 bytecode and
-  JavaScript text. `src/ithaqua` (→ one self-contained `.wasm`) and
-  `src/jorogumo` (→ one self-contained `.js`) are its two command-line faces.
-  Codegen and link in one tool, because a whole-program module *is* the link
-  step. See [doc/web.md](doc/web.md).
+  JavaScript text. `src/jorogumo` is the one tool over it: `jorogumo w` writes
+  a self-contained `.wasm`, `jorogumo j` a self-contained `.js`. Codegen and
+  link in one tool, because a whole-program module *is* the link step. See
+  [doc/web.md](doc/web.md).
 
 Targets: `linux/amd64`, `windows/amd64`, `linux/arm64`, `macosx/arm64`,
 plus the bare-metal `arm32` / `riscv32` / `avr` ones, `wasm32` and JavaScript.
@@ -47,8 +47,7 @@ sibling directory (`../nimony`). Then, from the repository root:
 ```sh
 nim c src/arkham/arkham.nim      # -> bin/arkham
 nim c src/nifasm/nifasm.nim      # -> src/nifasm/nifasm
-nim c src/ithaqua/ithaqua.nim    # -> bin/ithaqua
-nim c src/jorogumo/jorogumo.nim  # -> bin/jorogumo
+nim c src/jorogumo/jorogumo.nim  # -> bin/jorogumo (both web renderers)
 nim r tests/tester.nim           # builds them all and runs the whole corpus
 ```
 

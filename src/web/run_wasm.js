@@ -1,4 +1,4 @@
-// The node host for a module ithaqua emits: the two `env` imports every
+// The node host for a module `jorogumo w` emits: the two `env` imports every
 // program has, then `_start`. `nim_write` is synchronous so a `nim_exit` that
 // follows cannot cut it short; `nim_exit` is the process exit.
 const fs = require("fs");

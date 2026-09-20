@@ -230,7 +230,7 @@ proc isVoidType(t: Cursor): bool =
 proc isAggType(g: var WebGen; t: Cursor): bool =
   ## A DotToken is the ABSENCE of a type — a void result, an elided field type.
   ## It has no size to ask for, so it is not an aggregate. The spelled `(void)`
-  ## is the same absence (ithaqua's sret test checks `isVoidType` first for
+  ## is the same absence (the sret test checks `isVoidType` first for
   ## exactly this reason): a void result returns nothing, it does not sret a
   ## zero-byte object.
   if t.kind == DotToken: return false
@@ -389,7 +389,7 @@ proc ensureProc(g: var WebGen; sym: SymId; decl: Cursor)
 
 proc procValue(g: var WebGen; sym: SymId): uint32 =
   ## A proc as a VALUE: its function-table slot, AND a reachability edge —
-  ## ithaqua's `tableSlotOf` resolves through `refProc`, which declares the
+  ## the slot resolves through the decl, which declares the
   ## body. A slot for a proc nobody lowered would bind the "unbound extern"
   ## stub: right for a bodyless import, wrong for a body that was forgotten.
   result = tableSlotOf(g, sym)
@@ -554,7 +554,7 @@ proc constScalarBits(g: var WebGen; v: Cursor; ok: var bool): uint64 =
         elif t.kind == Symbol and lookupSym(typeCtx(g), symName(t)).cat == scProc:
           # A PROC's address as a static value — an RTTI method-table entry, a
           # function pointer in a const — is its function-table slot, not a
-          # memory address. ithaqua stores the funcref slot the same way.
+          # memory address. The wasm renderer stores the funcref slot the same way.
           result = uint64(procValue(g, symId(t)))
         elif t.kind == Symbol and (ptrTarget or isAggregateGlobal(g, symName(t))):
           # The ADDRESS of a global is a layout-time constant here, since
@@ -1304,7 +1304,7 @@ proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
       elif isFirst:
         # The INHERITANCE HEADER, ahead of the named fields: either the vtable
         # pointer of a RootObj-derived object (`(addr T.vt.)`) stored in the slot
-        # at offset 0 — as ithaqua stores it — or a nested `oconstr` for the base
+        # at offset 0 — or a nested `oconstr` for the base
         # subobject, which fills that same region IN PLACE.
         header = t.kind != TagLit or t.exprKind != OconstrC
         if not header and not isInheritedPart(g, ty, partName(t)):
@@ -1934,7 +1934,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
 
 proc procDeclOf(g: var WebGen; nm: SymId; found: var bool): Cursor =
   ## The `(proc …)` decl of a symbol: the main module's list, then the lazy
-  ## foreign loader — ithaqua's `refProc` pattern. This is what makes the
+  ## foreign loader. This is what makes the
   ## `ini` chain callable: hexer emits `main` calling `ini.0.<module>` for
   ## every import, and those procs live in the imported modules' files.
   ## Registering the typenav target on the way out is what classifies the
@@ -2653,7 +2653,7 @@ proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
   if known and ct.syscall:
     # The syscall's C name is encoded in the target's asmName as
     # `` <c>`sys.0.<mod> `` (arkham #165 put the role in the identifier);
-    # `cNameOfAsmName` strips the backtick role tag. ithaqua's twin rule.
+    # `cNameOfAsmName` strips the backtick role tag.
     var base = nm
     if ct.asmName.len > 0: base = cNameOfAsmName(ct.asmName)
     genSyscall(g, base, target, t, wantValue)
@@ -2865,7 +2865,7 @@ proc genAsgn(g: var WebGen; c: Cursor) =
     let dst = t
     skip t
     if dst.kind == TagLit and dst.exprKind in {ErrvC, OvfC}:
-      # errv/ovf as destinations → the flag globals, like ithaqua's
+      # errv/ovf as destinations → the flag globals
       g.outp.tree ExprStmt:
         g.outp.openTree Assign
         g.outp.symUse(if dst.exprKind == OvfC: GlobOvf else: GlobErrv)
@@ -2904,7 +2904,7 @@ proc ovfTest(g: var WebGen; opKind: LengExpr; sc: Scal; w: WidthCode;
   ## The boolean overflow test over the bound temps: operands `av`, `bv` and
   ## the already-wrapped result `rv`.
   if sc.kind == skI32:
-    # ithaqua's ≤32-bit move: compare the wrapped result against the WIDE one.
+    # The ≤32-bit move: compare the wrapped result against the WIDE one.
     # The wide world is BigInt — exact at these widths — and `cvt` moves the
     # operands there without loss; `!=` then bridges back by value.
     let bigW = if sc.signed: wI64 else: wU64
@@ -2928,7 +2928,7 @@ proc ovfTest(g: var WebGen; opKind: LengExpr; sc: Scal; w: WidthCode;
     g.outp.closeTag
     g.outp.closeTag
     return
-  # skI64: the classic identities, in BigInt — the same ones ithaqua emits.
+  # skI64: the classic identities, at the operation's own width.
   case opKind
   of AddC:
     if sc.signed:
@@ -3284,7 +3284,7 @@ proc landingPadLabel(c: Cursor): SymId =
   ##
   ## C's `if (0) { L: … }`. The try body `jmp`s INTO the guarded branch, so a
   ## plain if-lowering could never reach the label; `genStmtList` restructures
-  ## it instead (ithaqua's `landingPadLabel`, ported).
+  ## it instead.
   result = SymId(0)
   if c.stmtKind != IfS: return
   var t = c
@@ -3320,7 +3320,7 @@ proc genStmtList(g: var WebGen; c: Cursor) =
   ## ordinary order is enough.
   ##
   ## A landing-pad child `(if (elif (false) (stmts (lab L) …)))` gets the twin
-  ## of ithaqua's restructure: TWO blocks open at the head of the list —
+  ## a restructure: TWO blocks open at the head of the list —
   ##
   ##   $join: { $L: { …try children…; break $join }  …guarded body…  }
   ##
@@ -3507,7 +3507,7 @@ proc genStmt(g: var WebGen; c: var Cursor) =
   of CaseS: genCase(g, c)
   of OnerrS: genOnerr(g, c)
   of TryS, RaiseS:
-    # ithaqua's refusal, kept: `eraiser` lowers every source-level `try` and
+    # A refusal: `eraiser` lowers every source-level `try` and
     # catchable `raise` to the flat `lab`/`jmp` form long before Leng, so one
     # of these in a body means a pass was skipped, not a feature to invent.
     err g, "C++-mode try/raise cannot appear in JavaScript Leng"

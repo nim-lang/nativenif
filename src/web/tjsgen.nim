@@ -67,11 +67,11 @@ if nodeExe.len == 0: quit "tjsgen: node is required — this harness runs what i
 const knownDivergences = {
   # `scope_slot_reuse` compares the ADDRESSES of two locals declared in sibling
   # `(scope)` blocks; its oracle (exit 7) is arkham x64 reusing one frame slot
-  # for them. Neither the wasm nor the JS backend reuses it — ithaqua also
-  # exits 1 — so jorogumo matches its twin, not arkham's layout-specific answer.
+  # for them. The web back end does not reuse it on either target, so it
+  # answers 1 where arkham's layout-specific oracle says 7.
   # A distinct slot per address-taken local is a valid frame, and the property
   # this fixture pins is an allocator detail, not defined behaviour.
-  "scope_slot_reuse": "arkham x64 slot-reuse oracle; ithaqua parity is exit 1",
+  "scope_slot_reuse": "arkham x64 slot-reuse oracle; the web back end exits 1",
 }.toTable
 
 let dir = corpusDir()
@@ -111,8 +111,8 @@ for file in walkFiles(dir / "*.c.nif"):
   # The generator runs as a PROCESS: a refusal may come from arkham's own
   # assertions, and those are fatal in this build — an in-process harness would
   # die on the first fixture that steps outside what typenav can type. Exit
-  # status is the answer, exactly as `tests/tester.nim` treats ithaqua.
-  let gen = execCmdEx(quoteShell(jorogumo) & " -m:4194304 -o:" & quoteShell(jsPath) &
+  # status is the answer, exactly as `tests/tester.nim` treats it.
+  let gen = execCmdEx(quoteShell(jorogumo) & " j -m:4194304 -o:" & quoteShell(jsPath) &
                       " " & quoteShell(file))
   if gen.exitCode != 0 or not fileExists(jsPath):
     inc refused

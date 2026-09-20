@@ -133,7 +133,8 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "  const bin = atob(b64);\n" &
   "  for (let i = 0; i < bin.length; ++i) U8[at + i] = bin.charCodeAt(i);\n" &
   "}\n" &
-  # The host face, the same two entry points ithaqua imports from `env`. The
+  # The host face, the same two entry points the wasm renderer imports from
+  # `env`. The
   # body branches on the target: node writes the fd synchronously; a browser
   # buffers UTF-8 into __outBuf (drained via __takeOutput) and has no process
   # to exit, so nim_exit throws and the host's frame call unwinds.
@@ -164,7 +165,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
      "  return len;\n" &
      "}\n" &
      "function nim_exit(code) { process.exit(code); }\n")) &
-  # ithaqua's ruling for a syscall the target cannot serve: `unreachable`, a
+  # The ruling for a syscall the target cannot serve: `unreachable`, a
   # loud trap, not a silent no-op. The throw is the JS twin of that trap.
   "function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }\n" &
   # The shadow stack (§2): the top `stackBytes` of the buffer, growing DOWN.
@@ -177,9 +178,8 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   # leave restores the CALLER's SP, not this frame's base. Restoring the base
   # would leave SP short by one frame after every call, so a proc called in a
   # loop (a seq `[]=` — one frame per write) would creep down and trip
-  # SP_MIN. ithaqua keeps a frame POINTER local and restores `fp + frameSize`
-  # on return; JS has no such local, so the entry SP is parked on a parallel
-  # stack. Frames are strictly nested (one frame()/leave() pair per routine,
+  # SP_MIN. The wasm renderer parks the entry SP in a local of its own; JS has
+  # no such local, so it goes on a parallel stack. Frames are strictly nested (one frame()/leave() pair per routine,
   # callees between them), so LIFO push/pop restores the exact entry SP.
   "let SP_MIN = " & $(memBytes - stackBytes) & ";\n" &
   "let SP = " & $memBytes & ";\n" &

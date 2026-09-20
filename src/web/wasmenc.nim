@@ -1,5 +1,5 @@
 #
-#           Ithaqua — WebAssembly code generator for Leng
+#           The web back end — the wasm32 binary encoder
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -7,8 +7,8 @@
 
 ## Binary module encoder for wasm 1.0 (MVP) plus the sign-extension ops.
 ##
-## This is the byte-emitting foundation ithaqua's codegen layer drives to
-## assemble a whole-program `wasm32` module from Leng IR. It owns three layers:
+## This is the byte-emitting foundation `wasmrender` drives to assemble a
+## whole-program `wasm32` module from the web IR. It owns three layers:
 ## a `ByteBuf` with LEB128/IEEE primitives, the value-type and opcode constants
 ## from the wasm spec, and a `WasmModule` section assembler whose `encode`
 ## serializes sections in spec order (empty sections skipped).

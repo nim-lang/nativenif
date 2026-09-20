@@ -518,14 +518,13 @@ proc buildToolchain() =
   ## for, and the fix is to stop having a build be a side effect of a test.
   exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
   exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
-  # `bin/ithaqua` and `bin/jorogumo` — the two faces of the web back end — for
-  # the same reason, and for one more: `src/web` compiles against arkham's
-  # `core/` program model without living under it, so a rename or a signature
-  # change in `core/` breaks it and NOTHING ELSE in this repo notices. That is
-  # not hypothetical — it is how ithaqua arrived: a merge left `typeToSlot`
-  # calls passing an argument its callee no longer took, and the backend
-  # simply did not compile.
-  exec "nim c --hints:off src/ithaqua/ithaqua.nim"
+  # `bin/jorogumo` — the web back end, both renderers in one tool — for the
+  # same reason, and for one more: `src/web` compiles against arkham's `core/`
+  # program model without living under it, so a rename or a signature change in
+  # `core/` breaks it and NOTHING ELSE in this repo notices. That is not
+  # hypothetical — it is how the wasm backend arrived: a merge left
+  # `typeToSlot` calls passing an argument its callee no longer took, and the
+  # backend simply did not compile.
   exec "nim c --hints:off src/jorogumo/jorogumo.nim"
 
 proc requiredExe(name, what: string): string =
@@ -583,9 +582,10 @@ const webRunDivergent: seq[string] = @[
 ]
 
 proc webTests() =
-  ## The web back end — ONE code generator (`src/web/codegen.nim`), rendered
-  ## as wasm32 by ithaqua and as JavaScript by jorogumo — over the same
-  ## hand-written Leng corpus arkham runs, plus the unit tests of `src/web`.
+  ## The web back end — ONE code generator (`src/web/codegen.nim`) and one
+  ## tool, `jorogumo w` rendering wasm32 and `jorogumo j` JavaScript — over the
+  ## same hand-written Leng corpus arkham runs, plus the unit tests of
+  ## `src/web`.
   ##
   ## Every fixture not in `webUnsupported` must produce a module on BOTH
   ## targets (and the listed ones must be refused by both). With node on
@@ -599,8 +599,9 @@ proc webTests() =
   exec("nim c -r --hints:off src/web/tjsrender.nim", showProgress = true)
   exec("nim c -r --hints:off src/web/tcodegen.nim", showProgress = true)
 
-  let tools = [("wasm", ("bin" / "ithaqua").addFileExt(ExeExt)),
-               ("js", ("bin" / "jorogumo").addFileExt(ExeExt))]
+  let jorogumo = ("bin" / "jorogumo").addFileExt(ExeExt)
+  let tools = [("wasm", quoteShell(jorogumo) & " w"),
+               ("js", quoteShell(jorogumo) & " j")]
   let runner = "src" / "web" / "run_wasm.js"
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
@@ -615,7 +616,7 @@ proc webTests() =
     for (target, tool) in tools:
       let outFile = workDir / (stem & "." & target)
       removeFile outFile
-      let (o, code) = execCmdEx(quoteShell(tool) & " -o:" & quoteShell(outFile) &
+      let (o, code) = execCmdEx(tool & " -o:" & quoteShell(outFile) &
                                 " " & quoteShell(file))
       if stem in webUnsupported:
         if code == 0:

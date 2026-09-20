@@ -14,7 +14,7 @@
 ## 42 — need `node` on PATH; without it they are skipped and the skip is
 ## reported, so a run on a machine with no node is not silently thinner than it
 ## looks. CI installs node, and the tester turns its absence into a failure
-## there (see `ithaquaTests`).
+## there (see `webTests`).
 
 import std / [os, osproc, strutils, sequtils]
 import wasmenc
@@ -48,7 +48,7 @@ var skipped = 0
 
 proc runNode(scriptSrc, wasmPath: string): tuple[output: string; exitCode: int] =
   ## Writes `scriptSrc` to a temp .js and runs `node script wasmPath`.
-  let scriptPath = getTempDir() / "ithaqua_check_" & $getCurrentProcessId() & ".js"
+  let scriptPath = getTempDir() / "webenc_check_" & $getCurrentProcessId() & ".js"
   writeFile(scriptPath, scriptSrc)
   defer: removeFile(scriptPath)
   let cmd = "node " & quoteShell(scriptPath) & " " & quoteShell(wasmPath)
@@ -105,7 +105,7 @@ block golden:
   if nodeExe.len == 0:
     inc skipped
     break golden
-  let wasmPath = getTempDir() / "ithaqua_add2_" & $getCurrentProcessId() & ".wasm"
+  let wasmPath = getTempDir() / "webenc_add2_" & $getCurrentProcessId() & ".wasm"
   writeFile(wasmPath, got)
   defer: removeFile(wasmPath)
   const src = """
@@ -156,7 +156,7 @@ block richer:
   if nodeExe.len == 0:
     inc skipped
     break richer
-  let wasmPath = getTempDir() / "ithaqua_rich_" & $getCurrentProcessId() & ".wasm"
+  let wasmPath = getTempDir() / "webenc_rich_" & $getCurrentProcessId() & ".wasm"
   writeFile(wasmPath, bytes)
   defer: removeFile(wasmPath)
   const src = """

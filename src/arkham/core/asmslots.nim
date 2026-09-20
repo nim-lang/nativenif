@@ -104,7 +104,7 @@ const
     ## `defaultFloatSlot` — which is reached while classifying types, before any
     ## refusal — yields a well-formed slot rather than a zero-sized one.
   Wasm32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 8, maxFloat: 8)
-    ## wasm32 (ithaqua). A pointer is a 32-bit linear-memory offset, but `i64`
+    ## wasm32 (the web back end). A pointer is a 32-bit linear-memory offset, but `i64`
     ## and `f64` are first-class wasm value types that one "register" — an
     ## unlimited typed local — holds, so unlike `Word32` the scalar and float
     ## bounds stay at 8. Only the pointer narrows.
