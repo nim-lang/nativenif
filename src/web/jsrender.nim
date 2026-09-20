@@ -533,8 +533,6 @@ proc operandTexts(c: Cursor; indent: int; w: out WidthCode): seq[string] =
     skip it
 
 proc exprText(c: Cursor; indent: int): string =
-  # Literals and symbols are PLAIN TOKENS, so the dispatch starts on the token
-  # kind; only composite and special-cased nodes are tags.
   case c.kind
   of Symbol, SymbolDef, Ident: return nameOf(c)
   of IntLit: return $intVal(c)

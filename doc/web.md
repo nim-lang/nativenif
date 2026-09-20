@@ -158,9 +158,6 @@ programs. Each fixture is the same source pushed through the native backend
 (the oracle) and through `nimony w`/`nimony j`, requiring byte-identical
 stdout and matching exit codes.
 
-The driver side in nimony still spawns a tool called `ithaqua`; it pins this
-repository by commit, so nothing breaks until that pin moves and the two
-commands become `jorogumo w` / `jorogumo j`.
 
 ## Non-goals
 
