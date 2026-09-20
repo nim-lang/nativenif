@@ -259,6 +259,13 @@ else:
   proc `[]`(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
 proc `[]=`(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
 
+proc plannedSpan*(plan: Plan): Slice[int] {.inline.} =
+  ## The token positions `planned` can answer for — the proc's whole span, which
+  ## is what `locs` is sized to. For a WHOLE-PLAN read (`-d:arkhamDumpLocs`);
+  ## every other caller has the one position it is asking about, and asking for
+  ## the span to find one would be a scan of the proc per query.
+  plan.locs.base ..< plan.locs.base + plan.locs.data.len
+
 proc planned*(plan: Plan; pos: int): Location {.inline.} =
   ## THE plan for the value produced at token position `pos`.
   ##

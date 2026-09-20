@@ -179,7 +179,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamDumpLocs):
     block:
       stderr.writeLine "=== allocValue locs ==="
-      for pos in g.plan.locs.base ..< g.plan.locs.base + g.plan.locs.data.len:
+      for pos in g.plan.plannedSpan:
         let l = g.plan.planned(pos)
         if l.kind == Undef: continue
         var s = "  pos " & $pos & " : " & $l.kind
@@ -187,7 +187,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
         of InReg: s.add " r=" & $l.r
         of InRegPair: s.add " r0=" & $l.r0 & " r1=" & $l.r1
         of Imm: s.add " imm=" & $l.ival
-        of NamedStack, Glob, Tvar: s.add " " & l.name
+        of NamedStack, Glob, Tvar: s.add " " & g.spelling(l.name)
         else: discard
         stderr.writeLine s
   if g.retIndirect:

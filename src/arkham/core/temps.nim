@@ -17,6 +17,8 @@
 import std / envvars
 import std / syncio
 import std / [strutils, os]
+import std / tables   # `-d:arkhamHomeAudit` walks `plan.symPos`; the rest of this
+                      # file asks the plan about ONE register at a time
 
 
 import nifcore
@@ -111,7 +113,7 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
       for name, pos in g.plan.symPos:
         let l = g.plan.planned(pos)
         if l.kind == InReg and l.r == r:
-          who.add (if who.len > 0: "," else: "") & name & ":" & $l.typ.kind &
+          who.add (if who.len > 0: "," else: "") & g.spelling(name) & ":" & $l.typ.kind &
                   (if l.typ.size > 0: "/" & $l.typ.size else: "")
       stderr.writeLine "HOMEAUDIT " & g.curProcName & " " & $r & " admits [" & who & "]"
 
