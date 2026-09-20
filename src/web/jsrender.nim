@@ -52,10 +52,9 @@ const
 proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   ## The host contract, emitted once per file: the linear-memory buffer, the
   ## views above it, the extern-value table of the bridge (§6). The buffer
-  ## GROWS (`growMem` is wasm `memory.grow`'s twin: reallocate, copy, rebind
+  ## GROWS (`memoryGrow` is wasm `memory.grow`'s twin: reallocate, copy, rebind
   ## the views; old pages survive, and so does every pointer, because pointers
-  ## ARE offsets). The M0 refusal — `memoryGrow(_) { return -1; }` — was the
-  ## placeholder for this.
+  ## ARE offsets).
   ##
   ## The buffer is split: static data and the bump heap from 0 upwards, the
   ## SHADOW STACK (§2) in the last `stackBytes`, growing down from the top.
@@ -65,109 +64,128 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   ## grow past `SP_MIN`, so the two cannot collide; appended pages land ABOVE
   ## the stack, exactly as they do in wasm, where the same crowding exists at
   ## exhaustion.
+  ##
+  ## The blocks below are TRIPLE-QUOTED: what is written is what is emitted, so
+  ## a `\n` here is the JavaScript escape and not a line break in this file.
   # The target face: node writes to fds through `fs`; a browser has neither
   # `fs` nor a synchronous fd, so stdout/stderr land on `console.log`/
   # `console.error` one line at a time (devtools shows engine output live,
   # no host drain loop), `nim_exit` throws instead of killing the tab, and
   # `__takeOutput()` still returns whatever has no line ending yet.
-  (if browser:
-    ("const __outBuf = [];  // writes to fds the console cannot serve\n" &
-     "const __dec = [new TextDecoder(\"utf-8\"), new TextDecoder(\"utf-8\")];\n" &
-     "  // one streaming decoder per console fd: a UTF-8 sequence split across\n" &
-     "  // two flushes must not decode into a replacement char\n" &
-     "let __pend = [\"\", \"\"];  // the unterminated tail of each console fd\n" &
-     "function __takeOutput() {\n" &
-     "  const s = __outBuf.join(\"\") + __pend[0] + __pend[1];\n" &
-     "  __outBuf.length = 0; __pend = [\"\", \"\"];\n" &
-     "  return s;\n" &
-     "}\n")
-   else:
-    "const fs = require(\"fs\");  // for the synchronous nim_write below\n") &
-  "let JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
-  "let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),\n" &
-  "    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
-  "    I32 = new Int32Array(JMEM), U32 = new Uint32Array(JMEM),\n" &
-  "    F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),\n" &
-  "    BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM),\n" &
-  "    DV = new DataView(JMEM);  // width-2+ heap access: no alignment trap, no vanishing store\n" &
-  "const EXT = [];  // extern value table: handle -> real JS value (§6)\n" &
-  "const FTAB = []; // function table: slot -> JS function; 0 is the null pointer\n" &
-  "let JSP = [null];  // the same table, grown by ewrap\n" &
-  "function ewrap(v) {\n" &
-  "  if (typeof v === \"number\" || typeof v === \"bigint\") return v;\n" &
-  "  if (typeof v === \"boolean\") return v ? 1 : 0;\n" &
-  "  if (v === null || v === undefined) return 0;\n" &
-  "  const h = JSP.length; JSP.push(v); return h | 0;\n" &
-  "}\n" &
-  "function eunwrap(h) {\n" &
-  "  if (typeof h === \"bigint\") return Number(h);\n" &
-  "  return h < 1 ? null : JSP[h];\n" &
-  "}\n" &
-  "const __internExt = ewrap; // splice-facing alias: intern a host value as a handle\n" &
+  if browser:
+    result.add """
+const __outBuf = [];  // writes to fds the console cannot serve
+const __dec = [new TextDecoder("utf-8"), new TextDecoder("utf-8")];
+  // one streaming decoder per console fd: a UTF-8 sequence split across
+  // two flushes must not decode into a replacement char
+let __pend = ["", ""];  // the unterminated tail of each console fd
+function __takeOutput() {
+  const s = __outBuf.join("") + __pend[0] + __pend[1];
+  __outBuf.length = 0; __pend = ["", ""];
+  return s;
+}
+"""
+  else:
+    result.add """
+const fs = require("fs");  // for the synchronous nim_write below
+"""
+  result.add "let JMEM = new ArrayBuffer(" & $memBytes & ");\n"
+  result.add """
+let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),
+    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),
+    I32 = new Int32Array(JMEM), U32 = new Uint32Array(JMEM),
+    F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),
+    BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM),
+    DV = new DataView(JMEM);  // width-2+ heap access: no alignment trap, no vanishing store
+const EXT = [];  // extern value table: handle -> real JS value (§6)
+const FTAB = []; // function table: slot -> JS function; 0 is the null pointer
+let JSP = [null];  // the same table, grown by ewrap
+function ewrap(v) {
+  if (typeof v === "number" || typeof v === "bigint") return v;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  if (v === null || v === undefined) return 0;
+  const h = JSP.length; JSP.push(v); return h | 0;
+}
+function eunwrap(h) {
+  if (typeof h === "bigint") return Number(h);
+  return h < 1 ? null : JSP[h];
+}
+const __internExt = ewrap; // splice-facing alias: intern a host value as a handle
+"""
   # The osalloc contract is wasm's: size in 64 KiB pages, grow returns the old
   # page count or -1. Not bytes — osalloc multiplies by 65536 itself.
-  "function memorySize() { return JMEM.byteLength >> 16; }\n" &
-  # wasm `memory.grow`'s twin: append `pages` 64 KiB pages, contents intact,
-  # return the OLD page count or -1. Pointers are offsets, so the copy keeps
-  # every one valid; the views are rebound to the new buffer, and every reader
-  # goes through the live binding.
-  "function memoryGrow(pages) {\n" &
-  "  const old = JMEM.byteLength >> 16;\n" &
-  "  let nb;\n" &
-  "  try {\n" &
-  "    nb = new ArrayBuffer(JMEM.byteLength + pages * 65536);\n" &
-  "    new Uint8Array(nb).set(new Uint8Array(JMEM));\n" &
-  "  } catch (e) { return -1; }\n" &
-  "  JMEM = nb;\n" &
-  "  I8 = new Int8Array(JMEM); U8 = new Uint8Array(JMEM);\n" &
-  "  I16 = new Int16Array(JMEM); U16 = new Uint16Array(JMEM);\n" &
-  "  I32 = new Int32Array(JMEM); U32 = new Uint32Array(JMEM);\n" &
-  "  F32 = new Float32Array(JMEM); F64 = new Float64Array(JMEM);\n" &
-  "  BI64 = new BigInt64Array(JMEM); BU64 = new BigUint64Array(JMEM);\n" &
-  "  DV = new DataView(JMEM);\n" &
-  "  return old;\n" &
-  "}\n" &
+  #
+  # `memoryGrow` is wasm `memory.grow`'s twin: append `pages` 64 KiB pages,
+  # contents intact, return the OLD page count or -1. Pointers are offsets, so
+  # the copy keeps every one valid; the views are rebound to the new buffer,
+  # and every reader goes through the live binding.
+  result.add """
+function memorySize() { return JMEM.byteLength >> 16; }
+function memoryGrow(pages) {
+  const old = JMEM.byteLength >> 16;
+  let nb;
+  try {
+    nb = new ArrayBuffer(JMEM.byteLength + pages * 65536);
+    new Uint8Array(nb).set(new Uint8Array(JMEM));
+  } catch (e) { return -1; }
+  JMEM = nb;
+  I8 = new Int8Array(JMEM); U8 = new Uint8Array(JMEM);
+  I16 = new Int16Array(JMEM); U16 = new Uint16Array(JMEM);
+  I32 = new Int32Array(JMEM); U32 = new Uint32Array(JMEM);
+  F32 = new Float32Array(JMEM); F64 = new Float64Array(JMEM);
+  BI64 = new BigInt64Array(JMEM); BU64 = new BigUint64Array(JMEM);
+  DV = new DataView(JMEM);
+  return old;
+}
+"""
   # The static image: the wasm data section's twin. Base64 because the image
   # is arbitrary bytes and a JS string literal is not.
-  "function D(b64, at) {\n" &
-  "  const bin = atob(b64);\n" &
-  "  for (let i = 0; i < bin.length; ++i) U8[at + i] = bin.charCodeAt(i);\n" &
-  "}\n" &
+  result.add """
+function D(b64, at) {
+  const bin = atob(b64);
+  for (let i = 0; i < bin.length; ++i) U8[at + i] = bin.charCodeAt(i);
+}
+"""
   # The host face, the same two entry points the wasm renderer imports from
-  # `env`. The
-  # body branches on the target: node writes the fd synchronously; a browser
-  # buffers UTF-8 into __outBuf (drained via __takeOutput) and has no process
-  # to exit, so nim_exit throws and the host's frame call unwinds.
-  (if browser:
-    ("function nim_write(fd, buf, len) {\n" &
-     "  if (fd === 1 || fd === 2) {\n" &
-     "    // the console is line-oriented: log every complete line as it forms,\n" &
-     "    // keep the partial tail for the next write (or __takeOutput)\n" &
-     "    const i = fd - 1;\n" &
-     "    __pend[i] += __dec[i].decode(U8.subarray(buf, buf + len), {stream: true});\n" &
-     "    let nl;\n" &
-     "    while ((nl = __pend[i].indexOf(\"\\n\")) >= 0) {\n" &
-     "      (fd === 2 ? console.error : console.log)(__pend[i].slice(0, nl));\n" &
-     "      __pend[i] = __pend[i].slice(nl + 1);\n" &
-     "    }\n" &
-     "  } else {\n" &
-     "    __outBuf.push(new TextDecoder(\"utf-8\").decode(U8.subarray(buf, buf + len)));\n" &
-     "  }\n" &
-     "  return len;\n" &
-     "}\n" &
-     "function nim_exit(code) { throw new Error(\"nim_exit(\" + code + \")\"); }\n")
-   else:
-    ("function nim_write(fd, buf, len) {\n" &
-     "  // fs.writeSync, not process.stdout.write: the latter is asynchronous on\n" &
-     "  // pipes (macOS/Windows), and the process.exit a `nim_exit` performs would\n" &
-     "  // cut a pending write. The sync call lands before the exit, everywhere.\n" &
-     "  fs.writeSync(fd === 2 ? 2 : 1, Buffer.from(JMEM, buf, len));\n" &
-     "  return len;\n" &
-     "}\n" &
-     "function nim_exit(code) { process.exit(code); }\n")) &
+  # `env`. The body branches on the target: node writes the fd synchronously; a
+  # browser buffers UTF-8 into __outBuf (drained via __takeOutput) and has no
+  # process to exit, so nim_exit throws and the host's frame call unwinds.
+  if browser:
+    result.add """
+function nim_write(fd, buf, len) {
+  if (fd === 1 || fd === 2) {
+    // the console is line-oriented: log every complete line as it forms,
+    // keep the partial tail for the next write (or __takeOutput)
+    const i = fd - 1;
+    __pend[i] += __dec[i].decode(U8.subarray(buf, buf + len), {stream: true});
+    let nl;
+    while ((nl = __pend[i].indexOf("\n")) >= 0) {
+      (fd === 2 ? console.error : console.log)(__pend[i].slice(0, nl));
+      __pend[i] = __pend[i].slice(nl + 1);
+    }
+  } else {
+    __outBuf.push(new TextDecoder("utf-8").decode(U8.subarray(buf, buf + len)));
+  }
+  return len;
+}
+function nim_exit(code) { throw new Error("nim_exit(" + code + ")"); }
+"""
+  else:
+    result.add """
+function nim_write(fd, buf, len) {
+  // fs.writeSync, not process.stdout.write: the latter is asynchronous on
+  // pipes (macOS/Windows), and the process.exit a `nim_exit` performs would
+  // cut a pending write. The sync call lands before the exit, everywhere.
+  fs.writeSync(fd === 2 ? 2 : 1, Buffer.from(JMEM, buf, len));
+  return len;
+}
+function nim_exit(code) { process.exit(code); }
+"""
   # The ruling for a syscall the target cannot serve: `unreachable`, a
   # loud trap, not a silent no-op. The throw is the JS twin of that trap.
-  "function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }\n" &
+  result.add """
+function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }
+"""
   # The shadow stack (§2): the top `stackBytes` of the buffer, growing DOWN.
   # frame(n) returns the new base; a frame's locals live at byte offsets from
   # the base in the SAME address space as the heap, which is what lets `addr`
@@ -179,30 +197,37 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   # would leave SP short by one frame after every call, so a proc called in a
   # loop (a seq `[]=` — one frame per write) would creep down and trip
   # SP_MIN. The wasm renderer parks the entry SP in a local of its own; JS has
-  # no such local, so it goes on a parallel stack. Frames are strictly nested (one frame()/leave() pair per routine,
-  # callees between them), so LIFO push/pop restores the exact entry SP.
-  "let SP_MIN = " & $(memBytes - stackBytes) & ";\n" &
-  "let SP = " & $memBytes & ";\n" &
-  "const _SPF = [];  // entry SP of each open frame; strictly nested, so LIFO\n" &
+  # no such local, so it goes on a parallel stack. Frames are strictly nested
+  # (one frame()/leave() pair per routine, callees between them), so LIFO
+  # push/pop restores the exact entry SP.
+  result.add "let SP_MIN = " & $(memBytes - stackBytes) & ";\n"
+  result.add "let SP = " & $memBytes & ";\n"
   # Modulo, not `& ~15`: a bitwise AND goes through ToInt32 and wraps at 2 GiB.
-  "function frame(n) {\n" &
-  "  const r = SP - n; const f = r - (r % 16);\n" &
-  "  if (f < SP_MIN) throw new Error(\"stack overflow\");\n" &
-  "  _SPF.push(SP); SP = f; return f;\n" &
-  "}\n" &
-  "function leave() { SP = _SPF.pop(); }\n" &
+  result.add """
+const _SPF = [];  // entry SP of each open frame; strictly nested, so LIFO
+function frame(n) {
+  const r = SP - n; const f = r - (r % 16);
+  if (f < SP_MIN) throw new Error("stack overflow");
+  _SPF.push(SP); SP = f; return f;
+}
+function leave() { SP = _SPF.pop(); }
+"""
   # Bit-level reinterpretation (`cast` between a float and an integer of the
   # same size). One scratch cell, read back through the other view; the program
   # is single-threaded and each helper completes before it returns.
-  "const _CB = new ArrayBuffer(8);\n" &
-  "const _CF = new Float64Array(_CB), _CI = new BigInt64Array(_CB),\n" &
-  "      _FF = new Float32Array(_CB), _FI = new Int32Array(_CB);\n" &
-  "function f64bits(x) { _CF[0] = x; return _CI[0]; }\n" &
-  "function bitsf64(b) { _CI[0] = b; return _CF[0]; }\n" &
-  "function f32bits(x) { _FF[0] = x; return _FI[0]; }\n" &
-  "function bitsf32(i) { _FI[0] = i | 0; return _FF[0]; }\n" &
-  # memcpy over the one buffer (overlap-safe, like wasm's `memory.copy`).
-  "function copyMem(d, s, n) { U8.copyWithin(d, s, s + n); }\n" &
+  #
+  # `copyMem` is memcpy over the one buffer (overlap-safe, like wasm's
+  # `memory.copy`).
+  result.add """
+const _CB = new ArrayBuffer(8);
+const _CF = new Float64Array(_CB), _CI = new BigInt64Array(_CB),
+      _FF = new Float32Array(_CB), _FI = new Int32Array(_CB);
+function f64bits(x) { _CF[0] = x; return _CI[0]; }
+function bitsf64(b) { _CI[0] = b; return _CF[0]; }
+function f32bits(x) { _FF[0] = x; return _FI[0]; }
+function bitsf32(i) { _FI[0] = i | 0; return _FF[0]; }
+function copyMem(d, s, n) { U8.copyWithin(d, s, s + n); }
+"""
   # The string bridge (M7 §6): a Nim `string` crossing an `importjs` splice.
   # The representation is the SSO string of lib/std/system/stringimpl.nim for
   # the 4-byte target: byte0 = slen (or the sentinel 254=static / 255=heap);
@@ -210,73 +235,81 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   # (value+4) points to a LongString { fullLen@0, rc@4, capImpl@8, data@12 }.
   # These mirror `len`/`rawData` exactly, so short, medium, long and static all
   # decode correctly. TextEncoder/Decoder exist in both node and the browser.
-  "const __STR_PAYLOAD = 6, __STR_DATAOFF = 12, __STR_STATIC = 254;\n" &
-  "function nimStrToJs(s) {\n" &
-  "  const sl = U8[s];\n" &
-  "  if (sl <= __STR_PAYLOAD)\n" &
-  "    return new TextDecoder(\"utf-8\").decode(U8.subarray(s + 1, s + 1 + sl));\n" &
-  "  const more = DV.getUint32(s + 4, true);\n" &
-  "  const n = DV.getInt32(more, true);\n" &
-  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(more + __STR_DATAOFF, more + __STR_DATAOFF + n));\n" &
-  "}\n" &
-  "function cstrToJs(p) {\n" &
-  "  let e = p; while (U8[e] !== 0) ++e;\n" &
-  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(p, e));\n" &
-  "}\n" &
+  result.add """
+const __STR_PAYLOAD = 6, __STR_DATAOFF = 12, __STR_STATIC = 254;
+function nimStrToJs(s) {
+  const sl = U8[s];
+  if (sl <= __STR_PAYLOAD)
+    return new TextDecoder("utf-8").decode(U8.subarray(s + 1, s + 1 + sl));
+  const more = DV.getUint32(s + 4, true);
+  const n = DV.getInt32(more, true);
+  return new TextDecoder("utf-8").decode(U8.subarray(more + __STR_DATAOFF, more + __STR_DATAOFF + n));
+}
+function cstrToJs(p) {
+  let e = p; while (U8[e] !== 0) ++e;
+  return new TextDecoder("utf-8").decode(U8.subarray(p, e));
+}
+"""
   # A JS string back to Nim as a STATIC string (byte0=254, capImpl=0): the GC's
   # `=destroy` frees only a HeapSlen string, so a bridge result is never freed
   # and never refcounted — it leaks rather than risk a bad refcount (plan §6
   # first-cut liveness, matching the never-released handle table). The inline
   # cache (first 3 chars at value+1) is synced so `==`/`hash` agree with a
   # compiler literal of the same text.
-  "function jsToNimStr(v) {\n" &
-  "  const enc = new TextEncoder().encode(typeof v === \"string\" ? v : String(v));\n" &
-  "  const n = enc.length;\n" &
-  "  const p = osalloc(0, __STR_DATAOFF + n + 1);\n" &
-  "  DV.setInt32(p + 0, n, true); DV.setInt32(p + 4, 0, true); DV.setInt32(p + 8, 0, true);\n" &
-  "  U8.set(enc, p + __STR_DATAOFF); U8[p + __STR_DATAOFF + n] = 0;\n" &
-  "  const val = osalloc(0, 8);\n" &
-  "  U8[val] = __STR_STATIC;\n" &
-  "  for (let i = 0; i < 3 && i < n; ++i) U8[val + 1 + i] = enc[i];\n" &
-  "  DV.setUint32(val + 4, p, true);\n" &
-  "  return val;\n" &
-  "}\n" &
-  "function jsToCstr(v) {\n" &
-  "  const enc = new TextEncoder().encode(typeof v === \"string\" ? v : String(v));\n" &
-  "  const n = enc.length;\n" &
-  "  const p = osalloc(0, n + 1);\n" &
-  "  U8.set(enc, p); U8[p + n] = 0;\n" &
-  "  return p;\n" &
-  "}\n" &
+  result.add """
+function jsToNimStr(v) {
+  const enc = new TextEncoder().encode(typeof v === "string" ? v : String(v));
+  const n = enc.length;
+  const p = osalloc(0, __STR_DATAOFF + n + 1);
+  DV.setInt32(p + 0, n, true); DV.setInt32(p + 4, 0, true); DV.setInt32(p + 8, 0, true);
+  U8.set(enc, p + __STR_DATAOFF); U8[p + __STR_DATAOFF + n] = 0;
+  const val = osalloc(0, 8);
+  U8[val] = __STR_STATIC;
+  for (let i = 0; i < 3 && i < n; ++i) U8[val + 1 + i] = enc[i];
+  DV.setUint32(val + 4, p, true);
+  return val;
+}
+function jsToCstr(v) {
+  const enc = new TextEncoder().encode(typeof v === "string" ? v : String(v));
+  const n = enc.length;
+  const p = osalloc(0, n + 1);
+  U8.set(enc, p); U8[p + n] = 0;
+  return p;
+}
+"""
   # Length-based bridges, for the C shapes that are neither a Nim string nor
   # a NUL-terminated cstring: a (data, length) view. `strViewToJs` decodes a
   # WGPUStringView (WebGPU's string shape — NOT NUL-terminated); `memView`
   # hands the host a live subarray of linear memory (queue.writeBuffer data),
-  # re-reading U8 at call time so a grown memory is never stale.
-  "function strViewToJs(p, n) {\n" &
-  "  if (n === 0 || p === 0) return \"\";\n" &
-  "  if (n < 0) {\n" &
-  "    // WGPUStringView's WGPU_STRLEN sentinel (high(csize_t) crosses as -1):\n" &
-  "    // the string is NUL-terminated, so find the end before decoding.\n" &
-  "    let z = U8.indexOf(0, p);\n" &
-  "    n = z < 0 ? U8.length - p : z - p;\n" &
-  "  }\n" &
-  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(p, p + n));\n" &
-  "}\n" &
-  "function memView(p, n) { return U8.subarray(p, p + n); }\n" &
+  # re-reading U8 at call time so a grown memory is never stale. `fillMem` is
   # wasm's `memory.fill`.
-  "function fillMem(d, v, n) { U8.fill(v, d, d + n); }\n" &
+  result.add """
+function strViewToJs(p, n) {
+  if (n === 0 || p === 0) return "";
+  if (n < 0) {
+    // WGPUStringView's WGPU_STRLEN sentinel (high(csize_t) crosses as -1):
+    // the string is NUL-terminated, so find the end before decoding.
+    let z = U8.indexOf(0, p);
+    n = z < 0 ? U8.length - p : z - p;
+  }
+  return new TextDecoder("utf-8").decode(U8.subarray(p, p + n));
+}
+function memView(p, n) { return U8.subarray(p, p + n); }
+function fillMem(d, v, n) { U8.fill(v, d, d + n); }
+"""
   # The portable bit rows. wasm has i32.ctz/clz/popcount; JS has Math.clz32
   # and nothing else, so the rest are loops spelled the obvious way. The
   # count is a Number (0..64) in both worlds; the zero case answers with the
   # width, like the wasm opcodes do (C calls it UB; nimony guards, but the
   # wasm target records 32/64 and so does this).
-  "function ctz32(x) { x |= 0; if (x === 0) return 32; let n = 0; while ((x & 1) === 0) { x >>>= 1; ++n; } return n; }\n" &
-  "function clz32(x) { return Math.clz32(x | 0); }\n" &
-  "function popcnt32(x) { x >>>= 0; let n = 0; while (x !== 0) { x &= x - 1; ++n; } return n; }\n" &
-  "function ctz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 1n) === 0n) { u >>= 1n; ++n; } return n; }\n" &
-  "function clz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 0x8000000000000000n) === 0n) { u <<= 1n; ++n; } return n; }\n" &
-  "function popcnt64(x) { let u = BigInt.asUintN(64, x); let n = 0; while (u !== 0n) { u &= u - 1n; ++n; } return n; }\n" &
+  result.add """
+function ctz32(x) { x |= 0; if (x === 0) return 32; let n = 0; while ((x & 1) === 0) { x >>>= 1; ++n; } return n; }
+function clz32(x) { return Math.clz32(x | 0); }
+function popcnt32(x) { x >>>= 0; let n = 0; while (x !== 0) { x &= x - 1; ++n; } return n; }
+function ctz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 1n) === 0n) { u >>= 1n; ++n; } return n; }
+function clz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 0x8000000000000000n) === 0n) { u <<= 1n; ++n; } return n; }
+function popcnt64(x) { let u = BigInt.asUintN(64, x); let n = 0; while (u !== 0n) { u &= u - 1n; ++n; } return n; }
+"""
   # Division by zero traps natively (SIGFPE) and on wasm; JS would hand back
   # Infinity->0 or a RangeError with a foreign message. One story for both
   # widths: a named throw — and the helper form means each operand is
@@ -284,21 +317,25 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   # A float → integer conversion traps when the truncated value does not fit,
   # and on NaN, exactly as wasm's `trunc` does; `lo`/`hi` are the range of the
   # 32- or 64-bit conversion the target width goes through.
-  "function ftoi(x, lo, hi) { const t = Math.trunc(x); if (!(t >= lo && t < hi)) throw new Error(\"float conversion out of range\"); return t; }\n" &
-  "function idiv(a, b) { if (b === 0) throw new Error(\"division by zero\"); return Math.trunc(a / b); }\n" &
-  "function imod(a, b) { if (b === 0) throw new Error(\"division by zero\"); return a % b; }\n" &
-  "function idiv64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a / b; }\n" &
-  "function imod64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a % b; }\n" &
+  result.add """
+function ftoi(x, lo, hi) { const t = Math.trunc(x); if (!(t >= lo && t < hi)) throw new Error("float conversion out of range"); return t; }
+function idiv(a, b) { if (b === 0) throw new Error("division by zero"); return Math.trunc(a / b); }
+function imod(a, b) { if (b === 0) throw new Error("division by zero"); return a % b; }
+function idiv64(a, b) { if (b === 0n) throw new Error("division by zero"); return a / b; }
+function imod64(a, b) { if (b === 0n) throw new Error("division by zero"); return a % b; }
+"""
   # The allocator is the osalloc CONTRACT (§5): the same shape as wasm's, and
   # bounded by SP_MIN so the heap can never walk into the shadow stack.
-  "let heapTop = " & $dataEnd & ";\n" &
+  result.add "let heapTop = " & $dataEnd & ";\n"
   # Modulo, not `& ~15`: a bitwise AND goes through ToInt32 and wraps at 2 GiB.
-  "function osalloc(_, n) {\n" &
-  "  const a = heapTop + 15; const b = a - (a % 16);\n" &
-  "  const m = n + 15; const r = b + (m - (m % 16));\n" &
-  "  if (r > SP_MIN) throw new Error(\"out of memory\");\n" &
-  "  heapTop = r; return b >>> 0;\n" &
-  "}\n"
+  result.add """
+function osalloc(_, n) {
+  const a = heapTop + 15; const b = a - (a % 16);
+  const m = n + 15; const r = b + (m - (m % 16));
+  if (r > SP_MIN) throw new Error("out of memory");
+  heapTop = r; return b >>> 0;
+}
+"""
 
 proc utf8Len(b: char): int =
   ## The length of the UTF-8 sequence starting at `b`, 0 when `b` cannot
