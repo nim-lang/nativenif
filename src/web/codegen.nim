@@ -31,8 +31,10 @@
 
 import std / [tables, sets, strutils, assertions, algorithm]
 import nifcore, nifcdecl
-import webnif
+import webnif, diag
 import "../arkham/core" / [asmslots, programs, typenav, typeutil]
+
+include compat2   # getOrQuit on host Nim
 
 const
   WebPtrSize* = 4
@@ -134,16 +136,10 @@ type
     wtJs                               ## JavaScript: `importjs` splices are legal
     wtWasm                             ## wasm32
 
-type
-  WebGenError* = object of CatchableError
-    ## A program the generator does not understand. This is an ordinary
-    ## failure, not a broken invariant: the CLI reports it as one line and the
-    ## coverage harness can ask "can you generate this?" without dying. An
-    ## assertion here would be fatal — `--panics` off makes a `Defect`
-    ## uncatchable — so a refusal must never be one.
-
 proc err(g: WebGen; msg: string) {.noreturn.} =
-  raise (ref WebGenError)(msg: msg)
+  ## A program the generator does not understand — an ordinary failure, not a
+  ## broken invariant, so it is never an `assert`: see `diag.refuse`.
+  refuse msg
 
 proc lengSym(g: var WebGen; name: string): SymId {.inline.} =
   ## A Leng symbol's pool id from its spelling — the boundary where `core`'s
@@ -276,12 +272,12 @@ proc flexPayloadLen(g: var WebGen; initv: Cursor): int =
     var ac = initv
     ac.into:
       let arrT = resolveType(g.prog, ac)
-      var esz: int
+      var esz = 0
       if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
         esz = WebPtrSize
       else:
         let elemT = innerType(g.prog, arrT)
-        (esz, _) = typeSizeAlign(g.prog, elemT)
+        esz = typeSizeAlign(g.prog, elemT)[0]
       skip ac
       var n = 0
       while ac.hasMore: (inc n; skip ac)
@@ -306,12 +302,12 @@ proc flexPayloadLen(g: var WebGen; initv: Cursor): int =
             var ac = kv
             ac.into:
               let arrT = resolveType(g.prog, ac)
-              var esz: int
+              var esz: int = default(int)
               if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
                 esz = WebPtrSize
               else:
                 let elemT = innerType(g.prog, arrT)
-                (esz, _) = typeSizeAlign(g.prog, elemT)
+                esz = typeSizeAlign(g.prog, elemT)[0]
               skip ac
               var n = 0
               while ac.hasMore: (inc n; skip ac)
@@ -340,13 +336,13 @@ proc globalAddrOf(g: var WebGen; name: SymId): uint32 =
   ## Zero-initialized globals reserve space only; static initializers become
   ## image segments in `serializeStatics`.
   let canon = gvarRefName(g.prog, name)
-  if g.globalAddr.hasKey(canon): return g.globalAddr[canon]
+  if g.globalAddr.hasKey(canon): return g.globalAddr.getOrQuit(canon)
   let si = lookupSym(typeCtx(g), name)
   if si.cat notin {scGlobal, scTvar}:          # tvar: single-threaded target → a global
     err g, "not a global: " & g.spell(name)
   var d = si.decl
-  var typ: Cursor
-  var initv: Cursor
+  var typ: Cursor = default(Cursor)
+  var initv: Cursor = default(Cursor)
   var hasInit = false
   d.into:
     inc d                                      # name
@@ -365,7 +361,7 @@ proc globalAddrOf(g: var WebGen; name: SymId): uint32 =
   # The decl to serialize: prefer one that carries an initializer, so an
   # `importc` reference seen first cannot hide the defining module's static.
   if not g.canonDecl.hasKey(canon) or
-      (hasInit and not declHasInit(g.canonDecl[canon])):
+      (hasInit and not declHasInit(g.canonDecl.getOrQuit(canon))):
     g.canonDecl[canon] = si.decl
   if si.cat == scGlobal and not g.globals.hasKey(name):
     g.globals[name] = si.decl                  # cache foreign decls for typenav
@@ -373,7 +369,7 @@ proc globalAddrOf(g: var WebGen; name: SymId): uint32 =
     g.tvars[name] = si.decl
 
 proc strLitAddr(g: var WebGen; s: string): uint32 =
-  if g.rodataAddr.hasKey(s): return g.rodataAddr[s]
+  if g.rodataAddr.hasKey(s): return g.rodataAddr.getOrQuit(s)
   result = allocStatic(g, s.len + 1, 1, tag = "strlit")  # NUL-terminated, like the C backend
   g.rodataAddr[s] = result
   g.dataSegs.add (result, s & '\0')
@@ -381,7 +377,7 @@ proc strLitAddr(g: var WebGen; s: string): uint32 =
 proc tableSlotOf(g: var WebGen; sym: SymId): uint32 =
   ## A proc as a VALUE is an index into the function table — the twin of
   ## wasm's funcref table, with 0 reserved for nil.
-  if g.tableSlot.hasKey(sym): return g.tableSlot[sym]
+  if g.tableSlot.hasKey(sym): return g.tableSlot.getOrQuit(sym)
   result = g.nextTableSlot
   inc g.nextTableSlot
   g.tableSlot[sym] = result
@@ -407,6 +403,7 @@ proc fieldOffsetIn(g: var WebGen; objType: Cursor; field: SymId;
                    found: var bool): int =
   ## Byte offset of `field` inside the RESOLVED object type `objType` (own
   ## fields only; the caller walks inheritance). Mirrors `objSizeAlign`.
+  result = 0
   var oc = objType
   var off = 0
   found = false
@@ -466,7 +463,7 @@ proc dotOffset(g: var WebGen; baseType: Cursor; field: SymId; depth: int): int =
     if t.kind != TagLit or t.typeKind != ObjectT:
       err g, "dot into a non-object type"
     var oc = t
-    var base: Cursor
+    var base: Cursor = default(Cursor)
     var hasBase = false
     oc.into:
       base = oc
@@ -511,6 +508,7 @@ proc isAggregateGlobal(g: var WebGen; nm: SymId): bool =
 proc constScalarBits(g: var WebGen; v: Cursor; ok: var bool): uint64 =
   ## The bit pattern of a compile-time scalar. Addresses resolve to absolute
   ## numbers because the generator owns the layout — this is where a fixup lands.
+  result = 0'u64
   ok = true
   case v.kind
   of IntLit: result = cast[uint64](intVal(v))
@@ -641,14 +639,14 @@ proc serializeConstInto(g: var WebGen; bytes: var string; base: int;
     var t = v
     t.into:
       let arrT = resolveType(g.prog, t)
-      var elemT: Cursor
-      var esz: int
+      var elemT = default(Cursor)
+      var esz = 0
       if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
         elemT = arrT                           # a method table: the slots ARE pointers
         esz = WebPtrSize
       else:
         elemT = innerType(g.prog, arrT)
-        (esz, _) = typeSizeAlign(g.prog, elemT)
+        esz = typeSizeAlign(g.prog, elemT)[0]
       skip t
       var idx = 0
       while t.hasMore:
@@ -740,13 +738,13 @@ proc serializeStatics(g: var WebGen) =
     sort(round, proc (a, b: (string, SymId)): int = cmp(a[0], b[0]))
     if round.len == 0: break
     for (_, n) in round:
-      var typ, initv: Cursor
+      var typ, initv: Cursor = default(Cursor)
       var hasInit = false
-      if not staticInit(g, g.canonDecl[n], typ, initv, hasInit): continue
+      if not staticInit(g, g.canonDecl.getOrQuit(n), typ, initv, hasInit): continue
       var bytes = ""
       serializeConstInto(g, bytes, 0, typ, initv)
       if bytes.len > 0:
-        g.dataSegs.add (g.globalAddr[n], bytes)
+        g.dataSegs.add (g.globalAddr.getOrQuit(n), bytes)
 
 proc layoutProgram*(g: var WebGen) =
   ## Assign every global and thread-local an address and serialize the statics
@@ -791,6 +789,7 @@ const
 proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    target = wtJs; hostImports = false): WebGen =
   setTargetWord Wasm32               # the linear-memory model: 4-byte pointers
+  result = default(WebGen)
   result.tags = tags
   result.target = target
   result.hostImports = hostImports
@@ -932,7 +931,7 @@ proc irName(g: var WebGen; sym: SymId): SymId =
   ## of it get the same name. The `n_` prefix keeps every generated name clear
   ## of the runtime floor (`nim_write`, `errv`, …), of the JS preamble and of
   ## JS reserved words.
-  if g.irNameOf.hasKey(sym): return g.irNameOf[sym]
+  if g.irNameOf.hasKey(sym): return g.irNameOf.getOrQuit(sym)
   var base = "n_"
   for ch in poolSym(g.lengPool, sym):
     base.add (if ch in {'a'..'z', 'A'..'Z', '0'..'9', '_'}: ch else: '_')
@@ -1010,7 +1009,7 @@ proc genSymAddr(g: var WebGen; c: Cursor) =
   ## parameter arrived as, or a global's static address.
   let nm = c.symId
   if g.p.locals.hasKey(nm):
-    let s = g.p.locals[nm]
+    let s = g.p.locals.getOrQuit(nm)
     case s.kind
     of lkReg: err g, "the register local `" & g.spell(nm) & "` has no address"
     of lkSlot: slotAddr(g, s.off)
@@ -1167,8 +1166,8 @@ proc genSymValue(g: var WebGen; c: Cursor) =
   ## static address.
   let nm = c.symId
   if g.p.locals.hasKey(nm):
-    let s = g.p.locals[nm]
-    let ty = g.p.symType[nm]
+    let s = g.p.locals.getOrQuit(nm)
+    let ty = g.p.symType.getOrQuit(nm)
     if isAggType(g, ty) or s.kind == lkPtr:
       genSymAddr(g, c)                    # a location travels as its address
     elif s.kind == lkReg:
@@ -1246,10 +1245,11 @@ proc isInheritedPart(g: var WebGen; objTy: Cursor; part: SymId): bool =
   ## Is `part` one of `objTy`'s bases? Only the base chain says which nested
   ## `oconstr` is the inherited part, and guessing would write it at offset 0 of
   ## an object it does not belong to.
+  result = false
   var t = resolveType(g.prog, objTy)
   while t.kind == TagLit and t.typeKind == ObjectT:
     var oc = t
-    var base: Cursor
+    var base: Cursor = default(Cursor)
     var hasBase = false
     oc.into:
       base = oc
@@ -1275,9 +1275,9 @@ proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
     var elemOff = 0
     var isFirst = true
     while t.hasMore:
-      var val: Cursor
+      var val: Cursor = default(Cursor)
       var off = 0
-      var vt: Cursor
+      var vt: Cursor = default(Cursor)
       var header = false
       if rt.typeKind != ObjectT:
         val = t
@@ -1378,6 +1378,7 @@ proc calleeProctype(g: var WebGen; target: Cursor): Cursor =
   ## typenav's rule for a call's type is the callee proctype's return child;
   ## an unknown symbol would trip its `raiseAssert`, so the check that turns
   ## it into a refusal naming the symbol happens here instead.
+  result = default(Cursor)
   if target.kind == Symbol:
     let nm = target.symId
     if not g.p.symType.hasKey(nm) and lookupSym(typeCtx(g), nm).cat == scNone:
@@ -1392,6 +1393,7 @@ proc calleeResultType(g: var WebGen; target: Cursor): Cursor =
   ## The result type from a call TARGET cursor — the same child a call node
   ## opens with. `(onerr ACTION FN ARGS…)` reaches the call through here
   ## because its target is not the first child of the node itself.
+  result = default(Cursor)
   var pt = calleeProctype(g, target)
   if not pt.cursorIsNil:
     pt.into:                                   # (proctype NAME PARAMS RET PRAGMAS)
@@ -1529,7 +1531,7 @@ proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
   # callback) as JS values, NOT as fresh Nim copies — `genCallArgs` emits the
   # conversion instead of `genAggArg`. The plan must skip those reservations or
   # the two walks desynchronize.
-  var spliceBridges: seq[JsBridgeKind]
+  var spliceBridges: seq[JsBridgeKind] = default(seq[JsBridgeKind])
   if c.exprKind == CallC:
     var tg = sub(c)
     if tg.kind == Symbol:
@@ -2022,7 +2024,7 @@ proc genCalleeValue(g: var WebGen; target: Cursor) =
   if target.kind == Symbol:
     let nm = target.symId
     if g.p.locals.hasKey(nm):
-      let s = g.p.locals[nm]
+      let s = g.p.locals.getOrQuit(nm)
       case s.kind
       of lkReg: g.outp.symUse irName(g, nm)
       of lkSlot:
@@ -2078,8 +2080,8 @@ proc genIndirectCall(g: var WebGen; target: Cursor; t: var Cursor) =
     err g, (if target.kind == Symbol: "indirect call through unknown symbol " &
                                           g.spell(target.symId)
             else: "indirect call through a non-proctype value")
-  var retT: Cursor
-  var paramsT: Cursor
+  var retT: Cursor = default(Cursor)
+  var paramsT: Cursor = default(Cursor)
   pt.into:
     skip pt                                    # the name slot
     paramsT = pt
@@ -2389,7 +2391,7 @@ proc proctypeSig(g: var WebGen; pt: Cursor): (seq[Cursor], Cursor) =
   ## The parameter types and the return type of a `(proctype NAME PARAMS RET …)`.
   ## Read-only (`sub`): the cursors point into the caller's stable `decl` and are
   ## classified later, so nothing here may consume the tree.
-  var params: seq[Cursor]
+  var params: seq[Cursor] = default(seq[Cursor])
   var p = sub(pt)
   skip p                                     # NAME
   if p.kind == TagLit and p.typeKind == ParamsT:
@@ -2407,6 +2409,7 @@ proc operandProcSym(g: var WebGen; t: Cursor): SymId =
   ## The proc symbol a callback operand names: a bare proc Symbol, or one under
   ## `(addr …)`/`(haddr …)`. Empty when it is not a direct proc reference — a
   ## stored fn-ptr or a closure literal — which a bridged wrapper cannot target.
+  result = default(SymId)
   var c = t
   while c.kind == TagLit and c.exprKind in {AddrC, HaddrC}:
     inc c
@@ -2517,7 +2520,7 @@ proc genCallArgs(g: var WebGen; decl: Cursor; t: var Cursor; splice = false) =
         var w = wU32
         var agg = false
         var bk = jbNone
-        var ptq: Cursor                      # the proctype of a callback parameter
+        var ptq = default(Cursor)            # the proctype of a callback parameter
         q.into:
           inc q                              # name
           skip q                             # pragmas
@@ -2573,10 +2576,11 @@ proc declSignature(g: var WebGen; decl: Cursor): WebImport =
   ## The IR signature of a `(proc …)` decl: an aggregate parameter travels as
   ## its address, an aggregate result through a hidden first parameter whose
   ## address comes back as the result.
+  result = default(WebImport)
   var d = decl
   d.into:
     inc d                                      # name
-    var rt: Cursor
+    var rt = default(Cursor)
     var ps: seq[WidthCode] = @[]
     if d.kind == TagLit:
       var pc = d
@@ -2593,7 +2597,7 @@ proc declSignature(g: var WebGen; decl: Cursor): WebImport =
     rt = d
     result.ret = resultWidth(g, rt, result.hasRet)
     if result.hasRet and isAggType(g, rt): result.params.add wU32
-    result.params.add ps
+    for p in ps: result.params.add p
     while d.hasMore: skip d
 
 proc hostImport(g: var WebGen; sym: SymId; decl: Cursor): SymId =
@@ -2608,7 +2612,7 @@ proc hostImport(g: var WebGen; sym: SymId; decl: Cursor): SymId =
     parsePragmas(d, icName, ecName)
     while d.hasMore: skip d
   if icName.len == 0: icName = poolSym(g.lengPool, sym)
-  if g.importOf.hasKey(icName): return g.importOf[icName]
+  if g.importOf.hasKey(icName): return g.importOf.getOrQuit(icName)
   var imp = declSignature(g, decl)
   imp.name = icName
   if icName in [ImpWrite, ImpExit, GlobErrv, GlobOvf, MemcmpFunc]:
@@ -2626,7 +2630,7 @@ proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
   var indirect = true
   var nm = NoTypeSym
   var nmSym = SymId(0)
-  var ct: CallTarget
+  var ct: CallTarget = default(CallTarget)
   var known = false
   if t.kind == Symbol:
     nm = t.symId
@@ -2640,7 +2644,7 @@ proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
       if fnd and fd.stmtKind == ProcS:
         g.callTarget[nm] = foreignCallTarget(g.prog, nm)
     if g.callTarget.hasKey(nm):
-      ct = g.callTarget[nm]
+      ct = g.callTarget.getOrQuit(nm)
       known = true
     # a Symbol that is not a proc decl — a local, param or proc-typed
     # global holding a fn-ptr — dispatches through the table. arkham's
@@ -2771,7 +2775,7 @@ proc genVar(g: var WebGen; c: Cursor) =
   ## address-taken local has no local to point at: `planFrame` gave it a slot,
   ## and its initializer becomes a store into that slot.
   var nm = NoTypeSym
-  var initv: Cursor
+  var initv: Cursor = default(Cursor)
   var hasInit = false
   var t = c
   t.into:
@@ -2784,19 +2788,19 @@ proc genVar(g: var WebGen; c: Cursor) =
       hasInit = true
     while t.hasMore: skip t
   if not g.p.locals.hasKey(nm): err g, "internal: unplanned local `" & g.spell(nm) & "`"
-  let sl = g.p.locals[nm]
+  let sl = g.p.locals.getOrQuit(nm)
   case sl.kind
   of lkReg:
     # The binding came from the prologue; this statement only gives it its value.
     # With no initializer the hoisted zero already is the answer.
     if hasInit:
-      let w = widthOf(scalOf(g, g.p.symType[nm]))
+      let w = widthOf(scalOf(g, g.p.symType.getOrQuit(nm)))
       g.outp.tree ExprStmt:
         g.outp.tree Assign:
           g.outp.symUse irName(g, nm)
           g.genExprCoerced(initv, w)
   of lkSlot:
-    let ty = g.p.symType[nm]
+    let ty = g.p.symType.getOrQuit(nm)
     if isAggType(g, ty):
       if hasInit:
         if initv.kind == TagLit and initv.exprKind in {OconstrC, AconstrC}:
@@ -2823,7 +2827,7 @@ proc lvalueType(g: var WebGen; c: Cursor): Cursor =
   ## the node.
   if c.kind == Symbol:
     let nm = c.symId
-    if g.p.locals.hasKey(nm): result = g.p.symType[nm]
+    if g.p.locals.hasKey(nm): result = g.p.symType.getOrQuit(nm)
     else: result = declType(g, nm)
   elif c.kind == TagLit and c.exprKind == BaseobjC:
     var t = c
@@ -2839,11 +2843,11 @@ proc assignTo(g: var WebGen; dst, src: Cursor) =
   ## global, a field, an element, a `deref` — reduces to an address, and an
   ## aggregate moves as a copy between two of them.
   if dst.kind == Symbol and g.p.locals.hasKey(dst.symId) and
-      g.p.locals[dst.symId].kind == lkReg:
+      g.p.locals.getOrQuit(dst.symId).kind == lkReg:
     let nm = dst.symId
     g.outp.tree Assign:
       g.outp.symUse irName(g, nm)
-      g.genExprCoerced(src, widthOf(scalOf(g, g.p.symType[nm])))
+      g.genExprCoerced(src, widthOf(scalOf(g, g.p.symType.getOrQuit(nm))))
     return
   let ty = lvalueType(g, dst)
   if isAggType(g, ty):
@@ -2886,7 +2890,7 @@ proc storeTempTo(g: var WebGen; dst: Cursor; tmp: SymId; w: WidthCode) =
   ## half of `assignTo` for the case where the value is a `let`-bound temp
   ## rather than a cursor, so no coercion is needed.
   if dst.kind == Symbol and g.p.locals.hasKey(dst.symId) and
-      g.p.locals[dst.symId].kind == lkReg:
+      g.p.locals.getOrQuit(dst.symId).kind == lkReg:
     g.outp.tree Assign:
       g.outp.symUse irName(g, dst.symId)
       g.outp.symUse tmp
@@ -3028,8 +3032,8 @@ proc genKeepovf(g: var WebGen; c: Cursor) =
     skip t
     while t.hasMore: skip t
     var a = arith
-    var opKind: LengExpr
-    var typ, lhs, rhs: Cursor
+    var opKind: LengExpr = default(LengExpr)
+    var typ, lhs, rhs: Cursor = default(Cursor)
     a.into:
       opKind = arith.exprKind
       typ = a
@@ -3086,7 +3090,7 @@ proc leaveFrame(g: var WebGen) =
     g.outp.lit Leave
 
 proc genRet(g: var WebGen; c: Cursor) =
-  var src: Cursor
+  var src: Cursor = default(Cursor)
   var hasVal = false
   var t = c
   t.into:
@@ -3143,7 +3147,7 @@ proc caseRangeTest(g: var WebGen; w: WidthCode; scrutinee: SymId; r: Cursor) =
   ## One `BranchRange` — a value, or `(range LO HI)` — as a test on the bound
   ## scrutinee.
   if r.kind == TagLit and r.substructureKind == RangeU:
-    var lo, hi: Cursor
+    var lo, hi: Cursor = default(Cursor)
     var t = r
     t.into:
       lo = t
@@ -3176,7 +3180,7 @@ proc genCaseBranch(g: var WebGen; w: WidthCode; scrutinee: SymId;
   ## `switch` (or a wasm `br_table`) is the obvious spelling but the wrong one: its `break` would
   ## capture a `(break)` that belongs to an enclosing loop, and it cannot say
   ## `(range LO HI)` at all.
-  var rs: seq[Cursor]
+  var rs: seq[Cursor] = default(seq[Cursor])
   var t = branches[i][0]
   t.into:
     while t.hasMore:
@@ -3208,9 +3212,9 @@ proc genCaseBranch(g: var WebGen; w: WidthCode; scrutinee: SymId;
 proc genCase(g: var WebGen; c: Cursor) =
   ## `(case E (of (ranges BR+) STMTS)* (else STMTLIST)?)`. The discriminant is
   ## evaluated ONCE into a binding, because every branch tests it.
-  var branches: seq[(Cursor, Cursor)]
-  var elseBody: Cursor
-  var scrutinee: Cursor
+  var branches: seq[(Cursor, Cursor)] = @[]
+  var elseBody: Cursor = default(Cursor)
+  var scrutinee: Cursor = default(Cursor)
   var t = c
   t.into:
     scrutinee = t
@@ -3370,7 +3374,7 @@ proc genStmtList(g: var WebGen; c: Cursor) =
       if pl != SymId(0) and padJoin.hasKey(pl):
         # normal fallthrough skips the guarded body:
         g.outp.openTree Break
-        g.outp.symUse padJoin[pl]
+        g.outp.symUse padJoin.getOrQuit(pl)
         g.outp.closeTag
         # Descend into the guarded branch and emit its `(stmts …)` children
         # INLINE — not through genStmtList, whose own Block would sit between
@@ -3393,7 +3397,7 @@ proc genStmtList(g: var WebGen; c: Cursor) =
         # The `(lab L)` marker popped $L; $join closes right after the pad,
         # not at the end of the list — the siblings that follow must run on
         # the path the fallthrough break skips past the HANDLER only.
-        if g.p.labs.len == 0 or g.p.labs[^1] != padJoin[pl]:
+        if g.p.labs.len == 0 or g.p.labs[^1] != padJoin.getOrQuit(pl):
           err g, "landing pad body did not close its `$L` block"
         discard g.p.labs.pop()
         g.outp.closeTag
@@ -3550,6 +3554,7 @@ proc hasPragma(decl: Cursor; want: LengPragma): bool =
 proc procBody(decl: Cursor): Cursor =
   ## BODY of `(proc :name PARAMS RESULT PRAGMAS BODY)` — the last child, which
   ## is robust to wherever `parsePragmas` leaves its cursor.
+  result = default(Cursor)
   var d = decl
   d.into:
     while d.hasMore:
@@ -3605,14 +3610,14 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
                 locals: initTable[SymId, LocalSlot]())
   let body = procBody(decl)
   var importcN, exportcN = ""
-  var params: seq[(SymId, Cursor)]
+  var params: seq[(SymId, Cursor)] = @[]
   var t = decl
   t.into:
     inc t                                      # the name
     t.into:                                    # params
       while t.hasMore:
         var pname = NoTypeSym
-        var ptyp: Cursor
+        var ptyp: Cursor = default(Cursor)
         var q = t
         q.into:
           pname = q.symId
@@ -3636,7 +3641,7 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
   # An aggregate result is returned through a slot the caller reserves, so the
   # signature gains a hidden first parameter for it.
   g.p.sret = not g.p.retType.cursorIsNil and isAggType(g, g.p.retType)
-  var taken: HashSet[SymId]
+  var taken: HashSet[SymId] = default(HashSet[SymId])
   if body.kind == TagLit: markTaken(body, taken)
   planFrame(g, body, params, taken)
 
@@ -3655,7 +3660,7 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
     # A scalar parameter whose address is taken arrives in a local, which
     # nothing can point at: it is spilled into the slot `addr` answers with.
     for (pn, pt) in params:
-      let sl = g.p.locals[pn]
+      let sl = g.p.locals.getOrQuit(pn)
       if sl.kind == lkSlot:
         g.outp.tree ExprStmt:
           g.outp.tree HStore:
@@ -3677,7 +3682,7 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
   # inside it would be out of sight the moment the `break` lands.
   var locals: seq[(SymId, WidthCode)] = @[]
   for nm in g.p.regLocals:
-    locals.add (irName(g, nm), widthOf(scalOf(g, g.p.symType[nm])))
+    locals.add (irName(g, nm), widthOf(scalOf(g, g.p.symType.getOrQuit(nm))))
   for tv in g.p.temps: locals.add tv
   var hasRet = false
   let rw = resultWidth(g, g.p.retType, hasRet)
@@ -3768,7 +3773,7 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## both renderers need besides code (`module`).
   var g = createWebGen(buf, inputPath, tags, target, hostImports)
   layoutProgram(g)
-  var entryDecl: Cursor
+  var entryDecl: Cursor = default(Cursor)
   var haveEntry = false
   for pi in g.prog.procs:
     if pi.isEntry:
@@ -3780,12 +3785,14 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       break
   if not haveEntry: err g, "no entry proc (exportc \"main\") in " & inputPath
   g.top.openTree Top
-  ensureProc(g, g.entrySym, entryDecl)
+  let entrySym = g.entrySym            # a field of `g` cannot also be an
+  ensureProc(g, entrySym, entryDecl)   # argument of a call that mutates it
   # Every other exportc proc in the entry module is an external entry point: a
   # reachability root (so DCE keeps it) and an export the host calls. A
   # host-driven module (the sumi engine frame, the ward brain) exposes its
   # whole surface this way; without this rooting the procs are dead code.
   var exportRoots: seq[(SymId, string)] = @[]   # (decl symbol, C name)
+  var rootDecls: seq[(SymId, Cursor)] = @[]     # the same procs, with their decls
   for pi in g.prog.procs:
     if pi.isEntry: continue
     var nc = pi.decl
@@ -3802,7 +3809,11 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       while d.hasMore: skip d
     if exportcN.len > 0 and importcN.len == 0:
       exportRoots.add (sym, exportcN)
-      ensureProc(g, sym, pi.decl)
+      rootDecls.add (sym, pi.decl)
+  # `ensureProc` GROWS `g`, and the walk above reads `g.prog.procs` — so the
+  # roots are collected first and reached afterwards, never from inside it.
+  for (sym, decl) in rootDecls:
+    ensureProc(g, sym, decl)
   # Lowering and static serialization feed each other across module
   # boundaries: a body addresses a foreign global whose initializer names a
   # proc nobody has reached yet. Run both to the fixpoint.
@@ -3841,10 +3852,11 @@ proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     else:
       table.add ""
   let esig = declSignature(g, entryDecl)
+  let entryName = irName(g, entrySym)
   module = WebModule(imports: g.imports,
                      globals: @[(GlobErrv, wI32), (GlobOvf, wI32)],
                      dataSegs: g.dataSegs, memTop: g.memTop, table: table,
-                     entry: poolSym(g.irPool, irName(g, g.entrySym)),
+                     entry: poolSym(g.irPool, entryName),
                      entryParams: esig.params, entryHasRet: esig.hasRet,
                      entryRet: esig.ret, callbacks: g.callbacks)
   for (sym, cName) in exportRoots:

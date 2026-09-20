@@ -33,9 +33,11 @@
 ##   `nim_exit` — the exit code of the native program — unless the module is
 ##   a host-driven library.
 
-import std / [tables, strutils]
+import std / [tables, strutils, assertions]
 import nifcore
-import webnif, wasmenc
+import webnif, wasmenc, diag
+
+include compat2   # getOrQuit on host Nim
 
 const
   PageSize = 65536
@@ -72,13 +74,25 @@ type
     savedSp: int                   ## hidden local: SP on entry (-1: none yet)
     frameTmp: int                  ## hidden local: the new frame base
 
-  WasmRenderError* = object of CatchableError
-
 const SpGlobal = 0'u32
 
 proc err(r: WasmRender; msg: string) {.noreturn.} =
-  raise (ref WasmRenderError)(msg: "wasm: " & msg &
-    (if r.fname != SymId(0): " (in `" & poolSym(r.pool, r.fname) & "`)" else: ""))
+  ## The wasm renderer's half of the refusal channel — same contract as the
+  ## generator's, see `diag.refuse`.
+  refuse "wasm: " & msg &
+    (if r.fname != SymId(0): " (in `" & poolSym(r.pool, r.fname) & "`)" else: "")
+
+proc bigIntValue(digits: string): int64 =
+  ## A `(bigint …)` payload: decimal digits spanning the WHOLE u64 range, which
+  ## is why the IR carries them as text at all. Folded here rather than through
+  ## `strutils` — its `parseBiggestUInt` is host-Nim only and its
+  ## `parseBiggestInt` raises — and negated in u64 so `int64.low` survives the
+  ## round trip.
+  var mag = 0'u64
+  let neg = digits.startsWith("-")
+  for i in (if neg: 1 else: 0) ..< digits.len:
+    mag = mag * 10'u64 + uint64(ord(digits[i]) - ord('0'))
+  result = cast[int64](if neg: 0'u64 - mag else: mag)
 
 proc vtOf(w: WidthCode): VT =
   case w
@@ -114,9 +128,9 @@ proc firstWidth(c: Cursor): WidthCode = widthAt(c.sub())
 
 proc pairWidths(c: Cursor): (WidthCode, WidthCode) =
   var it = c.sub()
-  result[0] = widthAt(it)
+  let src = widthAt(it)
   skip it
-  result[1] = widthAt(it)
+  result = (src, widthAt(it))
 
 # ── emission helpers ────────────────────────────────────────────────────────
 
@@ -155,6 +169,7 @@ proc canon(r: var WasmRender; w: WidthCode) =
 
 proc sigOfTree(c: Cursor): FuncSig =
   ## `(sig RET W*)`.
+  result = default(FuncSig)
   var it = c.sub()
   result.ret = if it.kind == DotToken: vtVoid else: vtOf(widthAt(it))
   skip it
@@ -165,6 +180,7 @@ proc sigOfTree(c: Cursor): FuncSig =
 proc typeOf(r: WasmRender; c: Cursor): VT
 
 proc lastChild(c: Cursor): Cursor =
+  result = default(Cursor)
   var it = c.sub()
   while it.hasMore:
     result = it
@@ -179,8 +195,8 @@ proc typeOf(r: WasmRender; c: Cursor): VT =
   of FloatLit: return vtF64
   of Symbol, Ident:
     let n = nameOf(r, c)
-    if r.locals.hasKey(n): return r.locals[n][1]
-    if r.globals.hasKey(n): return r.globals[n][1]
+    if r.locals.hasKey(n): return r.locals.getOrQuit(n)[1]
+    if r.globals.hasKey(n): return r.globals.getOrQuit(n)[1]
     r.err "unknown name `" & r.spell(n) & "`"
   else: discard
   case webTagOf(c)
@@ -190,7 +206,7 @@ proc typeOf(r: WasmRender; c: Cursor): VT =
   of Call:
     let fn = nameOf(r, c.sub())
     if not r.sigs.hasKey(fn): r.err "call of unknown function `" & r.spell(fn) & "`"
-    r.sigs[fn].ret
+    r.sigs.getOrQuit(fn).ret
   of ICall: sigOfTree(c.sub()).ret
   of Assign: typeOf(r, c.sub())
   of Cond:
@@ -419,12 +435,12 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
   of Symbol, Ident:
     let n = nameOf(r, c)
     if r.locals.hasKey(n):
-      let (i, t) = r.locals[n]
+      let (i, t) = r.locals.getOrQuit(n)
       if want != vtVoid:
         r.localGet i
         adapt(r, t, want, c)
     elif r.globals.hasKey(n):
-      let (i, t) = r.globals[n]
+      let (i, t) = r.globals.getOrQuit(n)
       if want != vtVoid:
         r.op OpGlobalGet; r.u32 i
         adapt(r, t, want, c)
@@ -436,8 +452,7 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
   case tag
   of BigIntLit:
     let digits = strVal(c.sub())
-    let v = if digits.startsWith("-"): parseBiggestInt(digits)
-            else: cast[int64](parseBiggestUInt(digits))
+    let v = bigIntValue(digits)
     case want
     of vtVoid: discard
     of vtI64, vtAny: r.constI64 v
@@ -453,10 +468,10 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
     skip it
     if not r.funcIdx.hasKey(fn):
       r.err "call of unknown function `" & r.spell(fn) & "`"
-    let sig = r.sigs[fn]
+    let sig = r.sigs.getOrQuit(fn)
     genArgs(r, it, sig.params, "the call of `" & r.spell(fn) & "`")
     r.op OpCall
-    r.u32 r.funcIdx[fn]
+    r.u32 r.funcIdx.getOrQuit(fn)
     adapt(r, sig.ret, want, c)
   of ICall:
     var it = c.sub()
@@ -487,14 +502,14 @@ proc genExpr(r: var WasmRender; c: Cursor; want: VT) =
     let n = nameOf(r, it)
     skip it
     if r.locals.hasKey(n):
-      let (i, t) = r.locals[n]
+      let (i, t) = r.locals.getOrQuit(n)
       genExpr(r, it, t)
       if want == vtVoid: r.localSet i
       else:
         r.localTee i
         adapt(r, t, want, c)
     elif r.globals.hasKey(n):
-      let (i, t) = r.globals[n]
+      let (i, t) = r.globals.getOrQuit(n)
       genExpr(r, it, t)
       r.op OpGlobalSet; r.u32 i
       if want != vtVoid:
@@ -854,8 +869,11 @@ proc genFunc(r: var WasmRender; c: Cursor) =
   r.fname = SymId(0)
 
 proc sigTypes(sig: FuncSig): (seq[byte], seq[byte]) =
-  for p in sig.params: result[0].add valType(p)
-  if sig.ret != vtVoid: result[1].add valType(sig.ret)
+  var ps: seq[byte] = @[]
+  var rs: seq[byte] = @[]
+  for p in sig.params: ps.add valType(p)
+  if sig.ret != vtVoid: rs.add valType(sig.ret)
+  result = (ps, rs)
 
 proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
                  exportAll = false): seq[byte] =
@@ -880,7 +898,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
   while it.hasMore:
     if webTagOf(it) != Func: raiseAssert "wasmrender: `top` holds functions only"
     var name = SymId(0)
-    var sig: FuncSig
+    var sig = default(FuncSig)
     funcHeader(r, it, name, sig)
     let (ps, rs) = sigTypes(sig)
     r.funcIdx[name] = r.wm.addFunction(r.wm.addFuncType(ps, rs))
@@ -928,7 +946,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
     of vtF64: (sb.add OpF64Const; sb.addF64 0.0)
     else: (sb.add OpI32Const; sb.addI32 0)
   sb.add OpCall
-  sb.addU32 r.funcIdx[id m.entry]
+  sb.addU32 r.funcIdx.getOrQuit(id m.entry)
   if m.entryHasRet:
     if m.exports.len > 0:
       sb.add OpDrop
@@ -939,7 +957,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
       of vtF64: sb.add OpI32TruncF64S
       else: discard
       sb.add OpCall
-      sb.addU32 r.funcIdx[id m.imports[1].name]   # nim_exit
+      sb.addU32 r.funcIdx.getOrQuit(id m.imports[1].name)   # nim_exit
   r.wm.addCode(newSeq[(uint32, byte)](), sb.data)
   # the image
   for (a, s) in m.dataSegs:
@@ -953,7 +971,7 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
     var elems: seq[uint32] = @[]
     for slot in 1 ..< m.table.len:
       let f = m.table[slot]
-      elems.add(if f.len > 0 and r.funcIdx.hasKey(id f): r.funcIdx[id f]
+      elems.add(if f.len > 0 and r.funcIdx.hasKey(id f): r.funcIdx.getOrQuit(id f)
                 else: uint32(unbound))
     r.wm.addElem(1, elems)
   let pages = (stackTop + uint32(PageSize) - 1) div uint32(PageSize) + 1
@@ -963,8 +981,8 @@ proc renderWasm*(tree: var TokenBuf; m: WebModule; stackBytes: int;
   r.wm.addExportTable("table", 0)              # JS bridge: callbacks call back
                                                # into wasm via table.get(slot)
   for (cName, f) in m.exports:
-    r.wm.addExportFunc(cName, r.funcIdx[id f])
+    r.wm.addExportFunc(cName, r.funcIdx.getOrQuit(id f))
   if exportAll:
     for f in order:
-      r.wm.addExportFunc("dbg$" & r.spell(f), r.funcIdx[f])
+      r.wm.addExportFunc("dbg$" & r.spell(f), r.funcIdx.getOrQuit(f))
   result = encode(r.wm)

@@ -35,6 +35,7 @@
 ## wasm renderer refuses them by name; the code generator does not produce them
 ## for a wasm build.
 
+import std / [assertions]
 import nifcore
 
 type
@@ -138,7 +139,7 @@ template webTagOf*(c: Cursor): WebTag =
     NoTag
   else:
     let id = uint32(c.cursorTagId)
-    doAssert id >= 1'u32 and id <= uint32(WebTag.high) + 1'u32,
+    assert id >= 1'u32 and id <= uint32(WebTag.high) + 1'u32,
       "webTagOf: foreign tag id " & $id
     cast[WebTag](id - 1'u32)
 
@@ -158,7 +159,7 @@ proc isSigned*(w: WidthCode): bool {.inline.} = w in {wI8, wI16, wI32, wI64}
 # these, never `openTag`/`addIntLit` directly, so the grammar lives in one file.
 
 proc openTree*(b: var TokenBuf; t: WebTag) {.inline.} =
-  doAssert t != NoTag, "openTree: NoTag is a sentinel, not a tag"
+  assert t != NoTag, "openTree: NoTag is a sentinel, not a tag"
   b.openTag tagOf(t)
 
 template tree*(b: var TokenBuf; t: WebTag; body: untyped) =
@@ -187,7 +188,7 @@ proc bigIntLit*(b: var TokenBuf; digits: string) {.inline.} =
 proc ident*(b: var TokenBuf; name: string) {.inline.} = b.addIdent name
 proc lit*(b: var TokenBuf; t: WebTag) {.inline.} =
   ## Nullary literal tags.
-  doAssert t in {TrueLit, FalseLit, NanLit, InfLit, MemSize, Unreachable, Leave},
+  assert t in {TrueLit, FalseLit, NanLit, InfLit, MemSize, Unreachable, Leave},
     "lit: not a nullary tag"
   b.openTree t
   b.closeTag

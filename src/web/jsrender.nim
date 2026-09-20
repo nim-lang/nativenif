@@ -30,7 +30,7 @@
 ## expressions as well as statements: an `arrow` body is a statement list
 ## inside an expression and must line up with the statement that holds it.
 
-import std / [strutils, base64]
+import std / [strutils, base64, assertions]
 import nifcore
 import webnif
 
@@ -67,6 +67,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   ##
   ## The blocks below are TRIPLE-QUOTED: what is written is what is emitted, so
   ## a `\n` here is the JavaScript escape and not a line break in this file.
+  result = ""
   # The target face: node writes to fds through `fs`; a browser has neither
   # `fs` nor a synchronous fd, so stdout/stderr land on `console.log`/
   # `console.error` one line at a time (devtools shows engine output live,
@@ -399,12 +400,12 @@ proc escapeJsString*(s: string): string =
     else:
       if uint8(c) < 0x20:
         # a raw control byte in a JS literal is a syntax error or a trap
-        result.add "\\x" & toHex(uint32(uint8(c)), 2)
+        result.add "\\x" & toHex(int64(uint8(c)), 2)
         inc i
         continue
       let n = validUtf8At(s, i)
       if n == 0:
-        result.add "\\x" & toHex(uint32(uint8(c)), 2)
+        result.add "\\x" & toHex(int64(uint8(c)), 2)
         inc i
       elif c == '\xE2' and n == 3 and s[i + 2] in ['\xA8', '\xA9']:
         result.add "\\u202" & (if s[i + 2] == '\xA8': '8' else: '9')
@@ -533,7 +534,7 @@ proc spliceTemplate(name, tpl: string; args: openArray[string]): string =
       inc i
       continue
     if ch == '#':
-      doAssert consumed < args.len, "importjs: more # than arguments"
+      assert consumed < args.len, "importjs: more # than arguments"
       result.add args[consumed]
       inc consumed
       inc i
@@ -555,13 +556,14 @@ proc pairWidths(c: Cursor): (WidthCode, WidthCode) =
   var it = c.firstChild
   if it.kind != IntLit:
     raiseAssert "jsrender: `" & $webTagOf(c) & "` carries no width children"
-  result[0] = WidthCode(it.intVal)
+  let src = WidthCode(it.intVal)
   skip it
   if it.kind != IntLit:
     raiseAssert "jsrender: `" & $webTagOf(c) & "` has no destination width"
-  result[1] = WidthCode(it.intVal)
+  result = (src, WidthCode(it.intVal))
 
 proc operandTexts(c: Cursor; indent: int; w: out WidthCode): seq[string] =
+  result = @[]
   var it = c.firstChild
   w = opWidth(c)
   skip it
@@ -603,7 +605,7 @@ proc exprText(c: Cursor; indent: int): string =
       fn = "(" & fn & ")"                        # an immediately-invoked arrow
                                                  # needs grouping: `(() => {…})(…)`
     skip it
-    var args: seq[string]
+    var args: seq[string] = @[]
     while it.hasMore:
       args.add exprText(it, indent)
       skip it
@@ -629,12 +631,12 @@ proc exprText(c: Cursor; indent: int): string =
     # The comma operator: every part runs, the last one is the value. An
     # aggregate is a LOCATION, so a constructor compiles to a run of stores
     # whose value is the address they were written through.
-    var parts: seq[string]
+    var parts: seq[string] = @[]
     var it = c.firstChild
     while it.hasMore:
       parts.add exprText(it, indent)
       skip it
-    doAssert parts.len > 0, "jsrender: empty seq"
+    assert parts.len > 0, "jsrender: empty seq"
     result = "(" & parts.join(", ") & ")"
   of ICall:
     # (icall SIG TARGET ARG*) — the function-table slot; JS does not check
@@ -643,13 +645,13 @@ proc exprText(c: Cursor; indent: int): string =
     skip it                                      # the signature
     let fn = exprText(it, indent)
     skip it
-    var args: seq[string]
+    var args: seq[string] = @[]
     while it.hasMore:
       args.add exprText(it, indent)
       skip it
     result = "FTAB[" & fn & "](" & args.join(", ") & ")"
   of MemCopy, MemFill, MemGrow, Frame:
-    var args: seq[string]
+    var args: seq[string] = @[]
     var it = c.firstChild
     while it.hasMore:
       args.add exprText(it, indent)
@@ -673,7 +675,7 @@ proc exprText(c: Cursor; indent: int): string =
     result = base & (if w.isBig: "64(" else: "32(") & exprText(it, indent) & ")"
   of Arrow:
     var it = c.firstChild
-    var ps: seq[string]
+    var ps: seq[string] = @[]
     if webTagOf(it) == Params:
       var pit = it.firstChild
       while pit.hasMore:
@@ -777,7 +779,7 @@ proc exprText(c: Cursor; indent: int): string =
     skip it
     let tpl = strVal(it)
     skip it
-    var args: seq[string]
+    var args: seq[string] = @[]
     while it.hasMore:
       args.add exprText(it, indent)
       skip it
@@ -794,9 +796,9 @@ proc exprText(c: Cursor; indent: int): string =
     # arity is verified once here so every branch below stays a single
     # expression — the width-wrap template must compose, not statement.
     if webTagOf(c) in {Not, Neg, BNot}:
-      doAssert ops.len == 1, "jsrender: unary op with " & $ops.len & " operands"
+      assert ops.len == 1, "jsrender: unary op with " & $ops.len & " operands"
     else:
-      doAssert ops.len == 2, "jsrender: binary op with " & $ops.len & " operands"
+      assert ops.len == 2, "jsrender: binary op with " & $ops.len & " operands"
     template wrap(s: string): string = wrapNarrow(s, w)
     template bin(op: string): string = wrap("(" & ops[0] & op & ops[1] & ")")
     template cmp(op: string): string =
@@ -987,8 +989,9 @@ proc stmtText*(c: Cursor; indent: int): string =
 proc genJs*(buf: var TokenBuf): string =
   ## Render a whole program: the buffer's root must be a `top` tree. The
   ## preamble is NOT included — the CLI prepends it once per file.
+  result = ""
   var c = beginRead(buf)
-  doAssert webTagOf(c) == Top, "jsrender: genJs expects a `top` root, got " & $webTagOf(c)
+  assert webTagOf(c) == Top, "jsrender: genJs expects a `top` root, got " & $webTagOf(c)
   var it = c.sub()
   while it.hasMore:
     result.add stmtText(it, 0) & '\n'
