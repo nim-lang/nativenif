@@ -495,9 +495,10 @@ type
                              ## identity a `Symbol` token already carries, so nothing
                              ## materialises a string to compare or store one (the
                              ## reasoning `noReturnProcs` spells out; the input buffers
-                             ## share one pool, so ids are comparable). Text is minted
-                             ## only at the two boundaries that need it: the name-keyed
-                             ## layout API (`lookupType`) and the asm buffer's own pool.
+                             ## share one pool, so ids are comparable, and so does
+                             ## the asm buffer — emitting one is a token, not a
+                             ## spelling). Text is minted only where the name-keyed
+                             ## layout API (`lookupType`) asks for it.
                              ## Not `aggrType`: `Field` owns that name, and a variant's
                              ## branches share one field namespace.
     of Mem: cur*: Cursor

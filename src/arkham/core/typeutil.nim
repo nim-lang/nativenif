@@ -155,18 +155,14 @@ proc aggrByRef*(g: var CodeGen; typeSym: SymId): bool {.inline.} =
   aggrByteSize(g.prog, typeSym) > g.md.aggrByRefThreshold
 
 proc emTypeSym*(g: var CodeGen; id: SymId) {.inline.} =
-  ## Emit the nominal type `id` as an asm-NIF symbol — THE boundary where a pool id
-  ## becomes text, and now the only one. The asm buffer gets its own pool
-  ## (`initAsmBuf` calls `createTokenBuf` with no `sharedPool`), so an INPUT-pool id
-  ## is meaningless there and the name has to cross as characters; `addSymUse`
-  ## re-interns it on the far side.
+  ## Emit the nominal type `id` as an asm-NIF symbol. The asm buffer shares the
+  ## input's literals pool (`initAsmBuf`), so the id IS the name there and this
+  ## is one token, not a spelling built and re-interned.
   ##
-  ## Everything upstream of this call is keyed by the id: `lookupType` and the
-  ## layout API over it, `varType`, `Location.StackPtr.pointeeType` /
-  ## `Location.Field.aggrType`, `retAggrSym`. `symString` builds the spelling
-  ## from the pool's taken-apart form (nimony#2457), so this is the one place
-  ## that pays for it.
-  g.ab.sym symString(g.prog.pool, id)
+  ## Everything upstream of this call is keyed by the id too: `lookupType` and
+  ## the layout API over it, `varType`, `Location.StackPtr.pointeeType` /
+  ## `Location.Field.aggrType`, `retAggrSym`.
+  g.ab.sym id
 
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng

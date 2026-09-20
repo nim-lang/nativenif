@@ -596,7 +596,7 @@ const FullSigAggrByRefThreshold = 16
 
 proc spelling*(p: Program; sym: SymId): string {.inline.} =
   ## The TEXT of a symbol, built from the pool record. Call it where text is what
-  ## is wanted — a diagnostic, a name for the asm buffer's own pool — and nowhere
+  ## is wanted — a diagnostic, a name that is built out of one — and nowhere
   ## else: identity is the id (`SymId`), and comparing spellings is the habit this
   ## backend moved away from.
   symString(p.pool, sym)
