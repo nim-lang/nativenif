@@ -503,6 +503,48 @@ proc arkhamWinTvarFieldTests() =
          " (want 41 = tv.data survived the block walk and derefed)"
   echo "1 / 1 arkham win64 thread-local field tests successful"
 
+proc arkhamWinCrtTests() =
+  ## win_x64 linked with the C runtime: `arkham --crt`, `nifasm --emit-obj` (a COFF
+  ## object), then MinGW's gcc as the system linker — the Windows twin of Linux's
+  ## `nimony n -d:useLibc`.
+  ##
+  ## `tests/win_crt.c.nif` calls libc with NO `dynlib` (a direct call the linker
+  ## binds through msvcrt's import library, `snprintf` variadic with a double),
+  ## reads argc/argv as the crt passes them to `main` (the Win64 → arkham stub),
+  ## and writes a thread-local that lives in the crt's TLS template. It returns
+  ## 1|2 (snprintf's length and text) | 4 (argc) | 8 (argv[0]) + 16 (the tvar) = 31.
+  ## `win_tls` is linked the same way: its two threads are what checks the tvar
+  ## offset is right on every thread, not just the one that ran `main`.
+  let gcc = when defined(windows): findExe("gcc") else: findExe("x86_64-w64-mingw32-gcc")
+  if gcc.len == 0:
+    echo "0 / 0 arkham win64 crt tests (no MinGW gcc)"
+    return
+  when not defined(windows):
+    if findExe("wine").len == 0:
+      echo "0 / 0 arkham win64 crt tests (wine not installed)"
+      return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  var total, passed = 0
+  for (name, want) in [("win_crt", 31), ("win_tls", 7), ("win_tvar_field", 41)]:
+    inc total
+    let asmNif = workDir / (name & ".crt.asm.nif")
+    let obj = workDir / (name & ".crt.o")
+    let exe = workDir / (name & ".crt.exe")
+    exec quoteShell(arkham) & " -a:win_x64 --crt -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / (name & ".c.nif"))
+    exec quoteShell(nifasm) & " --emit-obj -o:" & quoteShell(obj) & " " & quoteShell(asmNif)
+    exec quoteShell(gcc) & " -o " & quoteShell(exe) & " " & quoteShell(obj)
+    let (_, code) = when defined(windows): runProgram(exe)
+                    else: runProgram(findExe("wine"), [exe])
+    if code != want:
+      quit "FAILURE arkham win64 crt " & name & ": exit code " & $code & " (want " &
+           $want & ")"
+    inc passed
+  echo passed, " / ", total, " arkham win64 crt tests successful"
+
 proc buildToolchain() =
   ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
   ##
@@ -2613,6 +2655,8 @@ when defined(linux):
   arkhamWinTlsTests()
   arkhamWinTvarFieldTests()
   arkhamWinAbiTests()
+when defined(linux) or defined(windows):
+  arkhamWinCrtTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

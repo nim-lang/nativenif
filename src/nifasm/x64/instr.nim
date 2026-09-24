@@ -1740,6 +1740,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
           # the offset folds into the lea displacement — no pointer arithmetic.
           displacement = int32(offsetSym.offset)
           tlsRel = ctx.tlsRelocated(offsetSym)
+          if ctx.winTlsDelta(offsetSym):
+            # A COFF object's thread-locals are one `.tls$` contribution to the
+            # crt's template, at an offset only the linker knows. SECREL would say
+            # it, but GNU ld gives a SECREL in code a base relocation, which ASLR
+            # then applies. So the `main` stub stores the offset in a `.data` cell
+            # (`setupWinCrtMain`), added here: `dest = base + delta + tvar.offset`.
+            if baseReg != dest:
+              x86.emitMov(ctx.buf.data, dest, baseReg)
+              baseReg = dest
+            let pos = x86.emitAddRipPlaceholder(ctx.buf, dest)
+            ctx.gvarSites.add (pos, ctx.winTlsDeltaSym)
         elif offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
           displacement = int32(offsetSym.offset)
         else:

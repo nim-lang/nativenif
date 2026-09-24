@@ -138,9 +138,10 @@ type
     buf*: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf*: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch*: Arch
-    emitObj*: bool       # `--emit-obj`: write a relocatable MH_OBJECT for the system
-                        # linker (foreign `.o`/framework linking) instead of a
-                        # standalone executable. Mach-O / arm64 only for now.
+    emitObj*: bool       # `--emit-obj`: write a relocatable object for the system
+                        # linker (foreign `.o`/framework/libc linking) instead of a
+                        # standalone executable: Mach-O (macOS arm64), ELF (Linux
+                        # x86-64), COFF (Windows x86-64).
     symMap*: bool        # `--symmap`: dump each generated proc's vaddr to stderr
     listing*: bool       # `--listing:FILE`: record one row per asm-NIF instruction node
     listingPath*: string # where to write it
@@ -341,7 +342,18 @@ type
     winEntryOffset*: int          # .text offset of the synthesized PE entry stub, or -1
                                  # (see setupWinEntry — the Windows counterpart of the
                                  # FS-setup prologue: it supplies `main`'s arguments,
-                                 # which the OS does not put anywhere it can find them)
+                                 # which the OS does not put anywhere it can find them).
+                                 # In a COFF object it is the global `main` the crt
+                                 # calls instead (see `setupWinCrtMain`).
+    winCrtMainEnd*: int           # COFF object only: one past the `main` stub's last byte
+    winCrtMainUnwind*: seq[byte]  # COFF object only: the stub's `UNWIND_INFO`. It saves
+                                  # xmm6–15, which `ProcUnwind` does not model.
+    winTlsDeltaSym*: Symbol       # COFF object only: the `.data` cell holding the offset
+                                  # of the program's `.tls$` in the crt's TLS template
+                                  # (`&.tls$ - &_tls_start`), which the stub `main`
+                                  # stores and every thread-local address adds
+    winTlsSites*: (int, int)      # COFF object only: the stub's two `lea` placeholders,
+                                  # of `.tls$` and of `_tls_start`; (-1, -1) if none
     # A gvar with a compile-time constant scalar initializer is laid out as static
     # data: arkham emits its bits as the gvar value, and these are written into the
     # (writable) `.bss` image on disk so the slot starts with that value (correct in
@@ -444,8 +456,16 @@ proc tlsRelocated*(ctx: GenContext; sym: Symbol): bool =
   ## and the program's thread-locals are one module of ITS static TLS block. The
   ## self-pointer slot is the exception: `fs:[0]` is the psABI's TCB pointer, which
   ## holds the thread pointer under libc exactly as it does in nifasm's own block.
+  ## (Windows: see `winTlsDelta`.)
   ctx.emitObj and ctx.arch == Arch.X64 and sym != ctx.tlsSelfSym and
     not sym.gsFixedSlot
+
+proc winTlsDelta*(ctx: GenContext; sym: Symbol): bool =
+  ## Whether a win_x64 thread-local's address needs the `.tls$` delta added: in a
+  ## COFF object the crt owns the TLS template, and the program's thread-locals
+  ## are one `.tls$` contribution to it, at an offset the stub `main` computes
+  ## (`winTlsDeltaSym`). The TEB field (`gsFixedSlot`) is a fixed GS displacement.
+  ctx.emitObj and ctx.arch == Arch.WinX64 and not sym.gsFixedSlot
 
 proc inCall*(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
@@ -489,6 +509,7 @@ proc newGenContext*(mainPool: Pool; baseDir, thisModule: string;
     dedupTable: initTable[SymId, SymId](),
     entryStubOffset: -1,
     winEntryOffset: -1,
+    winTlsSites: (-1, -1),
     symMap: symMap,
     listing: listing.len > 0,
     listingPath: listing,

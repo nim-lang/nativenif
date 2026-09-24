@@ -135,8 +135,11 @@ type
                                             ## CALLED by crt's `_start` as `main` and returns
                                             ## its status; every `importc` binds to libc,
                                             ## whose semantics (`-1` + `errno`) the stdlib
-                                            ## then expects, as on the C backend
-    windows*: bool                          ## PE/Win64 target: every `importc` binds through
+                                            ## then expects, as on the C backend.
+                                            ## Windows: nifasm's `main` stub adapts the crt's
+                                            ## Win64 call, and an `importc` without `dynlib`
+                                            ## is legal, bound by the linker
+    windows*: bool                         ## PE/Win64 target: every `importc` binds through
                                             ## the import table (no Linux syscalls), and the
                                             ## image is single-threaded, so a Nim thread-local
                                             ## is collected as an ordinary `.bss` global —
@@ -882,9 +885,11 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # module-LOCAL and leave it out of the `.index` — unresolvable when this
           # module is a foreign module of a bundle. See `extprocAsmName`.
           let asmN = result.lengSym(extprocAsmName(importcN, thisModuleSuffix(result)))
-          if windows and dllN.len == 0:
+          if windows and dllN.len == 0 and not crtEntry:
             # No implicit import library: a Windows extern must NAME its dll
             # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
+            # Linked with the crt it need not: the system linker binds it (libc
+            # through the crt's import libraries, or a foreign object).
             quit "arkham: the Windows extern `" & importcN &
               "` names no import library; annotate the declaration with " &
               "`dynlib` (e.g. `dynlib: \"kernel32\"`)"

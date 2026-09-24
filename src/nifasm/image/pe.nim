@@ -318,7 +318,7 @@ const
   UWOP_ALLOC_LARGE = 1'u8
   UWOP_ALLOC_SMALL = 2'u8
 
-proc unwindInfoFor(p: ProcUnwind): seq[byte] =
+proc unwindInfoFor*(p: ProcUnwind): seq[byte] =
   ## One `UNWIND_INFO` for `p`, or an empty seq when the proc is a LEAF — no
   ## pushes, no frame — which needs no entry at all: the OS then assumes the
   ## return address is at `[rsp]`, which for such a proc is exactly true.

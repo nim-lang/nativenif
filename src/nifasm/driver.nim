@@ -29,7 +29,7 @@ import x64/encoder as x86
 import arm64/encoder as arm64
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
-import image / [writecommon, writeelf, writeelfobj, writemacho, writepe, writecortexm, writeavr, writerv32]
+import image / [writecommon, writeelf, writeelfobj, writecoffobj, writemacho, writepe, writecortexm, writeavr, writerv32]
 import pass1, pass2
 
 include compat2   # getOrQuit on host Nim
@@ -236,6 +236,83 @@ proc setupWinEntry(ctx: var GenContext) =
   x86.emitMovImmToReg(ctx.buf.data, x86.RDX, 0)             # envp = nil
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
+proc setupWinCrtMain(ctx: var GenContext) =
+  ## The COFF object's `main`: the crt's `mainCRTStartup` calls it as a C function,
+  ## i.e. with the Win64 convention: argc/argv/envp in rcx/rdx/r8, and rdi, rsi and
+  ## xmm6–15 preserved. arkham's `main.0` has the internal convention (SysV
+  ## registers, all xmm volatile), so the stub is an adapter: save what Win64 says
+  ## the callee keeps, move the arguments over, CALL the entry, restore, return its
+  ## status (eax, untouched). The stub is the Windows counterpart of Linux's `main`
+  ## being `main.0` itself, which the SysV crt can call directly.
+  ##
+  ## Its prologue saves xmm registers, which `ProcUnwind` has no step for, so the
+  ## stub's `UNWIND_INFO` is built here, next to the bytes it describes.
+  const
+    UwopPushNonvol = 0'u8
+    UwopAllocLarge = 1'u8
+    UwopSaveXmm128 = 8'u8
+    XmmArea = 10 * 16
+    Alloc = XmmArea + 8          # entry rsp ≡ 8 (mod 16), two pushes keep it so,
+                                 # `+ 8` makes the save area and the call aligned
+  if ctx.arch != Arch.WinX64 or ctx.entrySym == nil: return
+  let start = ctx.buf.data.len
+  ctx.winEntryOffset = start
+  x86.emitPush(ctx.buf.data, x86.RSI)
+  let afterRsi = ctx.buf.data.len - start
+  x86.emitPush(ctx.buf.data, x86.RDI)
+  let afterRdi = ctx.buf.data.len - start
+  x86.emitSubImm(ctx.buf.data, x86.RSP, Alloc)
+  let afterAlloc = ctx.buf.data.len - start
+  var afterXmm: array[10, int]
+  for i in 0 ..< 10:
+    x86.emitMovdquStore(ctx.buf.data,
+                        x86.MemoryOperand(base: x86.RSP, displacement: int32(16 * i)),
+                        x86.XmmRegister(6 + i))
+    afterXmm[i] = ctx.buf.data.len - start
+  if ctx.tlsOffset > 0 and ctx.winTlsDeltaSym != nil:
+    # Where the program's `.tls$` sits in the crt's template, for every thread-local
+    # address to add (see `winTlsDelta`): both addresses are RIP-relative, so no
+    # base relocation is involved and ASLR cannot skew it. Nothing of the program
+    # runs before this — its threads are started from `main.0`.
+    ctx.bssOffset = (ctx.bssOffset + 7) and not 7
+    ctx.winTlsDeltaSym.size = ctx.bssOffset
+    ctx.bssOffset += 8
+    let tlsPos = x86.emitLeaRipPlaceholder(ctx.buf, x86.R10)   # r10 = &.tls$
+    let startPos = x86.emitLeaRipPlaceholder(ctx.buf, x86.R11) # r11 = &_tls_start
+    ctx.winTlsSites = (tlsPos, startPos)
+    x86.emitSub(ctx.buf.data, x86.R10, x86.R11)
+    let pos = x86.emitMovRipPlaceholder(ctx.buf, x86.R10, 64, signed = false,
+                                        isLoad = false)
+    ctx.gvarSites.add (pos, ctx.winTlsDeltaSym)
+  x86.emitMov(ctx.buf.data, x86.RDI, x86.RCX)              # argc
+  x86.emitMov(ctx.buf.data, x86.RSI, x86.RDX)              # argv
+  x86.emitMov(ctx.buf.data, x86.RDX, x86.R8)               # envp
+  x86.emitCall(ctx.buf, LabelId(ctx.entrySym.offset))      # eax = main.0(argc, argv, envp)
+  for i in 0 ..< 10:
+    x86.emitMovdquLoad(ctx.buf.data, x86.XmmRegister(6 + i),
+                       x86.MemoryOperand(base: x86.RSP, displacement: int32(16 * i)))
+  x86.emitAddImm(ctx.buf.data, x86.RSP, Alloc)             # the epilogue proper: the
+  x86.emitPop(ctx.buf.data, x86.RDI)                       # unwinder recognizes exactly
+  x86.emitPop(ctx.buf.data, x86.RSI)                       # `add rsp; pop…; ret`
+  x86.emitRet(ctx.buf.data)
+  ctx.winCrtMainEnd = ctx.buf.data.len
+  # UNWIND_INFO, codes in DESCENDING prologue offset (the unwinder undoes the
+  # prologue backwards from the faulting PC).
+  var codes: seq[byte] = @[]
+  for i in countdown(9, 0):
+    codes.add byte(afterXmm[i])
+    codes.add UwopSaveXmm128 or byte((6 + i) shl 4)
+    codes.add byte(i); codes.add 0'u8                      # offset / 16, as a u16
+  codes.add byte(afterAlloc)
+  codes.add UwopAllocLarge                                 # OpInfo 0: size / 8 as a u16
+  codes.add byte(Alloc div 8); codes.add 0'u8
+  codes.add byte(afterRdi); codes.add UwopPushNonvol or byte(int(x86.RDI) shl 4)
+  codes.add byte(afterRsi); codes.add UwopPushNonvol or byte(int(x86.RSI) shl 4)
+  ctx.winCrtMainUnwind = @[1'u8, byte(afterXmm[9]), byte(codes.len div 2), 0'u8]
+  ctx.winCrtMainUnwind.add codes
+  if (codes.len div 2) mod 2 != 0:                         # the array is DWORD-aligned
+    ctx.winCrtMainUnwind.add 0'u8; ctx.winCrtMainUnwind.add 0'u8
+
 proc setupLinuxA64Entry(ctx: var GenContext) =
   ## Synthesize the AArch64/Linux entry stub — the counterpart of `setupTls`'s
   ## argc/argv tail on x86-64.
@@ -428,6 +505,10 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                               size: -1, offset: -1)
   scope.define(ctx.winTlsIndexSym)
   ctx.generatedSymbols.incl ctx.symIdOf(TlsIndexSymbol)
+  # A COFF object's `.tls$` offset cell (`winTlsDelta`). No asm-NIF names it, so
+  # it is not in scope; `setupWinCrtMain` gives it its slot.
+  ctx.winTlsDeltaSym = Symbol(name: ctx.symIdOf("arkham.tlsdelta.0"), kind: skGvar,
+                              typ: Type(kind: UIntT, bits: 64), size: -1, offset: -1)
 
   let mainModule = ctx.modules.getOrQuit(MainModuleName)   # a ref: its `buf` is not `ctx`'s
   var n1 = beginRead(mainModule.buf)
@@ -480,8 +561,12 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
     # libc, not nifasm, points the thread pointer at the static TLS block.
     setupTls(ctx)
     setupLinuxA64Entry(ctx)
-  setupTlsWin(ctx)
-  setupWinEntry(ctx)
+    # Nor a TLS directory or a PE entry: on Windows the crt owns both (`_tls_used`,
+    # `_tls_index`; `mainCRTStartup`), and the object supplies a `main` for it.
+    setupTlsWin(ctx)
+    setupWinEntry(ctx)
+  else:
+    setupWinCrtMain(ctx)
 
   if ctx.emitObj:
     # Relocatable object for the system linker (foreign `.o` / framework linking).
@@ -494,8 +579,14 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
         writeElfObject(ctx, outfile)
       except:
         quit "nifasm: cannot write " & outfile
+    of Arch.WinX64:
+      try:
+        writeCoffObject(ctx, outfile)
+      except:
+        quit "nifasm: cannot write " & outfile
     else:
-      quit "nifasm: --emit-obj is only supported for macOS arm64 and x86-64 Linux"
+      quit "nifasm: --emit-obj is only supported for macOS arm64 and x86-64 " &
+           "Linux and Windows"
   else:
     # A memory map describes a BOARD, and only the firmware target has one. Every
     # other arch is handed its address space by a loader, so honouring the flags
