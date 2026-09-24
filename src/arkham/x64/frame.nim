@@ -211,6 +211,29 @@ proc emitWinExtprocDecl*(g: var CodeGen; asmName: SymId; extName, dll: string; d
 proc emitWinExtproc*(g: var CodeGen; ex: Extern) =
   g.emitWinExtprocDecl(ex.asmName, ex.extName, ex.dll, ex.decl)
 
+proc emitSysvExtprocDecl*(g: var CodeGen; asmName: SymId; extName: string; decl: Cursor;
+                          tail: openArray[AsmSlot] = []) =
+  ## Emit a Linux extern's declaration: `(extproc :<name>.c.<mod> "<name>"
+  ## (params …) (result …)? (clobber …))`. No library: the symbol comes from a
+  ## foreign object (`{.compile.}`/`{.link.}`) or libc, which the SYSTEM linker
+  ## resolves — nifasm writes a relocatable object for it (`--emit-obj`). The
+  ## signature is arkham's own SysV one, the convention a C compiler uses too,
+  ## so the call site is checked like a call to any proc in the image.
+  ## A `{.varargs.}` extern is declared once per call SHAPE, `tail` being the
+  ## variadic arguments of that shape (see `variadicTarget`).
+  var c = decl
+  c.into:
+    inc c                                        # name
+    g.ab.tree ExtprocD:
+      g.ab.symDef asmName
+      g.ab.str extName
+      let paramRegs = g.emitParamsAndResult(c, byRef = false, x64Machine, tail)
+      g.emitAbiClobber(paramRegs)
+    while c.hasMore: skip c                       # drain the importc decl's pragmas + body
+
+proc emitSysvExtproc*(g: var CodeGen; ex: Extern) =
+  g.emitSysvExtprocDecl(ex.asmName, ex.extName, ex.decl)
+
 
 proc genType*(g: var CodeGen; name: SymId; decl: Cursor) =
   ## `(type :name <body>)` — nifasm's stack-slot allocator consults it for field
@@ -461,11 +484,12 @@ proc computeFrameX64*(g: var CodeGen; isEntry, hasCall: bool) =
   # rsp ≡ 8 (the caller's pushed return address). The Linux ENTRY is the exception —
   # the kernel jumps to it with rsp ≡ 0 and no return address; the Windows entry is
   # not: ntdll's thread-start thunk `call`s it, so it is biased like any other callee.
+  # Neither is a Linux entry that crt's `_start` calls as `main` (`crtEntry`).
   # Each saved reg is 8 bytes, so after the pushes the parity may be wrong — pad with
   # an extra 8 when this proc itself makes a call.
   g.framePad = 0
   if hasCall:
-    let entryBias = if isEntry and not g.prog.windows: 0 else: 8
+    let entryBias = if isEntry and not g.prog.entryReturns: 0 else: 8
     if (entryBias + 8 * g.frameRegs.len) mod 16 != 0: g.framePad = 8
   g.hasFrame = g.frameRegs.len > 0 or g.framePad > 0
 
@@ -713,7 +737,7 @@ proc emProcessExit*(g: var CodeGen; code: Location) =
   ## proc and the thunk exits the thread with the returned status — the entry
   ## is not special-cased there at all. (nimony's synthesized `main` never
   ## reaches either path: it terminates through a declared call to `cExit`.)
-  assert not g.prog.windows, "arkham x64: emProcessExit on a win_x64 target"
+  assert not g.prog.entryReturns, "arkham x64: emProcessExit on an entry that returns"
   g.place(code, RDI)
   g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
 

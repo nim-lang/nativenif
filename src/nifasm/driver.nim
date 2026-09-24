@@ -29,7 +29,7 @@ import x64/encoder as x86
 import arm64/encoder as arm64
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
-import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writeavr, writerv32]
+import image / [writecommon, writeelf, writeelfobj, writemacho, writepe, writecortexm, writeavr, writerv32]
 import pass1, pass2
 
 include compat2   # getOrQuit on host Nim
@@ -475,10 +475,13 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # (Windows), the kernel's argument block (AArch64/Linux). At most one applies.
   appendTraceTable(ctx)
   appendTlsSize(ctx)
-  setupTls(ctx)
+  if not ctx.emitObj:
+    # A relocatable object has no entry stub: crt's `_start` calls `main`, and
+    # libc, not nifasm, points the thread pointer at the static TLS block.
+    setupTls(ctx)
+    setupLinuxA64Entry(ctx)
   setupTlsWin(ctx)
   setupWinEntry(ctx)
-  setupLinuxA64Entry(ctx)
 
   if ctx.emitObj:
     # Relocatable object for the system linker (foreign `.o` / framework linking).
@@ -486,8 +489,13 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
     case ctx.arch
     of Arch.A64:
       writeMachOObject(ctx, outfile)
+    of Arch.X64:
+      try:
+        writeElfObject(ctx, outfile)
+      except:
+        quit "nifasm: cannot write " & outfile
     else:
-      quit "nifasm: --emit-obj is only supported for macOS arm64"
+      quit "nifasm: --emit-obj is only supported for macOS arm64 and x86-64 Linux"
   else:
     # A memory map describes a BOARD, and only the firmware target has one. Every
     # other arch is handed its address space by a loader, so honouring the flags

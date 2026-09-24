@@ -3435,13 +3435,16 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   let resultByRef = hasResult and resSlot.kind == AMem and amd.passesByRef(resSlot.size)
   var callArgSlots: seq[AsmSlot] = @[]
   for a in argCurs: callArgSlots.add g.exprSlot(a)
-  # A `{.varargs.}` Windows extern: the call goes through a declaration of its own
-  # SHAPE (`winVariadicTarget`), so every variadic argument has a parameter to be
-  # marshalled into; a double in a register position travels as its bits.
-  let variadicFrom = if foreignCall and tgt.isVarargs: tgt.fixedParams else: -1
+  # A `{.varargs.}` extern: the call goes through a declaration of its own SHAPE
+  # (`variadicTarget`), so every variadic argument has a parameter to be marshalled
+  # into. On Windows a double in a register position travels as its bits; SysV
+  # passes the variadic tail exactly like fixed arguments (and counts the vector
+  # registers in `al`, see below).
+  let variadicFrom = if tgt.extern and tgt.isVarargs: tgt.fixedParams else: -1
   if variadicFrom >= 0:
-    tgt.asmName = g.winVariadicTarget(tgt.asmName, callArgSlots, variadicFrom)
-  let plan = planCall(amd, callArgSlots, resultByRef, variadicFrom)
+    tgt.asmName = g.variadicTarget(tgt.asmName, callArgSlots, variadicFrom)
+  let plan = planCall(amd, callArgSlots, resultByRef,
+                      (if foreignCall: variadicFrom else: -1))
   if foreignCall:
     # A Win64 call ALWAYS has an outgoing stack-argument area — the 32-byte shadow
     # space — even with no stack-passed argument, so the frame must carry the
@@ -3971,6 +3974,16 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
     # ── phase 2: one parallel move ───────────────────────────────────────────
     g.resolve(pending)
     for s in stashes: g.giveBack s
+    if variadicFrom >= 0 and not foreignCall:
+      # A SysV variadic callee reads `al` as an upper bound of the vector registers
+      # the call passes arguments in. rax carries no argument and the call destroys
+      # it, so whatever is bound to it is dead here — the argument registers' case,
+      # see `releaseArgDest`.
+      var nf = 0
+      for pl in plan.args:
+        if pl.isFloat and not pl.onStack: inc nf
+      g.releaseArgDest(RAX, NoSymId)
+      g.ab.tree MovX64: (g.ab.rawReg RAX; g.ab.intLit nf.int64)
     if isSyscall: g.emSyscall()
     elif tgt.extern: g.ab.keyword ExtcallX64     # dynamic import → indirect via the IAT/GOT
     elif doTail:

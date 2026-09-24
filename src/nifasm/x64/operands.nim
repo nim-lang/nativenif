@@ -779,7 +779,8 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         base: x86.RBP,  # RBP allows displacement-only addressing
         displacement: int32(sym.offset),
         hasIndex: false,
-        seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs)
+        seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs),
+        tlsRel: ctx.tlsRelocated(sym)
       )
       result.typ = sym.typ
       inc n
@@ -910,7 +911,8 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
          base: RBP,  # RBP allows displacement-only addressing
          displacement: int32(sym.offset),
          hasIndex: false,
-         seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs)
+         seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs),
+         tlsRel: ctx.tlsRelocated(sym)
        )
        result.typ = sym.typ
        inc n

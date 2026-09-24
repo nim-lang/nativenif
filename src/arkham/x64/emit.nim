@@ -1139,8 +1139,12 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
   # a param's NAME ordinal advances by exactly 1 per param, decoupled from the
   # GPR index (a stack/float param consumes 0 GPRs, an aggregate several).
   let fixedSlots = paramSlots(g.prog, c)
+  # Only Win64 treats a variadic tail specially (a double in a register position
+  # travels as its bits). SysV passes it like fixed arguments — and `planCall`'s
+  # other variadic rule is Apple AArch64's (tail on the stack), not this ABI's.
   let plan = planCall(amd, withTail(fixedSlots, tail), retByRef,
-                      variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
+                      variadicFrom = (if tail.len > 0 and amd.positionalArgs:
+                                        fixedSlots.len else: -1))
   var pIdx = 0
   g.ab.tree ParamsD:
     if retByRef:                                # synthetic hidden result pointer in rdi
@@ -1571,9 +1575,9 @@ proc directCallTarget*(g: var CodeGen; fsym: SymId): CallTarget =
       g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
   g.callTarget.getOrQuit(fsym)
 
-proc winVariadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
-                        fixed: int): SymId =
-  ## The symbol a Win64 call to the `{.varargs.}` extern `asmName` goes through: a
+proc variadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
+                     fixed: int): SymId =
+  ## The symbol a call to the `{.varargs.}` extern `asmName` goes through: a
   ## declaration of this call's SHAPE (see `VariadicExtern`), registered for the
   ## driver to emit. The tail's positions follow the convention, so the shape is
   ## what each slot IS: a double, an integer word, an aggregate by value, or one
@@ -1587,7 +1591,7 @@ proc winVariadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot
   var ex = default(Extern)
   for e in g.prog.externOrder:
     if e.asmName == asmName: ex = e
-  assert ex.asmName != NoSymId, "arkham win_x64: a variadic call to an unknown extern " & g.spelling(asmName)
+  assert ex.asmName != NoSymId, "arkham x64: a variadic call to an unknown extern " & g.spelling(asmName)
   result = g.lengSym(derivedName(g.prog.cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
                      thisModuleSuffix(g.prog))
   for v in g.variadicExterns:
