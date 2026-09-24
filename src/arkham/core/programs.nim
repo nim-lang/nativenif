@@ -130,6 +130,12 @@ type
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
+    crtEntry*: bool                         ## Linux: the program is linked with libc by the
+                                            ## system linker (`arkham --crt`). Its entry is
+                                            ## CALLED by crt's `_start` as `main` and returns
+                                            ## its status; every `importc` binds to libc,
+                                            ## whose semantics (`-1` + `errno`) the stdlib
+                                            ## then expects, as on the C backend
     windows*: bool                          ## PE/Win64 target: every `importc` binds through
                                             ## the import table (no Linux syscalls), and the
                                             ## image is single-threaded, so a Nim thread-local
@@ -618,6 +624,18 @@ proc syprocAsmName*(cname, module: string): string =
   ## both `die` and `exit` (`importc "exit"`) give one syproc.
   result = derivedName(cname & ".0", "sys") & "." & module
 
+proc rawSyscalls*(p: Program): bool {.inline.} =
+  ## Whether a libc name the syscall table knows is lowered to a raw kernel trap:
+  ## only on a Linux target that links no libc. Darwin and Windows have no stable
+  ## syscall ABI, and a program linked with libc (`crtEntry`) calls libc's wrapper.
+  not p.darwin and not p.windows and not p.crtEntry
+
+proc entryReturns*(p: Program): bool {.inline.} =
+  ## Whether the entry proc is CALLED and returns its exit status (Windows' thread
+  ## thunk, crt's `_start`), rather than being jumped to by the kernel and ending in
+  ## an `exit_group` trap (a freestanding Linux image).
+  p.windows or p.crtEntry
+
 proc extprocAsmName*(cname, module: string): string =
   ## The asm symbol for the extern declaration of the C function `cname`:
   ## `` write`c.0.<module> ``, mirroring `syprocAsmName` for the same reasons.
@@ -681,7 +699,7 @@ proc procSigType(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false; windows = false): Program =
+              darwin = false; windows = false; crtEntry = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -705,7 +723,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    scheme: splitModulePath(inputPath), tags: tags,
                    pool: buf.pool, thisModule: buf.pool.strings.getOrIncl(
                      splitModulePath(inputPath).name),
-                   darwin: darwin, windows: windows)
+                   darwin: darwin, windows: windows, crtEntry: crtEntry)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -839,7 +857,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
           # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
           result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-        elif not darwin and not windows and importcN.len > 0 and lookupSyscall(importcN).found:
+        elif result.rawSyscalls and importcN.len > 0 and lookupSyscall(importcN).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
           # and declares the kernel's clobbers; calls go through the declarative
@@ -870,10 +888,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             quit "arkham: the Windows extern `" & importcN &
               "` names no import library; annotate the declaration with " &
               "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
-          # The external symbol as the dynamic loader spells it: Mach-O prefixes every
-          # C symbol with an underscore, PE does not.
+          # The external symbol as the linker spells it: Mach-O prefixes every C
+          # symbol with an underscore, PE and ELF do not.
           result.externOrder.add Extern(asmName: asmN, decl: procStart, dll: dllN,
-                                        extName: (if windows: importcN else: "_" & importcN))
+                                        extName: (if darwin: "_" & importcN else: importcN))
           # A Windows extern is called DECLARATIVELY (`(arg pN)` against the signature
           # its `(extproc …)` decl carries) — see `emitWinExtproc`. That is what gives
           # the 5th+ argument of e.g. `WriteFile` a checked stack slot above the Win64
@@ -1043,7 +1061,7 @@ proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
                     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
                     "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-  elif not p.darwin and not p.windows and importcN.len > 0 and lookupSyscall(importcN).found:
+  elif p.rawSyscalls and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
     result = CallTarget(asmName: p.lengSym(syprocAsmName(importcN, s.module)), extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,

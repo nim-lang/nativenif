@@ -1725,6 +1725,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       # (lea dest base-reg offset) - explicit addressing. `base-reg` is a raw `(reg)`
       # or a register-bound local name (a `rebind`'d scratch temp).
       var displacement: int32 = 0
+      var tlsRel = false
 
       # Parse offset - can be integer or stack variable name
       if n.kind == IntLit:
@@ -1738,6 +1739,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
           # nifasm owns the offset, the caller supplies the FS-base register, and
           # the offset folds into the lea displacement — no pointer arithmetic.
           displacement = int32(offsetSym.offset)
+          tlsRel = ctx.tlsRelocated(offsetSym)
         elif offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
           displacement = int32(offsetSym.offset)
         else:
@@ -1749,7 +1751,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let mem = x86.MemoryOperand(
         base: baseReg,
         displacement: displacement,
-        hasIndex: false
+        hasIndex: false,
+        tlsRel: tlsRel
       )
       x86.emitLea(ctx.buf.data, dest, mem)
     else:

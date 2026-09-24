@@ -438,6 +438,15 @@ type
 
 # ── reading the record ───────────────────────────────────────────────────────
 
+proc tlsRelocated*(ctx: GenContext; sym: Symbol): bool =
+  ## Whether an x86-64 thread-local operand's offset is left to the SYSTEM linker
+  ## (an `R_X86_64_TPOFF32`): in a relocatable object libc owns the thread pointer
+  ## and the program's thread-locals are one module of ITS static TLS block. The
+  ## self-pointer slot is the exception: `fs:[0]` is the psABI's TCB pointer, which
+  ## holds the thread pointer under libc exactly as it does in nifasm's own block.
+  ctx.emitObj and ctx.arch == Arch.X64 and sym != ctx.tlsSelfSym and
+    not sym.gsFixedSlot
+
 proc inCall*(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
   ctx.callContext.state != CallContextState.Disabled

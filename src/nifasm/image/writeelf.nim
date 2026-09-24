@@ -22,63 +22,66 @@ import elf, dwarf, writecommon
 
 include compat2   # canRaise
 
-proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
-  # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT
-  # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
-  # relays out `.text`, so remap every code byte-offset we still need afterwards:
-  # the gvar `lea`/`adrp` patch sites and the synthesized entry stub.
+proc remapSites(a: var GenContext; map: seq[int]; extra: var seq[int]) =
+  ## Carry every code byte-offset tracked outside `a.buf` through one layout pass:
+  ## the gvar `lea`/`adrp` patch sites, the synthesized entry stub, the listing and
+  ## unwind rows, and the caller's `extra` positions.
+  for k in 0 ..< a.gvarSites.len:
+    a.gvarSites[k] = (map[a.gvarSites[k][0]], a.gvarSites[k][1])
+  if a.entryStubOffset >= 0:
+    a.entryStubOffset = map[a.entryStubOffset]
+  for k in 0 ..< extra.len:
+    extra[k] = map[extra[k]]
+  a.remapListing(map)
+  a.remapUnwind(map)
+
+proc layoutCode*(a: var GenContext; extra: var seq[int]) =
+  ## The branch-relaxation passes both ELF writers run before `finalize`. Each
+  ## moves code and hands back an old->new position map; `extra` is remapped with
+  ## the rest (the relocatable object's thread-local operand sites).
   # Arch-agnostic jump threading + dead-jump prune runs FIRST (both arches): it removes
   # unconditional jumps to their own fall-through and threads branch chains, which also
-  # exposes more rel8 opportunities for the x64 shortener below. Both passes return an
-  # old→new position map; apply them in sequence to every external code offset we track
-  # (gvar `lea`/`adrp` patch sites, the entry stub).
-  block:
-    let threadMap = threadJumps(a.buf)
-    for k in 0 ..< a.gvarSites.len:
-      a.gvarSites[k] = (threadMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.entryStubOffset >= 0:
-      a.entryStubOffset = threadMap[a.entryStubOffset]
-    a.remapListing(threadMap)
-    a.remapUnwind(threadMap)
-  block:
-    # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
-    # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
-    # both arches); only the opcode flip inside is arch-specific.
-    let invMap = invertCondJumps(a.buf)
-    for k in 0 ..< a.gvarSites.len:
-      a.gvarSites[k] = (invMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.entryStubOffset >= 0:
-      a.entryStubOffset = invMap[a.entryStubOffset]
-    a.remapListing(invMap)
-    a.remapUnwind(invMap)
+  # exposes more rel8 opportunities for the x64 shortener below.
+  remapSites(a, threadJumps(a.buf), extra)
+  # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
+  # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
+  # both arches); only the opcode flip inside is arch-specific.
+  remapSites(a, invertCondJumps(a.buf), extra)
   if a.arch == Arch.X64:
-    # Code-alignment candidates, as LABEL IDS (stable across the layout passes):
-    # every generated proc's entry + every loop head (= target of a backward
-    # jmp/jcc, collected now — after shortening those jumps are patched inline
-    # and no longer tracked). The shortener keeps any jump whose displacement a
-    # pad would change in rel32 form; `alignCodeX64` then inserts the NOP pads
-    # so entries and loop heads start on a 16-byte boundary (gcc pads ~2.7k NOPs
-    # into the same workload; nifasm previously aligned nothing, which both
-    # costs fetch bandwidth on hot loop heads and made wall-clock timings swing
-    # with incidental layout shifts).
+    # Shorten x86 rel32 jumps to rel8 where they fit. Code-alignment candidates,
+    # as LABEL IDS (stable across the layout passes): every generated proc's entry
+    # + every loop head (= target of a backward jmp/jcc, collected now — after
+    # shortening those jumps are patched inline and no longer tracked). The
+    # shortener keeps any jump whose displacement a pad would change in rel32 form;
+    # `alignCodeX64` then inserts the NOP pads so entries and loop heads start on a
+    # 16-byte boundary (gcc pads ~2.7k NOPs into the same workload; nifasm
+    # previously aligned nothing, which both costs fetch bandwidth on hot loop
+    # heads and made wall-clock timings swing with incidental layout shifts).
     var alignLabels: seq[int] = @[]
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc: alignLabels.add sym.offset
     for id in backwardBranchTargets(a.buf): alignLabels.add id
-    let posMap = shortenX64Jumps(a.buf, alignLabels)
-    for k in 0 ..< a.gvarSites.len:
-      a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.entryStubOffset >= 0:
-      a.entryStubOffset = posMap[a.entryStubOffset]
-    a.remapListing(posMap)
-    a.remapUnwind(posMap)
-    let alignMap = alignCodeX64(a.buf, alignLabels)
-    for k in 0 ..< a.gvarSites.len:
-      a.gvarSites[k] = (alignMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.entryStubOffset >= 0:
-      a.entryStubOffset = alignMap[a.entryStubOffset]
-    a.remapListing(alignMap)
-    a.remapUnwind(alignMap)
+    remapSites(a, shortenX64Jumps(a.buf, alignLabels), extra)
+    remapSites(a, alignCodeX64(a.buf, alignLabels), extra)
+
+proc rejectExternCalls(a: GenContext) =
+  ## A static executable has no loader to bind an extern: a call to one (an
+  ## `(extproc …)` that is not a syscall) needs the system linker, i.e. a
+  ## relocatable object (`--emit-obj`). Left in, its `call [rip+slot]` would jump
+  ## through a slot nothing ever fills.
+  for r in a.buf.relocs:
+    if r.kind == rkIatCall:
+      var name = "?"
+      for ext in a.extProcs:
+        if ext.gotSlot == int(r.target): name = ext.extName
+      quit "nifasm: `" & name & "` is an external symbol, which a static " &
+           "executable cannot bind; link with the system linker (--emit-obj; " &
+           "`nimony n -d:useLibc` on Linux)"
+
+proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
+  rejectExternCalls(a)
+  var noExtra: seq[int] = @[]
+  layoutCode(a, noExtra)
   when defined(arkhamDbgReloc):
     block validateRelocs:
       var defined = initHashSet[int]()

@@ -47,6 +47,9 @@ Options:
                            Forwarded into the asm-NIF so nifasm places segments
                            from the same description rather than reading the file
                            a second time
+  --crt                    linux/amd64: the entry proc is CALLED by a C runtime's
+                           `_start` (the system linker finishes the program, see
+                           nifasm --emit-obj), not jumped to by the kernel
   -a:arch, --arch:arch     legacy combined form: arm64 | x64 | linux_arm64 |
                            win_x64 (cannot be mixed with --os/--cpu)
   -h, --help               show this help
@@ -124,14 +127,14 @@ proc archOf(os, cpu: string): string =
          " embedded/arm32, embedded/avr, embedded/riscv32)",
          QuitFailure)
 
-proc run(input, output, arch: string; board: layout.Layout) =
+proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
   let code = case arch
-             of "x64", "x86_64", "amd64": generateX64(buf, input, tags)
+             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
@@ -146,6 +149,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
 proc main() =
   var input, output, arch, os, cpu = ""
   var board = Layout()
+  var crt = false
   for kind, key, val in getopt():
     case kind
     of cmdArgument:
@@ -156,6 +160,7 @@ proc main() =
       of "arch", "a": arch = val
       of "os": os = val
       of "cpu": cpu = val
+      of "crt": crt = true
       of "layout":
         board = parseLayout(val)
         let bad = layout.validate(board)
@@ -178,7 +183,7 @@ proc main() =
     if os.len == 0: os = hostOS
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
-  run(input, output, arch, board)
+  run(input, output, arch, board, crt)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:

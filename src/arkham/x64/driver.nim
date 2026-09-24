@@ -271,7 +271,7 @@ proc genGlobal*(g: var CodeGen; nifName: SymId; decl: Cursor) =
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  windows = false): string =
+                  windows = false; crtEntry = false): string =
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
   ## `.exe` whose imports bind through the import table (each extern's own
@@ -295,7 +295,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   var g = newCodeGen(buf, x64MachineA, x64RegName)   # register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
-  g.prog = collect(buf, inputPath, tags, windows = windows)
+  g.prog = collect(buf, inputPath, tags, windows = windows, crtEntry = crtEntry)
   g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
@@ -319,6 +319,11 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         for i in 0 ..< g.prog.externOrder.len:
           let ex = g.prog.externOrder[i]
           if ex.dll == dll: g.emitWinExtproc(ex)
+    else:
+      # Linux: an `importc` that is not a syscall names a symbol of a foreign
+      # object or of libc. After the types, like the Windows externs above.
+      for i in 0 ..< g.prog.externOrder.len:
+        g.emitSysvExtproc(g.prog.externOrder[i])
     let globalDecls = g.prog.globalsInOrder()
     for (name, decl) in globalDecls:
       g.genGlobal(name, decl)
@@ -336,8 +341,11 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       genProc(g, info)
     for i in 0 ..< g.variadicExterns.len:  # the variadic call shapes the bodies used
       let v = g.variadicExterns[i]
-      g.ab.tree ImpD: g.ab.str v.dll
-      g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
+      if windows:
+        g.ab.tree ImpD: g.ab.str v.dll
+        g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
+      else:
+        g.emitSysvExtprocDecl(v.asmName, v.extName, v.decl, v.tail)
     for i in 0 ..< g.rodata.len:
       let (nm, bytes) = g.rodata[i]
       g.ab.tree RodataD:

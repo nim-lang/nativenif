@@ -5,6 +5,9 @@ import std / [strutils]
 type
   Bytes* = object
     data: seq[byte]
+    tlsSites*: seq[int]  ## positions of the disp32 of every thread-local operand
+                         ## encoded with `tlsRel` (relocatable-object mode only):
+                         ## each becomes an `R_X86_64_TPOFF32`. See `emitMem`.
 
 when defined(nimony):
   proc add*[T](s: var seq[T]; other: openArray[T]) =

@@ -39,6 +39,11 @@ type
                          # base=101 under mod=00). `base` must be left RAX so the
                          # emitters' REX.B-from-base computations stay silent.
     seg*: SegOverride    # segment-override prefix, if any (thread-local storage)
+    tlsRel*: bool        # the displacement is a thread-local's offset that the
+                         # SYSTEM linker must supply (`--emit-obj`): always
+                         # encoded as a disp32, whose position is recorded in
+                         # `Bytes.tlsSites`. Its value is the offset in nifasm's
+                         # block, which becomes the relocation's addend.
 
 # REX prefix encoding
 type RexPrefix* = object
@@ -89,6 +94,7 @@ proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
   if mem.seg != segNone:
     dest.add(encodeModRM(amIndirect, reg, 0b100))   # mod=00, rm=100 → SIB follows
     dest.add(encodeSIB(1, 0b100, 0b101))            # index=none, base=none → [disp32]
+    if mem.tlsRel: dest.tlsSites.add dest.getCurrentPosition()
     dest.addt32(mem.displacement)
     return
   if mem.noBase:
@@ -109,7 +115,10 @@ proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
     rmb = 4 # SIB follows
 
   # Determine Mod and DispSize
-  if mem.displacement == 0 and (mem.base != RBP and mem.base != R13):
+  if mem.tlsRel:
+    modb = 0b10 # the linker writes the displacement: it needs all 32 bits
+    dispSize = 4
+  elif mem.displacement == 0 and (mem.base != RBP and mem.base != R13):
     modb = 0b00 # Indirect
   elif mem.displacement >= -128 and mem.displacement <= 127:
     modb = 0b01 # Indirect + Disp8
@@ -129,6 +138,7 @@ proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
   if dispSize == 1:
     dest.add(byte(mem.displacement and 0xFF))
   elif dispSize == 4:
+    if mem.tlsRel: dest.tlsSites.add dest.getCurrentPosition()
     dest.addt32(mem.displacement)
 
 # Core MOV instruction implementations

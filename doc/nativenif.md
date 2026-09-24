@@ -43,7 +43,21 @@ suffix, generic instances are deduplicated across modules, unreferenced symbols
 are never generated, and the finished image is written directly: a static,
 libc-free ELF on Linux, a Mach-O linked against libSystem on macOS, a PE with an
 import table on Windows. `--emit-obj` produces a relocatable object for the
-system linker instead (macOS arm64).
+system linker instead (macOS arm64, Linux x86-64).
+
+On Linux x86-64 that is how a program links foreign objects (Nimony's
+`.compile`/`.link`) and libc: `nimony n -d:useLibc` runs `arkham --crt` and
+`nifasm --emit-obj`, then the system linker. Everything the executable writer
+resolves itself becomes a relocation instead (`image/writeelfobj.nim`): a
+global's RIP-relative access is `R_X86_64_PC32`, an extern call
+`R_X86_64_GOTPCRELX`, an absolute address in a rodata blob or a global's
+initializer `R_X86_64_64`, and a thread-local's offset `R_X86_64_TPOFF32`. libc
+owns the thread pointer then, and the program's thread-locals are one
+`.tdata`/`.tbss` module of its static TLS block. With `--crt` arkham treats the
+entry as crt's `main` (called, so biased like any callee, and returning its
+status), declares each `importc` as a SysV `(extproc …)` and calls libc for it
+rather than lowering it to a syscall. A static executable refuses an extern call
+instead of leaving it unbound.
 
 [doc/nifasm.md](nifasm.md) is the language; [doc/instructions.md](instructions.md)
 is the complete tag vocabulary.

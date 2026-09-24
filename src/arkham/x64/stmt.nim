@@ -492,9 +492,10 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     var cc = c
     cc.into:
       let hasVal = cc.hasMore and cc.kind != DotToken
-      if g.isEntryProc and not g.prog.windows:
-        # The Linux entry proc terminates the process: its return value is the
-        # exit status. (The Windows entry returns normally — see emProcessExit.)
+      if g.isEntryProc and not g.prog.entryReturns:
+        # A kernel-entered Linux entry terminates the process: its return value
+        # is the exit status. (A called entry returns normally — see
+        # `entryReturns`.)
         if hasVal:
           var v = needsReg(ScalarSlot)
           g.emitValue(cc, v)
@@ -934,10 +935,11 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   c.into:
     inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
     # The whole body is in tail position: after it, control reaches the epilogue.
-    # The LINUX entry proc ends in an exit syscall (no epilogue jump), so it gets
-    # no flags at all; the Windows entry returns like any other proc.
+    # A Linux entry the kernel jumped to ends in an exit syscall (no epilogue
+    # jump), so it gets no flags at all; one that is called (Windows, crt's
+    # `main`) returns like any other proc.
     let bodyFlags: set[StmtFlag] =
-      if info.isEntry and not g.prog.windows: {} else: {TailStmt, TailPos}
+      if info.isEntry and not g.prog.entryReturns: {} else: {TailStmt, TailPos}
     if c.stmtKind == StmtsS:
       g.condFuse.tag.clear()
       g.scanCondFusions(c)
@@ -945,7 +947,7 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
-  if info.isEntry and not g.prog.windows:
+  if info.isEntry and not g.prog.entryReturns:
     g.emProcessExit(immLoc(0, ScalarSlot))    # fell off the end of `main` ⇒ exit(0)
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
   when defined(arkhamHomeDbg):
@@ -987,6 +989,9 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       for st in g.plan.spillTemps:
         g.declSpillSlot(st.name, st.typ, st.isFloat)
       g.ab.append side                                 # the body
-      if not info.isEntry:
+      # A Linux entry the kernel jumped to ends in `exit_group` and has nowhere to
+      # return to; one that is CALLED (crt's `_start`, Windows' thread thunk)
+      # returns its status like any proc.
+      if not info.isEntry or g.prog.entryReturns:
         g.framePop()
         g.ab.keyword RetX64

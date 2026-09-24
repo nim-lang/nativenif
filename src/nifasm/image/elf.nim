@@ -45,6 +45,11 @@ type
     st_value*: Elf64_Addr
     st_size*: Elf64_Xword
 
+  Elf64_Rela* = object
+    r_offset*: Elf64_Addr
+    r_info*: Elf64_Xword        ## symbol index << 32 | type
+    r_addend*: Elf64_Sxword
+
   Elf64_Shdr* = object
     sh_name*: Elf64_Word
     sh_type*: Elf64_Word
@@ -78,6 +83,7 @@ const
   EV_CURRENT = 1.byte
   ELFOSABI_SYSV = 0.byte # Or ELFOSABI_LINUX
 
+  ET_REL* = 1.Elf64_Half
   ET_EXEC* = 2.Elf64_Half
   EM_X86_64* = 62.Elf64_Half
   EM_AARCH64* = 183.Elf64_Half
@@ -92,18 +98,30 @@ const
   SHT_PROGBITS* = 1.Elf64_Word
   SHT_SYMTAB* = 2.Elf64_Word
   SHT_STRTAB* = 3.Elf64_Word
-  SHT_NOBITS = 8.Elf64_Word
+  SHT_RELA* = 4.Elf64_Word
+  SHT_NOBITS* = 8.Elf64_Word
 
   # Section flags
-  SHF_WRITE = 1.Elf64_Xword
+  SHF_WRITE* = 1.Elf64_Xword
   SHF_ALLOC* = 2.Elf64_Xword
   SHF_EXECINSTR* = 4.Elf64_Xword
+  SHF_INFO_LINK* = 0x40.Elf64_Xword
+  SHF_TLS* = 0x400.Elf64_Xword
 
   # Symbol binding / type, packed into `st_info` as `(bind shl 4) or typ`.
   STB_LOCAL* = 0'u8
   STB_GLOBAL* = 1'u8
   STT_NOTYPE* = 0'u8
+  STT_OBJECT* = 1'u8
   STT_FUNC* = 2'u8
+  STT_SECTION* = 3'u8
+  STT_TLS* = 6'u8
+
+  # x86-64 psABI relocation types (the ones a relocatable object from nifasm uses).
+  R_X86_64_64* = 1'u32          ## S + A, 64-bit absolute
+  R_X86_64_PC32* = 2'u32        ## S + A - P
+  R_X86_64_TPOFF32* = 23'u32    ## offset in the static TLS block (local exec)
+  R_X86_64_GOTPCRELX* = 41'u32  ## G + GOT + A - P, relaxable `call *sym@GOTPCREL(%rip)`
 
 proc initHeader*(entry: uint64; machine: Elf64_Half): Elf64_Ehdr =
   result = default(Elf64_Ehdr)
