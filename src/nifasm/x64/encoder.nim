@@ -2212,6 +2212,16 @@ proc emitLeaRipPlaceholder*(dest: var Buffer; reg: Register): int =
   dest.data.add(encodeModRM(amIndirect, int(reg), 5)) # Mod=00, Reg=reg, RM=101 (RIP-rel)
   dest.data.addt32(0) # placeholder disp32, patched in writeElf
 
+proc emitAddRipPlaceholder*(dest: var Buffer; reg: Register): int =
+  ## Emit `ADD reg, [RIP + disp32]` (64-bit), laid out like `emitLeaRipPlaceholder`
+  ## — disp32 at `result + 3`, RIP at `result + 7` — so it is a `gvarSites` entry
+  ## like any global access.
+  result = dest.data.getCurrentPosition()
+  dest.data.add(encodeRex(RexPrefix(w: true, r: needsRex(reg))))
+  dest.data.add(0x03) # ADD r64, r/m64
+  dest.data.add(encodeModRM(amIndirect, int(reg), 5))
+  dest.data.addt32(0)
+
 proc emitMovRipPlaceholder*(dest: var Buffer; reg: Register; bits: int;
                             signed, isLoad: bool): int =
   ## Emit `mov reg, [RIP + disp32]` (load) or `mov [RIP + disp32], reg` (store) with a

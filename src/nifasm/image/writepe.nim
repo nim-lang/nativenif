@@ -38,6 +38,9 @@ proc writeExe*(a: var GenContext; outfile: string) =
   for lib in a.imports:
     dynlink.libs.add pe.ImportedLibInfo(name: lib.name, ordinal: lib.ordinal)
   for ext in a.extProcs:
+    if ext.libOrdinal == 0:
+      quit "nifasm: `" & ext.extName & "` names no import library, so only the " &
+           "system linker can bind it (--emit-obj; arkham --crt)"
     dynlink.extProcs.add pe.ExternalProcInfo(
       name: ext.name, extName: ext.extName,
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,

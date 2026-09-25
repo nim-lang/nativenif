@@ -47,9 +47,11 @@ Options:
                            Forwarded into the asm-NIF so nifasm places segments
                            from the same description rather than reading the file
                            a second time
-  --crt                    linux/amd64: the entry proc is CALLED by a C runtime's
-                           `_start` (the system linker finishes the program, see
-                           nifasm --emit-obj), not jumped to by the kernel
+  --crt                    linux/amd64, windows/amd64: the program is linked with
+                           the C runtime by the system linker (see nifasm
+                           --emit-obj): the entry proc is CALLED as `main`, and an
+                           `importc` binds to libc (Windows: an `importc` without
+                           `dynlib` is left to the linker)
   -a:arch, --arch:arch     legacy combined form: arm64 | x64 | linux_arm64 |
                            win_x64 (cannot be mixed with --os/--cpu)
   -h, --help               show this help
@@ -135,7 +137,7 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
   var buf = parseFromFile(input, sharedTags = tags)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
-             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true)
+             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":

@@ -43,7 +43,7 @@ suffix, generic instances are deduplicated across modules, unreferenced symbols
 are never generated, and the finished image is written directly: a static,
 libc-free ELF on Linux, a Mach-O linked against libSystem on macOS, a PE with an
 import table on Windows. `--emit-obj` produces a relocatable object for the
-system linker instead (macOS arm64, Linux x86-64).
+system linker instead (macOS arm64, Linux x86-64, Windows x86-64).
 
 On Linux x86-64 that is how a program links foreign objects (Nimony's
 `.compile`/`.link`) and libc: `nimony n -d:useLibc` runs `arkham --crt` and
@@ -58,6 +58,21 @@ entry as crt's `main` (called, so biased like any callee, and returning its
 status), declares each `importc` as a SysV `(extproc …)` and calls libc for it
 rather than lowering it to a syscall. A static executable refuses an extern call
 instead of leaving it unbound.
+
+Windows x86-64 works the same way, with MinGW's gcc or clang as the system
+linker: `arkham -a:win_x64 --crt`, `nifasm --emit-obj` (a COFF object,
+`image/writecoffobj.nim`), then `gcc`. An `importc` without `dynlib` is legal
+there and becomes a direct call the linker binds (libc through the crt's import
+library, or a foreign object). One with `dynlib` calls through `__imp_<name>`,
+so its import library must be on the link line. The crt calls `main` with the
+Win64 convention, so nifasm emits a `main` stub that saves rdi/rsi/xmm6–15 and
+calls `main.0` with its arguments in the internal registers. The crt also owns
+the TLS directory: `_tls_index` replaces the image's own index cell, and the
+program's thread-locals are one `.tls$` contribution to the crt's template. Their
+offset in it would be a `SECREL`, but GNU ld also gives a `SECREL` in code a base
+relocation, which ASLR then applies. So the stub stores `&.tls$ - &_tls_start` in
+a cell instead, and every thread-local address adds it. Without `--emit-obj` a
+`dynlib`-less extern is refused, as before.
 
 [doc/nifasm.md](nifasm.md) is the language; [doc/instructions.md](instructions.md)
 is the complete tag vocabulary.

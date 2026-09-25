@@ -112,7 +112,7 @@ proc extprocLib*(ctx: var GenContext; n: var Cursor): int =
   ## The import-table ordinal an `(extproc :name "extname" "dll"? …)` binds to,
   ## consuming the optional dll operand.
   ##
-  ## Every Windows extern carries it (arkham rejects one that names no library), so
+  ## Every Windows extern carries it (`""` under `arkham --crt`: no library), so
   ## the decl is self-contained — which is what lets it be read anywhere, including
   ## the indexed jump `resolveForeignSym` reaches a foreign module's decls by, where
   ## no enclosing `(imp …)` is on any stack to consult. The Darwin form omits it and
@@ -123,10 +123,18 @@ proc extprocLib*(ctx: var GenContext; n: var Cursor): int =
   # literal there (the following decl's extern name) was taken for a dll operand
   # and `inc` asserted "advancing past end of scope" (measured: nifasm on every
   # stage-1 boot tool on macOS, from `resolveForeignSym`'s indexed jump).
+  var named = false
   if n.hasMore and n.kind == StrLit:
     libName = getStr(n)
+    named = true
     inc n
-  if libName.len > 0:
+  if named and libName.len == 0 and ctx.arch in {Arch.WinX64, Arch.WinA64}:
+    # `""`: no import library. The SYSTEM linker binds the symbol (libc through
+    # the crt's import libraries, or a foreign object), so the image has no import
+    # entry of its own for it. Only a COFF object can express that
+    # (`writeCoffObject`); the PE writer refuses it.
+    result = 0
+  elif libName.len > 0:
     result = ctx.importOrdinal(libName)
   elif ctx.imports.len > 0:
     result = ctx.imports[0].ordinal        # Mach-O: libSystem, the only one

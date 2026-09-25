@@ -315,7 +315,9 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         let ex = g.prog.externOrder[i]
         if ex.dll notin dlls: dlls.add ex.dll
       for dll in dlls:
-        g.ab.tree ImpD: g.ab.str dll
+        # `""` (only under `--crt`): no import library, the system linker binds it.
+        if dll.len > 0:
+          g.ab.tree ImpD: g.ab.str dll
         for i in 0 ..< g.prog.externOrder.len:
           let ex = g.prog.externOrder[i]
           if ex.dll == dll: g.emitWinExtproc(ex)
@@ -342,7 +344,8 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     for i in 0 ..< g.variadicExterns.len:  # the variadic call shapes the bodies used
       let v = g.variadicExterns[i]
       if windows:
-        g.ab.tree ImpD: g.ab.str v.dll
+        if v.dll.len > 0:
+          g.ab.tree ImpD: g.ab.str v.dll
         g.emitWinExtprocDecl(v.asmName, v.extName, v.dll, v.decl, v.tail)
       else:
         g.emitSysvExtprocDecl(v.asmName, v.extName, v.decl, v.tail)
