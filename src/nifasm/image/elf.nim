@@ -70,7 +70,7 @@ const
   EI_CLASS = 4
   EI_DATA = 5
   EI_VERSION = 6
-  EI_OSABI = 7
+  EI_OSABI* = 7
   EI_ABIVERSION = 8
 
   ELFMAG0 = 0x7f.byte
@@ -82,6 +82,8 @@ const
   ELFDATA2LSB = 1.byte
   EV_CURRENT = 1.byte
   ELFOSABI_SYSV = 0.byte # Or ELFOSABI_LINUX
+  ELFOSABI_FREEBSD* = 9.byte ## how FreeBSD's kernel recognises a static image
+                             ## as its own (it has no `.note.tag` to go by)
 
   ET_REL* = 1.Elf64_Half
   ET_EXEC* = 2.Elf64_Half

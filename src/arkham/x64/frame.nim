@@ -165,6 +165,9 @@ proc emitSyproc*(g: var CodeGen; sp: SyscallProc) =
       g.ab.tree ClobberD:                        # x86-64 `syscall` destroys rcx, r11
         g.ab.rawReg RCX
         g.ab.rawReg R11
+        # FreeBSD's kernel also hands back a second result word in rdx (`fork`'s
+        # child flag, `pipe`'s second fd), so rdx is not preserved across a trap.
+        if g.prog.freebsd: g.ab.rawReg RDX
       g.ab.intLit sp.sysNr.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
@@ -739,7 +742,8 @@ proc emProcessExit*(g: var CodeGen; code: Location) =
   ## reaches either path: it terminates through a declared call to `cExit`.)
   assert not g.prog.entryReturns, "arkham x64: emProcessExit on an entry that returns"
   g.place(code, RDI)
-  g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
+  g.movImm(RAX, (if g.prog.freebsd: FreeBsdX64ExitNr else: LinuxX64ExitNr))
+  g.emSyscall()
 
 proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   ## Make the destructive-SSE accumulator `resF` hold the value just produced at

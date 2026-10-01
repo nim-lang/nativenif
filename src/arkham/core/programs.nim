@@ -129,6 +129,8 @@ type
     requestedForeign*: seq[(SymId, Cursor)]  ## foreign types referenced (cross-module
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
+    freebsd*: bool                          ## FreeBSD/ELF target: raw syscalls like Linux,
+                                            ## but FreeBSD's numbers (`FreeBsdSyscalls`)
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
     crtEntry*: bool                         ## Linux: the program is linked with libc by the
                                             ## system linker (`arkham --crt`). Its entry is
@@ -391,6 +393,92 @@ const LinuxSyscalls* = {
   "io_uring_enter":    (426, 426),
   "io_uring_register": (427, 427)}
 
+# ── FreeBSD/amd64 syscall table ──────────────────────────────────────────────
+# The numbers are FreeBSD's own (`<sys/syscall.h>`), not Linux's. FreeBSD reports
+# failure differently too — carry flag set and a POSITIVE errno in rax — and
+# nifasm normalizes that at every `(syscall)` marker of a `freebsd_x64` image
+# (`genSyscallMarkerX64`), so the stdlib sees the Linux `-errno` convention its
+# `pcall` already expects. Only names whose kernel call has the libc function's
+# semantics are listed: `getcwd`/`stat`/`lstat`/`pipe`/`gettid`/`futex` do NOT
+# (the trap is `__getcwd` returning 0, `fstatat`, `pipe2`, `thr_self(&id)`,
+# `_umtx_op`), so std/posix spells those out on top of the names below rather
+# than letting a libc name silently mean something else.
+const FreeBsdSyscalls* = {
+  "read":        3,
+  "write":       4,
+  "open":        5,
+  "close":       6,
+  "openat":      499,
+  "mmap":        477,
+  "munmap":      73,
+  "lseek":       478,
+  "__getcwd":    326,
+  "fstat":       551,   # the 64-bit-inode `fstat` (FreeBSD 12+)
+  "fstatat":     552,
+  "ftruncate":   480,
+  # Returns the error number (not -1 + errno), exactly like the libc function.
+  "posix_fallocate": 530,
+  "_umtx_op":    454,
+  "exit":        1,
+  "_exit":       1,
+  "abort":       1,     # see the Linux row
+  "getpid":      20,
+  "kill":        37,
+  # The trap returns in BOTH processes; the child is told apart by rdx = 1, and
+  # nifasm rewrites the child's rax to 0 (see `genSyscallMarkerX64`).
+  "fork":        2,
+  "execve":      59,
+  "wait4":       7,
+  "pipe2":       542,
+  "dup2":        90,
+  "chdir":       12,
+  "setpgid":     82,
+  "readlink":    58,
+  "readlinkat":  500,
+  "symlinkat":   502,
+  "ioctl":       54,
+  "thr_self":    432,
+  "thr_new":     455,
+  "thr_exit":    431,
+  "cpuset_getaffinity": 487,
+  "cpuset_setaffinity": 488,
+  "clock_gettime": 232,
+  "nanosleep":   240,
+  "sched_yield": 331,
+  "mkdir":       136,
+  "rmdir":       137,
+  "unlink":      10,
+  "rename":      128,
+  "mkdirat":     496,
+  "unlinkat":    503,
+  "renameat":    501,
+  "chmod":       15,
+  "fchmodat":    490,
+  "fcntl":       92,
+  "getdirentries": 554, # the 64-bit-inode `getdirentries` (FreeBSD 12+)
+  "__sysctl":    202,
+  "sysarch":     165,
+  "socket":      97,
+  "socketpair":  135,
+  "connect":     98,
+  "accept":      30,
+  "accept4":     541,
+  "sendto":      133,
+  "recvfrom":    29,
+  "shutdown":    134,
+  "bind":        104,
+  "listen":      106,
+  "getsockname": 32,
+  "getpeername": 31,
+  "setsockopt":  105,
+  "getsockopt":  118,
+  "kqueue":      362,
+  "kevent":      560,
+  "getrandom":   563}
+
+const
+  FreeBsdX64ExitNr* = 1
+
 const CLinkageGvars* = ["cmdCount", "cmdLine", "nimEnviron"]
   ## Runtime gvars that link by their bare C name (`<cName>.0`) across all bundled
   ## modules: defined+written by the generated `main`, read by std modules via
@@ -401,9 +489,14 @@ const
   LinuxX64ExitNr* = 60
   LinuxA64ExitNr* = 93
 
-proc lookupSyscall(name: string): tuple[found: bool, x64, a64: int] =
+proc lookupSyscall(name: string; freebsd = false): tuple[found: bool, x64, a64: int] =
   ## Resolve libc `name` to its (x86-64, AArch64) syscall numbers, or `found=false`
   ## if arkham does not lower it (the call then goes through the normal extern path).
+  ## On FreeBSD there is only the amd64 column.
+  if freebsd:
+    for (n, nr) in FreeBsdSyscalls:
+      if n == name: return (true, nr, -1)
+    return (false, -1, -1)
   for (n, nr) in LinuxSyscalls:
     if n == name: return (true, nr[0], nr[1])
   result = (false, -1, -1)
@@ -702,7 +795,8 @@ proc procSigType(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false; windows = false; crtEntry = false): Program =
+              darwin = false; windows = false; crtEntry = false;
+              freebsd = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -726,7 +820,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    scheme: splitModulePath(inputPath), tags: tags,
                    pool: buf.pool, thisModule: buf.pool.strings.getOrIncl(
                      splitModulePath(inputPath).name),
-                   darwin: darwin, windows: windows, crtEntry: crtEntry)
+                   darwin: darwin, windows: windows, crtEntry: crtEntry,
+                   freebsd: freebsd)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -860,12 +955,13 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
           # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
           result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-        elif result.rawSyscalls and importcN.len > 0 and lookupSyscall(importcN).found:
+        elif result.rawSyscalls and importcN.len > 0 and
+            lookupSyscall(importcN, result.freebsd).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
           # and declares the kernel's clobbers; calls go through the declarative
           # `(prepare …)` path with a `(syscall)`/`(svc)` marker. See genCall.
-          let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
+          let (_, x64Nr, a64Nr) = lookupSyscall(importcN, result.freebsd)
           # Keying on the C `importcN` (not the proc's own `pname`) collapses aliases —
           # e.g. both `die` and `exit` (`importc "exit"`) → one syproc. See
           # `syprocAsmName` for the shape and why it is that shape.
@@ -1066,8 +1162,8 @@ proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
                     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
                     "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-  elif p.rawSyscalls and importcN.len > 0 and lookupSyscall(importcN).found:
-    let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
+  elif p.rawSyscalls and importcN.len > 0 and lookupSyscall(importcN, p.freebsd).found:
+    let (_, x64Nr, a64Nr) = lookupSyscall(importcN, p.freebsd)
     result = CallTarget(asmName: p.lengSym(syprocAsmName(importcN, s.module)), extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                         retType: retType, sigType: sigType)

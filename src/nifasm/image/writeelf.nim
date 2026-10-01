@@ -266,6 +266,7 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
       copyMem(addr symtab[at], addr sym, sizeof(Elf64_Sym))
 
   var ehdr = initHeader(entryAddr, machine)
+  if a.freebsd: ehdr.e_ident[EI_OSABI] = ELFOSABI_FREEBSD
   ehdr.e_phnum = 3  # Three program headers: .text, .bss and .eh_frame
   ehdr.e_phoff = 64  # Program headers start after ELF header
 

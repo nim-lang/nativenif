@@ -271,7 +271,7 @@ proc genGlobal*(g: var CodeGen; nifName: SymId; decl: Cursor) =
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  windows = false; crtEntry = false): string =
+                  windows = false; crtEntry = false; freebsd = false): string =
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
   ## `.exe` whose imports bind through the import table (each extern's own
@@ -295,10 +295,12 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   var g = newCodeGen(buf, x64MachineA, x64RegName)   # register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
-  g.prog = collect(buf, inputPath, tags, windows = windows, crtEntry = crtEntry)
+  g.prog = collect(buf, inputPath, tags, windows = windows, crtEntry = crtEntry,
+                   freebsd = freebsd)
   g.adoptProgram()
   g.ab.tree StmtsX64:
-    g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
+    g.ab.tree ArchD:
+      g.ab.ident (if windows: "win_x64" elif freebsd: "freebsd_x64" else: "x64")
     for i in 0 ..< g.prog.mainTypeList.len:
       let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)

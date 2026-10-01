@@ -312,6 +312,24 @@ proc genSyscallMarkerX64(n: var Cursor; ctx: var GenContext) =
     error("Multiple call/syscall instructions in prepare block", n)
   x86.emitMovImmToReg(ctx.buf.data, x86.RAX, int64(ctx.callContext.syscallNr))
   x86.emitSyscall(ctx.buf.data)
+  if ctx.freebsd:
+    # FreeBSD reports failure as carry set + a POSITIVE errno in rax. Rewrite it
+    # into the Linux convention (`-errno`) that the stdlib's `pcall` reads, so
+    # one syscall-shaped binding serves both kernels.
+    const FreeBsdForkNr = 2
+    let ok = ctx.buf.createLabel()
+    let done = ctx.buf.createLabel()
+    x86.emitJae(ctx.buf, ok)                    # CF clear: success
+    x86.emitNeg(ctx.buf.data, x86.RAX)
+    x86.emitJmp(ctx.buf, done)
+    ctx.buf.defineLabel(ok)
+    if ctx.callContext.syscallNr == FreeBsdForkNr:
+      # `fork` returns in BOTH processes with the other one's pid in rax; the
+      # child is the one with rdx = 1. POSIX `fork` returns 0 there.
+      x86.emitTest(ctx.buf.data, x86.RDX, x86.RDX)
+      x86.emitJe(ctx.buf, done)
+      x86.emitXor(ctx.buf.data, x86.RAX, x86.RAX)
+    ctx.buf.defineLabel(done)
   ctx.clobbered.incl(ctx.callContext.typ.clobbers)
   ctx.callContext.callEmitted = true
   inc n                   # past the `(syscall)` head
