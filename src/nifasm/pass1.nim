@@ -83,6 +83,11 @@ proc handleArch*(n: var Cursor; ctx: var GenContext) =
   let arch = n.strVal
   if arch == "x64":
     ctx.arch = Arch.X64
+  elif arch == "freebsd_x64":
+    # Every x86-64 encoding and the static-ELF layout are the Linux ones; only
+    # the edges where the kernel is the other party differ (see `freebsd`).
+    ctx.arch = Arch.X64
+    ctx.freebsd = true
   elif arch == "linux_arm64":
     ctx.arch = Arch.LinuxA64
   elif arch == "arm64":

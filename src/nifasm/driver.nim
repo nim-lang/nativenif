@@ -352,6 +352,8 @@ proc setupTls(ctx: var GenContext) =
   ## x86-64 only (AArch64 TLS uses a different mechanism, not yet implemented).
   const ArchSetFs = 0x1002      # arch_prctl(2) ARCH_SET_FS
   const ArchPrctlNr = 158       # x86-64 syscall number for arch_prctl
+  const Amd64SetFsbase = 129    # FreeBSD sysarch(2) AMD64_SET_FSBASE
+  const SysarchNr = 165         # FreeBSD syscall number for sysarch
   if ctx.arch != Arch.X64 or ctx.tlsOffset == 0: return
   if ctx.tlsBlockSym == nil or ctx.entrySym == nil: return
   # Reserve the per-thread block in .bss (16-byte aligned); its address is the FS
@@ -373,9 +375,17 @@ proc setupTls(ctx: var GenContext) =
   # can be computed from FS at run time. The main thread's is filled here; a
   # thread the runtime creates fills its own (see `std/rawthreads`).
   x86.emitMov(ctx.buf.data, x86.MemoryOperand(base: x86.RSI), x86.RSI)
-  x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
-  x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
-  x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
+  if ctx.freebsd:
+    # FreeBSD's `sysarch(AMD64_SET_FSBASE, &base)` reads the base THROUGH its
+    # pointer argument — and the self-pointer just stored makes `rsi` exactly
+    # such a pointer. sysarch clobbers rdx (the second result word), which is
+    # recomputed below anyway.
+    x86.emitMovImmToReg(ctx.buf.data, x86.RDI, Amd64SetFsbase)
+    x86.emitMovImmToReg(ctx.buf.data, x86.RAX, SysarchNr)
+  else:
+    x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
+    x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
+  x86.emitSyscall(ctx.buf.data)                             # arch_prctl / sysarch
   # Hand the kernel-provided argc/argv to `main(argc, argv)` the way a C crt0 would.
   # At process entry the SysV ABI puts argc at [rsp] and argv[0] at [rsp+8] (NOT in
   # rdi/rsi — the kernel zeroes the registers), and the prologue above leaves rsp

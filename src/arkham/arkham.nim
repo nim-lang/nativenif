@@ -77,6 +77,7 @@ when defined(nimony):
     hostOS =
       when defined(windows): "windows"
       elif defined(macosx): "macosx"
+      elif defined(freebsd): "freebsd"
       else: "linux"
 
 proc archOf(os, cpu: string): string =
@@ -104,6 +105,7 @@ proc archOf(os, cpu: string): string =
             of "linux": "linux"
             of "windows": "windows"
             of "macosx", "macos", "osx": "macosx"
+            of "freebsd": "freebsd"
             # `embedded` — there is no OS, which is a target and not the
             # absence of one.
             #
@@ -114,9 +116,10 @@ proc archOf(os, cpu: string): string =
             # about what is being built.
             of "embedded", "baremetal": "embedded"
             else: quit("arkham: unknown --os:" & os &
-                       " (supported: linux, windows, macosx, embedded)", QuitFailure)
+                       " (supported: linux, windows, macosx, freebsd, embedded)", QuitFailure)
   case osC & "/" & cpuC
   of "linux/amd64": "x64"
+  of "freebsd/amd64": "freebsd_x64"
   of "windows/amd64": "win_x64"
   of "linux/arm64": "linux_arm64"
   of "macosx/arm64": "arm64"
@@ -125,7 +128,7 @@ proc archOf(os, cpu: string): string =
   of "embedded/riscv32": "riscv32"
   else:
     quit("arkham: unsupported --os/--cpu combination: " & osC & "/" & cpuC &
-         " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64," &
+         " (supported: linux/amd64, freebsd/amd64, windows/amd64, linux/arm64, macosx/arm64," &
          " embedded/arm32, embedded/avr, embedded/riscv32)",
          QuitFailure)
 
@@ -138,6 +141,7 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
+             of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":

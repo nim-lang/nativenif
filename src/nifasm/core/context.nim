@@ -131,6 +131,8 @@ type
     text*: string        # the node, rendered as NIF (capped, see ListingTextCap)
 
   GenContext* = object
+    freebsd*: bool       # `(arch freebsd_x64)`: an `Arch.X64` image for FreeBSD —
+                         # FreeBSD's ELF brand, syscall error convention and TLS setup
     scope*: Scope        # Current (possibly proc-local) lexical scope
     rootScope*: Scope    # Module/global scope; foreign symbols are defined here so
                         # they persist past the proc that first referenced them
