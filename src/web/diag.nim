@@ -26,6 +26,9 @@ proc quitErr*(msg: string; code = QuitFailure) {.noreturn.} =
   stderr.writeLine msg
   quit code
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # `gInputFile` is set once by the single-threaded CLI
+
 var gInputFile = ""
 
 proc setInputFile*(f: string) {.inline.} = gInputFile = f

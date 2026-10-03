@@ -23,6 +23,9 @@
 ## makes that forwarding a splice rather than a translation.
 
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # single-threaded tool state
+
 import std / syncio
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagconv, tagpool, tags]
