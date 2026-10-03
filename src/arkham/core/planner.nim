@@ -75,6 +75,9 @@
 ## reuse it); the union of callee-saved registers ever used drives the
 ## prologue/epilogue.
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # single-threaded tool state
+
 import std / envvars
 import std / syncio
 import std / [tables, sets, assertions, os, strutils]

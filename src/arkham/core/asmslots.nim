@@ -9,6 +9,9 @@
 ## `AsmSlot` (kind + size + align). Drives register-class and width decisions
 ## in the register allocator and code generator.
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # single-threaded tool state
+
 import std / [assertions]
 import nifcore
 import nifcdecl
