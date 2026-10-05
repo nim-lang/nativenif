@@ -146,7 +146,7 @@ proc addName(dest, strtab: var seq[byte]; name: string) =
     strtab.add 0'u8
 
 proc writeCoffObject*(a: var GenContext; outfile: string) {.canRaise.} =
-  if a.arch != Arch.WinX64:
+  if not a.target.win64Abi:
     quit "nifasm: --emit-obj writes a COFF object for x86-64 Windows only"
   # No layout passes, as for the PE: the positions the encoder recorded are final.
   fillTraceTable(a)

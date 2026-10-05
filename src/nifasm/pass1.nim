@@ -81,33 +81,9 @@ proc handleArch*(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != Ident: error("Expected architecture symbol", n)
   let arch = n.strVal
-  if arch == "x64":
-    ctx.arch = Arch.X64
-  elif arch == "freebsd_x64":
-    # Every x86-64 encoding and the static-ELF layout are the Linux ones; only
-    # the edges where the kernel is the other party differ (see `freebsd`).
-    ctx.arch = Arch.X64
-    ctx.freebsd = true
-  elif arch == "linux_arm64":
-    ctx.arch = Arch.LinuxA64
-  elif arch == "arm64":
-    ctx.arch = Arch.A64
-  elif arch == "win_x64":
-    ctx.arch = Arch.WinX64
-  elif arch == "win_arm64":
-    ctx.arch = Arch.WinA64
-  elif arch == "cortex_m":
-    ctx.arch = Arch.CortexM
-  elif arch == "avr":
-    ctx.arch = Arch.Avr
-  elif arch == "riscv32":
-    ctx.arch = Arch.Rv32
-  else:
+  if not targetOfArchName(arch, ctx.target):
     error("Unknown architecture: " & arch, n)
-  setAsmWordSize(case ctx.arch
-                 of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8
-                 of Arch.CortexM, Arch.Rv32: 4
-                 of Arch.Avr: 2)
+  setAsmWordSize(ctx.target.wordSize)
   inc n
 
 proc pass1*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =
@@ -194,10 +170,10 @@ proc pass1*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string
           if n.kind != StrLit: error("Expected library path string", n)
           let libPath = getStr(n)
           inc n
-          # Load this library; `(imp …)` no longer decides what BINDS to it — each
-          # `(extproc …)` names its own, so an import that only needs loading (the
-          # Darwin TLV bootstrap, with no externs at all) is expressible too.
-          discard ctx.importOrdinal(libPath)
+          # Declare this library; `(imp …)` does not decide what BINDS to it — each
+          # `(extproc …)` names its own (or falls back to the first declared one).
+          # It is imported once an extern bound to it is called (`useExtProc`).
+          ctx.declareLib(libPath)
         of ExtprocD:
           # (extproc :name "external_name" "dll"? (params …)? (result …)? (clobber …)?)
           inc n
@@ -207,16 +183,13 @@ proc pass1*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string
           if n.kind != StrLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
           inc n
-          let libOrdinal = ctx.extprocLib(n)     # the optional dll operand
+          let libName = ctx.extprocLib(n)        # the optional dll operand
           let typ = parseExtprocSig(n, scope, ctx)
-          # Allocate GOT slot
-          let gotSlot = ctx.gotSlotCount
-          ctx.gotSlotCount += 1
-          # Create symbol
-          let sym = Symbol(name: ctx.symIdOf(name), kind: skExtProc, typ: typ, extName: extName, libName: "", gotSlot: gotSlot)
+          # Only the symbol: the GOT slot and the import entry come with the first
+          # call (`useExtProc`), so an extern nothing calls is not imported.
+          let sym = Symbol(name: ctx.symIdOf(name), kind: skExtProc, typ: typ, extName: extName,
+                           libName: libName, gotSlot: -1)
           scope.define(sym)
-          # Track for code generation
-          ctx.extProcs.add ExtProcInfo(name: name, extName: extName, libOrdinal: libOrdinal, gotSlot: gotSlot, stubOffset: -1)
         of SyprocD:
           # (syproc :name (params ...) (result ...) (clobber ...) NR) — defines a
           # syscall's proctype + number; emits no code (see genSyscallMarker*).

@@ -189,7 +189,7 @@ Fix, in two moves, no runtime indirection:
    ```
    where `genInstNode` is the local `withListingRow(ctx, n): genInstX64(n, ctx)`.
 
-`core/pass2.nim` then dispatches on `ctx.arch` to `genStmtX64` / `genStmtA64` /
+`core/pass2.nim` then dispatches on `ctx.target.cpu` to `genStmtX64` / `genStmtA64` /
 `genStmtM` once, at the top, instead of once per instruction.
 
 ## 6. Target tree — arkham

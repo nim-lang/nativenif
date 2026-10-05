@@ -151,10 +151,13 @@ type
     declStart*: int # Position in module's TokenBuf where declaration starts
 
     # External proc info (for skExtProc)
-    libName*: string  # Library name (e.g. "libSystem.B.dylib")
+    libName*: string  # Library the extern binds to ("" = none: the system linker
+                      # binds it). Only a NAME until the first call: see `useExtProc`
     extName*: string  # External symbol name (e.g. "_write")
     stubOffset*: int  # Offset into stub section
-    gotSlot*: int     # GOT slot index for this symbol
+    gotSlot*: int     # GOT slot index for this symbol, valid once `extUsed`
+    extUsed*: bool    # something called it: it has a GOT slot and an import entry
+    extProcIdx*: int  # its index into `GenContext.extProcs`, valid once `extUsed`
 
   Scope* = ref object
     parent*: Scope

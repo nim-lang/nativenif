@@ -5,7 +5,7 @@ Status: **M0–M4d complete.**
 | Milestone | State |
 |---|---|
 | M0 target contract | done — `tools/avr_probe.nim`, 18 checks |
-| M1 arch + word-size plumbing | done — `Arch.Avr`, `TargetArch.Avr`, `Word16` |
+| M1 arch + word-size plumbing | done — `Cpu.Avr`, `TargetArch.Avr`, `Word16` |
 | M2a encoder + relocations | done — `src/nifasm/avr/encoder.nim`, 59-check self-test |
 | M2b ELF32 image writer | done — `src/nifasm/image/writeavr.nim` |
 | M3 assembler integration | **working** — 6 fixtures run end to end |

@@ -64,7 +64,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:
-      if ctx.arch == Arch.A64 and sym.dataConst:
+      if ctx.target.format == ImageFormat.MachO and sym.dataConst:
         # Mach-O: a const whose fields are symbol addresses must be rebased by dyld,
         # which can only write a *writable* segment — so place it in __DATA (the .bss
         # image, like a statically-initialized gvar) rather than read-only __TEXT.
@@ -179,8 +179,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   of skTvar:
     if declTag == TvarD:
       let size = stackslots.alignedSize(sym.typ)
-      case ctx.arch
-      of Arch.A64:
+      if ctx.target.format == ImageFormat.MachO:
         # macOS TLV: give the variable a descriptor index and a byte offset in
         # the per-thread storage region, and bake a literal initializer (if any)
         # into the __thread_data template dyld copies on first access per thread.
@@ -229,7 +228,7 @@ proc setupWinEntry(ctx: var GenContext) =
   ## `main` storing garbage into `cmdCount`/`cmdLine`/`nimEnviron` and every later
   ## `paramStr` walking a wild pointer. (Wiring the real command line through
   ## `GetCommandLineW` + `CommandLineToArgvW` is a separate step.)
-  if ctx.arch != Arch.WinX64 or ctx.entrySym == nil: return
+  if not ctx.target.win64Abi or ctx.entrySym == nil: return
   ctx.winEntryOffset = ctx.buf.data.len
   x86.emitMovImmToReg(ctx.buf.data, x86.RDI, 0)             # argc = 0
   x86.emitMovImmToReg(ctx.buf.data, x86.RSI, 0)             # argv = nil
@@ -254,7 +253,7 @@ proc setupWinCrtMain(ctx: var GenContext) =
     XmmArea = 10 * 16
     Alloc = XmmArea + 8          # entry rsp ≡ 8 (mod 16), two pushes keep it so,
                                  # `+ 8` makes the save area and the call aligned
-  if ctx.arch != Arch.WinX64 or ctx.entrySym == nil: return
+  if not ctx.target.win64Abi or ctx.entrySym == nil: return
   let start = ctx.buf.data.len
   ctx.winEntryOffset = start
   x86.emitPush(ctx.buf.data, x86.RSI)
@@ -327,7 +326,8 @@ proc setupLinuxA64Entry(ctx: var GenContext) =
   ##
   ## Unlike x86-64 this is unconditional: AArch64 needs no TLS prologue to hang the
   ## argument setup off, so the stub exists purely for this.
-  if ctx.arch != Arch.LinuxA64 or ctx.entrySym == nil: return
+  if ctx.target.cpu != Cpu.Arm64 or ctx.target.os != TargetOS.Linux or
+     ctx.entrySym == nil: return
   # Same 4-alignment rule as a proc body (see `pass2Proc`): the stub is appended
   # to a `.text` whose last bytes are a lazily emitted rodata blob of arbitrary
   # length, and the ELF entry must land on an instruction boundary or the very
@@ -354,7 +354,8 @@ proc setupTls(ctx: var GenContext) =
   const ArchPrctlNr = 158       # x86-64 syscall number for arch_prctl
   const Amd64SetFsbase = 129    # FreeBSD sysarch(2) AMD64_SET_FSBASE
   const SysarchNr = 165         # FreeBSD syscall number for sysarch
-  if ctx.arch != Arch.X64 or ctx.tlsOffset == 0: return
+  if ctx.target.cpu != Cpu.Amd64 or ctx.target.os notin {TargetOS.Linux, TargetOS.FreeBSD} or
+     ctx.tlsOffset == 0: return
   if ctx.tlsBlockSym == nil or ctx.entrySym == nil: return
   # Reserve the per-thread block in .bss (16-byte aligned); its address is the FS
   # base, and every tvar lives at `FS:[its offset]` within it.
@@ -375,7 +376,7 @@ proc setupTls(ctx: var GenContext) =
   # can be computed from FS at run time. The main thread's is filled here; a
   # thread the runtime creates fills its own (see `std/rawthreads`).
   x86.emitMov(ctx.buf.data, x86.MemoryOperand(base: x86.RSI), x86.RSI)
-  if ctx.freebsd:
+  if ctx.target.os == TargetOS.FreeBSD:
     # FreeBSD's `sysarch(AMD64_SET_FSBASE, &base)` reads the base THROUGH its
     # pointer argument — and the self-pointer just stored makes `rsi` exactly
     # such a pointer. sysarch clobbers rdx (the second result word), which is
@@ -416,7 +417,7 @@ proc setupTlsWin(ctx: var GenContext) =
   ## the template is indexed by exactly those, so `arkham.tls.self.0` still owns
   ## offset 0 (unused here — Windows finds the block through the TEB, not through a
   ## self-pointer) and every real tvar sits where its `lea` says it does.
-  if ctx.arch != Arch.WinX64 or ctx.tlsOffset == 0: return
+  if not ctx.target.win64Abi or ctx.tlsOffset == 0: return
   if ctx.winTlsIndexSym == nil: return
   ctx.winTlsTemplate = newSeq[byte]((ctx.tlsOffset + 15) and not 15)
   for it in ctx.tlsInits:
@@ -429,6 +430,94 @@ proc setupTlsWin(ctx: var GenContext) =
   ctx.bssOffset = (ctx.bssOffset + 7) and not 7
   ctx.winTlsIndexSym.size = ctx.bssOffset
   ctx.bssOffset += TlsIndexCellBytes
+
+proc writeFirmware(ctx: var GenContext; outfile: string; memMap: elf32.MemoryMap) =
+  ## The bare-metal image: what precedes the code (vector table, reset jump, or
+  ## nothing) and where it is loaded are properties of the core, not of an OS.
+  case ctx.target.cpu
+  of Cpu.Rv32:
+    # A firmware image, not a hosted executable — but unlike Cortex-M there is
+    # no vector table at its head, so the code starts at the load address and
+    # `absBase` is that address exactly. See `writerv32.nim`.
+    ctx.buf.absBase = Rv32LoadAddr
+    finalize(ctx.buf)
+    var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+    for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+    # The entry is the ENTRY PROC, not the first byte emitted. Those coincide
+    # today only because `pass2` generates `_start`/`main.0` eagerly the moment
+    # it sees one; nothing guarantees it, and a wrong entry starts executing
+    # some other proc's prologue with no diagnostic.
+    var entryOff = 0
+    if ctx.entrySym != nil:
+      let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+      if pos < 0:
+        quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+             "' has no address"
+      entryOff = pos
+    try:
+      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
+    except:
+      quit "nifasm: cannot write " & outfile
+  of Cpu.CortexM:
+    # A firmware image, not a hosted executable: vector table, then code.
+    #
+    # `absBase` is what makes the MOVW+MOVT absolute relocations correct: those
+    # carry a label's real ADDRESS, and the code is loaded 8 bytes above the
+    # image base because the vector table sits there. Without it every
+    # `(adr …)` would resolve 8 bytes low — near enough to look plausible and
+    # read the wrong bytes.
+    ctx.buf.absBase = memMap.flashBase + uint32(ctx.interruptTableBytes)
+    finalize(ctx.buf)
+    var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+    for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+    # The reset vector points at the ENTRY PROC, not at the first byte emitted.
+    # Those coincide today only because `pass2` generates `_start`/`main.0`
+    # eagerly the moment it sees it; nothing guarantees that, and a wrong reset
+    # vector starts executing some other proc's prologue with no diagnostic.
+    # A module of bare top-level statements has no entry symbol, and there 0 is
+    # genuinely right.
+    var entryOff = 0
+    if ctx.entrySym != nil:
+      let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+      if pos < 0:
+        quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+             "' has no address"
+      entryOff = pos
+    try:
+      writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
+    except:
+      quit "nifasm: cannot write " & outfile
+  of Cpu.Avr:
+    # A firmware image: a reset `jmp`, then the code.
+    #
+    # `absBase` is the reset vector's four bytes, and it is load-bearing: a
+    # label's position is measured inside `ctx.buf`, which does not contain the
+    # vector, while the finished image prepends it. Without this every `call`
+    # and `jmp` resolves four bytes low — which on this machine is two words,
+    # so it lands on a real instruction in the middle of the intended proc and
+    # runs. The flash base itself contributes nothing: the core begins
+    # executing at 0 and no board says otherwise.
+    ctx.buf.absBase = uint32(ResetVectorBytes)
+    finalize(ctx.buf)
+    var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+    for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+    # The reset vector points at the ENTRY PROC, not at the first byte emitted.
+    # Those coincide today only because `pass2` generates the entry eagerly the
+    # moment it sees it; nothing guarantees that, and a wrong reset vector
+    # starts executing some other proc's prologue with no diagnostic.
+    var entryOff = 0
+    if ctx.entrySym != nil:
+      let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+      if pos < 0:
+        quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+             "' has no address"
+      entryOff = pos
+    try:
+      writeFile(outfile, writeAvrImage(ctx, code, entryOff))
+    except:
+      quit "nifasm: cannot write " & outfile
+  of Cpu.Amd64, Cpu.Arm64:
+    quit "nifasm: no firmware image layout for " & $ctx.target.cpu
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                listing = ""; debugInfo = true;
@@ -529,7 +618,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # offset must be fixed before any code is generated — otherwise a reference
   # compiled before the tvar's lazy `generateSymbol` would capture the default 0.
   # (macOS/A64 resolves tvars through relocated descriptors and allocates lazily.)
-  if ctx.arch in {Arch.X64, Arch.WinX64}:
+  if ctx.target.cpu == Cpu.Amd64 and ctx.target.format != ImageFormat.MachO:
     var tn = beginRead(ctx.modules.getOrQuit(MainModuleName).buf)
     if tn.kind == TagLit and tn.tag == StmtsTagId:
       loopInto tn:
@@ -581,119 +670,41 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   if ctx.emitObj:
     # Relocatable object for the system linker (foreign `.o` / framework linking).
     # Standalone executable emission below is unaffected.
-    case ctx.arch
-    of Arch.A64:
+    case ctx.target.format
+    of ImageFormat.MachO:
       writeMachOObject(ctx, outfile)
-    of Arch.X64:
+    of ImageFormat.Elf:
       try:
         writeElfObject(ctx, outfile)
       except:
         quit "nifasm: cannot write " & outfile
-    of Arch.WinX64:
+    of ImageFormat.Pe:
       try:
         writeCoffObject(ctx, outfile)
       except:
         quit "nifasm: cannot write " & outfile
-    else:
+    of ImageFormat.Firmware:
       quit "nifasm: --emit-obj is only supported for macOS arm64 and x86-64 " &
            "Linux and Windows"
   else:
     # A memory map describes a BOARD, and only the firmware target has one. Every
     # other arch is handed its address space by a loader, so honouring the flags
     # there is impossible and ignoring them silently is worse than saying so.
-    if memMap.given and ctx.arch != Arch.CortexM:
+    if memMap.given and ctx.target.cpu != Cpu.CortexM:
       quit "nifasm: the memory-map flags apply to the cortex_m target only"
-    case ctx.arch
-    of Arch.X64, Arch.LinuxA64:
+    case ctx.target.format
+    of ImageFormat.Elf:
       try:
         writeElf(ctx, outfile)
       except:
         quit "nifasm: cannot write " & outfile
-    of Arch.A64:
+    of ImageFormat.MachO:
       writeMachO(ctx, outfile)
-    of Arch.WinX64, Arch.WinA64:
+    of ImageFormat.Pe:
       writeExe(ctx, outfile.changeFileExt("exe"))
-    of Arch.Rv32:
-      # A firmware image, not a hosted executable — but unlike Cortex-M there is
-      # no vector table at its head, so the code starts at the load address and
-      # `absBase` is that address exactly. See `writerv32.nim`.
-      ctx.buf.absBase = Rv32LoadAddr
-      finalize(ctx.buf)
-      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
-      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
-      # The entry is the ENTRY PROC, not the first byte emitted. Those coincide
-      # today only because `pass2` generates `_start`/`main.0` eagerly the moment
-      # it sees one; nothing guarantees it, and a wrong entry starts executing
-      # some other proc's prologue with no diagnostic.
-      var entryOff = 0
-      if ctx.entrySym != nil:
-        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
-        if pos < 0:
-          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
-               "' has no address"
-        entryOff = pos
-      try:
-        writeFile(outfile, writeRv32Image(ctx, code, entryOff))
-      except:
-        quit "nifasm: cannot write " & outfile
-    of Arch.CortexM:
-      # A firmware image, not a hosted executable: vector table, then code.
-      #
-      # `absBase` is what makes the MOVW+MOVT absolute relocations correct: those
-      # carry a label's real ADDRESS, and the code is loaded 8 bytes above the
-      # image base because the vector table sits there. Without it every
-      # `(adr …)` would resolve 8 bytes low — near enough to look plausible and
-      # read the wrong bytes.
-      ctx.buf.absBase = memMap.flashBase + uint32(ctx.interruptTableBytes)
-      finalize(ctx.buf)
-      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
-      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
-      # The reset vector points at the ENTRY PROC, not at the first byte emitted.
-      # Those coincide today only because `pass2` generates `_start`/`main.0`
-      # eagerly the moment it sees it; nothing guarantees that, and a wrong reset
-      # vector starts executing some other proc's prologue with no diagnostic.
-      # A module of bare top-level statements has no entry symbol, and there 0 is
-      # genuinely right.
-      var entryOff = 0
-      if ctx.entrySym != nil:
-        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
-        if pos < 0:
-          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
-               "' has no address"
-        entryOff = pos
-      try:
-        writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
-      except:
-        quit "nifasm: cannot write " & outfile
-    of Arch.Avr:
-      # A firmware image: a reset `jmp`, then the code.
-      #
-      # `absBase` is the reset vector's four bytes, and it is load-bearing: a
-      # label's position is measured inside `ctx.buf`, which does not contain the
-      # vector, while the finished image prepends it. Without this every `call`
-      # and `jmp` resolves four bytes low — which on this machine is two words,
-      # so it lands on a real instruction in the middle of the intended proc and
-      # runs. The flash base itself contributes nothing: the core begins
-      # executing at 0 and no board says otherwise.
-      ctx.buf.absBase = uint32(ResetVectorBytes)
-      finalize(ctx.buf)
-      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
-      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
-      # The reset vector points at the ENTRY PROC, not at the first byte emitted.
-      # Those coincide today only because `pass2` generates the entry eagerly the
-      # moment it sees it; nothing guarantees that, and a wrong reset vector
-      # starts executing some other proc's prologue with no diagnostic.
-      var entryOff = 0
-      if ctx.entrySym != nil:
-        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
-        if pos < 0:
-          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
-               "' has no address"
-        entryOff = pos
-      try:
-        writeFile(outfile, writeAvrImage(ctx, code, entryOff))
-      except:
-        quit "nifasm: cannot write " & outfile
+    of ImageFormat.Firmware:
+      writeFirmware(ctx, outfile, memMap)
+  # Close all foreign-module readers
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:
     let fm = module.foreign

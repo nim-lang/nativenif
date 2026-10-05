@@ -30,15 +30,15 @@ proc writeMachO*(a: var GenContext; outfile: string) =
   let code = a.buf.data
 
   # Determine CPU type based on architecture
-  let (cputype, cpusubtype) = case a.arch
-    of Arch.X64:
+  let (cputype, cpusubtype) = case a.target.cpu
+    of Cpu.Amd64:
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
-    of Arch.A64, Arch.LinuxA64:
+    of Cpu.Arm64:
       (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
-    of Arch.WinX64, Arch.WinA64, Arch.CortexM, Arch.Avr, Arch.Rv32:
-      # Unreachable: Windows emits PE, and Cortex-M, AVR and RV32 each emit a bare
-      # ELF32 firmware image, so none of them ever reaches the Mach-O writer.
-      # Covered so the case stays exhaustive.
+    of Cpu.CortexM, Cpu.Avr, Cpu.Rv32:
+      # Unreachable: Cortex-M, AVR and RV32 each emit a bare firmware image, so
+      # none of them ever reaches the Mach-O writer. Covered so the case stays
+      # exhaustive.
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
 
   # Build dynlink info for external procs
@@ -150,8 +150,8 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
   finalize(a.bssBuf)
   let code = a.buf.data
 
-  let (cputype, cpusubtype) = case a.arch
-    of Arch.A64: (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
+  let (cputype, cpusubtype) = case a.target.cpu
+    of Cpu.Arm64: (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
     else:
       quit "nifasm: --emit-obj is only supported for macOS arm64"
 

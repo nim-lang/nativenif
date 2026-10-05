@@ -1047,6 +1047,32 @@ buildToolchain()
 # it runs everywhere in the matrix rather than only where native output executes.
 webTests()
 
+proc deadImportTests() =
+  ## Externs are bound on their first CALL, not where they are declared: a module
+  ## may declare another OS's API (or this one's, unused) and the image must not
+  ## import it. `dead_imports_win64.nif` is `hello_win64.nif` plus an uncalled
+  ## `Sleep` from kernel32 and an uncalled `MessageBoxA` from a `user32.dll` nothing
+  ## else uses, so its image must be byte-identical to hello's. Assembling only,
+  ## so it runs on every host.
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "nimcache"
+  createDir workDir
+  let withDead = workDir / "dead_imports_win64"
+  let plain = workDir / "dead_imports_plain"
+  exec quoteShell(nifasm) & " -o:" & quoteShell(withDead) & " " &
+       quoteShell("tests" / "dead_imports_win64.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(plain) & " " &
+       quoteShell("tests" / "hello_win64.nif")
+  let image = readFile(withDead & ".exe")
+  for dead in ["user32.dll", "MessageBoxA", "Sleep"]:
+    if dead in image:
+      quit "FAILURE dead imports: the image imports the uncalled `" & dead & "`"
+  if image != readFile(plain & ".exe"):
+    quit "FAILURE dead imports: uncalled externs changed the image"
+  echo "1 / 1 dead import tests successful"
+
+deadImportTests()
+
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
   exec "tests/hello_darwin"

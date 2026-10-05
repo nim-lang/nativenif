@@ -11,11 +11,11 @@
 ## Serves both `x64` (Linux/ELF) and `win_x64` (PE). They share every encoding;
 ## what differs is the calling convention — the shadow space a Win64 caller
 ## reserves, and the import-address-table indirection an `extcall` goes
-## through — and that is guarded by `ctx.arch` rather than duplicated.
+## through — and that is guarded by `ctx.target` rather than duplicated.
 
 import std / [tables, sets]
 import nifcore
-import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
+import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem, modules,
                     listing, emit, tags, model, tagconv, decls,
                     tagpool, stackslots, relocs, buffers]
 import encoder as x86
@@ -99,7 +99,7 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     argsSet: initHashSet[SymId](),
     resultsSet: initHashSet[SymId](),
     callEmitted: false,
-    stackArgBase: (if ctx.arch == Arch.WinX64: WinShadowSpace else: 0)
+    stackArgBase: (if ctx.target.win64Abi: WinShadowSpace else: 0)
   )
 
   if sym == nil:
@@ -133,11 +133,7 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     # bare extern has no signature to check against, so only the marker is verified.
     ctx.callContext.state = CallContextState.ExternalCall
     ctx.callContext.typ = sym.typ
-    let extName = name
-    for i, ext in ctx.extProcs:
-      if ext.name == extName:
-        ctx.callContext.extProcIdx = i
-        break
+    ctx.callContext.extProcIdx = ctx.useExtProc(sym)
   else:
     error("Expected proc symbol, got " & $sym.kind, hdr)
 
@@ -312,7 +308,7 @@ proc genSyscallMarkerX64(n: var Cursor; ctx: var GenContext) =
     error("Multiple call/syscall instructions in prepare block", n)
   x86.emitMovImmToReg(ctx.buf.data, x86.RAX, int64(ctx.callContext.syscallNr))
   x86.emitSyscall(ctx.buf.data)
-  if ctx.freebsd:
+  if ctx.target.os == TargetOS.FreeBSD:
     # FreeBSD reports failure as carry set + a POSITIVE errno in rax. Rewrite it
     # into the Linux convention (`-errno`) that the stdlib's `pcall` reads, so
     # one syscall-shaped binding serves both kernels.
@@ -372,16 +368,8 @@ proc genIatX64(n: var Cursor; ctx: var GenContext) =
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
   if sym == nil or sym.kind != skExtProc: error("iat requires external proc, got: " & name, n)
   inc n
-  # Find the extproc to get its IAT slot
-  var iatSlot = -1
-  for i in 0..<ctx.extProcs.len:
-    if ctx.extProcs[i].name == name:
-      iatSlot = ctx.extProcs[i].gotSlot
-      break
-  if iatSlot == -1:
-    error("External proc not found: " & name, n)
   # Emit indirect call through IAT using relocation system
-  ctx.buf.emitIatCall(iatSlot)
+  ctx.buf.emitIatCall(ctx.extProcs[ctx.useExtProc(sym)].gotSlot)
 
 proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let start = n

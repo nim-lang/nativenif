@@ -25,12 +25,10 @@ proc writeExe*(a: var GenContext; outfile: string) =
 
   # Determine machine type based on architecture
   let machine =
-    case a.arch
-    of Arch.WinX64:
-      pe.IMAGE_FILE_MACHINE_AMD64
-    of Arch.WinA64:
+    case a.target.cpu
+    of Cpu.Arm64:
       pe.IMAGE_FILE_MACHINE_ARM64
-    else:
+    of Cpu.Amd64, Cpu.CortexM, Cpu.Avr, Cpu.Rv32:
       pe.IMAGE_FILE_MACHINE_AMD64
 
   # Build dynlink info for external procs

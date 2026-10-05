@@ -68,15 +68,37 @@ type
       foreign*: ForeignModule
     loaded*: bool  # True if already loaded into scope
 
-  Arch* = enum
-    X64        # Linux x86-64 (ELF)
-    LinuxA64   # Linux ARM64 (ELF)
-    A64        # macOS ARM64 (Mach-O)
-    WinX64     # Windows x86-64 (PE)
-    WinA64     # Windows ARM64 (PE)
-    CortexM    # Bare-metal ARMv7E-M / Cortex-M4 (ELF32 firmware image, no OS)
-    Avr        # Bare-metal AVR / avr5 (ELF32 firmware image, no OS)
-    Rv32       # Bare-metal RV32IMAFD / ilp32d (ELF32 firmware image, no OS)
+  Cpu* = enum            ## The instruction set: picks the encoder, the register
+                         ## model and the frame shape. Nothing about the OS.
+    Amd64      # x86-64
+    Arm64      # AArch64
+    CortexM    # ARMv7E-M / Cortex-M4 (Thumb-2)
+    Avr        # AVR / avr5
+    Rv32       # RV32IMAFD / ilp32d
+
+  TargetOS* = enum       ## Who loads and runs the image: entry shape, syscall
+                         ## convention, how imports bind, how TLS is set up.
+    BareMetal  # no OS: the image is flashed and starts at the reset vector
+    Linux
+    FreeBSD
+    MacOSX
+    Windows
+
+  ImageFormat* = enum    ## The container the image writer produces.
+    Elf        # ELF64 executable (or, with `--emit-obj`, a relocatable object)
+    MachO      # Mach-O executable (or object)
+    Pe         # PE executable (or, with `--emit-obj`, a COFF object)
+    Firmware   # bare-metal image; its layout (vector table, reset jump) is per CPU
+
+  Target* = object
+    ## What one assembly produces code for. The three axes are independent on
+    ## purpose: a check that depends on the instruction set asks `cpu`, one that
+    ## depends on the loader asks `os`, one that depends on the file layout asks
+    ## `format`. A multi-arch container is then several units that differ only in
+    ## `cpu`, written by one container writer.
+    cpu*: Cpu
+    os*: TargetOS
+    format*: ImageFormat
 
   ImportedLib* = object
     name*: string     # Library path (e.g. "/usr/lib/libSystem.B.dylib")
@@ -131,15 +153,13 @@ type
     text*: string        # the node, rendered as NIF (capped, see ListingTextCap)
 
   GenContext* = object
-    freebsd*: bool       # `(arch freebsd_x64)`: an `Arch.X64` image for FreeBSD —
-                         # FreeBSD's ELF brand, syscall error convention and TLS setup
-    scope*: Scope        # Current (possibly proc-local) lexical scope
+    scope*: Scope       # Current (possibly proc-local) lexical scope
     rootScope*: Scope    # Module/global scope; foreign symbols are defined here so
                         # they persist past the proc that first referenced them
                         # (processReachableSymbols looks them up to emit bodies).
     buf*: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf*: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
-    arch*: Arch
+    target*: Target      # set by `(arch …)`, which precedes every declaration
     emitObj*: bool       # `--emit-obj`: write a relocatable object for the system
                         # linker (foreign `.o`/framework/libc linking) instead of a
                         # standalone executable: Mach-O (macOS arm64), ELF (Linux
@@ -270,8 +290,11 @@ type
                         # (re)bind it. The precision (s/d) is recovered from the bound
                         # symbol's type. Reset per proc.
     # Dynamic linking
-    imports*: seq[ImportedLib]  # Imported libraries
-    extProcs*: seq[ExtProcInfo]  # External procs to bind
+    imports*: seq[ImportedLib]  # Libraries the image imports: only those a CALLED
+                                # extern binds to (see `useExtProc`)
+    declaredLibs*: seq[string]  # every `(imp …)` seen, in order; the first one is
+                                # where an extern without a dll operand binds
+    extProcs*: seq[ExtProcInfo]  # External procs to bind: only the CALLED ones
     gotSlotCount*: int  # Number of GOT slots allocated
     # Module system / dead code elimination
     pendingSymbols*: seq[SymId]  # Symbols pending code generation
@@ -452,6 +475,43 @@ type
 
 # ── reading the record ───────────────────────────────────────────────────────
 
+const
+  DefaultTarget* = Target(cpu: Amd64, os: Linux, format: Elf)
+    ## What an assembly without an `(arch …)` header is for (the hand-written
+    ## x86-64 fixtures in `tests/`).
+
+proc targetOfArchName*(name: string; t: var Target): bool =
+  ## The `(arch NAME)` spellings arkham emits, each mapped to its three axes.
+  ## The one place that knows the fused names.
+  result = true
+  case name
+  of "x64": t = Target(cpu: Amd64, os: Linux, format: Elf)
+  of "freebsd_x64": t = Target(cpu: Amd64, os: FreeBSD, format: Elf)
+  of "win_x64": t = Target(cpu: Amd64, os: Windows, format: Pe)
+  of "linux_arm64": t = Target(cpu: Arm64, os: Linux, format: Elf)
+  of "arm64": t = Target(cpu: Arm64, os: MacOSX, format: MachO)
+  of "win_arm64": t = Target(cpu: Arm64, os: Windows, format: Pe)
+  of "cortex_m": t = Target(cpu: CortexM, os: BareMetal, format: Firmware)
+  of "avr": t = Target(cpu: Avr, os: BareMetal, format: Firmware)
+  of "riscv32": t = Target(cpu: Rv32, os: BareMetal, format: Firmware)
+  else: result = false
+
+proc wordSize*(t: Target): int =
+  ## Bytes in a machine word / pointer.
+  case t.cpu
+  of Amd64, Arm64: 8
+  of CortexM, Rv32: 4
+  of Avr: 2
+
+proc linkRegisterCalls*(t: Target): bool {.inline.} =
+  ## The return address stays in a link register (`lr`, `ra`) instead of being
+  ## pushed: AArch64, Cortex-M, RV32.
+  t.cpu in {Arm64, CortexM, Rv32}
+
+proc win64Abi*(t: Target): bool {.inline.} =
+  ## The Microsoft x64 calling convention: 32-byte shadow space, GS-based TEB.
+  t.cpu == Amd64 and t.os == Windows
+
 proc tlsRelocated*(ctx: GenContext; sym: Symbol): bool =
   ## Whether an x86-64 thread-local operand's offset is left to the SYSTEM linker
   ## (an `R_X86_64_TPOFF32`): in a relocatable object libc owns the thread pointer
@@ -459,7 +519,8 @@ proc tlsRelocated*(ctx: GenContext; sym: Symbol): bool =
   ## self-pointer slot is the exception: `fs:[0]` is the psABI's TCB pointer, which
   ## holds the thread pointer under libc exactly as it does in nifasm's own block.
   ## (Windows: see `winTlsDelta`.)
-  ctx.emitObj and ctx.arch == Arch.X64 and sym != ctx.tlsSelfSym and
+  ctx.emitObj and ctx.target.cpu == Cpu.Amd64 and ctx.target.format == ImageFormat.Elf and
+    sym != ctx.tlsSelfSym and
     not sym.gsFixedSlot
 
 proc winTlsDelta*(ctx: GenContext; sym: Symbol): bool =
@@ -467,7 +528,7 @@ proc winTlsDelta*(ctx: GenContext; sym: Symbol): bool =
   ## COFF object the crt owns the TLS template, and the program's thread-locals
   ## are one `.tls$` contribution to it, at an offset the stub `main` computes
   ## (`winTlsDeltaSym`). The TEB field (`gsFixedSlot`) is a fixed GS displacement.
-  ctx.emitObj and ctx.arch == Arch.WinX64 and not sym.gsFixedSlot
+  ctx.emitObj and ctx.target.win64Abi and not sym.gsFixedSlot
 
 proc inCall*(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
@@ -503,7 +564,9 @@ proc newGenContext*(mainPool: Pool; baseDir, thisModule: string;
     baseDir: baseDir,
     thisModule: thisModule,
     thisModuleId: mainPool.strings.getOrIncl(thisModule),
+    target: DefaultTarget,
     imports: @[],
+    declaredLibs: @[],
     extProcs: @[],
     gotSlotCount: 0,
     pendingSymbols: @[],

@@ -61,7 +61,7 @@ proc handleLayout*(n: var Cursor; ctx: var GenContext) =
   ## Nothing here says which section goes where, because nothing needs to: code
   ## and constants go in the region the image SHIPS IN, mutable storage in the one
   ## that holds nothing at reset. Those are what the two regions ARE.
-  if ctx.arch != Arch.CortexM:
+  if ctx.target.cpu != Cpu.CortexM:
     error("(layout …) is a Cortex-M declaration", n)
   n.into:
    while n.hasMore:
@@ -119,7 +119,7 @@ proc handleInterrupts*(n: var Cursor; ctx: var GenContext) =
   ## reached only through this table — so without that it is dropped by the same
   ## reachability walk that drops any unreferenced proc, and the image gets a
   ## table word pointing at a proc that was never emitted.
-  if ctx.arch notin {Arch.CortexM, Arch.Rv32}:
+  if ctx.target.cpu notin {Cpu.CortexM, Cpu.Rv32}:
     error("(interrupts …) is a bare-metal declaration; this target has an OS to " &
           "route traps for it", n)
   # `into`, not a bare `inc`: `hasMore` on an unbounded cursor keeps reading into
@@ -143,7 +143,7 @@ proc handleInterrupts*(n: var Cursor; ctx: var GenContext) =
       # vector at all: a RISC-V core resets to a fixed PC and `mtvec` is written
       # by the code that runs there. The number is a trap CAUSE, and cause 0 is a
       # real one (a machine software interrupt is 3, but nothing makes 0 special).
-      if ctx.arch == Arch.CortexM and slot < 2:
+      if ctx.target.cpu == Cpu.CortexM and slot < 2:
         error("interrupt slot " & $slot & " is the image writer's (initial MSP, reset)", e)
       let name = getSym(e)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, e)
