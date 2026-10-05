@@ -65,6 +65,11 @@ type
                              ## where that tail begins.
     indirect*: bool          ## true → call *through* a function-pointer variable
                              ## (`asmName` is the gvar/tvar holding the pointer)
+    missingImportLib*: string ## non-empty → a Windows extern without a `dynlib` (outside
+                             ## `--crt`): its C name. Nothing can bind it, but that is
+                             ## an error only for a CALL — a declaration nothing calls
+                             ## (another OS's API, folded away) is harmless and nifasm
+                             ## does not import it. See `checkImportLib`.
     foreignAbi*: bool        ## the callee is FOREIGN code reached through a pointer, so
                              ## the call marshals by the platform convention rather than
                              ## arkham's own. Only a `stdcall` proctype on Windows sets
@@ -794,6 +799,22 @@ proc procSigType(declStart: Cursor): Cursor =
   buf.closeTag()
   result = beginRead(buf)
 
+proc missingImportLib(p: Program; importcN, dllN: string): string =
+  ## `importcN` when nothing could bind this extern: on Windows there is no implicit
+  ## import library, so an extern must NAME its dll (a `dynlib: "kernel32"` on the
+  ## Nim decl → `(dynlib …)` in Leng). Linked with the crt it need not: the system
+  ## linker binds it (libc through the crt's import libraries, or a foreign object).
+  if p.windows and dllN.len == 0 and not p.crtEntry: importcN else: ""
+
+proc checkImportLib*(tgt: CallTarget) =
+  ## Called where a call to an extern is GENERATED, not where it is declared: the
+  ## stdlib declares the API of every OS it supports, and after the target
+  ## conditions are folded most of those declarations are never called.
+  if tgt.missingImportLib.len > 0:
+    quit "arkham: the Windows extern `" & tgt.missingImportLib &
+      "` names no import library; annotate the declaration with " &
+      "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
+
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
               darwin = false; windows = false; crtEntry = false;
               freebsd = false): Program =
@@ -981,14 +1002,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # module-LOCAL and leave it out of the `.index` — unresolvable when this
           # module is a foreign module of a bundle. See `extprocAsmName`.
           let asmN = result.lengSym(extprocAsmName(importcN, thisModuleSuffix(result)))
-          if windows and dllN.len == 0 and not crtEntry:
-            # No implicit import library: a Windows extern must NAME its dll
-            # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
-            # Linked with the crt it need not: the system linker binds it (libc
-            # through the crt's import libraries, or a foreign object).
-            quit "arkham: the Windows extern `" & importcN &
-              "` names no import library; annotate the declaration with " &
-              "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
           # The external symbol as the linker spells it: Mach-O prefixes every C
           # symbol with an underscore, PE and ELF do not.
           result.externOrder.add Extern(asmName: asmN, decl: procStart, dll: dllN,
@@ -1001,7 +1014,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let fixed = fixedParamCount(procStart)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
                                                 isVarargs: fixed >= 0, fixedParams: fixed,
-                                                retFloat: retFloat, retType: retType, sigType: sigType)
+                                                retFloat: retFloat, retType: retType, sigType: sigType,
+                                                missingImportLib: missingImportLib(result, importcN, dllN))
           result.needsLibSystem = true
         else:
           # The program entry is the C `main` (`exportc "main"`). Every OTHER
@@ -1138,14 +1152,16 @@ proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
   var d = declCur
   var retFloat = false
   var retType: Cursor
-  var importcN, exportcN = ""
+  var importcN, exportcN, dllN = ""
+  var intrinsic = default(IntrinsicOp)
+  var asmProc = false
   d.into:
     inc d                                     # name
     skip d                                    # params
     retType = d
     retFloat = d.kind == TagLit and d.typeKind == FT
     skip d                                    # return type
-    parsePragmas(d, importcN, exportcN)
+    parsePragmas(d, importcN, exportcN, intrinsic, asmProc, dllN)
     while d.hasMore: skip d                    # body
   let sigType = procSigType(declCur)
   # A cross-module call must classify the foreign decl EXACTLY as the owning
@@ -1174,7 +1190,8 @@ proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
     # the externOrder naming in `collect`).
     p.needsLibSystem = true
     result = CallTarget(asmName: p.lengSym(extprocAsmName(importcN, s.module)), extern: true, retFloat: retFloat,
-                        retType: retType, sigType: sigType)
+                        retType: retType, sigType: sigType,
+                        missingImportLib: missingImportLib(p, importcN, dllN))
   else:
     result = CallTarget(asmName: sym, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,

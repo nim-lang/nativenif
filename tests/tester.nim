@@ -1052,8 +1052,8 @@ proc deadImportTests() =
   ## may declare another OS's API (or this one's, unused) and the image must not
   ## import it. `dead_imports_win64.nif` is `hello_win64.nif` plus an uncalled
   ## `Sleep` from kernel32 and an uncalled `MessageBoxA` from a `user32.dll` nothing
-  ## else uses, so its image must be byte-identical to hello's. Assembling only,
-  ## so it runs on every host.
+  ## else uses, so its image must be byte-identical to hello's. Code generation
+  ## and assembling only, so it runs on every host.
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "nimcache"
   createDir workDir
@@ -1069,7 +1069,23 @@ proc deadImportTests() =
       quit "FAILURE dead imports: the image imports the uncalled `" & dead & "`"
   if image != readFile(plain & ".exe"):
     quit "FAILURE dead imports: uncalled externs changed the image"
-  echo "1 / 1 dead import tests successful"
+
+  # The same rule one stage earlier: arkham must not reject a Windows extern
+  # without a `dynlib` for being DECLARED — only for being called. Both fixtures
+  # declare libc's `getpid` with no library; only the second calls it.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let deadAsm = workDir / "win_dead_extern.asm.nif"
+  let deadImg = workDir / "win_dead_extern"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(deadAsm) & " " &
+       quoteShell("tests" / "win_dead_extern.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(deadImg) & " " & quoteShell(deadAsm)
+  if "getpid" in readFile(deadImg & ".exe"):
+    quit "FAILURE dead imports: the image imports the uncalled `getpid`"
+  execExpectFailure(quoteShell(arkham) & " -a:win_x64 -o:" &
+                    quoteShell(workDir / "win_called_extern.asm.nif") & " " &
+                    quoteShell("tests" / "win_called_extern.c.nif"),
+                    "the Windows extern `getpid` names no import library")
+  echo "3 / 3 dead import tests successful"
 
 deadImportTests()
 

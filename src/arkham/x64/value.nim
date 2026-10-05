@@ -3440,6 +3440,7 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
   # into. On Windows a double in a register position travels as its bits; SysV
   # passes the variadic tail exactly like fixed arguments (and counts the vector
   # registers in `al`, see below).
+  if tgt.extern: checkImportLib(tgt)   # only a CALL needs a library to bind it
   let variadicFrom = if tgt.extern and tgt.isVarargs: tgt.fixedParams else: -1
   if variadicFrom >= 0:
     tgt.asmName = g.variadicTarget(tgt.asmName, callArgSlots, variadicFrom)
