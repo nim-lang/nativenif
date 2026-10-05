@@ -93,7 +93,7 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
       # its signature says — reserved even for a call with no stack argument at all,
       # and even for one whose target does not resolve here. Must match
       # `genPrepareX64`'s `stackArgBase`, which is what it checks against.
-      let base = if ctx.arch == Arch.WinX64: WinShadowSpace else: 0
+      let base = if ctx.target.win64Abi: WinShadowSpace else: 0
       acc = max(acc, base)
       var t = n; inc t                           # the call target symbol
       if t.kind == Symbol:
@@ -127,13 +127,13 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # length, e.g. a 2-byte string constant) may immediately precede this proc in
     # the text stream, and AArch64 instructions are fixed 4-byte words — a
     # misaligned body desynchronizes the whole following instruction stream.
-    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM, Arch.Rv32}:
+    if ctx.target.linkRegisterCalls:
       # Cortex-M needs only halfword alignment, but a 32-bit Thumb encoding
       # straddling a word boundary costs a cycle on some cores and nothing here
       # benefits from the two saved bytes, so it aligns like the others. RV32
       # without the C extension is fixed 4-byte words, so it needs this outright.
       while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
-    elif ctx.arch == Arch.Avr:
+    elif ctx.target.cpu == Cpu.Avr:
       # Two, not four: an AVR instruction IS a 16-bit word and the PC counts
       # words, so an odd position is not merely slow, it is unaddressable — every
       # branch and call displacement here is a byte distance divided by two.
@@ -159,9 +159,8 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # CFA at entry: on x86-64 the `call` pushed the return address (SP+8); on
     # AArch64, Cortex-M and RV32 it is still in the link register (`lr`, `ra`),
     # so the CFA is SP.
-    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
-                                 Arch.Rv32}: 0'i32
-                 elif ctx.arch == Arch.Avr: 2'i32   # `call` pushed a 2-byte return address
+    ctx.cfaOff = if ctx.target.linkRegisterCalls: 0'i32
+                 elif ctx.target.cpu == Cpu.Avr: 2'i32   # `call` pushed a 2-byte return address
                  else: 8'i32
 
     # Initialize stack context
@@ -194,13 +193,12 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # in the link register rather than on the stack, and the caller leaves SP
     # pointing at the first stack argument, so incoming stack params are
     # SP-relative from offset 0.
-    let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
-                                 Arch.Rv32}
+    let isA64Proc = ctx.target.linkRegisterCalls
     # …and on Win64 the caller's stack arguments start above the shadow space it also
     # reserved, so the callee's view of them shifts by the same amount.
-    var paramOffset = if ctx.arch == Arch.Avr: 0  # stack params refused by name
+    var paramOffset = if ctx.target.cpu == Cpu.Avr: 0  # stack params refused by name
                       elif isA64Proc: 0
-                      elif ctx.arch == Arch.WinX64: 16 + WinShadowSpace
+                      elif ctx.target.win64Abi: 16 + WinShadowSpace
                       else: 16
     for param in sym.typ.params:
       if param.typ.isOnStack:
@@ -215,7 +213,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
         # (a leaf param stays unnamed in its incoming arg register), so params are NOT
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
-        if ctx.arch == Arch.Avr:
+        if ctx.target.cpu == Cpu.Avr:
           # AVR spells a register param by its NAME in the body, like x86-64 and
           # unlike the Arm targets — so a raw use of the register it arrived in
           # is a code-generator bug and gets tracked. Both halves when it is a
@@ -291,10 +289,10 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
   # and there is no unaligned trap to avoid — and rounding to 16 there would both
   # waste the RAM of a part that has kilobytes of it and burn the `adiw`
   # immediate that carries the frame size, which reaches 63.
-  let frameAlign = if ctx.arch == Arch.Avr: 1 else: 16
+  let frameAlign = if ctx.target.cpu == Cpu.Avr: 1 else: 16
   let alignedStackSize = (peakStackSize + frameAlign - 1) and not (frameAlign - 1)
-  let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
-  let isM = ctx.arch == Arch.CortexM
+  let isA64 = ctx.target.cpu == Cpu.Arm64
+  let isM = ctx.target.cpu == Cpu.CortexM
   var deadFrameAdjusts: seq[int] = @[]   ## frame `add`/`sub` halves that patch to #0
   for (pos, pad) in ctx.ssizePatches:
     # `pad` is the caller-supplied alignment correction from `(ssize N)`: the frame
@@ -303,7 +301,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
     let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
-    if ctx.arch == Arch.Rv32:
+    if ctx.target.cpu == Cpu.Rv32:
       # A `lui`+`addi` pair, always 8 bytes, so no instruction changes length and
       # no position downstream moves — the same property that lets the Cortex-M
       # arm below patch in place, and for the same reason it was chosen over a
@@ -316,7 +314,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
       if pos + 8 > ctx.buf.data.len: continue
       ctx.buf.data.patchRvLuiAddiPair(pos, v)
       continue
-    if ctx.arch == Arch.Avr:
+    if ctx.target.cpu == Cpu.Avr:
       # The 6-bit immediate of the `adiw`/`sbiw` at this position: `1001 011x
       # KKdd KKKK`, with K5:K4 in bits 7:6 and K3:K0 in bits 3:0. Fixed width, so
       # patching never resizes an instruction and no position downstream moves.
@@ -408,16 +406,16 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
   ## The listing row is recorded inside each arm rather than around this call:
   ## `withListingRow` is a template, so the three selectors stay independent of
   ## each other and of this dispatcher.
-  case ctx.arch
-  of Arch.X64, Arch.WinX64:
+  case ctx.target.cpu
+  of Cpu.Amd64:
     genInstNodeX64(n, ctx)
-  of Arch.A64, Arch.WinA64, Arch.LinuxA64:
+  of Cpu.Arm64:
     genInstNodeA64(n, ctx)
-  of Arch.CortexM:
+  of Cpu.CortexM:
     genInstNodeM(n, ctx)
-  of Arch.Avr:
+  of Cpu.Avr:
     genInstNodeAvr(n, ctx)
-  of Arch.Rv32:
+  of Cpu.Rv32:
     genInstNodeRv(n, ctx)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =

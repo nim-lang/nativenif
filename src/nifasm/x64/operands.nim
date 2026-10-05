@@ -766,7 +766,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       # live in a loader-allocated block reached THROUGH that field rather than
       # at a fixed segment displacement — see `gsFixedSlot`.
       # RBP as the base is what selects displacement-only addressing.
-      if ctx.arch == Arch.WinX64 and not sym.gsFixedSlot:
+      if ctx.target.win64Abi and not sym.gsFixedSlot:
         # A PE thread-local is NOT at a fixed segment displacement: the loader puts
         # each thread's block wherever it likes and records the address in the TEB,
         # so the producer has to walk there (arkham's `emTvarAddr`) and deref the
@@ -903,7 +903,7 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
     elif sym != nil and sym.kind == skTvar:
        # A thread-local written through a segment register — see the read side for
        # what `gsFixedSlot` selects and why win_x64 refuses the plain form.
-       if ctx.arch == Arch.WinX64 and not sym.gsFixedSlot:
+       if ctx.target.win64Abi and not sym.gsFixedSlot:
          error("thread-local '" & ctx.nameOf(sym.name) &
                "' needs an address-then-deref on win_x64, not a segment operand", n)
        result.kind = okMem

@@ -243,6 +243,13 @@ may carry `(params …) (result …) (clobber …)` after the external name, and
 call sites bind `(arg name)` / `(res name)` and are checked exactly like calls to a
 proc in the image.
 
+Externs follow the same dead-code rule as procs and data: an `(extproc …)` is only
+a declaration, and it gets its GOT/IAT slot and its import-table entry when the
+first `(extcall)` or `(iat …)` reaches it. Likewise `(imp "lib")` only declares a
+library; the image imports it once a called extern binds to it. So a module may
+declare the API of every OS it might run on, and the image carries the imports
+of the code that is actually reachable.
+
 ### Stack arguments with `(csize)`
 
 When a proc has stack parameters, the caller must explicitly manage the stack. The `(csize)` builtin computes the total stack space required for the current call's stack arguments (analogous to `(ssize)` for function entry points).

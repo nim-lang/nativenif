@@ -16,8 +16,8 @@ import std / [syncio]
 import "../core" / [context, relocs, buffers]
 import dwarf, tracetable
 
-proc dwarfArchOf(arch: Arch): DwarfArch {.inline.} =
-  if arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}: dwA64 else: dwX64
+proc dwarfArchOf(t: Target): DwarfArch {.inline.} =
+  if t.cpu == Cpu.Arm64: dwA64 else: dwX64
 
 proc appendTraceTable*(ctx: var GenContext) =
   ## Reserve the stack-trace table at the end of `.text` and define the label that
@@ -36,7 +36,7 @@ proc appendTraceTable*(ctx: var GenContext) =
   # `u32` and both targets permit unaligned word loads.
   while (ctx.buf.data.len and 7) != 0: ctx.buf.data.add 0'u8
   ctx.buf.defineLabel(ctx.traceLabel)
-  let n = traceTableSize(collectTraceProcs(ctx.unwind, dwarfArchOf(ctx.arch)))
+  let n = traceTableSize(collectTraceProcs(ctx.unwind, dwarfArchOf(ctx.target)))
   for i in 0 ..< n: ctx.buf.data.add 0'u8
 
 proc appendTlsSize*(ctx: var GenContext) =
@@ -64,7 +64,7 @@ proc fillTraceTable*(a: var GenContext) =
   for ld in a.buf.labels:
     if ld.id == a.traceLabel: at = ld.position
   if at < 0: return
-  let bytes = encodeTraceTable(collectTraceProcs(a.unwind, dwarfArchOf(a.arch)), at)
+  let bytes = encodeTraceTable(collectTraceProcs(a.unwind, dwarfArchOf(a.target)), at)
   # The reservation is computed from the same `collectTraceProcs`, so a mismatch
   # means a layout pass grew or dropped a proc between the two calls — silently
   # writing a truncated table would produce a stack trace with invented names.

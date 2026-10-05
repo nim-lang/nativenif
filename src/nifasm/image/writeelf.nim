@@ -47,7 +47,7 @@ proc layoutCode*(a: var GenContext; extra: var seq[int]) =
   # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
   # both arches); only the opcode flip inside is arch-specific.
   remapSites(a, invertCondJumps(a.buf), extra)
-  if a.arch == Arch.X64:
+  if a.target.cpu == Cpu.Amd64:
     # Shorten x86 rel32 jumps to rel8 where they fit. Code-alignment candidates,
     # as LABEL IDS (stable across the layout passes): every generated proc's entry
     # + every loop head (= target of a backward jmp/jcc, collected now — after
@@ -154,7 +154,7 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
   for (pos, sym) in a.gvarSites:
     let instrVaddr = textVaddr + headersSize.uint64 + pos.uint64
     let targetVaddr = bssVaddr + sym.size.uint64
-    if a.arch == Arch.LinuxA64:
+    if a.target.cpu == Cpu.Arm64:
       # AArch64: a PC-relative `adrp rd, page` + `add rd, rd, #pageoff` pair (the
       # placeholder carries the dest reg with zero immediates, so OR them in). Same
       # encoding as the Mach-O backend's gvar patch.
@@ -215,11 +215,11 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
           code[sitePos + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
-  let machine = case a.arch
-    of Arch.X64, Arch.LinuxA64:
-      if a.arch == Arch.X64: EM_X86_64 else: EM_AARCH64
-    else:
-      EM_X86_64  # fallback
+  let machine = case a.target.cpu
+    of Cpu.Arm64: EM_AARCH64
+    of Cpu.Amd64, Cpu.CortexM, Cpu.Avr, Cpu.Rv32:
+      # The ELF32 firmware images have writers of their own; only x86-64 lands here.
+      EM_X86_64
 
   # ── debug info: `.symtab` (proc names) and `.eh_frame` (unwind) ─────────────
   # Both are METADATA: nothing the program executes reads either, and they exist so a
@@ -248,7 +248,7 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
       for ld in a.buf.labels:
         if int(ld.id) == a.entrySym.offset: entryOffs.add ld.position
     ehFrame = buildEhFrame(a.unwind,
-                           (if a.arch == Arch.LinuxA64: dwA64 else: dwX64),
+                           (if a.target.cpu == Cpu.Arm64: dwA64 else: dwX64),
                            procVaddrBase, entryOffs)
     strtab.add 0'u8                                   # index 0 is the empty name
     symtab.setLen sizeof(Elf64_Sym)                   # index 0 is the null symbol
@@ -266,7 +266,7 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
       copyMem(addr symtab[at], addr sym, sizeof(Elf64_Sym))
 
   var ehdr = initHeader(entryAddr, machine)
-  if a.freebsd: ehdr.e_ident[EI_OSABI] = ELFOSABI_FREEBSD
+  if a.target.os == TargetOS.FreeBSD: ehdr.e_ident[EI_OSABI] = ELFOSABI_FREEBSD
   ehdr.e_phnum = 3  # Three program headers: .text, .bss and .eh_frame
   ehdr.e_phoff = 64  # Program headers start after ELF header
 

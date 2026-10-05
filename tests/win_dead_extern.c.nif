@@ -1,0 +1,8 @@
+(.nif27)
+(stmts
+ (proc :ExitProcess.0 (params (param :code.0 . (u 32))) .
+  (pragmas (importc "ExitProcess") (dynlib "kernel32")) (stmts .))
+ (proc :getpid.0 (params) (i 32)
+  (pragmas (importc "getpid")) (stmts .))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
+  (call ExitProcess.0 (conv (u 32) 7)))))

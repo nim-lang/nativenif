@@ -125,7 +125,7 @@ proc alignTo(dest: var seq[byte]; alignment: int) =
   while dest.len mod alignment != 0: dest.add 0'u8
 
 proc writeElfObject*(a: var GenContext; outfile: string) {.canRaise.} =
-  if a.arch != Arch.X64:
+  if a.target.cpu != Cpu.Amd64 or a.target.format != ImageFormat.Elf:
     quit "nifasm: --emit-obj writes an ELF object for x86-64 only"
   # The thread-local sites were recorded by the encoder; the layout passes move
   # code, so take them out first and carry them through the same maps.

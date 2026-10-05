@@ -17,7 +17,7 @@
 import std / [tables, sets, os, strutils]
 import nifcore, nifmodules
 import "../../../../nimony/src/lib" / symparser
-import context, diagnostics, cursors
+import context, diagnostics, cursors, sem
 
 const
   WindowsKernelDll* = "kernel32.dll"
@@ -108,9 +108,13 @@ proc importOrdinal*(ctx: var GenContext; libPath: string): int =
   result = ctx.imports.len + 1
   ctx.imports.add ImportedLib(name: libPath, ordinal: result)
 
-proc extprocLib*(ctx: var GenContext; n: var Cursor): int =
-  ## The import-table ordinal an `(extproc :name "extname" "dll"? …)` binds to,
-  ## consuming the optional dll operand.
+proc extprocLib*(ctx: var GenContext; n: var Cursor): string =
+  ## The library an `(extproc :name "extname" "dll"? …)` binds to, consuming the
+  ## optional dll operand. `""` means none: the system linker binds the symbol.
+  ##
+  ## Only the NAME: nothing enters the import table until the extern is called
+  ## (`useExtProc`), so a declaration nothing reaches — another OS's API, after
+  ## the target conditions have been folded — costs the image nothing.
   ##
   ## Every Windows extern carries it (`""` under `arkham --crt`: no library), so
   ## the decl is self-contained — which is what lets it be read anywhere, including
@@ -128,20 +132,44 @@ proc extprocLib*(ctx: var GenContext; n: var Cursor): int =
     libName = getStr(n)
     named = true
     inc n
-  if named and libName.len == 0 and ctx.arch in {Arch.WinX64, Arch.WinA64}:
+  if named and libName.len == 0 and ctx.target.os == TargetOS.Windows:
     # `""`: no import library. The SYSTEM linker binds the symbol (libc through
     # the crt's import libraries, or a foreign object), so the image has no import
     # entry of its own for it. Only a COFF object can express that
     # (`writeCoffObject`); the PE writer refuses it.
-    result = 0
+    result = ""
   elif libName.len > 0:
-    result = ctx.importOrdinal(libName)
-  elif ctx.imports.len > 0:
-    result = ctx.imports[0].ordinal        # Mach-O: libSystem, the only one
+    result = libName
+  elif ctx.declaredLibs.len > 0:
+    result = ctx.declaredLibs[0]           # Mach-O: libSystem, the only one
+  elif ctx.target.os == TargetOS.Windows:
+    result = WindowsKernelDll
   else:
-    result = ctx.importOrdinal(
-      if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
-      else: "/usr/lib/libSystem.B.dylib")
+    result = "/usr/lib/libSystem.B.dylib"
+
+proc declareLib*(ctx: var GenContext; libPath: string) =
+  ## `(imp "libPath")`: the library exists for the externs that follow. It enters
+  ## the import table only once one of them is called (`useExtProc`).
+  if libPath notin ctx.declaredLibs: ctx.declaredLibs.add libPath
+
+proc useExtProc*(ctx: var GenContext; sym: sem.Symbol): int =
+  ## The index into `ctx.extProcs` of the extern `sym`, binding it on its FIRST
+  ## call: a GOT/IAT slot, the import-table entry of its library, and the
+  ## `ExtProcInfo` the image writer binds. Every extern is resolved this way, from
+  ## the main module or a foreign one alike, so the import table holds exactly the
+  ## externs the reachable code calls — the same dead-code rule procs and data
+  ## follow (`processReachableSymbols`).
+  assert sym.kind == skExtProc
+  if not sym.extUsed:
+    sym.extUsed = true
+    sym.gotSlot = ctx.gotSlotCount
+    inc ctx.gotSlotCount
+    let libOrdinal = if sym.libName.len == 0: 0 else: ctx.importOrdinal(sym.libName)
+    sym.extProcIdx = ctx.extProcs.len
+    ctx.extProcs.add ExtProcInfo(name: ctx.nameOf(sym.name), extName: sym.extName,
+                                 libOrdinal: libOrdinal, gotSlot: sym.gotSlot,
+                                 stubOffset: -1)
+  result = sym.extProcIdx
 
 proc openForeignModule*(ctx: var GenContext; modname: string; n: Cursor) =
   ## Open a foreign module for LAZY, on-demand symbol resolution: read just its

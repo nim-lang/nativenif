@@ -346,7 +346,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # and the real offset into later ones — a size field then aliases what a pointer
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
-    if ctx.arch in {Arch.X64, Arch.WinX64} and
+    if ctx.target.cpu == Cpu.Amd64 and ctx.target.format != ImageFormat.MachO and
        result.name notin ctx.generatedSymbols:
       allocTlsSlotX64(ctx, result, declStartCur)
       ctx.generatedSymbols.incl result.name
@@ -374,22 +374,19 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # arkham emits each used extern's decl in the module that declares the `importc`;
     # a bundle whose MAIN module has no externs of its own still reaches them here).
     # Mirrors the main-module pass-1 ExtprocD case: define the skExtProc symbol with
-    # its external name and a fresh GOT slot, and register it for import binding.
+    # its external name; the GOT slot and the import entry come with its first call
+    # (`useExtProc`).
     inc c
     if c.kind != SymbolDef: return nil
     discard getSymDef(c)
     if c.kind != StrLit: return nil
     let extName = getStr(c)
     inc c
-    let libOrdinal = ctx.extprocLib(c)           # the decl's own dll operand
+    let libName = ctx.extprocLib(c)              # the decl's own dll operand
     let typ = parseExtprocSig(c, scope, ctx)     # the Windows form carries a signature
-    let gotSlot = ctx.gotSlotCount
-    ctx.gotSlotCount += 1
     result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, typ: typ, extName: extName,
-                    libName: "", gotSlot: gotSlot, isForeign: true, moduleName: modname)
+                    libName: libName, gotSlot: -1, isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
-    ctx.extProcs.add ExtProcInfo(name: fullName, extName: extName, libOrdinal: libOrdinal,
-                                 gotSlot: gotSlot, stubOffset: -1)
   of SyprocD:
     # A foreign syscall (arkham emits each used syscall's `(syproc …)` in the module
     # that declares the `importc`; another module that calls it resolves it here).

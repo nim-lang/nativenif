@@ -584,7 +584,7 @@ proc parseOperandA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skRodata:
-      if ctx.arch == Arch.A64 and sym.dataConst:
+      if ctx.target.format == ImageFormat.MachO and sym.dataConst:
         # A `dataConst` blob lives in writable __DATA (it is rebased at load), so
         # its address is formed like a global's — adrp+add through the gvar path —
         # not as a PC-relative __TEXT label. `sym.size` becomes its __DATA offset

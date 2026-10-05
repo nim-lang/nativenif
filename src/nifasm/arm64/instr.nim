@@ -10,11 +10,11 @@
 ##
 ## Serves Darwin, Linux and Windows on arm64 — they differ in their object
 ## format and their syscall convention, not in their instruction set, so what
-## varies here is guarded by `ctx.arch` rather than duplicated.
+## varies here is guarded by `ctx.target` rather than duplicated.
 
 import std / [tables, sets, assertions]
 import nifcore
-import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
+import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem, modules,
                     listing, emit, tags, model, tagconv, decls,
                     tagpool, stackslots, relocs, buffers]
 import encoder as arm64
@@ -86,10 +86,7 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     # verified below.
     ctx.callContext.state = CallContextState.ExternalCall
     ctx.callContext.typ = sym.typ
-    for i, ext in ctx.extProcs:
-      if ext.name == name:
-        ctx.callContext.extProcIdx = i
-        break
+    ctx.callContext.extProcIdx = ctx.useExtProc(sym)
   else:
     error("Expected proc symbol, got " & $sym.kind, hdr)
 

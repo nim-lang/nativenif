@@ -3496,6 +3496,7 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
     if tgt.syscall and Freestanding notin g.md.caps:
       g.ab.tree SvcA64: g.ab.intLit 0
     elif tgt.extern:
+      checkImportLib(tgt)                    # only a CALL needs a library to bind it
       g.ab.keyword ExtcallA64                # a dynamic import: through its stub
     elif doTail:
       # The arguments are in their ABI registers; from here nothing of ours is
