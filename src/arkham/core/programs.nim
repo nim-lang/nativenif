@@ -231,6 +231,11 @@ const NoTypeSym* = default(SymId)
 const LinuxSyscalls* = {
   "read":       (0,   63),
   "write":      (1,   64),
+  # libc's pread/pwrite names map to the kernel's pread64/pwrite64 traps.
+  # On both 64-bit targets (fd, buf, count, offset) maps directly to four
+  # syscall arguments; offset stays i64 in r10 (x86-64) / x3 (AArch64).
+  "pread":      (17,  67),
+  "pwrite":     (18,  68),
   "open":       (2,   -1),
   "openat":     (257, 56),
   # std/posix reimplements opendir/readdir on top of this (DIR is a libc struct,

@@ -187,6 +187,11 @@ const arkhamDarwinUnsupported: seq[string] =
     # MAP_ANONYMOUS == 0x20 on Linux). On macOS MAP_ANON == 0x1000, so 34 is
     # MAP_PRIVATE plus an unsupported bit and mmap returns MAP_FAILED.
     "mmap_anon",
+    # Positioned transfers use Linux O_TMPFILE | O_RDWR (4259842) with mode
+    # 0600 (384); /tmp must support O_TMPFILE (tmpfs/ext4 do). The anonymous
+    # sparse file checks offsets above 4 GiB, EOF, unchanged cursor, and raw
+    # -EBADF/-EINVAL results, not Darwin libc semantics.
+    "positioned_file",
     # `futex` is a Linux syscall lowered to a raw kernel trap (svc/syscall); macOS has
     # no `futex` symbol, so it's Linux-only here. The Darwin equivalent is exercised by
     # `ulock_wake` (just as `std/private/syslocks` selects `futex` vs `__ulock_wake`
@@ -619,6 +624,7 @@ const webRunDivergent: seq[string] = @[
   # Each is a named divergence, not a tolerance.
   "futex_wake",       # a futex/mmap program cannot be served by a web host:
   "mmap_anon",        # the syscall is a loud trap (`unreachable`), by design
+  "positioned_file",  # raw Linux file syscalls have no web host implementation
   "scope_slot_reuse", # reads a dead scope's slot — the answer 7 is arkham's
                       # stack layout, not a language guarantee
 ]
@@ -2412,7 +2418,7 @@ const cortexMUnsupported: seq[string] = @[
   # slot, which is a decision about the board and not about the ISA — a Cortex-M
   # part with four cores has four threads and is refused by name until the
   # SP-masked thread-local base exists.
-  "mmap_anon", "futex_wake", "ulock_wake", "darwin_varargs", "darwin_varargs_many",
+  "mmap_anon", "futex_wake", "positioned_file", "ulock_wake", "darwin_varargs", "darwin_varargs_many",
   "naked_stacktrace_x64",
 
   # `(onerr ACTION FN ARGS…)` — no arkham backend lowers it (and, unlike the
