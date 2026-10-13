@@ -3681,7 +3681,8 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
   # `jmp` pair wraps a statement list in a label block, and a local declared
   # inside it would be out of sight the moment the `break` lands.
   var locals: seq[(SymId, WidthCode)] = @[]
-  for nm in g.p.regLocals:
+  for i in 0 ..< g.p.regLocals.len:
+    let nm = g.p.regLocals[i]
     locals.add (irName(g, nm), widthOf(scalOf(g, g.p.symType.getOrQuit(nm))))
   for tv in g.p.temps: locals.add tv
   var hasRet = false

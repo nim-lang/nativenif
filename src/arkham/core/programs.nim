@@ -1529,9 +1529,12 @@ proc cleanSigProcs*(p: var Program): HashSet[SymId] =
   ## the decl's `SymbolDef` id, which is the SAME id a call site's target token
   ## carries, so the analyser tests a direct callee with an integer compare.
   result = initHashSet[SymId]()
-  for pi in p.procs:
-    var nc = pi.decl; inc nc                    # (proc → name
-    if nc.kind == SymbolDef and isCleanSigProc(p, pi.decl):
+  # `isCleanSigProc` takes `p` as `var` (`slotOf` may load modules into it), so
+  # index the procs rather than borrow `p.procs` across the call.
+  for i in 0 ..< p.procs.len:
+    let decl = p.procs[i].decl
+    var nc = decl; inc nc                       # (proc → name
+    if nc.kind == SymbolDef and isCleanSigProc(p, decl):
       result.incl nc.symId
 
 proc declIsNoReturn*(decl: Cursor): bool =

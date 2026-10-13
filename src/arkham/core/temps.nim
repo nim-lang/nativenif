@@ -141,9 +141,14 @@ template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) {.untyped.} =
   ## analyser's whole-proc facts: rdx is destroyed by `idiv`, rcx by a variable
   ## shift (and by `rep movs`, which only ever runs inside a call — where no temp
   ## is live anyway). A proc that contains neither has no second use for them.
+  #
+  # Indexed rather than `for r in g.md.…`: `body` passes `g` on as `var`
+  # (`regFreeForTemp`), which may not happen while `g.md` is borrowed by a loop.
   block:
-    for r {.inject.} in g.md.intTempRegs: body            # r10
-    for r {.inject.} in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
+    for tempCandIdx in 0 ..< g.md.intTempRegs.len:                 # r10
+      let r {.inject.} = g.md.intTempRegs[tempCandIdx]; body
+    for tempCandIdx in 0 ..< g.md.intLocalTempRegs.len:            # rdi, rsi, r8, r9 — no fixed role
+      let r {.inject.} = g.md.intLocalTempRegs[tempCandIdx]; body
     if g.md.divRemReg != NoReg and not g.plan.divRegClobbered:
       let r {.inject.} = g.md.divRemReg; body
     if g.md.shiftCountReg != NoReg and not g.plan.shiftRegClobbered:
@@ -172,7 +177,8 @@ proc tempCensus*(g: var CodeGen): string =
     elif g.rb.isBound(r): result.add "bound " & g.spelling(g.rb.boundName(r))
     elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
     else: result.add "FREE (unreachable)"
-  for r in g.md.intCalleeSaved:
+  for i in 0 ..< g.md.intCalleeSaved.len:
+    let r = g.md.intCalleeSaved[i]
     result.add "\n    " & $r & ": "
     if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
     elif g.plan.isSealed(r): result.add "sealed (in-flight call)"
@@ -223,7 +229,8 @@ proc pickTempReg*(g: var CodeGen; avoid: set[Reg] = {}): Reg =
       elif g.rb.isAccum(r): inc tempRefusals[2]
       elif g.rb.isBound(r): inc tempRefusals[3]
       elif g.regHoldsHome(r): inc tempRefusals[4]
-  for r in g.md.intCalleeSaved:
+  for i in 0 ..< g.md.intCalleeSaved.len:
+    let r = g.md.intCalleeSaved[i]
     if r notin avoid and regFreeForTemp(g, r):
       g.plan.usedCallee.incl r
       return r
@@ -236,14 +243,16 @@ proc tempPoolDry*(g: var CodeGen): bool =
   ## its existing home and only want a temp when one is genuinely free.
   forEachVolatileTempCand(g, r):
     if regFreeForTemp(g, r): return false
-  for r in g.md.intCalleeSaved:
+  for i in 0 ..< g.md.intCalleeSaved.len:
+    let r = g.md.intCalleeSaved[i]
     if regFreeForTemp(g, r): return false
   true
 
 proc pickFTempReg*(g: var CodeGen): FReg =
   ## The SIMD twin of `pickTempReg`: volatile float pool first, then the
   ## callee-saved float pool (empty on x86-64 SysV).
-  for f in g.md.floatTempRegs:
+  for i in 0 ..< g.md.floatTempRegs.len:
+    let f = g.md.floatTempRegs[i]
     if f notin g.pickedFRegs and not g.rb.isSealedF(f) and
        (g.rb.boundFName(f) == NoSymId or g.rb.isFMirror(f)) and
        not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
@@ -257,7 +266,8 @@ proc pickHeldReg*(g: var CodeGen): Reg =
   ## (re-derivable) value to a `heldN.0` slot or fails loudly; demoting a local
   ## mid-emission is impossible in the merged core (its uses are already
   ## emitted), and the corpus needed that demotion exactly once.
-  for r in g.md.intCalleeSaved:
+  for i in 0 ..< g.md.intCalleeSaved.len:
+    let r = g.md.intCalleeSaved[i]
     if regFreeForTemp(g, r):
       g.plan.usedCallee.incl r
       return r
