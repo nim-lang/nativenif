@@ -84,6 +84,12 @@ proc keyword*[T: enum](a: var AsmBuf; t: T) {.inline.} =
   ## A childless tag, e.g. `(extcall)` / `(params)`.
   a.openS($t); a.close()
 
+proc zeroReg*(a: var AsmBuf) {.inline.} =
+  ## AArch64's `(xzr)`: register 31 where an encoding reads it as zero. It is no
+  ## `Reg` slot — nothing can be allocated to it or bound to it — so it has its
+  ## own spelling rather than a `renderReg` entry.
+  a.openS("xzr"); a.close()
+
 proc rawReg*(a: var AsmBuf; r: Reg) {.inline.} =
   ## The PHYSICAL register `(xN)`/`(r5)`/`(rax)` — a childless tag named after
   ## the register via the (per-target) `renderReg` shim.

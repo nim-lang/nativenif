@@ -1,0 +1,11 @@
+(.nif27)
+(stmts
+ (proc :addx.0 (params (param :d.0 . (ptr (u 64))) (param :s.0 . (u 64))) . (pragmas (instruction "add")) (stmts .))
+ (proc :subject.0 (params (param :p.0 (pragmas (register "x0")) (aptr (u 64)))) (u 64) (pragmas (assembler))
+  (stmts
+   (var :result.0 . (u 64) .)
+   (var :t.0 (pragmas (register "x9")) (u 64) .)
+   (asgn t.0 1)
+   (instr addx.0 (haddr t.0) (pat p.0 1))
+   (asgn result.0 t.0)
+   (ret result.0))))

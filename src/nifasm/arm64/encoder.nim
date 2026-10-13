@@ -193,6 +193,45 @@ proc emitSub*(dest: var Bytes; rd, rn, rm: Register; w = false) =
   if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
+# Flag-setting arithmetic: the multi-word carry chain. Same data-processing
+# families as ADD/SUB (shifted register / immediate) with the S bit (29) set, and
+# ADC/SBC's "add/subtract with carry" family. A register operand of 31 is XZR here,
+# which is how a chain adds just the carry: `adcs d, d, xzr`.
+proc emitAddsSubsReg*(dest: var Bytes; rd, rn, rm: Register; sub: bool; w = false) =
+  ## ADDS/SUBS rd, rn, rm: 1o10 1011 000m mmmm 0000 00nn nnnd dddd
+  var instr = (if sub: 0xEB000000'u32 else: 0xAB000000'u32) or
+              (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
+proc emitAddsSubsImm*(dest: var Bytes; rd, rn: Register; imm: uint16; sub: bool; w = false) =
+  ## ADDS/SUBS rd, rn, #imm12: 1o11 0001 00ii iiii iiii iinn nnnd dddd
+  var instr = (if sub: 0xF1000000'u32 else: 0xB1000000'u32) or
+              (uint32(imm) shl 10) or (encodeReg(rn) shl 5) or encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
+proc emitAdcsSbcs*(dest: var Bytes; rd, rn, rm: Register; sub: bool; w = false) =
+  ## ADCS/SBCS rd, rn, rm: 1o11 1010 000m mmmm 0000 00nn nnnd dddd
+  var instr = (if sub: 0xFA000000'u32 else: 0xBA000000'u32) or
+              (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
+proc emitRorImm*(dest: var Bytes; rd, rn: Register; amount: uint8; w = false) =
+  ## ROR rd, rn, #amount — the alias of EXTR rd, rn, rn, #amount.
+  ## 64-bit: 1001 0011 110m mmmm ssss ssnn nnnd dddd; 32-bit: 0001 0011 100m …
+  let base = if w: 0x13800000'u32 else: 0x93C00000'u32
+  dest.addUint32(base or (encodeReg(rn) shl 16) or (uint32(amount) shl 10) or
+                 (encodeReg(rn) shl 5) or encodeReg(rd))
+
+proc emitRorReg*(dest: var Bytes; rd, rn, rm: Register; w = false) =
+  ## RORV rd, rn, rm: x001 1010 110m mmmm 0010 11nn nnnd dddd
+  var instr = 0x9AC02C00'u32 or (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
 # SUB immediate
 proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint16; w = false) =
   ## Emit SUB instruction: SUB rd, rn, #imm  (Wd form when `w`)

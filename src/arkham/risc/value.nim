@@ -3929,6 +3929,34 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.ab.tree RevA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
     if tgt.argBits == 16:
       g.binImm(LsrA64, res.r, 16)
+  of RorOp, Mul3Op, UmulhOp:
+    # The two-source AArch64 rows: three-address, so the destination needs no
+    # copy of `a` first. A rotate exists at 32 and 64 bits only; the `w` forms
+    # leave the 32-bit result zero-extended, which is arkham's canonical form.
+    if tgt.op == RorOp and tgt.argBits notin [32, 64]:
+      lengError c, "AArch64 rotates 32- and 64-bit values only; `ror` on a " &
+                $tgt.argBits & "-bit operand has no instruction here", lengInfo(c)
+    let a1 = g.plan.planned(cursorToPosition(g.buf[], argCurs[1]))
+    let tag =
+      case tgt.op
+      of RorOp: (if bits == 32: Rorw3A64 else: Ror3A64)
+      of Mul3Op: (if bits == 32: Mulw3A64 else: Mul3A64)
+      else: Umulh3A64
+    g.ab.tree tag:
+      g.emReg res.r
+      g.emReg src
+      case a1.kind
+      of InReg: g.emReg a1.r
+      of Imm:
+        if tgt.op != RorOp:
+          raiseAssert "arkham a64n: `" & IntrinsicNames[tgt.op] &
+                      "` operand was not placed in a register"
+        if a1.ival < 0 or a1.ival >= bits:
+          lengError c, "a rotate count must be 0.." & $(bits - 1), lengInfo(c)
+        g.ab.intLit a1.ival
+      else:
+        raiseAssert "arkham a64n: `" & IntrinsicNames[tgt.op] &
+                    "` operand location " & $a1.kind
   of VgClientRequestOp:
     # `(vgreq D S)` — one node, because valgrind only recognizes its request
     # sequence when the instructions arrive INTACT and adjacent. Emitting the
