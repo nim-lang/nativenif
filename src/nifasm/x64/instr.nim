@@ -1303,7 +1303,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of RolX64, RorX64, RclX64, RcrX64:
     let name = $instTag
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, name, start)
     if dest.kind == okMem: error("Rotate destination cannot be memory", n)
@@ -1312,6 +1312,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       x86.emitShiftCl(ctx.buf.data, dest.reg, if instTag == RolX64: 0 else: 1)
     elif op.kind != okImm:
       error("Rotate count must be immediate or CL", n)
+    elif dest.castBits != 0 and instTag in {RolX64, RorX64}:
+      # `(rol (cast (u 32) x) n)`: the rotate runs at the cast's width
+      x86.emitRotSized(ctx.buf.data, dest.reg, int(op.immVal),
+                       if instTag == RolX64: 0 else: 1, dest.castBits)
+    elif dest.castBits != 0:
+      error(name & " has no sub-width form", n)
     else:
       let count = int(op.immVal)
       case instTag

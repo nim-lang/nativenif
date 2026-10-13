@@ -705,10 +705,20 @@ proc emitIntrinsicOps*(g: var CodeGen; op: IntrinsicOp; argBits: int;
       g.ab.tree ShrX64: (g.emReg dst; g.ab.intLit 16)
     else:
       g.ab.tree BswapX64: (g.emReg dst; g.ab.intLit bits)
-  of RolOp:
-    g.ab.tree RolX64: (g.emReg dst; g.ab.intLit rotCount)
-  of RorOp:
-    g.ab.tree RorX64: (g.emReg dst; g.ab.intLit rotCount)
+  of RolOp, RorOp:
+    # A rotate is the one ALU op whose result depends on the width it runs at:
+    # a 32-bit value rotated as 64 bits moves its top into the upper half. So a
+    # narrower operand rotates through a width cast (and a 32-bit rotate
+    # zero-extends, which keeps arkham's normalized-register invariant).
+    let tag = if op == RolOp: RolX64 else: RorX64
+    g.ab.tree tag:
+      if argBits in [8, 16, 32]:
+        g.ab.tree CastX:
+          g.ab.uintType argBits
+          g.emReg dst
+      else:
+        g.emReg dst
+      g.ab.intLit rotCount
   of StackPointerOp:
     # The one register arkham otherwise never lets a value be read out of: `rsp`
     # is the frame, and `asmPinReg` rejects it as a home for exactly that reason.

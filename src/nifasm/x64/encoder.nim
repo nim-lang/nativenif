@@ -1104,6 +1104,22 @@ proc emitShrCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 5)
 proc emitSarCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 7)
 
 # Rotate operations
+proc emitRotSized*(dest: var Bytes; reg: Register; count: int; digit, bits: int) =
+  ## A rotate by an immediate at `bits` (8/16/32): `digit` is the group-2
+  ## extension (ROL /0, ROR /1). A 32-bit rotate wraps at bit 31 and zero-extends
+  ## the register; 8/16-bit ones leave the upper bits alone. Not the 64-bit form
+  ## with a narrower type — that rotates the upper half into the value.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  # an 8-bit access to rsp..rdi needs a REX prefix to mean spl..dil, not ah..bh
+  if rex.b or (bits == 8 and int(reg) in 4..7):
+    dest.add(encodeRex(rex))
+  let one = count == 1
+  dest.add(if bits == 8: (if one: 0xD0'u8 else: 0xC0'u8) else: (if one: 0xD1'u8 else: 0xC1'u8))
+  dest.add(encodeModRM(amDirect, digit, int(reg)))
+  if not one: dest.add(byte(count))
+
 proc emitRol*(dest: var Bytes; reg: Register; count: int) =
   ## Emit ROL instruction: ROL reg, count (rotate left)
   var rex = RexPrefix(w: true)

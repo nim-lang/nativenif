@@ -289,6 +289,19 @@ proc asmOperand*(g: var CodeGen; cur: Cursor) =
   else:
     lengError c, "an `.assembler` operand must be a variable or a literal", g.asmInfo
 
+proc asmNarrowType(g: CodeGen; c: Cursor): Cursor =
+  ## The Leng type of a register destination declared narrower than 64 bits,
+  ## or nil. A `uint32` local takes a 32-bit `add`: the declared type says what
+  ## the instruction is, exactly as it does for a load or a store.
+  result = default(Cursor)
+  var d = c
+  if d.kind == TagLit and d.exprKind == HaddrC: inc d
+  if d.kind != Symbol or d.symId in g.asmStack: return
+  let t = g.symType.getOrDefault(d.symId, default(Cursor))
+  if cursorIsNil(t) or t.kind != TagLit or t.typeKind notin {LengType.IT, LengType.UT, LengType.CT}: return
+  let bits = typeBits(t)
+  if bits > 0 and bits < 64: result = t
+
 proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   ## Emit the destination of a two-address row. The operand arrives as
   ## `(haddr d)` — the compiler binding d's LOCATION for a `var` parameter, not
@@ -373,6 +386,20 @@ proc asmInoutInstrImpl(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
       # a memory destination with a register or immediate source is fine.
       lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
                 g.asmInfo
+    if op in {AddOp, SubOp, AndOp, OrOp, XorOp}:
+      let narrow = g.asmNarrowType(argCurs[0])
+      if not cursorIsNil(narrow):
+        # nifasm's width-cast destination: the operation runs at the declared
+        # width (a 32-bit one zero-extends), flags included
+        g.ab.tree tag:
+          g.ab.tree CastX:
+            var tc = narrow
+            g.genTypeBody(tc)
+            var d = argCurs[0]
+            if d.kind == TagLit and d.exprKind == HaddrC: inc d
+            g.emReg g.asmRegOf(d)
+          g.asmOperand(argCurs[1])
+        return
     if op in {CmovzOp..CmovleOp, ImulOp}:
       # a conditional move and a two-operand multiply write a REGISTER and take
       # no immediate: the encodings do not exist
@@ -539,6 +566,7 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
     skip cc                                      # type
     let hasInit = cc.hasMore and cc.kind != DotToken
     let initC = asmAtom(cc)
+    g.symType[nm] = typeCur
     case loc.kind
     of aslReg:
       g.asmReg[nm] = loc.r
