@@ -985,6 +985,42 @@ proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = e
 proc emitOrImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64)  = emitAluImmMem(dest, 1, mem, imm, bits)
 proc emitXorImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 6, mem, imm, bits)
 
+# Add/subtract with carry: the steps after the first `add`/`sub` of a
+# multi-word sum or difference. Same encodings as `add`/`sub` with the carry
+# opcodes (ADC r/m64,r64 = 0x11, r64,r/m64 = 0x13, group-1 /2; SBB = 0x19,
+# 0x1B, /3), 64-bit only: a multi-word number is made of machine words.
+proc emitCarryRR(dest: var Bytes; opRM: byte; a, b: Register) =
+  var rex = RexPrefix(w: true)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
+  dest.add(encodeRex(rex))
+  dest.add(opRM)
+  dest.add(encodeModRM(amDirect, int(b), int(a)))
+
+proc emitCarryMem(dest: var Bytes; op: byte; reg: Register; mem: MemoryOperand) =
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  dest.add(encodeRex(rex))
+  dest.add(op)
+  dest.emitMem(int(reg), mem)
+
+proc emitAdc*(dest: var Bytes; a, b: Register) = emitCarryRR(dest, 0x11, a, b)
+  ## ADC a, b: a = a + b + CF
+proc emitAdc*(dest: var Bytes; reg: Register; mem: MemoryOperand) = emitCarryMem(dest, 0x13, reg, mem)
+proc emitAdc*(dest: var Bytes; mem: MemoryOperand; reg: Register) = emitCarryMem(dest, 0x11, reg, mem)
+proc emitAdcImm*(dest: var Bytes; reg: Register; imm: int32) = emitAluImmReg(dest, 2, reg, imm)
+proc emitAdcImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 2, mem, imm, 64)
+
+proc emitSbb*(dest: var Bytes; a, b: Register) = emitCarryRR(dest, 0x19, a, b)
+  ## SBB a, b: a = a - b - CF
+proc emitSbb*(dest: var Bytes; reg: Register; mem: MemoryOperand) = emitCarryMem(dest, 0x1B, reg, mem)
+proc emitSbb*(dest: var Bytes; mem: MemoryOperand; reg: Register) = emitCarryMem(dest, 0x19, reg, mem)
+proc emitSbbImm*(dest: var Bytes; reg: Register; imm: int32) = emitAluImmReg(dest, 3, reg, imm)
+proc emitSbbImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 3, mem, imm, 64)
+
 # Shift operations
 proc emitShl*(dest: var Bytes; reg: Register; count: int) =
   ## Emit SHL instruction: SHL reg, count (shift left)

@@ -474,6 +474,12 @@ type
     # so `emReg` renders whichever nifasm binding is live there.
     asmReg*: Table[SymId, Reg]                ## Leng local/param → its pinned register
     asmStack*: HashSet[SymId]                 ## Leng locals pinned to an `(s)` slot
+    asmFlags*: set[MachineFlag]               ## the condition flags that hold a KNOWN
+                                              ## definition at this point of the
+                                              ## `.assembler` body (see `asmproc.asmFlagEffect`)
+    asmCfBy*: IntrinsicOp                     ## the instruction whose CF is the current one
+    asmRegType*: Table[Reg, Cursor]           ## the Leng type of the binding each pinned
+                                              ## register currently carries
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own

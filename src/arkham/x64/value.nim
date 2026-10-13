@@ -4352,7 +4352,7 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
-  if row.isFlagRead or row.isFlagWrite:
+  if row.isFlagRead or row.isFlagWrite or row.isAssemblerOnly:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, where no " &
               "instruction may be inserted between one and its use",

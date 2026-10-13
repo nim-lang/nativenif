@@ -244,6 +244,15 @@ const arkhamRejections: seq[(string, string)] = @[
   ("err_naked_alone", "`{.naked.}` requires `{.assembler.}`"),
   ("err_naked_stack", "cannot declare a `{.stack.}` local"),
   ("err_naked_callee", "cannot use the callee-saved register(s) rbx"),
+  # Flag liveness: a carry chain is data carried in CF, and an instruction
+  # between definition and use that overwrites it breaks the arithmetic without
+  # a trace. These are the two ways that happens.
+  ("err_adc_no_carry", "reads CF, which is not defined here"),
+  ("err_adc_after_mul", "the last instruction to set CF was `mul`, whose CF is not one"),
+  # The fixed-register and encoding rules of the multi-word rows.
+  ("err_mul_reg", "must be a local pinned to rax"),
+  ("err_mem_to_mem", "a memory-to-memory move needs a scratch register"),
+  ("err_cmov_imm", "`cmovz` takes no immediate"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =
@@ -607,6 +616,8 @@ const webUnsupported: seq[string] = @[
   "err_flag_outside_asm", "err_flag_value", "err_inout_dest", "err_inout_value",
   "err_naked_alone", "err_naked_callee", "err_naked_stack", "err_nonflag_cond",
   "err_unannotated_local", "err_wrong_param_reg",
+  "err_adc_no_carry", "err_adc_after_mul", "err_mul_reg", "err_mem_to_mem",
+  "err_cmov_imm",
   "intrinsics", "intrinsics_x64", "naked_stacktrace_x64", "volatile_access",
   # 2. Pointer arithmetic, refused by arkham's own rule (`checkArithResultType`).
   "err_aptr_arith", "err_ptr_arith",

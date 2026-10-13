@@ -1020,6 +1020,43 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         checkDistinctAluRegs(dest, op, "sub", start)
         x86.emitSub(ctx.buf.data, dest.reg, op.reg)
 
+  of AdcX64, SbbX64:
+    # The carry steps of multi-word arithmetic. 64-bit only, so no sub-width
+    # cast: a limb is a machine word, and a narrower carry chain is a bug.
+    let isAdc = instTag == AdcX64
+    let what = if isAdc: "adc" else: "sbb"
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    checkIntegerArithmetic(dest.typ, what, start)
+    checkArithOperand(op.typ, what, start)
+    checkArithCompatible(dest.typ, op.typ, what, start)
+    if dest.kind == okMem:
+      if intMemAccess(dest.typ).bits != 64: error(what & " needs a 64-bit operand", n)
+      if op.kind == okImm:
+        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.mem, int32(op.immVal))
+        else: x86.emitSbbImm(ctx.buf.data, dest.mem, int32(op.immVal))
+      elif op.kind == okMem:
+        error("Cannot " & what & " memory to memory", n)
+      elif op.kind == okReg:
+        if isAdc: x86.emitAdc(ctx.buf.data, dest.mem, op.reg)
+        else: x86.emitSbb(ctx.buf.data, dest.mem, op.reg)
+      else:
+        error(what & ": unsupported source operand", n)
+    else:
+      if op.kind == okImm:
+        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        else: x86.emitSbbImm(ctx.buf.data, dest.reg, int32(op.immVal))
+      elif op.kind == okMem:
+        if intMemAccess(op.typ).bits != 64: error(what & " needs a 64-bit operand", n)
+        if isAdc: x86.emitAdc(ctx.buf.data, dest.reg, op.mem)
+        else: x86.emitSbb(ctx.buf.data, dest.reg, op.mem)
+      elif op.kind == okReg:
+        if isAdc: x86.emitAdc(ctx.buf.data, dest.reg, op.reg)
+        else: x86.emitSbb(ctx.buf.data, dest.reg, op.reg)
+      else:
+        error(what & ": unsupported source operand", n)
+
   of MulX64:
     inc n
     let op = parseOperand(n, ctx)

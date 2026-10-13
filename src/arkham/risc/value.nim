@@ -3697,7 +3697,7 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
       while fc.hasMore: (argCurs.add fc; skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
-  if row.isFlagRead or row.isFlagWrite:
+  if row.isFlagRead or row.isFlagWrite or row.isAssemblerOnly:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, where the body — " &
               "not the allocator — decides what runs between the compare and " &

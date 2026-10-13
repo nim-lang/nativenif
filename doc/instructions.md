@@ -671,7 +671,7 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(rp30)`               | AvrReg | AVR: the register PAIR r31:r30 — one 16-bit logical register — Z, a pointer register with a displaced form; the only indirect call target |
 | `(ldi D K)`            | AvrInst | AVR: load an 8-bit immediate. The only way to materialize a constant, and it reaches r16..r31 only — a constant destined for a low register goes through a high one and `(mov)`/`(movw)` |
 | `(movw D S)`           | AvrInst | AVR: copy a whole 16-bit PAIR in one instruction. Both operands are pair tags and both must be even. This is what makes a pair cheap enough to be the unit the allocator hands out |
-| `(adc D S)`            | AvrInst | AVR: add with carry — the HIGH half of a 16-bit add, whose low half is `(add)`. The two are separate tags because they are separate instructions; the carry between them is the reason neither is useful alone |
+| `(adc D S)`            | AvrInst, X64Inst | add with carry: D = D + S + CF. x86-64: the 64-bit `adc`, the step after the first `add` of a multi-word sum. AVR: add with carry — the HIGH half of a 16-bit add, whose low half is `(add)`. The two are separate tags because they are separate instructions; the carry between them is the reason neither is useful alone |
 | `(sbc D S)`            | AvrInst | AVR: subtract with borrow — the high half of a 16-bit subtract |
 | `(subi D K)`           | AvrInst | AVR: subtract an 8-bit immediate, r16..r31 only. There is no `addi` on this machine: adding a constant is subtracting its negation |
 | `(sbci D K)`           | AvrInst | AVR: subtract an immediate with borrow — the high half of the above, and also the third instruction of a 16-bit negation (`(not)` high, `(neg)` low, `(sbci)` high by -1) |
@@ -707,3 +707,4 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(wdr)`                | AvrInst | AVR: reset the watchdog timer |
 | `(lpm D)`              | AvrInst | AVR: read the flash byte at Z. Program memory is a SEPARATE address space here, so this is not `(ldb)` with a different operand — it is the only instruction that can reach a constant left in flash |
 | `(lpmpi D)`            | AvrInst | AVR: read the flash byte at Z and post-increment Z |
+| `(sbb D S)`            | X64Inst | x86-64: subtract with borrow, D = D - S - CF — the step after the first `sub` of a multi-word difference. (AVR's spelling of the same idea is `(sbc)`; x86 calls it `sbb`, and the source name is the mnemonic.) |

@@ -1541,6 +1541,23 @@ proc inoutInst*(op: IntrinsicOp): X64Inst =
   of NotOp: NotX64
   of IncOp: IncX64
   of DecOp: DecX64
+  of AdcOp: AdcX64
+  of SbbOp: SbbX64
+  of ImulOp: ImulX64
+  of CmovzOp: CmovzX64
+  of CmovnzOp: CmovnzX64
+  of CmovcOp: CmovcX64
+  of CmovncOp: CmovncX64
+  of CmovsOp: CmovsX64
+  of CmovnsOp: CmovnsX64
+  of CmovoOp: CmovoX64
+  of CmovnoOp: CmovnoX64
+  of CmovaOp: CmovaX64
+  of CmovbeOp: CmovbeX64
+  of CmovlOp: CmovlX64
+  of CmovgeOp: CmovgeX64
+  of CmovgOp: CmovgX64
+  of CmovleOp: CmovleX64
   else: NopX64
 
 proc proctypeOfTarget*(g: var CodeGen; targetCur: Cursor): Cursor =

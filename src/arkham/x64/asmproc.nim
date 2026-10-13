@@ -17,7 +17,7 @@ import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, asmcommon, 
-                    mirrors, regbind]
+                    mirrors, regbind, exprpred]
 import machine as machine_x64
 import emit, mem, value, frame
 
@@ -103,6 +103,173 @@ proc asmScanLocs*(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var b
   cc.into:
     while cc.hasMore: (g.asmScanLocs(cc, used, anyStack); skip cc)
 
+# ── flag liveness ────────────────────────────────────────────────────────────
+# A flag is a value with no register behind it, written by nearly every ALU
+# instruction as a side effect. In a carry chain or a `cmov` the flag IS the
+# data, and the classic way to get such code wrong is an instruction between
+# definition and use that overwrites it: a `mul` or a rotate between two `adc`s
+# silently breaks a bignum add. So the body is walked with the set of flags
+# that hold a known definition, and a read of any other is rejected. The
+# effects below are x86-64's, stated per instruction rather than read from the
+# intrinsic table's `defs` column, which records what a row SETS but not what
+# it leaves undefined.
+
+const AllFlags = {mfZF, mfCF, mfSF, mfOF, mfPF}
+
+proc asmFlagEffect(op: IntrinsicOp; c: Cursor): tuple[clobber, define: set[MachineFlag]] =
+  ## What executing `op` does to the flags: `clobber` loses its definition,
+  ## `define` gains one.
+  case op
+  of CmpOp, TestOp, AddOp, SubOp, AndOp, OrOp, XorOp, NegOp, AdcOp, SbbOp, PopcntOp:
+    (AllFlags, AllFlags)
+  of IncOp, DecOp:
+    (AllFlags - {mfCF}, AllFlags - {mfCF})          # CF is preserved
+  of ShlOp, ShrOp, SarOp:
+    # a count of 0 leaves every flag alone, any other count defines all but OF
+    # (OF only for a count of 1); a register count may be either
+    var count = c
+    var lit = false
+    var nonZero = false
+    if c.kind == TagLit:
+      count.into:
+        skip count                                   # callee
+        if count.hasMore: skip count                 # destination
+        if count.hasMore:
+          let a = asmAtom(count)
+          if a.kind == IntLit: (lit = true; nonZero = intVal(a) != 0)
+          elif a.kind == UIntLit: (lit = true; nonZero = uintVal(a) != 0'u64)
+        while count.hasMore: skip count
+    if lit and not nonZero: ({}, {})
+    elif lit: (AllFlags, AllFlags - {mfOF})
+    else: (AllFlags, {})
+  of NotOp, BswapPinnedOp, StackPointerOp, TraceTableOp, TlsSizeOp,
+     CmovzOp..CmovleOp:
+    ({}, {})
+  of RolOp, RorOp:
+    ({mfCF, mfOF}, {mfCF})
+  of BsfOp, BsrOp:
+    (AllFlags, {mfZF})
+  of MulOp, ImulOp:
+    (AllFlags, {mfCF, mfOF})
+  of ZfOp, NotZfOp, CfOp, NotCfOp, SfOp, NotSfOp, OfOp, NotOfOp, PfOp, NotPfOp:
+    ({}, {})                                         # a flag READ changes nothing
+  else:
+    (AllFlags, {})                                   # unknown lowering: assume the worst
+
+proc flagNames(fs: set[MachineFlag]): string =
+  result = ""
+  for f in fs:
+    if result.len > 0: result.add ", "
+    result.add (case f
+                of mfZF: "ZF"
+                of mfCF: "CF"
+                of mfSF: "SF"
+                of mfOF: "OF"
+                of mfPF: "PF")
+
+const CarryProducers = {AddOp, SubOp, AdcOp, SbbOp, NegOp, CmpOp,
+                        # a logic op CLEARS CF: `xor(t, t)` before an `adc`
+                        # chain is the idiom for a carry-in of zero
+                        AndOp, OrOp, XorOp, TestOp}
+  ## The instructions whose CF is an arithmetic CARRY (or borrow). `mul`, a
+  ## rotate, a shift or `bsf` also set CF, but to something else entirely —
+  ## the bit shifted out, "the high half is non-zero" — which is fine for `cf()`
+  ## and never what an `adc` means.
+
+proc asmUseFlags(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+  ## Reject a read of a flag that has no known definition here.
+  let uses = IntrinsicRows[op].uses
+  let missing = uses - g.asmFlags
+  if missing != {}:
+    lengError c, "`" & IntrinsicNames[op] & "` reads " & flagNames(missing) &
+              ", which is not defined here: no instruction on every path to this " &
+              "one sets it, or one in between (a `mul`, a rotate, a shift, …) " &
+              "overwrote it", g.asmInfo
+  if op in {AdcOp, SbbOp} and g.asmCfBy notin CarryProducers:
+    lengError c, "`" & IntrinsicNames[op] & "` reads CF as a carry, but the last " &
+              "instruction to set CF was `" & IntrinsicNames[g.asmCfBy] &
+              "`, whose CF is not one", g.asmInfo
+
+proc asmApplyFlags(g: var CodeGen; op: IntrinsicOp; c: Cursor) =
+  let (clobber, define) = asmFlagEffect(op, c)
+  g.asmFlags = (g.asmFlags - clobber) + define
+  if mfCF in define: g.asmCfBy = op
+  elif mfCF in clobber: g.asmCfBy = NoIntrinsicOp
+
+proc isAsmMemExpr(c: Cursor): bool {.inline.} =
+  ## A memory access through a pointer: `p[i]` on a `ptr UncheckedArray`
+  ## (`(pat p i)`), `p[]` (`(deref p)`) or `p.f` (`(dot (deref p) f)`).
+  c.kind == TagLit and c.exprKind in {PatC, DerefC, DotC}
+
+proc asmPtrBase(g: var CodeGen; c: Cursor) =
+  ## The base of an address: a pointer that already sits in a declared
+  ## register. Anything else would have to be computed into a register first,
+  ## and `.assembler` does not invent registers.
+  if c.kind != Symbol or g.isAsmStackSym(c):
+    lengError c, "an `.assembler` memory operand must be addressed through a " &
+              "pointer held in a `{.register: \"…\".}` local or parameter", g.asmInfo
+  g.emReg g.asmRegOf(c)
+
+proc asmAddr(g: var CodeGen; c: Cursor) =
+  ## The ADDRESS a memory expression denotes, as nifasm's typed address forms:
+  ## `(at base idx)` for an array element and `(dot base field)` for a field.
+  ## nifasm checks the types — `at` only through an `aptr`, a field only of the
+  ## pointee's object type — so a wrong access is a type error, not a wrong
+  ## displacement.
+  case c.exprKind
+  of PatC:
+    var cc = c
+    cc.into:
+      let base = cc
+      skip cc
+      let idx = asmAtom(cc)
+      g.ab.tree AtX:
+        g.asmPtrBase(base)
+        case idx.kind
+        of IntLit: g.ab.intLit intVal(idx)
+        of UIntLit: g.ab.intLit cast[int64](uintVal(idx))
+        of Symbol:
+          # a register index; nifasm folds it into the addressing mode when the
+          # element size is a legal scale and rejects the access otherwise
+          g.emReg g.asmRegOf(idx)
+        else:
+          lengError idx, "an `.assembler` index must be a literal or a register local",
+                    g.asmInfo
+      skip cc
+      while cc.hasMore: skip cc
+  of DerefC:
+    var cc = c
+    cc.into:
+      g.asmPtrBase(cc)
+      skip cc
+      while cc.hasMore: skip cc
+  of DotC:
+    var cc = c
+    cc.into:
+      let obj = cc
+      skip cc
+      let fld = cc
+      if not (obj.kind == TagLit and obj.exprKind == DerefC) or fld.kind != Symbol:
+        lengError c, "an `.assembler` field access must be `p.field` through a " &
+                  "pointer in a register", g.asmInfo
+      g.ab.tree DotX:
+        var oc = obj
+        oc.into:
+          g.asmPtrBase(oc)
+          skip oc
+          while oc.hasMore: skip oc
+        g.ab.sym fld.symId
+      skip cc
+      while cc.hasMore: skip cc
+  else:
+    lengError c, "unsupported `.assembler` memory operand", g.asmInfo
+
+proc asmMem(g: var CodeGen; c: Cursor) {.inline.} =
+  g.ab.tree MemX: g.asmAddr(c)
+
+proc isMemOperand(g: CodeGen; c: Cursor): bool {.inline.} =
+  isAsmMemExpr(c) or g.isAsmStackSym(c)
+
 proc asmOperand*(g: var CodeGen; cur: Cursor) =
   ## One source operand of a flag-defining instruction: a register local, a stack
   ## slot, or a literal. Unlike `asmRegOf` this permits memory and immediates,
@@ -114,6 +281,11 @@ proc asmOperand*(g: var CodeGen; cur: Cursor) =
     else: g.emReg g.asmRegOf(c)
   of IntLit: g.ab.intLit intVal(c)
   of UIntLit: g.ab.intLit cast[int64](uintVal(c))
+  of TagLit:
+    if isAsmMemExpr(c): g.asmMem(c)
+    else:
+      lengError c, "an `.assembler` operand must be a variable, a literal or a " &
+                "memory access through a pointer register", g.asmInfo
   else:
     lengError c, "an `.assembler` operand must be a variable or a literal", g.asmInfo
 
@@ -131,6 +303,10 @@ proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   inner.into:
     sym = inner; skip inner
     while inner.hasMore: skip inner
+  if isAsmMemExpr(sym):
+    # `add(p[i], x)`: the destination is memory, read and written in place
+    g.asmMem(sym)
+    return
   if sym.kind != Symbol:
     lengError sym, "the destination of a two-address instruction must be a local " &
               "with a declared location", g.asmInfo
@@ -138,9 +314,39 @@ proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   if nm in g.asmStack: g.emStackMem(nm)
   else: g.emReg g.asmRegOf(sym)
 
+proc asmFixedDest(g: var CodeGen; c: Cursor; want: Reg; what: string) =
+  ## A `var` operand the instruction writes in a register of its own choosing.
+  var d = c
+  if d.kind == TagLit and d.exprKind == HaddrC: inc d
+  if d.kind != Symbol or g.isAsmStackSym(d) or g.asmRegOf(d) != want:
+    lengError c, what & " of `mul` must be a local pinned to " & x64RegName(want) &
+              " — the instruction writes it there and nowhere else", g.asmInfo
+
+proc asmMul(g: var CodeGen; c: Cursor; args: seq[Cursor]) =
+  ## `mul(lo, hi, s)`: `rdx:rax = rax * s`. The signature names all three, so the
+  ## two results are visible to the reader, and the pins are CHECKED rather than
+  ## implied — the one-operand encoding has nowhere else to put them.
+  g.asmFixedDest(args[0], RAX, "the first operand (the low half, and the multiplicand)")
+  g.asmFixedDest(args[1], RDX, "the second operand (the high half)")
+  let s = args[2]
+  if s.kind in {IntLit, UIntLit}:
+    lengError c, "`mul` takes no immediate; load the multiplier into a register",
+              g.asmInfo
+  if s.kind == Symbol and not g.isAsmStackSym(s) and g.asmRegOf(s) == RDX:
+    lengError c, "the multiplier of `mul` cannot be rdx: the instruction overwrites " &
+              "it with the high half", g.asmInfo
+  g.ab.tree MulX64: g.asmOperand(s)
+
+proc asmInoutInstrImpl(g: var CodeGen; c: Cursor; op: IntrinsicOp)
+
 proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## `add(d, s)` / `neg(d)` — a row that writes THROUGH operand 0 and returns
   ## nothing. Statement-only, since there is no value to bind.
+  g.asmUseFlags(c, op)
+  g.asmInoutInstrImpl(c, op)
+  g.asmApplyFlags(op, c)
+
+proc asmInoutInstrImpl(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   var argCurs: seq[Cursor] = @[]
   var fc = c
   fc.into:
@@ -150,6 +356,9 @@ proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   if argCurs.len != row.arity:
     lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
               g.asmInfo
+  if op == MulOp:
+    g.asmMul(c, argCurs)
+    return
   let tag = inoutInst(op)
   if tag == NopX64:
     lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
@@ -157,19 +366,28 @@ proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   if row.arity == 1:
     g.ab.tree tag: g.asmInoutDest(argCurs[0])
   else:
-    if g.isAsmStackSym(argCurs[1]) and
-       argCurs[0].kind == TagLit and argCurs[0].exprKind == HaddrC:
+    var d = argCurs[0]
+    if d.kind == TagLit and d.exprKind == HaddrC: inc d
+    if g.isMemOperand(argCurs[1]) and g.isMemOperand(d):
       # `(add [mem], [mem])` does not exist. Only flagged when BOTH are memory;
       # a memory destination with a register or immediate source is fine.
-      var d = argCurs[0]; inc d
-      if d.kind == Symbol and d.symId in g.asmStack:
-        lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
-                  g.asmInfo
+      lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
+                g.asmInfo
+    if op in {CmovzOp..CmovleOp, ImulOp}:
+      # a conditional move and a two-operand multiply write a REGISTER and take
+      # no immediate: the encodings do not exist
+      if g.isMemOperand(d):
+        lengError c, "the destination of `" & IntrinsicNames[op] &
+                  "` must be a register", g.asmInfo
+      if op != ImulOp and argCurs[1].kind in {IntLit, UIntLit}:
+        lengError c, "`" & IntrinsicNames[op] & "` takes no immediate; load it " &
+                  "into a register first", g.asmInfo
     g.ab.tree tag: (g.asmInoutDest(argCurs[0]); g.asmOperand(argCurs[1]))
 
 proc asmFlagInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## `cmp(a, b)` / `test(a, b)` — an instruction whose entire output is flags.
   ## It is a statement, never a value: there is nothing to bind.
+  g.asmApplyFlags(op, c)
   var argCurs: seq[Cursor] = @[]
   var fc = c
   fc.into:
@@ -191,6 +409,23 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
     let destC = cc
     skip cc
     let srcC = asmAtom(cc)
+    if isAsmMemExpr(destC):
+      # a STORE: `p[i] = x`. The source must be a register or an immediate —
+      # memory to memory needs a scratch register no one declared.
+      if g.isMemOperand(srcC):
+        lengError srcC, "a memory-to-memory move needs a scratch register; " &
+                  "assign through a `{.register: \"…\".}` local", g.asmInfo
+      g.ab.tree MovX64:
+        g.asmMem(destC)
+        case srcC.kind
+        of Symbol: g.emReg g.asmRegOf(srcC)
+        of IntLit: g.ab.intLit intVal(srcC)
+        of UIntLit: g.ab.intLit cast[int64](uintVal(srcC))
+        else:
+          lengError srcC, "a store needs a register or a literal", g.asmInfo
+      skip cc
+      while cc.hasMore: skip cc
+      return
     # A `{.stack.}` local is a memory operand, so a move touching one is `mov
     # [slot], reg` / `mov reg, [slot]`. Memory on BOTH sides would take a scratch
     # register no one declared — the one thing `.assembler` will not invent.
@@ -224,10 +459,14 @@ proc asmAsgn*(g: var CodeGen; c: Cursor) =
     of UIntLit:
       g.movImm(dst, cast[int64](uintVal(srcC)))
     of TagLit:
-      if srcC.exprKind != InstrC:
+      if isAsmMemExpr(srcC):
+        # a LOAD: `x = p[i]`
+        g.ab.tree MovX64: (g.emReg dst; g.asmMem(srcC))
+      elif srcC.exprKind != InstrC:
         lengError srcC, "an `.assembler` statement must be one instruction; `" &
                   $srcC.exprKind & "` would need temporaries", g.asmInfo
-      g.asmInstr(destC, dst, srcC)
+      else:
+        g.asmInstr(destC, dst, srcC)
     else:
       lengError srcC, "unsupported `.assembler` operand", g.asmInfo
     skip cc
@@ -248,6 +487,7 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   if tgX64 notin row.targets:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no x86-64 lowering; an " &
               "`.assembler` proc has no fallback path", g.asmInfo
+  g.asmApplyFlags(tgt.op, c)          # value rows clobber flags too (`rol`, `bsf`)
   if row.isFlagRead:
     # The rule of §6, at its one enforcement point: a flag has no register behind
     # it, and `setcc` — the instruction that would give it one — reads the same
@@ -304,9 +544,15 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
       g.asmReg[nm] = loc.r
       # The signature already bound the ABI registers (`p0.0`, `ret.0`); pinning a
       # local onto one of those is legal — it is the same machine register under a
-      # second source name — but must not redeclare the binding.
-      if not g.rb.isBound(loc.r):
+      # second source name — and needs no new binding while the TYPE is the same.
+      # A different type is a different value in that register: `hi` of a `mul`
+      # landing in rdx after the pointer that arrived there was copied away. Then
+      # the register is re-declared, which ends the old binding, so nifasm types
+      # every later use as what the register now holds.
+      let prev = g.asmRegType.getOrDefault(loc.r, default(Cursor))
+      if not g.rb.isBound(loc.r) or cursorIsNil(prev) or not sameTree(prev, typeCur):
         g.emRegLocalVar(nm, loc.r, typeCur)
+        g.asmRegType[loc.r] = typeCur
     of aslStack:
       g.asmStack.incl nm
       g.emTypedStackVar(nm, typeCur)
@@ -393,6 +639,7 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       g.emitNullaryIntrinsicX64(op)
+      g.asmApplyFlags(op, c)
     else:
       lengError c, "an instruction used as a statement must have a destination",
                 g.asmInfo
@@ -409,9 +656,16 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       skip cc
       let lEnd = g.freshLabel()
       g.loopEnds.add lEnd
+      # the loop head is also reached by the back edge, where the flags are
+      # whatever the body's end left — so nothing is known on entry, and after
+      # the loop (reached by `break`s from anywhere in it) nothing either
+      g.asmFlags = {}
+      g.asmCfBy = NoIntrinsicOp
       g.emitLoop:
         while cc.hasMore: (g.asmStmt(cc); skip cc)
       g.emLab(lEnd)
+      g.asmFlags = {}
+      g.asmCfBy = NoIntrinsicOp
       discard g.loopEnds.pop()
   of IfS:
     # `if <flag>(): … else: …` → nifasm's `(ite (zf) then else)`, which already
@@ -442,6 +696,9 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             if flag == NoFlag:
               lengError condC, "`" & IntrinsicNames[op] &
                         "` has no x86-64 condition code", g.asmInfo
+            g.asmUseFlags(condC, op)
+            let atIf = g.asmFlags
+            let cfAtIf = g.asmCfBy
             skip bc
             # `(ite cond then else)`: nifasm reads exactly two statements, so an
             # `if` with no `else` gets an empty one.
@@ -453,6 +710,10 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
                 g.enterScope()
                 while bc.hasMore: (g.asmStmt(bc); skip bc)
                 g.exitScope()
+              let afterThen = g.asmFlags
+              let cfAfterThen = g.asmCfBy
+              g.asmFlags = atIf
+              g.asmCfBy = cfAtIf
               g.ab.tree StmtsX64:
                 if hasElse:
                   var ec = peek
@@ -460,6 +721,9 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
                     g.enterScope()
                     while ec.hasMore: (g.asmStmt(ec); skip ec)
                     g.exitScope()
+              # only what both arms leave defined is defined after the `if`
+              g.asmFlags = g.asmFlags * afterThen
+              if g.asmCfBy != cfAfterThen: g.asmCfBy = NoIntrinsicOp
         of ElseU:
           discard                                # emitted inside the `elif` above
         else:
@@ -470,6 +734,8 @@ proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       lengError c, "`break` outside a loop", g.asmInfo
     g.emJmp(g.loopEnds[^1])
   of LabS:
+    g.asmFlags = {}                  # reachable by a jump from anywhere
+    g.asmCfBy = NoIntrinsicOp
     var cc = c
     cc.into:
       g.emLab(cc.symId); skip cc
@@ -504,7 +770,9 @@ proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
   g.varType.clear(); g.symType.clear(); g.stackSlots.clear()
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.rawHomeRegs = {}; g.narrowHomes = false   # no allocator, no temp pool here
-  g.asmReg.clear(); g.asmStack.clear()
+  g.asmReg.clear(); g.asmStack.clear(); g.asmRegType.clear()
+  g.asmFlags = {}                    # the caller's flags are not ours to read
+  g.asmCfBy = NoIntrinsicOp
   g.asmInfo = lengInfo(info.decl)
   g.loopEnds = @[]
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false
@@ -551,6 +819,7 @@ proc genAsmProc*(g: var CodeGen; info: ProcInfo) =
                           x64RegName(loc.r), g.asmInfo
             g.asmReg[nm] = abiReg
             g.rb.bindParam(abiReg, g.paramName(ord))
+            g.asmRegType[abiReg] = pc               # the param's Leng type
             used.incl abiReg
             while pc.hasMore: skip pc
           inc ord
