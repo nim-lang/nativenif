@@ -2544,6 +2544,19 @@ proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   assert res.kind == InReg, "arkham a64n: cond-value result " & $res.kind
   if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
   let lEnd = g.freshLabel()
+  if not res.isTemp and g.exprReadsReg(c, res.r):
+    # `b = not b`: the destination is a home the condition READS, so the
+    # assume-1 scheme below would overwrite the operand before testing it and
+    # `b` would stick at false. Test first, then write — the x64 order.
+    let lFalse = g.freshLabel()
+    g.emitCond(c, lFalse, whenTrue = false)
+    g.movImm(res.r, 1)
+    g.emBr(BA64, lEnd)
+    g.emLab(lFalse)
+    g.movImm(res.r, 0)
+    g.emLab(lEnd)
+    dest = res
+    return
   g.movImm(res.r, 1)
   g.emitCond(c, lEnd, whenTrue = true)
   g.movImm(res.r, 0)
