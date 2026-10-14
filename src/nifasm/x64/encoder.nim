@@ -985,6 +985,42 @@ proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = e
 proc emitOrImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64)  = emitAluImmMem(dest, 1, mem, imm, bits)
 proc emitXorImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 6, mem, imm, bits)
 
+# Add/subtract with carry: the steps after the first `add`/`sub` of a
+# multi-word sum or difference. Same encodings as `add`/`sub` with the carry
+# opcodes (ADC r/m64,r64 = 0x11, r64,r/m64 = 0x13, group-1 /2; SBB = 0x19,
+# 0x1B, /3), 64-bit only: a multi-word number is made of machine words.
+proc emitCarryRR(dest: var Bytes; opRM: byte; a, b: Register) =
+  var rex = RexPrefix(w: true)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
+  dest.add(encodeRex(rex))
+  dest.add(opRM)
+  dest.add(encodeModRM(amDirect, int(b), int(a)))
+
+proc emitCarryMem(dest: var Bytes; op: byte; reg: Register; mem: MemoryOperand) =
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  dest.add(encodeRex(rex))
+  dest.add(op)
+  dest.emitMem(int(reg), mem)
+
+proc emitAdc*(dest: var Bytes; a, b: Register) = emitCarryRR(dest, 0x11, a, b)
+  ## ADC a, b: a = a + b + CF
+proc emitAdc*(dest: var Bytes; reg: Register; mem: MemoryOperand) = emitCarryMem(dest, 0x13, reg, mem)
+proc emitAdc*(dest: var Bytes; mem: MemoryOperand; reg: Register) = emitCarryMem(dest, 0x11, reg, mem)
+proc emitAdcImm*(dest: var Bytes; reg: Register; imm: int32) = emitAluImmReg(dest, 2, reg, imm)
+proc emitAdcImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 2, mem, imm, 64)
+
+proc emitSbb*(dest: var Bytes; a, b: Register) = emitCarryRR(dest, 0x19, a, b)
+  ## SBB a, b: a = a - b - CF
+proc emitSbb*(dest: var Bytes; reg: Register; mem: MemoryOperand) = emitCarryMem(dest, 0x1B, reg, mem)
+proc emitSbb*(dest: var Bytes; mem: MemoryOperand; reg: Register) = emitCarryMem(dest, 0x19, reg, mem)
+proc emitSbbImm*(dest: var Bytes; reg: Register; imm: int32) = emitAluImmReg(dest, 3, reg, imm)
+proc emitSbbImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 3, mem, imm, 64)
+
 # Shift operations
 proc emitShl*(dest: var Bytes; reg: Register; count: int) =
   ## Emit SHL instruction: SHL reg, count (shift left)
@@ -1068,6 +1104,22 @@ proc emitShrCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 5)
 proc emitSarCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 7)
 
 # Rotate operations
+proc emitRotSized*(dest: var Bytes; reg: Register; count: int; digit, bits: int) =
+  ## A rotate by an immediate at `bits` (8/16/32): `digit` is the group-2
+  ## extension (ROL /0, ROR /1). A 32-bit rotate wraps at bit 31 and zero-extends
+  ## the register; 8/16-bit ones leave the upper bits alone. Not the 64-bit form
+  ## with a narrower type — that rotates the upper half into the value.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  # an 8-bit access to rsp..rdi needs a REX prefix to mean spl..dil, not ah..bh
+  if rex.b or (bits == 8 and int(reg) in 4..7):
+    dest.add(encodeRex(rex))
+  let one = count == 1
+  dest.add(if bits == 8: (if one: 0xD0'u8 else: 0xC0'u8) else: (if one: 0xD1'u8 else: 0xC1'u8))
+  dest.add(encodeModRM(amDirect, digit, int(reg)))
+  if not one: dest.add(byte(count))
+
 proc emitRol*(dest: var Bytes; reg: Register; count: int) =
   ## Emit ROL instruction: ROL reg, count (rotate left)
   var rex = RexPrefix(w: true)
