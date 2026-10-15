@@ -401,7 +401,10 @@ const LinuxSyscalls* = {
   "eventfd2":      (290, 19),
   "io_uring_setup":    (425, 425),
   "io_uring_enter":    (426, 426),
-  "io_uring_register": (427, 427)}
+  "io_uring_register": (427, 427),
+  # `getrandom(buf, buflen, flags)` — std/crypto/sysrand's CSPRNG. glibc/musl
+  # export the same name with the kernel's argument order and result.
+  "getrandom":     (318, 278)}
 
 # ── FreeBSD/amd64 syscall table ──────────────────────────────────────────────
 # The numbers are FreeBSD's own (`<sys/syscall.h>`), not Linux's. FreeBSD reports
