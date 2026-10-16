@@ -130,6 +130,7 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(udiv D S)`           | A64Inst, MInst, RvInst | unsigned divide |
 | `(smulh D S)`          | A64Inst                  | signed multiply high (top 64 bits of D*S) |
 | `(umulh D S)`          | A64Inst                  | unsigned multiply high (top 64 bits of D*S) |
+| `(umulh3 D A B)`       | A64Inst                  | 3-operand unsigned multiply high: D = the top 64 bits of A*B |
 | `(add3 D A B)`         | A64Inst, MInst, RvInst | 3-operand add (D = A + B) |
 | `(sub3 D A B)`         | A64Inst, MInst, RvInst | 3-operand subtract (D = A - B) |
 | `(mul3 D A B)`         | A64Inst, MInst, RvInst | 3-operand multiply (D = A * B) |
@@ -184,6 +185,8 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(not O)`              | X64Inst, AvrInst | bitwise not |
 | `(rol D S)`            | X64Inst                  | rotate left |
 | `(ror D S)`            | X64Inst                  | rotate right |
+| `(ror3 D A B)`         | A64Inst                  | 3-operand 64-bit rotate right: D = A rotated right by B (an immediate 0..63, `extr`, or a register, `rorv`) |
+| `(rorw3 D A B)`        | A64Inst                  | 32-bit 3-operand rotate right (W-form, result zero-extended): an immediate 0..31 or a register |
 | `(rcl D S)`            | X64Inst                  | rotate left through carry |
 | `(rcr D S)`            | X64Inst                  | rotate right through carry |
 | `(bsf D S)`            | X64Inst                  | bit scan forward |
@@ -611,10 +614,10 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(blx D)`            | MInst                       | indirect call through the address in D |
 | `(mvn D S)`          | MInst                       | bitwise NOT (D = not S) |
 | `(bic3 D A B)`       | MInst                       | 3-operand bit clear (D = A and not B) |
-| `(adds3 D A B)`      | MInst                       | 3-operand add SETTING the flags — the low half of a 64-bit add |
-| `(adcs3 D A B)`      | MInst                       | 3-operand add with carry, setting the flags — the high half of a 64-bit add |
-| `(subs3 D A B)`      | MInst                       | 3-operand subtract setting the flags — the low half of a 64-bit subtract |
-| `(sbcs3 D A B)`      | MInst                       | 3-operand subtract with borrow, setting the flags — the high half of a 64-bit subtract |
+| `(adds3 D A B)`      | MInst, A64Inst              | 3-operand add SETTING the flags — the low half of a multi-word add (Cortex-M: of a 64-bit add). AArch64: `adds`, at the width of D's type (`w` for 32 bits and below, `x` otherwise); B may be a register or a 12-bit immediate |
+| `(adcs3 D A B)`      | MInst, A64Inst              | 3-operand add with carry, setting the flags — the next word of a multi-word add. AArch64: `adcs`, register operands only; `(xzr)` is the zero |
+| `(subs3 D A B)`      | MInst, A64Inst              | 3-operand subtract setting the flags — the low half of a multi-word subtract. Arm's C after a subtract is NOT-borrow. AArch64: `subs`, register or 12-bit immediate B |
+| `(sbcs3 D A B)`      | MInst, A64Inst              | 3-operand subtract with borrow (D = A - B - NOT C), setting the flags — the next word of a multi-word subtract. AArch64: `sbcs`, register operands only |
 | `(mls D A B C)`      | MInst                       | multiply-subtract (D = C - A*B); ARMv7-M has no modulo, so `a mod b` is `sdiv` then `mls` |
 | `(umull L H A B)`    | MInst                       | unsigned 64-bit product of A and B into the register pair L (low) / H (high) |
 | `(smull L H A B)`    | MInst                       | signed 64-bit product of A and B into the register pair L (low) / H (high) |

@@ -23,6 +23,11 @@ import regs, operands
 include compat2   # getOrQuit on host Nim
 
 proc genStmtA64(n: var Cursor; ctx: var GenContext)
+proc a64NarrowInt(t: Type): bool =
+  ## An integer type of 32 bits or fewer: the `w` form of an instruction whose
+  ## width follows its destination (the flag-setting carry chain).
+  t != nil and t.kind in {IntT, UIntT} and t.bits <= 32
+
 proc genInstA64(n: var Cursor; ctx: var GenContext)
 
 const A64CallClobbers* = {arm64.X0 .. arm64.X15}
@@ -1131,6 +1136,61 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         arm64.emitAsrImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
       else: error("Shift amount must be 0-63", n)
     else: arm64.emitAsr(ctx.buf.data, rd, rn, rm.reg)
+
+  of Adds3A64, Subs3A64:
+    # The flag-setting add/subtract: the first word of a multi-word sum or
+    # difference. The width is the DESTINATION's declared type — a `(u 32)` local
+    # gets the `w` form, whose carry is out of bit 31 — because that is the one
+    # operand whose type says what the instruction computes.
+    let sub = instTag == Subs3A64
+    let mn = if sub: "subs3" else: "adds3"
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, mn)
+    checkIntegerArithmetic(dstT, mn, start)
+    checkArithOperand(rm.typ, mn, start)
+    let w = a64NarrowInt(dstT)
+    if rm.kind == okImm:
+      if rm.immVal < 0 or rm.immVal > 4095:
+        error(mn & " takes a 12-bit immediate (0..4095); load a larger constant " &
+              "into a register", n)
+      arm64.emitAddsSubsImm(ctx.buf.data, rd, rn, uint16(rm.immVal), sub, w)
+    elif rm.kind != okReg: error(mn & " second source must be a register or immediate", n)
+    else: arm64.emitAddsSubsReg(ctx.buf.data, rd, rn, rm.reg, sub, w)
+
+  of Adcs3A64, Sbcs3A64:
+    # Add/subtract WITH carry, setting the flags: every word of a chain after the
+    # first. There is no immediate form; `(xzr)` adds just the carry.
+    let sub = instTag == Sbcs3A64
+    let mn = if sub: "sbcs3" else: "adcs3"
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, mn)
+    checkIntegerArithmetic(dstT, mn, start)
+    if rm.kind != okReg:
+      error(mn & " has no immediate form; use a register, or `(xzr)` for zero", n)
+    checkArithOperand(rm.typ, mn, start)
+    arm64.emitAdcsSbcs(ctx.buf.data, rd, rn, rm.reg, sub, a64NarrowInt(dstT))
+
+  of Umulh3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "umulh3")
+    checkIntegerType(dstT, "umulh", start)
+    checkIntegerType(rm.typ, "umulh", start)
+    if rm.kind != okReg: error("umulh3 second source must be a register", n)
+    arm64.emitUmulh(ctx.buf.data, rd, rn, rm.reg)
+
+  of Ror3A64, Rorw3A64:
+    let w = instTag == Rorw3A64
+    let mn = if w: "rorw3" else: "ror3"
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, mn)
+    checkBitwiseType(dstT, mn, start)
+    let limit = if w: 31 else: 63
+    if rm.kind == okImm:
+      if rm.immVal < 0 or rm.immVal > limit:
+        error(mn & " amount must be 0-" & $limit, n)
+      arm64.emitRorImm(ctx.buf.data, rd, rn, uint8(rm.immVal), w)
+    elif rm.kind != okReg: error(mn & " amount must be a register or an immediate", n)
+    else: arm64.emitRorReg(ctx.buf.data, rd, rn, rm.reg, w)
 
   of AddwA64:
     inc n

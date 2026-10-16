@@ -255,17 +255,36 @@ const arkhamRejections: seq[(string, string)] = @[
   ("err_cmov_imm", "`cmovz` takes no immediate"),
 ]
 
+const arkhamA64Rejections: seq[(string, string)] = @[
+  # The AArch64 half of the assembler mode. NZCV is tracked exactly there (only
+  # `cmp` and the `adds3`/`adcs3`/`subs3`/`sbcs3` rows write it), so a read with
+  # no definition on every path is rejected — including after a loop, which is
+  # reached by `break`s from anywhere in it.
+  ("err_a64_adcs_no_carry", "`adcs3` reads C, which is not defined here"),
+  ("err_a64_csel_after_loop", "`cselne` reads Z, which is not defined here"),
+  # Arm is a load/store machine, and the encodings have limits worth naming.
+  ("err_a64_mem_arith", "Arm arithmetic reads registers only"),
+  ("err_a64_narrow_shl", "`shl` on a 32-bit local has no AArch64 two-address form"),
+  ("err_a64_adds_imm", "`adds3` takes a 12-bit immediate"),
+]
+
 proc arkhamRejectionTests(arkham: string) =
-  ## Every fixture above must fail, with the stated reason. x86-64 only: the
-  ## register names in an `{.assembler.}` body are x86-64's, and the AArch64
-  ## backend rejects the whole mode before reaching any of these checks.
+  ## Every fixture above must fail, with the stated reason, on the target its
+  ## register pins name: `arkhamRejections` as x86-64, `arkhamA64Rejections` as
+  ## linux_arm64 (the other target refuses the pins before reaching the check).
   var passed = 0
   for (name, expected) in arkhamRejections:
     execExpectFailure(quoteShell(arkham) & " -a:x64 -o:" &
                       quoteShell("tests" / "arkham" / "nimcache" / (name & ".rej.nif")) &
                       " " & quoteShell("tests" / "arkham" / (name & ".c.nif")), expected)
     inc passed
-  echo passed, " / ", arkhamRejections.len, " arkham rejection tests successful"
+  for (name, expected) in arkhamA64Rejections:
+    execExpectFailure(quoteShell(arkham) & " -a:linux_arm64 -o:" &
+                      quoteShell("tests" / "arkham" / "nimcache" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham" / (name & ".c.nif")), expected)
+    inc passed
+  echo passed, " / ", arkhamRejections.len + arkhamA64Rejections.len,
+       " arkham rejection tests successful"
 
 proc arkhamDebugInfoTests() =
   ## nifasm emits `.symtab` + `.eh_frame`, so a debugger can name and unwind
@@ -618,6 +637,8 @@ const webUnsupported: seq[string] = @[
   "err_unannotated_local", "err_wrong_param_reg",
   "err_adc_no_carry", "err_adc_after_mul", "err_mul_reg", "err_mem_to_mem",
   "err_cmov_imm",
+  "err_a64_adcs_no_carry", "err_a64_csel_after_loop", "err_a64_mem_arith",
+  "err_a64_narrow_shl", "err_a64_adds_imm",
   "intrinsics", "intrinsics_x64", "naked_stacktrace_x64", "volatile_access",
   # 2. Pointer arithmetic, refused by arkham's own rule (`checkArithResultType`).
   "err_aptr_arith", "err_ptr_arith",
@@ -2694,9 +2715,9 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
                       known = arkhamStressKnown, level = arkhamStressLevel,
                       moves = "late")
 
-# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`), but
-# they are COMPILE-only — arkham is told `-a:x64` and the expectation is an error
-# message — so they need an x86-64 target, not an x86-64 host.
+# The `{.assembler.}` rejections (see `arkhamRejectionTests`) are COMPILE-only —
+# arkham is told `-a:x64` or `-a:linux_arm64` and the expectation is an error
+# message — so they need the target, not a host that runs it.
 when defined(linux):
   arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
 
