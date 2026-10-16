@@ -478,7 +478,10 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
   elif n.kind == TagLit:
     # Hardware flag: (ite (flag) ...)
     let flagTag = tagToX64Flag(n.tag)
-    inc n
+    # `(zf)` is a single childless token: one `inc` steps past it. A second one
+    # (a leftover from the format with closing tokens) stepped INTO the then-arm's
+    # `(stmts …)`, so only its first statement was the then-arm, the second became
+    # the else-arm and the rest ran unconditionally (#206).
     inc n
 
     case flagTag

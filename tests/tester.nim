@@ -1150,6 +1150,7 @@ exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
 exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
 exec "nim c -r src/nifasm/nifasm tests/mem_reg_index.nif"
 exec "nim c -r src/nifasm/nifasm tests/jcc_sign.nif"
+exec "nim c -r src/nifasm/nifasm tests/ite_multi_stmt.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_subwidth.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
@@ -1198,6 +1199,9 @@ when defined(linux) and defined(amd64):
   execRun "tests/mem_reg_index"
   # js/jns: sign-flag conditional jumps; exits 0 only when both are taken.
   execRun "tests/jcc_sign"
+  # A flag `ite` whose arms hold several statements (#206): the whole then-arm
+  # runs on the taken path and nothing of it leaks into the else-arm.
+  execRun "tests/ite_multi_stmt"
   # Sub-width register ALU via explicit `(cast (u N) (reg))`: 32-bit ops
   # zero-extend, 8/16-bit ops preserve the upper bits, flags at the operation
   # width, shift counts masked to it, REX-sensitive byte registers (sil/r14b).
