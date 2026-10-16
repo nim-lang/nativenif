@@ -219,17 +219,17 @@ proc calculateRelocDistance(fromPos: int; toPos: int; kind: RelocKind = rkJmp): 
   of rkRvLuiAddi:
     toPos                   # absolute, like the Thumb MOVW/MOVT pair
 
-proc patchAvrWord(buf: var Buffer; at: int; keep, bits: uint16) =
+proc patchAvrWord(buf: var Bytes; at: int; keep, bits: uint16) =
   ## Rewrite one AVR word in place, preserving every bit outside `keep`'s
   ## complement. Reading the word back rather than rebuilding it is what lets a
   ## single relocation kind serve all fourteen branch conditions and both
   ## `ldi` halves.
-  let old = uint16(buf.data[at]) or (uint16(buf.data[at + 1]) shl 8)
+  let old = uint16(buf[at]) or (uint16(buf[at + 1]) shl 8)
   let w = (old and keep) or bits
-  buf.data[at] = byte(w and 0xFF)
-  buf.data[at + 1] = byte((w shr 8) and 0xFF)
+  buf[at] = byte(w and 0xFF)
+  buf[at + 1] = byte((w shr 8) and 0xFF)
 
-proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
+proc patchAvrReloc(buf: var Bytes; absBase: uint32; at: int; kind: RelocKind; distance: int) =
   ## Every AVR displacement is a WORD count, so the byte distance is halved
   ## here — the one step that has no analogue on the other targets.
   case kind
@@ -255,7 +255,7 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
   of rkAvrJmp, rkAvrCall:
     # An absolute 22-bit WORD address, scattered across both words: k21..k17 in
     # bits 8:4 of the first, k16 in its bit 0, and k15..k0 in the second.
-    let target = distance + int(buf.absBase)
+    let target = distance + int(absBase)
     if (target and 1) != 0:
       quit("nifasm: AVR call to an odd address: " & $target)
     let k = target div 2
@@ -267,7 +267,7 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
   of rkAvrLdiAddr:
     # Two `ldi`s carrying a DATA address: low half, then high. `absBase` is what
     # the image writer contributes once it knows where the section lands.
-    let value = distance + int(buf.absBase)
+    let value = distance + int(absBase)
     proc kBits(v: int): uint16 =
       ((uint16(v) shr 4) and 0xF) shl 8 or (uint16(v) and 0xF)
     patchAvrWord(buf, at, 0xF0F0'u16, kBits(value and 0xFF))
@@ -538,7 +538,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data.patchThumbMovwMovtPair(currentPos,
                                       uint32(distance) + buf.absBase + thumbBit)
     of rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
-      patchAvrReloc(buf, currentPos, reloc.kind, distance)
+      patchAvrReloc(buf.data, buf.absBase, currentPos, reloc.kind, distance)
     of rkRvJ, rkRvJal:
       # RV32 J-type `jal rd, label`. The 20-bit field is scattered as
       # imm[20|10:1|11|19:12] and the low bit is IMPLICIT — a target address is
