@@ -2429,7 +2429,7 @@ const cortexMUnsupported: seq[string] = @[
   # `tests/arkham_m/fp32_*` — and a double is refused rather than lowered through
   # a softfloat library nobody asked for.
   "a64_vec_instr", "addrfloat", "float_array_index", "float_global_field",
-  "float_global_read", "float_special_values", "fp3264", "fparg_spill",
+  "float_global_read", "float_neg_zero", "float_special_values", "fp3264", "fparg_spill",
   "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",

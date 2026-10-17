@@ -4588,16 +4588,14 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
       var iv = dest
       g.emitFValue(inner, iv)                            # operand → dest
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
-      let z = g.pickFStagingSealed("a float neg temp")
-      g.bindFTmp(z)
-      g.fmovF(z, dest.f, bits)                           # z = operand
-      let gpr = g.pickStagingSealed("a float neg zero",
+      # Negation is a sign-bit flip, not `0.0 - x`: under IEEE 754
+      # `+0.0 - +0.0 == +0.0`, so the subtraction loses `-(+0.0) == -0.0`.
+      let gpr = g.pickStagingSealed("a float neg sign flip",
                                     AsmSlot(cls: AInt, size: 8, align: 8))
-      g.movImm(gpr, 0)
-      g.fmovFromGpr(dest.f, gpr, bits)                   # dest = 0.0
+      g.fmovToGpr(gpr, dest.f, bits)                     # gpr = bits of operand
+      g.ab.tree BtcX64: (g.emReg gpr; g.ab.intLit(bits - 1))
+      g.fmovFromGpr(dest.f, gpr, bits)                   # dest = sign-flipped
       g.giveBack gpr
-      g.fbin(SubssX64, SubsdX64, dest.f, z, bits)        # dest = 0.0 - operand
-      g.unbindFTmp(z); g.rb.unsealF z
     of InfC, NeginfC, NanC:
       if dest.kind != InFReg:
         dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
