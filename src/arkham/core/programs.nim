@@ -1124,7 +1124,8 @@ proc lookupForeignDecl*(p: var Program; sym: SymId; found: var bool): Cursor =
     # consts to module-suffixed top-level decls, and the C-linkage gvars
     # resolve through `gvarRefName` — nothing legitimate reaches here.
     return
-  let m = loadModule(p, p.pool.strings[module])
+  let suffix = p.pool.strings[module]
+  let m = loadModule(p, suffix)
   let name = symString(p.pool, sym)
   if not hasDecl(m, name): return
   result = getDecl(m, name, p.tags, p.pool)

@@ -740,7 +740,8 @@ proc serializeStatics(g: var WebGen) =
     for (_, n) in round:
       var typ, initv: Cursor = default(Cursor)
       var hasInit = false
-      if not staticInit(g, g.canonDecl.getOrQuit(n), typ, initv, hasInit): continue
+      let decl = g.canonDecl.getOrQuit(n)
+      if not staticInit(g, decl, typ, initv, hasInit): continue
       var bytes = ""
       serializeConstInto(g, bytes, 0, typ, initv)
       if bytes.len > 0:
@@ -2794,7 +2795,8 @@ proc genVar(g: var WebGen; c: Cursor) =
     # The binding came from the prologue; this statement only gives it its value.
     # With no initializer the hoisted zero already is the answer.
     if hasInit:
-      let w = widthOf(scalOf(g, g.p.symType.getOrQuit(nm)))
+      let symType = g.p.symType.getOrQuit(nm)
+      let w = widthOf(scalOf(g, symType))
       g.outp.tree ExprStmt:
         g.outp.tree Assign:
           g.outp.symUse irName(g, nm)
@@ -2847,7 +2849,8 @@ proc assignTo(g: var WebGen; dst, src: Cursor) =
     let nm = dst.symId
     g.outp.tree Assign:
       g.outp.symUse irName(g, nm)
-      g.genExprCoerced(src, widthOf(scalOf(g, g.p.symType.getOrQuit(nm))))
+      let symType = g.p.symType.getOrQuit(nm)
+      g.genExprCoerced(src, widthOf(scalOf(g, symType)))
     return
   let ty = lvalueType(g, dst)
   if isAggType(g, ty):
@@ -3103,21 +3106,22 @@ proc genRet(g: var WebGen; c: Cursor) =
     g.outp.openTree Return
     g.outp.closeTag
     return
-  if isAggType(g, g.p.retType):
+  let retType = g.p.retType
+  if isAggType(g, retType):
     # The destination is the CALLER's slot, handed in as the hidden first
     # argument, so it outlives this frame and may be returned after the pop.
     g.outp.tree ExprStmt:
       g.outp.openTree MemCopy
       g.outp.symUse g.p.sretName
       genExpr(g, src)
-      g.outp.numLit int64(byteSize(g, g.p.retType))
+      g.outp.numLit int64(byteSize(g, retType))
       g.outp.closeTag
     leaveFrame(g)
     g.outp.tree Return: g.outp.symUse g.p.sretName
   else:
     # The value may be read out of this very frame, so it is computed before
     # the pop and parked in a binding of its own.
-    let rw = widthOf(g, g.p.retType)
+    let rw = widthOf(g, retType)
     let r = newTemp(g, rw)
     g.outp.tree ExprStmt:
       g.setLocal r:
@@ -3640,7 +3644,8 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
 
   # An aggregate result is returned through a slot the caller reserves, so the
   # signature gains a hidden first parameter for it.
-  g.p.sret = not g.p.retType.cursorIsNil and isAggType(g, g.p.retType)
+  let retType = g.p.retType
+  g.p.sret = not retType.cursorIsNil and isAggType(g, retType)
   var taken: HashSet[SymId] = default(HashSet[SymId])
   if body.kind == TagLit: markTaken(body, taken)
   planFrame(g, body, params, taken)
@@ -3683,10 +3688,12 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
   var locals: seq[(SymId, WidthCode)] = @[]
   for i in 0 ..< g.p.regLocals.len:
     let nm = g.p.regLocals[i]
-    locals.add (irName(g, nm), widthOf(scalOf(g, g.p.symType.getOrQuit(nm))))
+    let symType = g.p.symType.getOrQuit(nm)
+    locals.add (irName(g, nm), widthOf(scalOf(g, symType)))
   for tv in g.p.temps: locals.add tv
   var hasRet = false
-  let rw = resultWidth(g, g.p.retType, hasRet)
+  let resType = g.p.retType
+  let rw = resultWidth(g, resType, hasRet)
   emitFunc(g, g.p.irName, sigParams, hasRet, rw, locals)
 
 proc isHostDeclaration(decl: Cursor): bool =
