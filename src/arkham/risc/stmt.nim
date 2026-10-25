@@ -175,6 +175,10 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
                             not g.frameIsAddressable and
                             TailCall in g.md.caps)
     g.freeVal(d)
+  of MemsetS, MemcpyS:
+    var d = dontCare
+    g.emitMemNode(c, (if c.stmtKind == MemsetS: "memset" else: "memcpy"), d,
+                  discardResult = true)
   of InstrS:
     var d = dontCare
     g.emitInstr(c, d)

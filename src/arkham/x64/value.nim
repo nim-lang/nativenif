@@ -76,6 +76,8 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
+                  discardResult = false)
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location)
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
 
@@ -559,10 +561,19 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       unroll = true
       nUnroll = n
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
+  # Each argument register is SEALED once it holds its value: the next
+  # argument may need a scratch register of its own (`&p[i]` stages the index),
+  # and an unsealed rdi is as good a pick as any — which overwrote the
+  # destination pointer with the index, the first time an operand was more than
+  # a leaf (shoggoth's `(memcpy …)` for a copy loop).
+  var placed: set[Reg] = {}
   for idx in 0 ..< nArgs:
     var aD = regLoc(g.md.intArgRegs[idx], s)
     g.releaseArgDest(aD.r, (if argCurs[idx].kind == Symbol: argCurs[idx].symId else: NoSymId))
     g.emitValue(argCurs[idx], aD)               # → rdi / rsi / rdx
+    g.rb.sealAccum aD.r
+    placed.incl aD.r
+  g.rb.unsealAccums placed
   # rdi (dest ptr) and rax (result/byte) are used RAW by the inline loop; a call-free
   # local the allocator homed in one of them leaves a stale typed name that `emReg`
   # would emit. Kill it so the loop sees raw registers (rsi/rdx/rcx get fresh temps).
@@ -794,6 +805,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     of CastC, ConvC: g.emitCast(c, dest)
     of CallC: g.emitCall(c, dest)
     of InstrC: g.emitInstr(c, dest)
+    of MemcmpC: g.emitMemNode(c, "memcmp", dest)
     of NegC, BitnotC:
       block:
         let (isConst, cval) =
@@ -4136,6 +4148,26 @@ when defined(arkhamCallerSaveDbg):
     stderr.write "CSCALL proc=" & gArkhamCurProc & " pos=" &
       $cursorToPosition(g.buf[], c) & " saved=" & saved & " nested=" & nest &
       " unbound=" & unbound & "\n"
+
+proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
+                  discardResult = false) =
+  ## `(memset D V N)` / `(memcpy D S N)` / `(memcmp A B N)`: the Leng nodes a
+  ## Shoggoth pass emits for a recognized fill/copy/compare loop. They lower
+  ## through the very inline loop a call to the importc'd C function of that name
+  ## gets (`emitMemIntrin`), inside the same caller-save window `emitCall` opens:
+  ## the operands go to the first three argument registers and the loop's scratch
+  ## takes volatiles, which is why the analyser records each as a call point.
+  ## Never diverging, never a tail call, no callee to resolve.
+  g.killAllMirrors()
+  let w = g.emCallerSaveOpen()
+  g.bridgeStep("a call", bdTwoInRegs)
+  var argCurs: seq[Cursor] = @[]
+  var cc = c
+  cc.into:
+    while cc.hasMore: (argCurs.add cc; skip cc)
+  g.emitMemIntrin(argCurs, builtin)
+  if not discardResult: g.settleResultReg(dest, RAX)
+  g.emCallerSaveClose(w, dest)
 
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =

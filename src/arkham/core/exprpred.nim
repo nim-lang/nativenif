@@ -148,7 +148,7 @@ proc subtreeHasCall*(n: Cursor): bool =
   ## survivor rather than a volatile the call clobbers. (Fused port of the
   ## allocator's `subtreeHasCall`.)
   if n.kind != TagLit: return false
-  if n.exprKind == CallC: return true
+  if n.exprKind in {CallC, MemcmpC}: return true   # memcmp: an inline call (see analyser)
   var cc = n
   cc.into:
     while cc.hasMore:

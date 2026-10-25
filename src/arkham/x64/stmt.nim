@@ -369,6 +369,10 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     var d = dontCare
     g.emitInstr(c, d)
     g.freeVal(d)
+  of MemsetS, MemcpyS:
+    var d = dontCare
+    g.emitMemNode(c, (if c.stmtKind == MemsetS: "memset" else: "memcpy"), d,
+                  discardResult = true)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham x64n: `break` outside a loop"
     g.emJmp(g.loopEnds[^1])

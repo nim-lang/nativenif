@@ -443,6 +443,26 @@ proc endsDiverging(c: Context; branch: Cursor): bool =
     while probe.hasMore: (last = probe; skip probe)
     cur = last
 
+proc analyseMemNode(c: var Context; n: var Cursor) =
+  ## `(memset D V N)` / `(memcpy D S N)` / `(memcmp A B N)` are lowered by the very
+  ## inline loop a call to the importc'd C function of that name gets: the operands
+  ## are marshalled into the first three argument registers and the loop's scratch
+  ## takes volatiles. So each is a call point exactly like that call, minus the
+  ## callee — and never a diverging one.
+  c.callPositions.add posOf(c, n)
+  if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
+  var probe = n
+  probe.into:
+    var ordinal = 0
+    while probe.hasMore:
+      markArgParamsUnsafe(c, probe, ordinal, cleanCall = false)
+      skip probe
+      inc ordinal
+  c.openCalls.add posOf(c, n)
+  analyseChildren(c, n)
+  discard c.openCalls.pop()
+  inc c.completedCalls
+
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -505,8 +525,12 @@ proc analyse(c: var Context; n: var Cursor) =
     of InstrS:                          # a two-address row: a statement, not a value
       c.res.clobbersBridgeReg = true    # see the expression case below
       analyseInstr(c, n)
+    of MemsetS, MemcpyS:
+      analyseMemNode(c, n)
     of NoStmt:
       case n.exprKind
+      of MemcmpC:
+        analyseMemNode(c, n)
       of PatC:
         # `(pat p i)` is POINTER indexing, and BOTH operands are plain value reads:
         # `p` is loaded into a register and scaled, exactly like `(deref p)` below.

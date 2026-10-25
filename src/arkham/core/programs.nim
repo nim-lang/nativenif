@@ -192,6 +192,7 @@ type
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
     boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
+    i32Type*: Cursor                        ## synthesized `(i 32)` — type of a `(memcmp …)`
 
   TypeEnv* = Table[SymId, Cursor]           ## a type-symbol table, keyed by POOL ID —
                                             ## the identity a `Symbol` token already
@@ -877,6 +878,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.floatType = beginRead(ftBuf)
     var btBuf = parseFromBuffer("(bool)", "", sharedTags = tags)
     result.boolType = beginRead(btBuf)
+    var i32Buf = parseFromBuffer("(i 32)", "", sharedTags = tags)
+    result.i32Type = beginRead(i32Buf)
   assert buf.beginRead().stmtKind == StmtsS, "Leng top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types for the signature, and a proc may reference a type

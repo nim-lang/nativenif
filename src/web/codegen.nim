@@ -1733,6 +1733,7 @@ proc genSufLit(g: var WebGen; c: Cursor) =
 
 proc genCall(g: var WebGen; c: Cursor; wantValue: bool)
 proc genInstr(g: var WebGen; c: Cursor; wantValue: bool)
+proc genMemNode(g: var WebGen; c: Cursor; name: string; wantValue: bool)
 proc declSignature(g: var WebGen; decl: Cursor): WebImport
 
 proc proctypeArity(g: var WebGen; t: Cursor): int =
@@ -1827,6 +1828,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
         g.outp.width wF64
         g.outp.lit InfLit
     of InstrC: genInstr(g, c, wantValue = true)
+    of MemcmpC: genMemNode(g, c, "memcmp", wantValue = true)
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC:
       genTypedBinop(g, c)
     of EqC, NeqC, LtC, LeC: genCmp(g, c)
@@ -2186,6 +2188,15 @@ template hloadOf(g: var WebGen; w: WidthCode; name: SymId) =
   g.outp.tree HLoad:
     g.outp.width w
     g.outp.symUse name
+
+proc genMemNode(g: var WebGen; c: Cursor; name: string; wantValue: bool) =
+  ## `(memset D V N)` / `(memcpy D S N)` / `(memcmp A B N)`: the Leng nodes for a
+  ## recognized fill/copy/compare loop, lowered like a call to the importc'd C
+  ## function of that name.
+  var t = c
+  t.into:
+    genMemIntrin(g, name, t, wantValue)
+    while t.hasMore: skip t
 
 proc genInstr(g: var WebGen; c: Cursor; wantValue: bool) =
   ## `(instr SYM args…)` — an intrinsic/instruction application (nimony
@@ -3531,6 +3542,10 @@ proc genStmt(g: var WebGen; c: var Cursor) =
   of InstrS:
     g.outp.tree ExprStmt:
       genInstr(g, c, wantValue = false)
+  of MemsetS, MemcpyS:                     # wrapped exactly like the call form
+    g.outp.tree ExprStmt:
+      genMemNode(g, c, (if c.stmtKind == MemsetS: "memset" else: "memcpy"),
+                 wantValue = false)
   else: err g, "unsupported statement: " & $c.stmtKind
   skip c                                   # NOT `inc`: that would enter the tree
 

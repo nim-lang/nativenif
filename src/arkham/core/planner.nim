@@ -801,7 +801,7 @@ let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
 proc initHasCallImpl(n: var Cursor): bool =
   ## Advances `n` past the subtree; true iff it contains a call anywhere.
   if n.kind == TagLit:
-    if n.exprKind == CallC: return true
+    if n.exprKind in {CallC, MemcmpC} or n.stmtKind in {MemsetS, MemcpyS}: return true
     n.into:
       while n.hasMore:
         if initHasCallImpl(n): return true    # each recursion consumes one child
