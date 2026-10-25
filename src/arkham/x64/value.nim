@@ -23,7 +23,7 @@ import std / [assertions, tables, sets, os, strutils, sequtils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     stress, context, diag, typeutil, constdata,
-                    mirrors, temps, exprpred, abi]
+                    mirrors, temps, exprpred, abi, divmagic]
 import "../core/typenav"
 export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
                  # backends' `g.lookupSym(...).cat` keeps resolving
@@ -2353,12 +2353,18 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   dest = res
 proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
   ## FUSED result settling: move/store a value produced in the fixed register
-  ## `resReg` (rax after a div/mem-intrinsic, rdx for a remainder) into `dest`,
-  ## resolving an unconstrained dest to `resReg` itself as a bound temp.
+  ## `resReg` (rax after a div/mem-intrinsic, rdx for a remainder) into `dest`.
+  ##
+  ## An unconstrained dest gets an ordinary expression temp, NOT `resReg`
+  ## itself: the value may have to survive the evaluation of a sibling operand,
+  ## and a second `div`/`mod` there loads its dividend into rax without asking
+  ## who lives in it. `(a div 10) != (b div x)` compiled to `cmp rax, rax` —
+  ## always equal — and the `mod` twin tripped the remainder-register assert
+  ## below. The temp pools exclude rax and rdx, so the temp is out of reach.
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
-    dest = regLoc(resReg, ScalarSlot, isTemp = true)
-    if not g.rb.isBoundTemp(resReg): g.bindTemp(resReg, dest.typ)
+    dest = g.takeTmp(ScalarSlot)
+    g.settleResultReg(dest, resReg)
   of InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     if dest.r != resReg: g.movReg(dest.r, resReg)
@@ -2368,6 +2374,78 @@ proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
     g.emitStoreLoc(dest, resReg)
     if not bound: g.unbindTemp(resReg)
   else: raiseAssert "arkham x64n: fixed-reg result dest " & $dest.kind
+
+proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
+                    signed, wantRem: bool; dest: var Location): bool =
+  ## A 64-bit `div`/`mod` by a constant that is not a power of two, as a
+  ## multiplication by its reciprocal (`divmagic.nim` has the derivation): one
+  ## `mul` and a few shifts instead of a `div` that costs tens of cycles and
+  ## does not pipeline. `x mod 10` in every integer-to-string conversion is the
+  ## case that matters. Returns false for the divisors the magic does not
+  ## cover (0, ±1, ±2^k, low(int64)) — those keep their existing paths.
+  ##
+  ## nifasm has only the one-operand UNSIGNED `mul` (rdx:rax = rax * src). The
+  ## signed high half is derived from it:
+  ##   mulhi_s(n, M) = mulhi_u(n, M) - (n < 0 ? M : 0) - (M < 0 ? n : 0)
+  ## which is two more instructions than an `imul`, still far below `idiv`.
+  let ud = cast[uint64](dval)
+  let absD = if signed and dval < 0: 0'u64 - ud else: ud
+  if absD <= 2'u64 or (absD and (absD - 1'u64)) == 0'u64: return false
+  if signed and dval == low(int64): return false
+  let m = if signed: signedDivMagic(dval) else: unsignedDivMagic(ud)
+  result = true
+  let acc = g.md.intRetReg                              # rax: dividend, then quotient
+  let hiR = g.md.divRemReg                              # rdx: the high half of the product
+  var aD = regLoc(acc, ScalarSlot)
+  g.emitValue(divC, aD)                                 # dividend → rax
+  # The dividend is still needed after `mul` overwrites rax: by the fixups and
+  # by the remainder. The unsigned no-add quotient alone does without it.
+  let keepN = signed or m.add or wantRem
+  var nR = NoReg
+  if keepN:
+    nR = g.pickStagingSealed("a magic-division dividend", ScalarSlot, avoid = acc)
+    g.movReg(nR, acc)
+  let mR = g.pickStagingSealed("a magic-division multiplier", ScalarSlot, avoid = acc)
+  g.movImm(mR, cast[int64](m.magic))
+  # `mul` writes rdx:rax without naming them, like `idiv`: the value in rax is
+  # the dividend being consumed, rdx is proved free above.
+  g.dropStaleBinding(acc)
+  g.dropStaleBinding(hiR)
+  g.ab.tree MulX64: g.emReg mR                          # rdx = mulhi_u(n, magic)
+  if signed:
+    # Signed high half. rax is free after `mul`: use it for the sign mask.
+    g.movReg(acc, nR)
+    g.binImm(SarX64, acc, 63)                           # n < 0 ? -1 : 0
+    g.binReg(AndX64, acc, mR)
+    g.binReg(SubX64, hiR, acc)
+    if cast[int64](m.magic) < 0: g.binReg(SubX64, hiR, nR)
+    if m.add:
+      g.binReg(if dval < 0: SubX64 else: AddX64, hiR, nR)
+    g.movReg(acc, hiR)
+    if m.shift > 0: g.binImm(SarX64, acc, m.shift)
+    g.movReg(hiR, acc)
+    g.binImm(ShrX64, hiR, 63)                           # round toward zero
+    g.binReg(AddX64, acc, hiR)
+  elif m.add:
+    g.movReg(acc, nR)
+    g.binReg(SubX64, acc, hiR)
+    g.binImm(ShrX64, acc, 1)
+    g.binReg(AddX64, acc, hiR)
+    g.binImm(ShrX64, acc, m.shift)
+  else:
+    g.movReg(acc, hiR)
+    g.binImm(ShrX64, acc, m.shift)
+  if wantRem:                                           # n - q * d
+    if dval >= low(int32).int64 and dval <= high(int32).int64:
+      g.binImm(ImulX64, acc, dval)
+    else:
+      g.movImm(mR, dval)
+      g.binReg(ImulX64, acc, mR)
+    g.binReg(SubX64, nR, acc)
+    g.movReg(acc, nR)
+  g.giveBack mR
+  if nR != NoReg: g.giveBack nR
+  g.settleResultReg(dest, acc)
 
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
@@ -2422,6 +2500,9 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
       g.binImm(SarX64, acc, k)
       g.giveBack tmp
     g.settleResultReg(dest, acc)
+    return
+  if dvsIsConst and intTypeWidth(resolveType(g.prog, tc)) == 64 and
+     g.emitDivByMagic(divC, dval, signed, wantRem, dest):
     return
   var aD = regLoc(acc, ScalarSlot)
   g.emitValue(divC, aD)                                 # dividend → rax
