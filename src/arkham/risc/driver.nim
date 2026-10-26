@@ -51,11 +51,13 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcs(g.prog)
     g.noReturnProcs = noReturnProcs(g.prog)
+    g.prog.memIntrinsics = memIntrinsicProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
-                       noReturnCallees = g.noReturnProcs)
+                       noReturnCallees = g.noReturnProcs,
+                       memCallees = g.prog.memIntrinsics)
   g.varType.clear()
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false

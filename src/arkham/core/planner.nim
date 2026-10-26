@@ -798,25 +798,26 @@ let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
   ## whose name hashes to `r mod N`, so a miscompile can be halved down to one proc.
   ## See `callerSaveRescue` for what the rescue does and why it is sound.
 
-proc initHasCallImpl(n: var Cursor): bool =
-  ## Advances `n` past the subtree; true iff it contains a call anywhere.
+proc initHasCallImpl(n: var Cursor; memCallees: HashSet[SymId]): bool =
+  ## Advances `n` past the subtree; true iff it contains a call anywhere — a
+  ## `Memset`/`Memcpy`/`Memcmp` row included (an inline call, see the analyser).
   if n.kind == TagLit:
-    if n.exprKind in {CallC, MemcmpC} or n.stmtKind in {MemsetS, MemcpyS}: return true
+    if n.exprKind == CallC or isMemInstr(n, memCallees): return true
     n.into:
       while n.hasMore:
-        if initHasCallImpl(n): return true    # each recursion consumes one child
+        if initHasCallImpl(n, memCallees): return true    # each recursion consumes one child
   else:
     inc n
   return false
 
-proc initHasCall(n: Cursor): bool =
+proc initHasCall(n: Cursor; memCallees: HashSet[SymId]): bool =
   ## A var whose initializer contains a call is not defined *before* that call — it is
   ## produced BY it. Such a var must never get a caller-saved home: the emitter's save
   ## would read a register that holds nothing yet, and the call's own result is what
   ## defines it. (`initEndPos` alone does not catch this: the decl's register is live
   ## from the decl, and the defining call sits after it.)
   var c = n
-  initHasCallImpl(c)
+  initHasCallImpl(c, memCallees)
 
 proc callsCrossedAfterInit(b: Builder; vi: VarInfo): int =
   ## Calls the value crosses ONCE IT EXISTS — counted from `initEndPos`, the position
@@ -865,7 +866,7 @@ proc callerSaveRescue(b: var Builder; name: SymId; slot: AsmSlot;
     if h mod csBisectMod != csBisectRem: return fallback
   if AddrTaken in props or not slot.inRegClass or slot.isFloat: return fallback
   if AllRegs in props: return fallback          # not a cross-call value; already handled
-  if not hasValue or initHasCall(valCur): return fallback
+  if not hasValue or initHasCall(valCur, b.prog.memIntrinsics): return fallback
   let vi = b.an.vars.getOrDefault(name)
   if vi.defs != 1 or vi.freeAfter == high(int): return fallback
   let crossings = b.callsCrossedAfterInit(vi)

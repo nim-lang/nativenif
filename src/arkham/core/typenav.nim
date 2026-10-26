@@ -196,8 +196,6 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     of BaseobjC:                              # `(baseobj BaseType depth value)` → the base type
       var t = c; inc t                        # → the base type (first child)
       result = t
-    of MemcmpC:                               # C's `memcmp` result: an `int`
-      result = tc.prog[].i32Type
     of SizeofC, AlignofC:                     # `sizeof`/`alignof` → an integer constant
       # An integer constant (the byte size / alignment). `exprSlot` already classes
       # these as `AInt size 8`; the matching type is the synthesized `(i 64)`.

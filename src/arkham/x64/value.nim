@@ -76,8 +76,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
-                  discardResult = false)
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location)
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
 
@@ -805,7 +804,6 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     of CastC, ConvC: g.emitCast(c, dest)
     of CallC: g.emitCall(c, dest)
     of InstrC: g.emitInstr(c, dest)
-    of MemcmpC: g.emitMemNode(c, "memcmp", dest)
     of NegC, BitnotC:
       block:
         let (isConst, cval) =
@@ -1705,7 +1703,7 @@ proc tryRmwStore*(g: var CodeGen; lhs: Cursor): bool =
   if sameTree(aC, lhs): srcC = bC
   elif commutativeExpr(rhs.exprKind) and sameTree(bC, lhs): srcC = aC
   else: return false
-  if subtreeHasCall(srcC): return false            # see WHAT MAKES IT SOUND
+  if subtreeHasCall(srcC, g.prog.memIntrinsics): return false   # see WHAT MAKES IT SOUND
   if not g.rmwIntOperand(lhs) or not g.rmwIntOperand(srcC): return false
   srcC = g.rmwStripConv(srcC, g.exprSlot(lhs).size * 8)
   # The source value FIRST, then the lvalue's address parts — the order (and the
@@ -4149,24 +4147,29 @@ when defined(arkhamCallerSaveDbg):
       $cursorToPosition(g.buf[], c) & " saved=" & saved & " nested=" & nest &
       " unbound=" & unbound & "\n"
 
-proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
-                  discardResult = false) =
-  ## `(memset D V N)` / `(memcpy D S N)` / `(memcmp A B N)`: the Leng nodes a
-  ## Shoggoth pass emits for a recognized fill/copy/compare loop. They lower
-  ## through the very inline loop a call to the importc'd C function of that name
-  ## gets (`emitMemIntrin`), inside the same caller-save window `emitCall` opens:
-  ## the operands go to the first three argument registers and the loop's scratch
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row, e.g. what Shoggoth's
+  ## `memidioms` emits for a recognized fill/copy loop. It lowers through the very
+  ## inline loop a call to the importc'd C function of that name gets
+  ## (`emitMemIntrin`), inside the same caller-save window `emitCall` opens: the
+  ## operands go to the first three argument registers and the loop's scratch
   ## takes volatiles, which is why the analyser records each as a call point.
-  ## Never diverging, never a tail call, no callee to resolve.
+  ## Never diverging, never a tail call.
   g.killAllMirrors()
   let w = g.emCallerSaveOpen()
   g.bridgeStep("a call", bdTwoInRegs)
   var argCurs: seq[Cursor] = @[]
   var cc = c
   cc.into:
+    skip cc                                     # the callee symbol
     while cc.hasMore: (argCurs.add cc; skip cc)
+  let builtin = case op
+                of MemsetOp: "memset"
+                of MemcpyOp: "memcpy"
+                else: "memcmp"
   g.emitMemIntrin(argCurs, builtin)
-  if not discardResult: g.settleResultReg(dest, RAX)
+  if op == MemcmpOp: g.settleResultReg(dest, RAX)
+  else: dest = Location(kind: Undef)            # no value: nothing consumes this node
   g.emCallerSaveClose(w, dest)
 
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
@@ -4465,6 +4468,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
+  if tgt.op.isMemOp:
+    g.emitMemInstr(c, tgt.op, dest)
+    return
   if row.isFlagRead or row.isFlagWrite or row.isAssemblerOnly:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, where no " &

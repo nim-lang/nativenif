@@ -167,8 +167,7 @@ proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
-proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
-                  discardResult = false)
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location)
 proc produceIntoFMem*(g: var CodeGen; c: Cursor; dst: Location)
@@ -1819,7 +1818,6 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
     of CastC, ConvC: g.emitCast(c, dest)
     of CallC: g.emitCall(c, dest)
     of InstrC: g.emitInstr(c, dest)
-    of MemcmpC: g.emitMemNode(c, "memcmp", dest)
     of NegC, BitnotC:
       block:
         let (isConst, cval) =
@@ -2876,18 +2874,24 @@ type
     reads: set[Reg]              ## the registers loading this move reads
     freads: set[FReg]
 
-proc emitMemNode*(g: var CodeGen; c: Cursor; builtin: string; dest: var Location;
-                  discardResult = false) =
-  ## `(memset D V N)` / `(memcpy D S N)` / `(memcmp A B N)`: lowered exactly like a
-  ## call to the importc'd C function of that name (the `memIntrin` arm of
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row: lowered exactly like
+  ## a call to the importc'd C function of that name (the `memIntrin` arm of
   ## `emitCall`) — the analyser records each as a call point for that reason.
   g.killAllMirrors()
   var argCurs: seq[Cursor] = @[]
   var cc = c
   cc.into:
+    skip cc                                     # the callee symbol
     while cc.hasMore: (argCurs.add cc; skip cc)
+  let builtin = case op
+                of MemsetOp: "memset"
+                of MemcpyOp: "memcpy"
+                else: "memcmp"
   g.emitMemIntrin(argCurs, builtin)
-  if discardResult: return
+  if op != MemcmpOp:
+    dest = Location(kind: Undef)                # no value: nothing consumes this node
+    return
   if not (dest.kind == InReg and not dest.isTemp):
     dest = regLoc(g.md.intRetReg, ScalarSlot, isTemp = true)
   elif dest.r != g.md.intRetReg:
@@ -3747,6 +3751,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
               g.md.targetName & " lowering — " &
               "guard the call with a `when`"
+  if tgt.op.isMemOp:
+    g.emitMemInstr(c, tgt.op, dest)
+    return
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps and SimdVector notin g.md.caps:
       # The rows below are AArch64 AdvSIMD spellings, and nothing makes them
