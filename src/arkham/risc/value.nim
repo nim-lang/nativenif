@@ -167,6 +167,7 @@ proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location)
 proc produceIntoFMem*(g: var CodeGen; c: Cursor; dst: Location)
@@ -675,6 +676,7 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       unroll = true
       nUnroll = n
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
+  var placed: set[Reg] = {}
   for idx in 0 ..< nArgs:
     let aSym = if argCurs[idx].kind == Symbol: argCurs[idx].symId else: NoSymId
     g.releaseArgDest(g.md.intArgRegs[idx], aSym)         # a dead local's name, if any
@@ -684,6 +686,8 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       # value. Never fires on the 64-bit targets (`isWideSlot` is false there by
       # construction). Measured: `memcpy_bulk` passes its `(i 64)` loop counter.
       g.wideLoad(g.md.intArgRegs[idx], g.wideValueSlot(argCurs[idx]), 0)
+      g.rb.sealAccum g.md.intArgRegs[idx]
+      placed.incl g.md.intArgRegs[idx]
       continue
     var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
     g.emitValue(argCurs[idx], aD)                        # → x0 / x1 / x2 directly
@@ -696,6 +700,11 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       # for a function-pointer target that came back off-register.
       g.place(aD, g.md.intArgRegs[idx])
     g.unbindTemp(g.md.intArgRegs[idx])                   # used raw below
+    # Sealed until every argument is placed: the next one may stage through a
+    # scratch register, and this one must not be it (see the x64 twin).
+    g.rb.sealAccum g.md.intArgRegs[idx]
+    placed.incl g.md.intArgRegs[idx]
+  g.rb.unsealAccums placed
   # The three ARGUMENT registers, read off the machine rather than written as
   # slot literals: `a0`/`a1`/`a2` are `x0`/`x1`/`x2` on Arm and `x10`/`x11`/`x12`
   # on RISC-V, where those literals name `zero`, `ra` and `sp` instead.
@@ -2865,6 +2874,29 @@ type
     reads: set[Reg]              ## the registers loading this move reads
     freads: set[FReg]
 
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row: lowered exactly like
+  ## a call to the importc'd C function of that name (the `memIntrin` arm of
+  ## `emitCall`) — the analyser records each as a call point for that reason.
+  g.killAllMirrors()
+  var argCurs: seq[Cursor] = @[]
+  var cc = c
+  cc.into:
+    skip cc                                     # the callee symbol
+    while cc.hasMore: (argCurs.add cc; skip cc)
+  let builtin = case op
+                of MemsetOp: "memset"
+                of MemcpyOp: "memcpy"
+                else: "memcmp"
+  g.emitMemIntrin(argCurs, builtin)
+  if op != MemcmpOp:
+    dest = Location(kind: Undef)                # no value: nothing consumes this node
+    return
+  if not (dest.kind == InReg and not dest.isTemp):
+    dest = regLoc(g.md.intRetReg, ScalarSlot, isTemp = true)
+  elif dest.r != g.md.intRetReg:
+    g.movReg(dest.r, g.md.intRetReg)
+
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
   ## A call: every argument expression runs, each register-passed word becomes a
@@ -3719,6 +3751,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
               g.md.targetName & " lowering — " &
               "guard the call with a `when`"
+  if tgt.op.isMemOp:
+    g.emitMemInstr(c, tgt.op, dest)
+    return
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps and SimdVector notin g.md.caps:
       # The rows below are AArch64 AdvSIMD spellings, and nothing makes them

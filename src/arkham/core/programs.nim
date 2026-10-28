@@ -117,6 +117,8 @@ type
     callTarget*: Table[SymId, CallTarget]   ## Leng proc symbol → how to call it
     instrTarget*: Table[SymId, InstrTarget] ## Leng proc symbol → which instruction(s)
                                             ## an `(instr …)` on it emits
+    memIntrinsics*: HashSet[SymId]          ## the `Memset`/`Memcpy`/`Memcmp` procs this
+                                            ## module applies (`memIntrinsicProcs`)
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[SymId, Cursor]          ## global (gvar/const) var symbol → its decl cursor
@@ -1618,6 +1620,38 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
       var found = false
       let d = lookupForeignDecl(p, id, found)
       if found and d.stmtKind == ProcS and declIsNoReturn(d): result.incl id
+
+proc collectInstrCallees(n: Cursor; seen: var HashSet[SymId];
+                         order: var seq[SymId]) =
+  ## Every `(instr SYM …)` callee in the subtree, deduped.
+  var n = n
+  if n.kind != TagLit: return
+  if n.stmtKind == InstrS or n.exprKind == InstrC:
+    let probe = sub(n)
+    if probe.kind == Symbol:
+      let id = probe.symId
+      if not seen.containsOrIncl(id): order.add id
+  n.loopInto:
+    collectInstrCallees(n, seen, order)
+    skip n
+
+proc memIntrinsicProcs*(p: var Program): HashSet[SymId] =
+  ## Pool ids of every intrinsic proc APPLIED in this module whose row is
+  ## `Memset`/`Memcpy`/`Memcmp`. arkham lowers those with the inline loop a call to
+  ## the importc'd C function gets — operands in the argument registers, scratch in
+  ## volatiles — so the analyser and the planner must see each application as a
+  ## call point, and they only get to look at the callee symbol.
+  result = initHashSet[SymId]()
+  var seen = initHashSet[SymId]()
+  var callees: seq[SymId] = @[]
+  for pi in p.procs:
+    if pi.isAsm: continue
+    var b = pi.decl
+    b.into:
+      inc b; skip b; skip b; skip b             # name, params, ret, pragmas
+      while b.hasMore: (collectInstrCallees(b, seen, callees); skip b)
+  for id in callees:
+    if instrTargetOf(p, id).op.isMemOp: result.incl id
 
 proc aggrByteSize*(p: var Program; typeSym: SymId): int =
   var d = lookupType(p, typeSym)

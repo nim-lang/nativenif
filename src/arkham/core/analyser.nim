@@ -217,6 +217,9 @@ type
                                ## one is NOT a call point for liveness: it never returns, so
                                ## nothing textually after it is reachable *through* it and no
                                ## value has to survive it. See `sawNoReturnCall`.
+    memCallees: HashSet[SymId] ## the `Memset`/`Memcpy`/`Memcmp` intrinsic procs this
+                               ## module applies (`Program.memIntrinsics`). An `(instr …)`
+                               ## on one is a call point: see `analyseMemInstr`.
     noReturnPositions: seq[int] ## token position of every DIVERGING call. Kept out of
                                ## `callPositions` (they deny nothing for `AllRegs`), but
                                ## still consulted for the fixed-role registers: `DivRegOk`
@@ -293,6 +296,13 @@ proc analyseInstr(c: var Context; n: var Cursor) =
           while n.hasMore: analyse(c, n)   # a read+write of the local, not an escape
       else:
         analyse(c, n)
+
+proc isMemInstr*(n: Cursor; memCallees: HashSet[SymId]): bool =
+  ## Is `n` an `(instr SYM …)` whose row is `Memset`/`Memcpy`/`Memcmp`?
+  if memCallees.len == 0 or n.kind != TagLit: return false
+  if n.stmtKind != InstrS and n.exprKind != InstrC: return false
+  let callee = sub(n)
+  result = callee.kind == Symbol and callee.symId in memCallees
 
 proc classifyInit(n: Cursor): InitClass =
   ## Peel value-preserving wrappers (`cast`/`conv`/`suf`/`par` — the same set
@@ -443,6 +453,29 @@ proc endsDiverging(c: Context; branch: Cursor): bool =
     while probe.hasMore: (last = probe; skip probe)
     cur = last
 
+proc analyseMemInstr(c: var Context; n: var Cursor) =
+  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row is lowered by the very
+  ## inline loop a call to the importc'd C function of that name gets: the operands
+  ## are marshalled into the first three argument registers and the loop's scratch
+  ## takes volatiles. So each is a call point exactly like that call, minus the
+  ## callee — and never a diverging one.
+  c.callPositions.add posOf(c, n)
+  if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
+  var probe = n
+  probe.into:
+    skip probe                          # the callee symbol
+    var ordinal = 0
+    while probe.hasMore:
+      markArgParamsUnsafe(c, probe, ordinal, cleanCall = false)
+      skip probe
+      inc ordinal
+  c.openCalls.add posOf(c, n)
+  n.into:
+    skip n                              # the callee symbol
+    while n.hasMore: analyse(c, n)
+  discard c.openCalls.pop()
+  inc c.completedCalls
+
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -504,7 +537,8 @@ proc analyse(c: var Context; n: var Cursor) =
     case n.stmtKind
     of InstrS:                          # a two-address row: a statement, not a value
       c.res.clobbersBridgeReg = true    # see the expression case below
-      analyseInstr(c, n)
+      if isMemInstr(n, c.memCallees): analyseMemInstr(c, n)
+      else: analyseInstr(c, n)
     of NoStmt:
       case n.exprKind
       of PatC:
@@ -593,7 +627,8 @@ proc analyse(c: var Context; n: var Cursor) =
         # all the allocator needs to know is that some row in this body may take the
         # bridge, so the one client allowed to draw it must not here.
         c.res.clobbersBridgeReg = true
-        analyseInstr(c, n)
+        if isMemInstr(n, c.memCallees): analyseMemInstr(c, n)
+        else: analyseInstr(c, n)
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
         c.divPositions.add ClobberSite(pos: posOf(c, n), stmtStart: c.stmtStart[^1])
@@ -826,12 +861,13 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[SymId] = initHashSet[SymId]();
                   cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
-                  noReturnCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
+                  noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
+                  memCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
-                  noReturnCallees: noReturnCallees,
+                  noReturnCallees: noReturnCallees, memCallees: memCallees,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS

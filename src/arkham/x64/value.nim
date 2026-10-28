@@ -23,7 +23,7 @@ import std / [assertions, tables, sets, os, strutils, sequtils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     stress, context, diag, typeutil, constdata,
-                    mirrors, temps, exprpred, abi]
+                    mirrors, temps, exprpred, abi, divmagic]
 import "../core/typenav"
 export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
                  # backends' `g.lookupSym(...).cat` keeps resolving
@@ -76,6 +76,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location)
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
 
@@ -559,10 +560,19 @@ proc emitMemIntrin*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       unroll = true
       nUnroll = n
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
+  # Each argument register is SEALED once it holds its value: the next
+  # argument may need a scratch register of its own (`&p[i]` stages the index),
+  # and an unsealed rdi is as good a pick as any — which overwrote the
+  # destination pointer with the index, the first time an operand was more than
+  # a leaf (shoggoth's `(memcpy …)` for a copy loop).
+  var placed: set[Reg] = {}
   for idx in 0 ..< nArgs:
     var aD = regLoc(g.md.intArgRegs[idx], s)
     g.releaseArgDest(aD.r, (if argCurs[idx].kind == Symbol: argCurs[idx].symId else: NoSymId))
     g.emitValue(argCurs[idx], aD)               # → rdi / rsi / rdx
+    g.rb.sealAccum aD.r
+    placed.incl aD.r
+  g.rb.unsealAccums placed
   # rdi (dest ptr) and rax (result/byte) are used RAW by the inline loop; a call-free
   # local the allocator homed in one of them leaves a stale typed name that `emReg`
   # would emit. Kill it so the loop sees raw registers (rsi/rdx/rcx get fresh temps).
@@ -1693,7 +1703,7 @@ proc tryRmwStore*(g: var CodeGen; lhs: Cursor): bool =
   if sameTree(aC, lhs): srcC = bC
   elif commutativeExpr(rhs.exprKind) and sameTree(bC, lhs): srcC = aC
   else: return false
-  if subtreeHasCall(srcC): return false            # see WHAT MAKES IT SOUND
+  if subtreeHasCall(srcC, g.prog.memIntrinsics): return false   # see WHAT MAKES IT SOUND
   if not g.rmwIntOperand(lhs) or not g.rmwIntOperand(srcC): return false
   srcC = g.rmwStripConv(srcC, g.exprSlot(lhs).size * 8)
   # The source value FIRST, then the lvalue's address parts — the order (and the
@@ -2353,12 +2363,18 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   dest = res
 proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
   ## FUSED result settling: move/store a value produced in the fixed register
-  ## `resReg` (rax after a div/mem-intrinsic, rdx for a remainder) into `dest`,
-  ## resolving an unconstrained dest to `resReg` itself as a bound temp.
+  ## `resReg` (rax after a div/mem-intrinsic, rdx for a remainder) into `dest`.
+  ##
+  ## An unconstrained dest gets an ordinary expression temp, NOT `resReg`
+  ## itself: the value may have to survive the evaluation of a sibling operand,
+  ## and a second `div`/`mod` there loads its dividend into rax without asking
+  ## who lives in it. `(a div 10) != (b div x)` compiled to `cmp rax, rax` —
+  ## always equal — and the `mod` twin tripped the remainder-register assert
+  ## below. The temp pools exclude rax and rdx, so the temp is out of reach.
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
-    dest = regLoc(resReg, ScalarSlot, isTemp = true)
-    if not g.rb.isBoundTemp(resReg): g.bindTemp(resReg, dest.typ)
+    dest = g.takeTmp(ScalarSlot)
+    g.settleResultReg(dest, resReg)
   of InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     if dest.r != resReg: g.movReg(dest.r, resReg)
@@ -2368,6 +2384,78 @@ proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
     g.emitStoreLoc(dest, resReg)
     if not bound: g.unbindTemp(resReg)
   else: raiseAssert "arkham x64n: fixed-reg result dest " & $dest.kind
+
+proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
+                    signed, wantRem: bool; dest: var Location): bool =
+  ## A 64-bit `div`/`mod` by a constant that is not a power of two, as a
+  ## multiplication by its reciprocal (`divmagic.nim` has the derivation): one
+  ## `mul` and a few shifts instead of a `div` that costs tens of cycles and
+  ## does not pipeline. `x mod 10` in every integer-to-string conversion is the
+  ## case that matters. Returns false for the divisors the magic does not
+  ## cover (0, ±1, ±2^k, low(int64)) — those keep their existing paths.
+  ##
+  ## nifasm has only the one-operand UNSIGNED `mul` (rdx:rax = rax * src). The
+  ## signed high half is derived from it:
+  ##   mulhi_s(n, M) = mulhi_u(n, M) - (n < 0 ? M : 0) - (M < 0 ? n : 0)
+  ## which is two more instructions than an `imul`, still far below `idiv`.
+  let ud = cast[uint64](dval)
+  let absD = if signed and dval < 0: 0'u64 - ud else: ud
+  if absD <= 2'u64 or (absD and (absD - 1'u64)) == 0'u64: return false
+  if signed and dval == low(int64): return false
+  let m = if signed: signedDivMagic(dval) else: unsignedDivMagic(ud)
+  result = true
+  let acc = g.md.intRetReg                              # rax: dividend, then quotient
+  let hiR = g.md.divRemReg                              # rdx: the high half of the product
+  var aD = regLoc(acc, ScalarSlot)
+  g.emitValue(divC, aD)                                 # dividend → rax
+  # The dividend is still needed after `mul` overwrites rax: by the fixups and
+  # by the remainder. The unsigned no-add quotient alone does without it.
+  let keepN = signed or m.add or wantRem
+  var nR = NoReg
+  if keepN:
+    nR = g.pickStagingSealed("a magic-division dividend", ScalarSlot, avoid = acc)
+    g.movReg(nR, acc)
+  let mR = g.pickStagingSealed("a magic-division multiplier", ScalarSlot, avoid = acc)
+  g.movImm(mR, cast[int64](m.magic))
+  # `mul` writes rdx:rax without naming them, like `idiv`: the value in rax is
+  # the dividend being consumed, rdx is proved free above.
+  g.dropStaleBinding(acc)
+  g.dropStaleBinding(hiR)
+  g.ab.tree MulX64: g.emReg mR                          # rdx = mulhi_u(n, magic)
+  if signed:
+    # Signed high half. rax is free after `mul`: use it for the sign mask.
+    g.movReg(acc, nR)
+    g.binImm(SarX64, acc, 63)                           # n < 0 ? -1 : 0
+    g.binReg(AndX64, acc, mR)
+    g.binReg(SubX64, hiR, acc)
+    if cast[int64](m.magic) < 0: g.binReg(SubX64, hiR, nR)
+    if m.add:
+      g.binReg(if dval < 0: SubX64 else: AddX64, hiR, nR)
+    g.movReg(acc, hiR)
+    if m.shift > 0: g.binImm(SarX64, acc, m.shift)
+    g.movReg(hiR, acc)
+    g.binImm(ShrX64, hiR, 63)                           # round toward zero
+    g.binReg(AddX64, acc, hiR)
+  elif m.add:
+    g.movReg(acc, nR)
+    g.binReg(SubX64, acc, hiR)
+    g.binImm(ShrX64, acc, 1)
+    g.binReg(AddX64, acc, hiR)
+    g.binImm(ShrX64, acc, m.shift)
+  else:
+    g.movReg(acc, hiR)
+    g.binImm(ShrX64, acc, m.shift)
+  if wantRem:                                           # n - q * d
+    if dval >= low(int32).int64 and dval <= high(int32).int64:
+      g.binImm(ImulX64, acc, dval)
+    else:
+      g.movImm(mR, dval)
+      g.binReg(ImulX64, acc, mR)
+    g.binReg(SubX64, nR, acc)
+    g.movReg(acc, nR)
+  g.giveBack mR
+  if nR != NoReg: g.giveBack nR
+  g.settleResultReg(dest, acc)
 
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
@@ -2422,6 +2510,9 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
       g.binImm(SarX64, acc, k)
       g.giveBack tmp
     g.settleResultReg(dest, acc)
+    return
+  if dvsIsConst and intTypeWidth(resolveType(g.prog, tc)) == 64 and
+     g.emitDivByMagic(divC, dval, signed, wantRem, dest):
     return
   var aD = regLoc(acc, ScalarSlot)
   g.emitValue(divC, aD)                                 # dividend → rax
@@ -4056,6 +4147,31 @@ when defined(arkhamCallerSaveDbg):
       $cursorToPosition(g.buf[], c) & " saved=" & saved & " nested=" & nest &
       " unbound=" & unbound & "\n"
 
+proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row, e.g. what Shoggoth's
+  ## `memidioms` emits for a recognized fill/copy loop. It lowers through the very
+  ## inline loop a call to the importc'd C function of that name gets
+  ## (`emitMemIntrin`), inside the same caller-save window `emitCall` opens: the
+  ## operands go to the first three argument registers and the loop's scratch
+  ## takes volatiles, which is why the analyser records each as a call point.
+  ## Never diverging, never a tail call.
+  g.killAllMirrors()
+  let w = g.emCallerSaveOpen()
+  g.bridgeStep("a call", bdTwoInRegs)
+  var argCurs: seq[Cursor] = @[]
+  var cc = c
+  cc.into:
+    skip cc                                     # the callee symbol
+    while cc.hasMore: (argCurs.add cc; skip cc)
+  let builtin = case op
+                of MemsetOp: "memset"
+                of MemcpyOp: "memcpy"
+                else: "memcmp"
+  g.emitMemIntrin(argCurs, builtin)
+  if op == MemcmpOp: g.settleResultReg(dest, RAX)
+  else: dest = Location(kind: Undef)            # no value: nothing consumes this node
+  g.emCallerSaveClose(w, dest)
+
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
   ## Caller-save wrapper: every caller-saved local bound right now is stored before
@@ -4352,6 +4468,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
+  if tgt.op.isMemOp:
+    g.emitMemInstr(c, tgt.op, dest)
+    return
   if row.isFlagRead or row.isFlagWrite or row.isAssemblerOnly:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, where no " &

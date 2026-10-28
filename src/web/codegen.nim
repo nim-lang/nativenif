@@ -2202,6 +2202,9 @@ proc genInstr(g: var WebGen; c: Cursor; wantValue: bool) =
     let it = instrTargetOf(g.prog, nm)
     skip t
     case it.op
+    of MemsetOp: genMemIntrin(g, "memset", t, wantValue)
+    of MemcpyOp: genMemIntrin(g, "memcpy", t, wantValue)
+    of MemcmpOp: genMemIntrin(g, "memcmp", t, wantValue)
     of AtomicLoadOp:
       let w = widthOf(scalOf(g, lengType(g, c)))
       g.outp.tree HLoad:

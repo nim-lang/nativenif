@@ -390,7 +390,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
       let needsScratch = g.atNeedsScratch(n) or (asBase and g.atIndexIsReg(n))
       n.into:
         var idxPeek = n; skip idxPeek
-        let held = heldBase or subtreeHasCall(idxPeek)
+        let held = heldBase or subtreeHasCall(idxPeek, g.prog.memIntrinsics)
         g.emitLvalWalk(n, globBase, isStore, held, asBase = true)  # the indexed base
         if n.kind in {IntLit, UIntLit}: skip n
         else: g.getExpr(n, false, "")
@@ -402,7 +402,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
       let needsScratch = g.atNeedsScratch(n) or (asBase and g.atIndexIsReg(n))
       n.into:
         var idxPeek = n; skip idxPeek
-        let held = heldBase or subtreeHasCall(idxPeek)
+        let held = heldBase or subtreeHasCall(idxPeek, g.prog.memIntrinsics)
         g.getExpr(n, held, "a pat base held across an index call")   # a clean value base
         if n.kind in {IntLit, UIntLit}: skip n
         else: g.getExpr(n, false, "")

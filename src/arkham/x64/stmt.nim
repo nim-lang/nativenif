@@ -180,7 +180,8 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   # DST — it is overwritten by the ELSE store before the compare — nor calls,
   # which would clobber the volatile staging register holding the THEN value.
   # Both are rare; they simply keep the branch lowering.
-  if subtreeHasCall(sd.a) or subtreeHasCall(sd.b): return false
+  if subtreeHasCall(sd.a, g.prog.memIntrinsics) or
+     subtreeHasCall(sd.b, g.prog.memIntrinsics): return false
   if g.readsReg(sd.a, sd.dst.r) or g.readsReg(sd.b, sd.dst.r): return false
   let rT = g.pickStagingSealed("a cmov then-value", g.selectStagingSlot(sd), avoid = sd.dst.r)
   g.genStore(sd.thenRhs, regLoc(rT, sd.dst.typ))

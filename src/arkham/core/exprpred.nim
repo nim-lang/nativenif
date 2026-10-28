@@ -13,7 +13,7 @@
 ## rescue that reads the last of them: what has to be spilled around a call, and
 ## where each spilled value goes.
 
-import std / [tables, assertions, algorithm]
+import std / [tables, sets, assertions, algorithm]
 
 import nifcore, nifcdecl
 import asmslots, machinedesc, analyser, planner, programs, abi
@@ -141,7 +141,7 @@ proc fixedRegsClobberedBy*(g: var CodeGen; n: Cursor): set[Reg] =
         stack.add ch
         skip ch
 
-proc subtreeHasCall*(n: Cursor): bool =
+proc subtreeHasCall*(n: Cursor; memCallees: HashSet[SymId]): bool =
   ## Does this expression subtree contain a CALL? Read-only. An `(at base idx)`
   ## whose INDEX calls — a bounds check, say — evaluates the base FIRST and
   ## reads it back AFTER the call, so the base's scratch must be a callee-saved
@@ -149,10 +149,12 @@ proc subtreeHasCall*(n: Cursor): bool =
   ## allocator's `subtreeHasCall`.)
   if n.kind != TagLit: return false
   if n.exprKind == CallC: return true
+  # a `Memset`/`Memcpy`/`Memcmp` row: an inline call (see the analyser)
+  if isMemInstr(n, memCallees): return true
   var cc = n
   cc.into:
     while cc.hasMore:
-      if subtreeHasCall(cc): return true
+      if subtreeHasCall(cc, memCallees): return true
       skip cc
   return false
 
