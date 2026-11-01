@@ -2421,6 +2421,9 @@ proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
   if signed and dval == low(int64): return false
   let m = if signed: signedDivMagic(dval) else: unsignedDivMagic(ud)
   result = true
+  # The dividend (kept for the fixups and the remainder) and the 64-bit
+  # multiplier, which `mul` only takes from a register, are live at once.
+  g.bridgeStep("a magic division", bdTwoInRegs)
   let acc = g.md.intRetReg                              # rax: dividend, then quotient
   let hiR = g.md.divRemReg                              # rdx: the high half of the product
   var aD = regLoc(acc, ScalarSlot)
