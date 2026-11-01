@@ -253,7 +253,10 @@ proc runFixture(dir, name, nodeExe: string): (string, int) =
 if nodeExe.len > 0:
   for r in fixtureRuns:
     let (output, code) = runFixture(path.parentDir, r.file, nodeExe)
-    check r.label, code == r.exitCode, "exit " & $code & "\n" & output
+    # The exit codes above are the POSIX status, the low 8 bits of what the
+    # program passed to `exit`. node on Windows reports all 32 bits (toomstr
+    # exits with 1296125702), so compare the part every host reports.
+    check r.label, (code and 0xFF) == r.exitCode, "exit " & $code & "\n" & output
 
 # `refuse` quits, so a refusal is read off a process (`--generate`). A plain
 # aggregate has no JS spelling as a splice RESULT (an argument is its address):
