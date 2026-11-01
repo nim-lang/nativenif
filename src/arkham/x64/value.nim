@@ -1145,7 +1145,7 @@ proc genFieldStore*(g: var CodeGen; dst: Location; valC: Cursor) =
   if dst.typ.kind == AMem and valC.kind == Symbol:     # nested aggregate, already built
     # A named aggregate (a local, a param, a global) needs no building: copy it
     # straight into the field. Through a temp it cost a stack slot as big as the
-    # field — 16 MB for nimony #2846's `Node(data: arr)` — and a second copy.
+    # field — 16 MB for a global `Outer(inner: big)` (nimony#2846) — and a second copy.
     # Addressing a symbol evaluates nothing, so no register is held across a call.
     let fty = g.fieldTypeByName(dst.aggrType, dst.field)
     if fty.kind != Symbol:
