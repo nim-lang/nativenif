@@ -2227,6 +2227,24 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind != InFReg: dest = g.takeFTmp(fslot)
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem(c, dest); return
+  if not dest.isTemp and dest.kind == InFReg:
+    # The x64 twin's alias guard: the consumer handed us a local's own home
+    # and the rhs still reads that local (`z = 1.0 - (r - z)`). Compute into
+    # a temp, then move the result home.
+    let lhsIsHome = lHome.kind == InFReg and lHome.f == dest.f
+    if not lhsIsHome and g.exprReadsFReg(rhsC, dest.f):
+      let home = dest
+      let bits = if fslot.size == 4: 32 else: 64
+      var t = g.takeFTmp(fslot)
+      if t.kind == NamedStack:
+        g.produceIntoFMem(c, t)
+        g.emFloatScalarLoad(home.f, t.name, bits)
+      else:
+        g.emitFBin(c, t)
+        g.fmovF(home.f, t.f, bits)
+        g.freeVal(t)
+      dest = home
+      return
   let res = dest
   # The width is the operation's, from its result type, not the temp's the
   # consumer passed (see the x64 twin: a generic 8-byte temp made a float32
@@ -3724,6 +3742,23 @@ when declared(FldrqOp):
     else:
       raiseAssert "arkham a64n: not a vector op: " & IntrinsicNames[op]
 
+proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
+  ## A float-valued `(instr SYM x)`: an FP-to-FP row (`fsqrt d, d`). No call
+  ## point, no fixed register, no flags — the twin of the `NegC` arm.
+  var arg = c
+  inc arg                                        # past the tag
+  skip arg                                       # past the callee
+  if dest.kind != InFReg:
+    dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: g.exprSlot(c))
+    if dest.kind == NamedStack:
+      g.produceIntoFMem(c, dest); return
+  let bits = if dest.typ.size == 4: 32 else: 64
+  var iv = dest                                    # dest-thread into the operand
+  g.emitFValue(arg, iv)
+  if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
+  g.ensureFAccum(dest.f, iv, bits)
+  g.ab.tree FsqrtA64: (g.emFReg(dest.f, bits); g.emFReg(dest.f, bits))
+
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
   ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
@@ -3753,6 +3788,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
               "guard the call with a `when`"
   if tgt.op.isMemOp:
     g.emitMemInstr(c, tgt.op, dest)
+    return
+  if tgt.op == SqrtOp:
+    g.emitFloatInstr(c, dest)
     return
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps and SimdVector notin g.md.caps:

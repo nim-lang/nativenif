@@ -238,6 +238,12 @@ type
                                      ## `IntLocalTempRegsN` in `risc/machine_a64.nim`
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
+    floatLocalTempRegs*: seq[FReg]   ## the float twin of `intLocalTempRegs`: volatile
+                                     ## ARGUMENT registers a call-free (`AllRegs`) float
+                                     ## local may be homed in. Disjoint from
+                                     ## `floatTempRegs` (the emitter's scratch) and from
+                                     ## the float return registers. Empty where the
+                                     ## callee-saved float pool already serves locals.
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs
     intCalleeSavedSet*: set[Reg]     ## membership form of `intCalleeSaved`
     floatCalleeSavedSet*: set[FReg]  ## membership form of `floatCalleeSaved`

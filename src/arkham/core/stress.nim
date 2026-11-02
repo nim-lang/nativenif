@@ -116,6 +116,7 @@ proc stressed*(md: MachineDesc): MachineDesc =
     result.intLocalTempRegs = keepFirst(md.intLocalTempRegs, 0)
     result.intTempRegs = keepFirst(md.intTempRegs, TempFloor)
     result.floatTempRegs = keepFirst(md.floatTempRegs, FTempFloor)
+    result.floatLocalTempRegs = keepFirst(md.floatLocalTempRegs, 0)
     result.floatCalleeSaved = keepFirst(md.floatCalleeSaved, 0)
     result.intCalleeSavedSet = {}
     for r in result.intCalleeSaved: result.intCalleeSavedSet.incl r
