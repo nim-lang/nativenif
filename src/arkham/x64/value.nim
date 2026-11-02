@@ -1763,6 +1763,26 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
   if dstAggr and isAggrCopySrc(rhs):                     # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize)
     return
+  if dstAggr and rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC} and
+     constrReadsDst(rhs, dst):
+    # `v = V(x: p, y: v.x / p)`: the constructor is evaluated before the store,
+    # but building it field by field INTO `v` overwrites `v.x` before `y` reads
+    # it. Build into a fresh `aggtmp` slot, then copy the whole aggregate.
+    let pos = cursorToPosition(g.buf[], rhs)
+    let home = g.lengSym(synth("aggtmp") & $pos & ".0")
+    var tcur = rhs; inc tcur                              # the constructed type
+    g.emTypedStackVar(home, tcur)
+    if tcur.kind == Symbol: g.varType[home] = tcur.symId
+    g.genStore(rhs, namedStackLoc(home, g.exprSlot(rhs)))
+    if dst.kind == Mem: g.emitLvalue(dst.cur)
+    var dstAddr = NoReg
+    let dstE = g.aggrDstEnd(dst, dstAddr)
+    if dst.kind == Mem: g.freeLvalTemps(dst.cur)
+    var tmp = g.pickStagingSealed("a self-reading constructor copy", AddrSlot)
+    g.copyAggr(dstE, AggrEnd(slot: home, reg: NoReg), aggrSize, tmp)
+    g.giveBack tmp
+    g.giveBack dstAddr
+    return
   if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
      g.exprSlot(rhs).kind == AMem:
     # A distinct / representation-preserving conversion of an AGGREGATE (`Path(s)` for
@@ -2084,7 +2104,12 @@ proc foldInto(g: var CodeGen; fop: X64Inst; rD: Reg; loc: Location; cur: Cursor;
   case loc.kind
   of Imm:
     if loc.ival < low(int32).int64 or loc.ival > high(int32).int64:
-      let s = g.pickStagingSealed("a bin imm64", typ)
+      # The staging register holds a 64-bit immediate, so it is bound 64 bits
+      # wide whatever `typ` says: a sub-width slot (the `u8` of an outer
+      # conversion's destination) made `(mov (u 8) 4294967295)`, which nifasm
+      # rightly rejects.
+      let wide = if typ.size >= 8: typ else: AsmSlot(cls: typ.cls, size: 8, align: 8)
+      let s = g.pickStagingSealed("a bin imm64", wide)
       g.movImm(s, loc.ival)
       g.binReg(fop, rD, s)
       g.giveBack s
@@ -2156,6 +2181,15 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
   checkArithResultType(g.prog, resTypeC, lengInfo(c))
+  if lhsC.kind == Symbol and rhsC.kind == Symbol and lhsC.symId == rhsC.symId and
+     ek in {SubC, BitandC, BitorC}:
+    # `x - x`, `x and x`, `x or x` on one variable: the algebraic result, not the
+    # instruction. `sub r, r` would be a correct `0`, but it is exactly the shape
+    # nifasm rejects as a register collision (a dropped source operand), which is
+    # the check worth keeping. (Integer only: `emitBin` never sees floats.)
+    if ek == SubC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
+    else: g.emitValue(lhsC, dest)
+    return
   let isShift = ek in {ShlC, ShrC}
   let varShift = isShift and g.md.shiftCountReg != NoReg and not isConstShiftCount(rhsC)
   let pinned = dest.kind == InReg
@@ -2477,6 +2511,17 @@ proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
   if nR != NoReg: g.giveBack nR
   g.settleResultReg(dest, acc)
 
+proc subtreeHasDivMod(n: Cursor): bool =
+  ## Does the expression contain a `div`/`mod` (which runs through rax/rdx)?
+  result = false
+  if n.kind != TagLit: return
+  if n.exprKind in {DivC, ModC}: return true
+  var m = n
+  m.into:
+    while m.hasMore:
+      if subtreeHasDivMod(m): return true
+      skip m
+
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
   ## (never rax/rdx — the temp pools exclude both); the result (rax quotient /
@@ -2535,9 +2580,17 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
      g.emitDivByMagic(divC, dval, signed, wantRem, dest):
     return
   var aD = regLoc(acc, ScalarSlot)
-  g.emitValue(divC, aD)                                 # dividend → rax
   var dD = needsReg(ScalarSlot)
-  g.emitValue(dvsC, dD)                                 # divisor → a register
+  if subtreeHasDivMod(dvsC):
+    # The divisor is itself a division: it runs through rax/rdx, so a dividend
+    # parked in rax first would be overwritten by it (`p div ((p div q) or 1)`
+    # divided the INNER quotient). Evaluate the divisor first — into a pool
+    # register, which is never rax/rdx — then the dividend.
+    g.emitValue(dvsC, dD)                               # divisor → a register
+    g.emitValue(divC, aD)                               # dividend → rax
+  else:
+    g.emitValue(divC, aD)                               # dividend → rax
+    g.emitValue(dvsC, dD)                               # divisor → a register
   if dD.kind == InReg and (dD.r == g.md.intRetReg or dD.r == g.md.divRemReg):
     raiseAssert "arkham: div/mod divisor aliases rax/rdx"
   var dvsLoc = dD
@@ -3192,7 +3245,11 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     let dstBits = if slotOf(g.prog, targetCur).size == 4: 32 else: 64
     if g.isFloatExpr(inner):
       var fv = res                                       # dest-pass into the operand
-      if isFloatLitTree(inner):
+      # Materializing a literal at the TARGET width is the conversion only when
+      # that rounds the same way: f64 -> f32 does (the literal rounds once, at
+      # 32 bits). An f32 literal widened to f64 must first be ROUNDED to f32 —
+      # `float64(16777217.0'f32)` is 16777216.0 — so it takes the general path.
+      if isFloatLitTree(inner) and not (g.floatBits(inner) == 32 and dstBits == 64):
         # A literal is materialized straight at the TARGET width — the value
         # is converted at compile time, as a C compiler folds `(float)2.0` —
         # and there is nothing left to convert at run time. Doing both was the
@@ -3241,11 +3298,15 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem(c, dest); return
     let res = dest
+    # The width is the OPERAND's float type, never the slot `emitFValue` came
+    # back with: a don't-care location is a generic 8-byte float, and reading
+    # its size made `cast[uint32](f32)` a `movq` of 64 bits.
+    let fbits = g.floatBits(inner)
     var fv = dontCare
+    fv.typ = AsmSlot(cls: AFloat, size: fbits div 8, align: fbits div 8)
     g.emitFValue(inner, fv)
     assert fv.kind == InFReg, "arkham x64n: float→int operand " & $fv.kind
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
-    let fbits = if fv.typ.size == 4: 32 else: 64
     if isCast:
       g.fmovToGpr(res.r, fv.f, fbits)
     else:
@@ -3259,6 +3320,31 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # ── int↔int / pointer reinterpret. Narrowing over a frozen symbol home
   # forces a fresh temp (copy-then-narrow, source intact).
   block:
+    if inner.kind == TagLit and inner.exprKind in {CastC, ConvC} and
+       dest.kind in {Undef, NeedsReg, RegOrImm}:
+      # A cast CHAIN over a register-homed local (`int64(cast[int32](u))`): the
+      # inner relabel threads the local's own home register up as its value,
+      # and the extend below would then rewrite the LOCAL. A direct symbol
+      # operand cannot hit this — a home is normalized for its declared type,
+      # so it `arrivesNormalized` — but a relabel changes the type without
+      # changing the register. Re-represent in a temp.
+      var root = inner
+      while root.kind == TagLit and root.exprKind in {CastC, ConvC}:
+        inc root; skip root                              # past tag + target type
+      if root.kind == Symbol and
+         g.plan.locationOfSym(root.symId, cursorToPosition(g.buf[], root)).kind == InReg:
+        g.forceRegDest(dest)
+    if inner.kind == Symbol and dest.kind in {Undef, NeedsReg, RegOrImm}:
+      # The same hazard one level down: `cast[int32](u)` over a register-homed
+      # `u: uint32` keeps the width but changes the EXTENSION, and the tail
+      # re-extends whatever register the value is in — `u`'s own. Only a pure
+      # relabel (same register representation) may use the home in place.
+      let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
+      var tgc2 = targetCur
+      let tslot = slotOf(g.prog, tgc2)
+      if sh.kind == InReg and tslot.kind in {ABool, AInt, AUInt} and
+         sh.typ.kind in {ABool, AInt, AUInt} and not sameRegRepr(sh.typ, tslot):
+        g.forceRegDest(dest)
     if inner.kind == Symbol:
       let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
       var tgc = targetCur
@@ -3306,6 +3392,21 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # `(u 8)` local receiving an `(i 64)` value is a narrowing move nifasm rejects,
   # and rightly: the narrowing is the `movzx` that follows, not the move.
   # Zero machine code either way; only the declared type moves.
+  if dest.kind == InReg and not dest.isTemp and g.exprReadsReg(inner, dest.r):
+    # The pre-retype below renames the destination to the INNER's type while the
+    # inner emits — wrong when the inner READS the destination at its own type
+    # (`a = uint64(ord(p * a <= x))` multiplied by a `bool`-typed `a`). Convert
+    # into a temp, then move it home.
+    let home = dest
+    var t = needsReg(home.typ)
+    g.emitCast(c, t)
+    if t.kind == InReg:
+      g.movReg(home.r, t.r)
+      g.freeVal(t)
+    else:
+      g.emitLoadLoc(t, home.r)
+    dest = home
+    return
   var preRetyped = NoSymId
   if dest.kind == InReg and not dest.isTemp:
     let nm = g.rb.boundName(dest.r)

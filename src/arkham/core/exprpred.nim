@@ -381,3 +381,29 @@ proc isLeafArg*(a: Cursor): bool =
   of IntLit, UIntLit, CharLit, StrLit, Symbol: true
   of TagLit: c.exprKind in {NilC, TrueC, FalseC}
   else: false
+
+proc constrReadsDst*(rhs: Cursor; dst: Location): bool =
+  ## Does the constructor `rhs` read memory its destination `dst` occupies? The
+  ## destination's root symbol appearing anywhere in `rhs` is a read of it; a
+  ## destination reached through a pointer is also read by any load through a
+  ## pointer, which may alias it.
+  var root = NoSymId
+  var throughPtr = false
+  case dst.kind
+  of NamedStack, Glob, Tvar: root = dst.name
+  of StackPtr: root = dst.ptrName; throughPtr = true
+  of Mem:
+    root = rootOf(dst.cur)
+    throughPtr = true
+  else: return false
+  proc walk(n: Cursor; root: SymId; throughPtr: bool): bool =
+    if n.kind == Symbol: return root != NoSymId and n.symId == root
+    if n.kind != TagLit: return false
+    if throughPtr and n.exprKind in {DerefC, PatC}: return true
+    var m = n
+    m.into:
+      while m.hasMore:
+        if walk(m, root, throughPtr): return true
+        skip m
+    false
+  result = walk(rhs, root, throughPtr)
