@@ -158,6 +158,15 @@ proc align*(address, alignment: int): int {.inline.} =
   (address + (alignment - 1)) and not (alignment - 1)
 
 proc isFloat*(s: AsmSlot): bool {.inline.} = s.kind == AFloat
+proc sameRegRepr*(src, dst: AsmSlot): bool =
+  ## True if a register holding a `src` value already holds the `dst` value — a
+  ## relabel needs no instruction. A sub-64-bit integer lives in its register
+  ## EXTENDED to 64 bits by its signedness (u32: `movzx`, i32: `movsxd`), so
+  ## `cast[int32](u)` must re-extend even though the width is the same.
+  proc ext(k: AsmTypeKind): AsmTypeKind {.inline.} =
+    if k == ABool: AUInt else: k
+  src.size == dst.size and (src.size >= 8 or ext(src.kind) == ext(dst.kind))
+
 proc inRegClass*(s: AsmSlot): bool {.inline.} =
   ## True if a value of this slot can live in a (single) register at all.
   s.kind != AMem and s.size > 0 and s.size <= maxScalarSize()

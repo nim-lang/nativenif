@@ -92,6 +92,18 @@ let
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
                                                          # staging bridge (FloatStagingBridge)
                                                          # — the SIMD twin of R11.
+                                                         # Not shrinkable for more local
+                                                         # homes: `produceIntoFMem` holds
+                                                         # one staging xmm per nesting
+                                                         # level, drawn from the bridge and
+                                                         # the arg registers no local homes.
+    floatLocalTempRegs: @[F2, F3, F4, F5, F6, F7],
+                                     # SysV has NO callee-saved xmm, so without these
+                                     # every float local is a stack slot. A call-free
+                                     # local may live in an argument register exactly as
+                                     # `intLocalTempRegs` allows for GPRs; xmm0/xmm1 stay
+                                     # out because they are the (pair) RETURN registers,
+                                     # the role rax/rdx have on the integer side.
     floatCalleeSaved: @[],
     intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
@@ -168,6 +180,7 @@ let
     intLocalTempRegs: @[RDI, RSI, R8, R9],
     intCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],
+    floatLocalTempRegs: @[F2, F3, F4, F5],   # Win64: xmm0-3 args, xmm4-5 volatile
     floatCalleeSaved: @[],
     intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},

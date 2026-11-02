@@ -870,6 +870,9 @@ proc emitFdiv*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
 proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E614000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
+proc emitFsqrt*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E61C000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
 proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E602000'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))
 

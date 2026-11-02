@@ -163,6 +163,8 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(cvttss2si D S)`      | X64Inst                  | scalar single -> int convert (truncating) |
 | `(cvtsd2ss D S)`       | X64Inst                  | scalar double -> scalar single convert |
 | `(cvtss2sd D S)`       | X64Inst                  | scalar single -> scalar double convert |
+| `(sqrtsd D S)`         | X64Inst                  | scalar double square root (D = sqrt(S)), correctly rounded |
+| `(sqrtss D S)`         | X64Inst                  | scalar single square root (D = sqrt(S)), correctly rounded |
 | `(comisd D S)`         | X64Inst                  | compare scalar double, set EFLAGS |
 | `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
 | `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops) |
@@ -562,6 +564,7 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(fmul D S)`        | A64Inst, MInst, RvInst | fp multiply (D = D * S) |
 | `(fdiv D S)`        | A64Inst, MInst, RvInst | fp divide (D = D / S) |
 | `(fneg D)`          | A64Inst, MInst, RvInst | fp negate (D = -D) |
+| `(fsqrt D S)`       | A64Inst                 | fp square root (D = sqrt(S)), correctly rounded |
 | `(fcmp D S)`        | A64Inst, MInst, RvInst | fp compare |
 | `(fldr D S)`        | A64Inst, MInst, RvInst | fp load register |
 | `(fstr D S)`        | A64Inst, MInst, RvInst | fp store register |

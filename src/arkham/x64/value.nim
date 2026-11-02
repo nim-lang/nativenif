@@ -3102,6 +3102,25 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind != InFReg: dest = g.takeFTmp(fslot)
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem(c, dest); return
+  if not dest.isTemp and dest.kind == InFReg:
+    # `x = y - x` / `z = 1.0 - (r - z)` with the local register-homed: the
+    # consumer hands us its own home, and computing the lhs into it destroys a
+    # value the rhs still reads. Compute into a temp, then move the result
+    # home. (An lhs that IS that local leaves the register unchanged.)
+    let lhsIsHome = lHome.kind == InFReg and lHome.f == dest.f
+    if not lhsIsHome and g.exprReadsFReg(rhsC, dest.f):
+      let home = dest
+      let bits = if fslot.size == 4: 32 else: 64
+      var t = g.takeFTmp(fslot)
+      if t.kind == NamedStack:
+        g.produceIntoFMem(c, t)
+        g.emFloatScalarLoad(home.f, t.name, bits)
+      else:
+        g.emitFBin(c, t)
+        g.fmovF(home.f, t.f, bits)
+        g.freeVal(t)
+      dest = home
+      return
   let res = dest
   # The width is the operation's, from its result type: `res` is whatever xmm
   # temp the consumer passed, often a generic 8-byte one, and sizing by it
@@ -4462,6 +4481,24 @@ when declared(FldrqOp):
     else:
       lengError c, "not a vector row"
 
+proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
+  ## A float-valued `(instr SYM x)`: an XMM-to-XMM row. No call point, no fixed
+  ## register, no flags — the operand is produced straight into the result
+  ## register and the instruction runs in place (`sqrtsd d, d`), exactly like
+  ## the precision convert.
+  var arg = c
+  inc arg                                                # past the tag
+  skip arg                                               # past the callee
+  if dest.kind != InFReg:
+    dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: g.exprSlot(c))
+    if dest.kind == NamedStack:
+      g.produceIntoFMem(c, dest); return
+  let bits = g.floatBits(c)
+  var iv = dest
+  g.emitFValue(arg, iv)                                  # operand → dest
+  if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
+  g.fbin(SqrtssX64, SqrtsdX64, dest.f, dest.f, bits)
+
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(instr SYM X*)`: allocInstr's operand/result placement decided
   ## inline; each evaluated operand's resolved Location is written to the
@@ -4488,6 +4525,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
+  if tgt.op == SqrtOp:
+    g.emitFloatInstr(c, dest)
+    return
   if tgt.op.isMemOp:
     g.emitMemInstr(c, tgt.op, dest)
     return

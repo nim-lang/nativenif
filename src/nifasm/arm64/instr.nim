@@ -1521,6 +1521,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let rd = parseFloatOperandA64(n, ctx)
     arm64.emitFneg(ctx.buf.data, rd, rd, single)
 
+  of FsqrtA64:
+    inc n
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rs = parseFloatOperandA64(n, ctx)
+    arm64.emitFsqrt(ctx.buf.data, rd, rs, single)
+
   of FcmpA64:
     inc n
     let single = isA64FpSingle(n, ctx)
