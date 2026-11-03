@@ -1737,6 +1737,81 @@ proc innerType*(p: var Program; t: Cursor): Cursor =
       while tc.hasMore: skip tc
   else: raiseAssert "arkham: deref/index of a non-pointer/array type"
 
+proc isZeroConst*(c: Cursor): bool =
+  ## Is the constant `c` all-zero bits? What an `(arepconstr T X)` asks of its
+  ## `X` before a back end fills the array with zeroes instead of storing `X`
+  ## element by element. `-0.0` is not zero bits, and a constructor with a
+  ## positional child (an inherited base's RTTI slot, `(addr vt)`) is not
+  ## either. The twin of nimony's `lengc/typenav.isZeroConst`.
+  case c.kind
+  of IntLit: result = intVal(c) == 0
+  of UIntLit: result = uintVal(c) == 0'u64
+  of FloatLit: result = cast[uint64](floatVal(c)) == 0'u64
+  of CharLit: result = charLit(c) == '\0'
+  of TagLit:
+    case c.exprKind
+    of FalseC, NilC: result = true
+    of SufC, ParC:
+      result = isZeroConst(sub(c))
+    of ConvC, CastC:
+      var x = sub(c)
+      skip x                                   # the target type
+      result = isZeroConst(x)
+    of AconstrC, OconstrC, ArepconstrC:
+      var x = sub(c)
+      skip x                                   # the constructed type
+      result = true
+      while result and x.hasMore:
+        if x.kind == TagLit and x.substructureKind == KvU:
+          var kv = sub(x)
+          skip kv                              # the field
+          result = isZeroConst(kv)
+        else:
+          result = isZeroConst(x)
+        skip x
+    else: result = false
+  else: result = false
+
+type
+  ArepShape* = object
+    ## An `(arepconstr T X)` seen as what it stores: `count` copies of `elem`,
+    ## each `elemSize` bytes of type `elemTy`. Directly nested arepconstrs are
+    ## FLATTENED — `(arepconstr A (arepconstr B X))` is `len(A)*len(B)` copies
+    ## of `X`, since an array has no padding between its elements — so `inner`
+    ## is the innermost one, `(arepconstr B X)`, and `elem` is its `X`.
+    inner*: Cursor
+    elem*: Cursor
+    elemTy*: Cursor     ## the nominal element type of `inner`'s array type
+    elemSize*: int
+    count*: int
+
+proc containsArepconstr*(c: Cursor): bool =
+  ## Does the subtree `c` contain an `(arepconstr …)`? A constructor that does is
+  ## one whose SIZE is no longer proportional to its IR — the very property the
+  ## tag buys — so a back end must build it in place rather than in a temp that
+  ## is then copied word by word.
+  if c.kind != TagLit: return false
+  if c.exprKind == ArepconstrC: return true
+  var x = sub(c)
+  while x.hasMore:
+    if containsArepconstr(x): return true
+    skip x
+  result = false
+
+proc arepShape*(p: var Program; c: Cursor): ArepShape =
+  assert c.kind == TagLit and c.exprKind == ArepconstrC
+  let (total, _) = typeSizeAlign(p, sub(c))
+  result = ArepShape(inner: c)
+  while true:
+    var x = sub(result.inner)
+    result.elemTy = innerType(p, resolveType(p, x))
+    skip x                                     # the array type
+    result.elem = x
+    if x.kind == TagLit and x.exprKind == ArepconstrC: result.inner = x
+    else: break
+  result.elemSize = typeSizeAlign(p, result.elemTy)[0]
+  result.count = (if result.elemSize > 0: total div result.elemSize else: 0)
+
 proc aggrWordCount*(p: var Program; typeSym: SymId): int =
   ## Number of GPRs a small aggregate occupies (1 or 2), at the TARGET's word
   ## size — 8 bytes on the 64-bit targets, 4 on Cortex-M. A two-`int32` struct is
@@ -1832,6 +1907,14 @@ proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & symString(p.pool, typeSym)
   layoutObjBody(p, body, 0, result, typeSymIsPacked(p, typeSym))
+
+proc fieldByteOffset*(p: var Program; typeSym, field: SymId): int =
+  ## The byte offset of `typeSym.field` (inherited fields included, as
+  ## `aggrLayout` flattens them).
+  for f in aggrLayout(p, typeSym):
+    if f.name == field: return f.off
+  raiseAssert "arkham: no field " & symString(p.pool, field) & " in " &
+              symString(p.pool, typeSym)
 
 proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   ## True when every field is a full 8-byte integer/pointer word at an 8-byte

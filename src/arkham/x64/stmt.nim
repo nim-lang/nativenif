@@ -519,7 +519,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             let pos = cursorToPosition(g.buf[], cc)
             srcName = g.lengSym(synth("rettmp") & $pos & ".0")
             var tcur = cc
-            if cc.exprKind in {OconstrC, AconstrC}: inc tcur   # the constructed type
+            if cc.exprKind in {OconstrC, AconstrC, ArepconstrC}: inc tcur   # the constructed type
             else: tcur = g.getType(cc)
             g.emTypedStackVar(srcName, tcur)
             g.varType[srcName] = g.retAggrSym

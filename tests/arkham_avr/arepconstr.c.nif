@@ -1,0 +1,25 @@
+(.nif27)
+(stmts
+ (type :Arr5.0 .
+  (array (i 16) 5))
+ (type :Pt.0 .
+  (object .
+   (fld :px.0 . (i 16))
+   (fld :py.0 . (i 16))))
+ (type :PtArr3.0 .
+  (array Pt.0 3))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :a.0 . Arr5.0 (arepconstr Arr5.0 7))
+   (var :z.0 . Arr5.0 (aconstr Arr5.0 9 9 9 9 9))
+   (asgn z.0 (arepconstr Arr5.0 0))
+   (var :p.0 . PtArr3.0 (arepconstr PtArr3.0 (oconstr Pt.0 (kv px.0 3) (kv py.0 2))))
+   (ret
+    (add (i 16)
+     (add (i 16) (at a.0 0) (at a.0 4))
+     (add (i 16)
+      (add (i 16) (at z.0 0) (at z.0 4))
+      (add (i 16) (dot (at p.0 2) px.0) (dot (at p.0 2) py.0))))))))

@@ -653,6 +653,21 @@ proc serializeConstInto(g: var WebGen; bytes: var string; base: int;
         serializeConstInto(g, bytes, base + idx * esz, elemT, t)
         skip t
         inc idx
+  elif v.kind == TagLit and v.exprKind == ArepconstrC:
+    # `len(T)` copies of one element: serialize it once and repeat its bytes.
+    # An all-zero one writes nothing; the image starts zeroed.
+    if not isZeroConst(v):
+      var t = v
+      t.into:
+        let elemT = elemTypeOf(g, t)
+        let esz = typeSizeAlign(g.prog, elemT)[0]
+        let total = typeSizeAlign(g.prog, t)[0]
+        skip t
+        serializeConstInto(g, bytes, base, elemT, t)
+        while bytes.len < base + total: bytes.add '\0'
+        for k in 1 ..< (if esz > 0: total div esz else: 0):
+          for i in 0 ..< esz: bytes[base + k * esz + i] = bytes[base + i]
+        skip t
   elif v.kind == TagLit and v.exprKind == NilC:
     putLE(bytes, base, 0, WebPtrSize)
   elif v.kind == Symbol and isPtrType(g, rt) and
@@ -692,6 +707,8 @@ proc staticInit(g: var WebGen; decl: Cursor; typ, initv: var Cursor;
     while d.hasMore: skip d
   if not hasInit: return
   if initv.kind == TagLit and initv.exprKind in {FalseC, NilC}: return
+  if initv.kind == TagLit and initv.exprKind == ArepconstrC and isZeroConst(initv):
+    return                                     # zero: the buffer starts zeroed
   if initv.kind == Symbol:
     let ic = lookupSym(typeCtx(g), initv.symId).cat
     if ic == scProc: discard                   # the function-table slot
@@ -717,7 +734,8 @@ proc staticInit(g: var WebGen; decl: Cursor; typ, initv: var Cursor;
       while t.hasMore: skip t
     result = staticInner
   elif initv.kind == TagLit and
-      initv.exprKind notin {OconstrC, AconstrC, TrueC, SufC, ParC, AddrC, HaddrC, NegC}:
+      initv.exprKind notin {OconstrC, AconstrC, ArepconstrC, TrueC, SufC, ParC, AddrC,
+                            HaddrC, NegC}:
     result = false                             # runtime-computed init
   else:
     result = true
@@ -1056,7 +1074,7 @@ proc genAddr(g: var WebGen; c: Cursor) =
       t.into:
         genExpr(g, t)                    # a pointer's value IS the address
         while t.hasMore: skip t
-    of CallC, OconstrC, AconstrC:
+    of CallC, OconstrC, AconstrC, ArepconstrC:
       # A struct-returning call and a constructor in value position both
       # materialize in a planned slot and travel as that slot's address, so the
       # address of one IS its value.
@@ -1240,7 +1258,7 @@ proc entryIsCtor(kv: Cursor): bool =
   var t = kv
   inc t                                    # the field name
   inc t                                    # the value
-  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}
+  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, ArepconstrC}
 
 proc isInheritedPart(g: var WebGen; objTy: Cursor; part: SymId): bool =
   ## Is `part` one of `objTy`'s bases? Only the base chain says which nested
@@ -1318,7 +1336,7 @@ proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
       isFirst = false
       if header:
         storeSlot(g, off, wU32, val)
-      elif val.kind == TagLit and val.exprKind in {OconstrC, AconstrC}:
+      elif val.kind == TagLit and val.exprKind in {OconstrC, AconstrC, ArepconstrC}:
         genCtorInto(g, off, val)             # nested: filled in place
       elif isAggType(g, vt):
         copyToSlot(g, off, val, byteSize(g, vt))
@@ -1327,6 +1345,34 @@ proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
       else:
         storeSlot(g, off, widthOf(scalOf(g, vt)), val)
       skip t
+    if c.exprKind == ArepconstrC:
+      # `(arepconstr T X)` read as `(aconstr T X)` stored element 0 above, by
+      # the same machinery and so consuming the same planned temps; the rest
+      # of the array is that element repeated. Zero bits are one `memfill`;
+      # anything else is copied in DOUBLING chunks — element 0 to 1, then 0..1
+      # to 2..3, and so on — so each `memcopy` reads only finished bytes, its
+      # two ranges never overlap, and the code is O(log len), never O(len).
+      let total = byteSize(g, ty)
+      let esz = elemOff
+      if total > esz:
+        var x = sub(c)
+        skip x                               # the type
+        if isZeroConst(x):
+          g.outp.openTree MemFill
+          slotAddr(g, destOff + esz)
+          g.outp.numLit 0
+          g.outp.numLit int64(total - esz)
+          g.outp.closeTag
+        else:
+          var n = esz
+          while n < total:
+            let m = min(n, total - n)
+            g.outp.openTree MemCopy
+            slotAddr(g, destOff + n)
+            slotAddr(g, destOff)
+            g.outp.numLit int64(m)
+            g.outp.closeTag
+            n += m
     slotAddr(g, destOff)                     # the sequence's value
     g.outp.closeTag
 
@@ -1425,7 +1471,7 @@ proc aggArgFresh(t: Cursor): bool =
   ## constructor materialized into its own temp, and a call's sret
   ## destination. Everything else must be copied before crossing the call
   ## boundary.
-  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, CallC}
+  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, ArepconstrC, CallC}
 
 proc aggArgDestSize(g: var WebGen; c: Cursor): (int, int) =
   ## What the CALLER must reserve for an aggregate ARGUMENT: a fresh copy
@@ -1489,7 +1535,7 @@ proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
         # home); an aggregate-typed variable is filled in place and needs none.
         # Any other initializer keeps `needsTemp` so a call's sret destination
         # is reserved here, matching `copyToSlot`/`genExpr`.
-        let initNeeds = if init.exprKind in {OconstrC, AconstrC}:
+        let initNeeds = if init.exprKind in {OconstrC, AconstrC, ArepconstrC}:
                           not isAggType(g, typ)
                         else:
                           true
@@ -1514,7 +1560,7 @@ proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
                                                # by the generic walk below
     # fall through: the generic walk plans the action and the argument copies
   var nest = needsTemp
-  let isCtorNode = c.exprKind in {OconstrC, AconstrC}
+  let isCtorNode = c.exprKind in {OconstrC, AconstrC, ArepconstrC}
   if isCtorNode and needsTemp:
     let sz = constrSize(g, c)
     let al = byteAlign(g, ctorType(g, c))
@@ -1572,7 +1618,7 @@ proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
         # An array element, or the type child: an element that is itself a
         # constructor fills in place; a reinterpretation reaching one is read
         # as a value and needs a temporary of its own.
-        childTemp = if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}: false
+        childTemp = if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, ArepconstrC}: false
                     elif not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}: true
                     else: needsTemp
       elif not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}:
@@ -1924,7 +1970,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
         g.outp.tree HLoad:
           g.outp.width widthOf(scalOf(g, ty))
           genAddr(g, c)
-    of OconstrC, AconstrC:
+    of OconstrC, AconstrC, ArepconstrC:
       # A constructor in value position materializes in its planned slot and
       # travels as that slot's address.
       let off = takeTemp(g, constrSize(g, c), "ctor")
@@ -2808,7 +2854,7 @@ proc genVar(g: var WebGen; c: Cursor) =
     let ty = g.p.symType.getOrQuit(nm)
     if isAggType(g, ty):
       if hasInit:
-        if initv.kind == TagLit and initv.exprKind in {OconstrC, AconstrC}:
+        if initv.kind == TagLit and initv.exprKind in {OconstrC, AconstrC, ArepconstrC}:
           g.outp.tree ExprStmt: genCtorInto(g, sl.off, initv)
         else:
           g.outp.tree ExprStmt: copyToSlot(g, sl.off, initv, byteSize(g, ty))

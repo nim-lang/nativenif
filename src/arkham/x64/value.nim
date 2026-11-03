@@ -440,6 +440,8 @@ proc place*(g: var CodeGen; src: Location; dest: Reg) =
 proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
 proc genConstr*(g: var CodeGen; c: Cursor; dst: Location)
 proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location)
+proc genArepFill*(g: var CodeGen; c: Cursor; p: Reg)
+proc genAggrInPlace*(g: var CodeGen; c: Cursor; p: Reg)
 proc binMemLval(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
 proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
@@ -998,7 +1000,7 @@ proc prematLval*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
         skip cc; skip cc                               # base type, depth
         g.prematLval(cc, hint = hint)                  # the inner lvalue
         while cc.hasMore: skip cc
-    of AconstrC, OconstrC:
+    of AconstrC, OconstrC, ArepconstrC:
       # A constructor used as an lvalue base (`[a,b][i]`): build it into a synthetic stack
       # temp `aggtmp<pos>` HERE (before the access instruction opens), then address that
       # temp in `emLvalAddr`. Mirrors the aggregate call-arg materialization.
@@ -1151,6 +1153,29 @@ proc genFieldStore*(g: var CodeGen; dst: Location; valC: Cursor) =
     if fty.kind != Symbol:
       raiseAssert "arkham x64n: nested aggregate field of non-nominal type"
     g.genAggrCopyStore(valC, dst, aggrByteSize(g.prog, fty.symId))
+  elif dst.typ.kind == AMem and containsArepconstr(valC):
+    # Built in place: through a temp it would cost a stack slot as big as the
+    # field and a copy unrolled over every word of it — for an `arepconstr`
+    # (or a constructor holding one) that is the size the tag keeps OUT of the
+    # code. Holding the field address across the build is sound: field values
+    # are flat operands (xelim hoisted the calls).
+    if dst.base.kind == FbReg and g.rb.isBoundTemp(dst.base.reg):
+      # The base is a scratch of the build itself — an enclosing in-place
+      # build's address. Move it onto the field and back rather than taking a
+      # register per nesting level: `std/posix`'s `Sockaddr_storage` sits five
+      # constructors deep in a resolver, and that ran the staging pool dry.
+      let r = dst.base.reg
+      let off = fieldByteOffset(g.prog, dst.aggrType, dst.field)
+      if off != 0: g.binImm(AddX64, r, off)
+      g.genAggrInPlace(valC, r)
+      if off != 0: g.binImm(SubX64, r, off)
+    else:
+      let (d, gbTmp) = g.materializeGlobBase(dst, NoReg)
+      let fptr = g.pickStagingSealed("an in-place field address", AddrSlot)
+      g.emFieldAddr(d, fptr)
+      g.genAggrInPlace(valC, fptr)
+      g.giveBack fptr
+      if gbTmp != NoReg: g.giveBack gbTmp
   elif dst.typ.kind == AMem:                            # nested aggregate field
     # Build the value into its own stack temp FIRST, holding nothing (see
     # `buildNestedAggrTemp`), and only then derive the field address for the copy.
@@ -1357,6 +1382,15 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp: untyped) {.unt
       var i {.inject.} = 0
       while cc.hasMore:
         let valC = cc
+        if elemSlot.kind == AMem and containsArepconstr(valC):
+          # Built in place, for the reason `genFieldStore` gives.
+          let eptr = g.pickStagingSealed("an in-place element address", AddrSlot)
+          g.ab.tree LeaX64: (g.emReg eptr; destOp)   # &element[i]
+          g.genAggrInPlace(valC, eptr)
+          g.giveBack eptr
+          inc i
+          skip cc
+          continue
         if elemSlot.kind == AMem:                       # nested aggregate element
           # Build first, lea `&element[i]` after — the field twin's depth-independence
           # (see `buildNestedAggrTemp`) applies to array elements just the same.
@@ -1443,6 +1477,124 @@ proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location) =
     g.giveBack base
   else:
     g.aconstrElemStores(c, i, g.emAggrElemMem(dst.name, i))
+
+proc emUnitThru(g: var CodeGen; p: Reg; bits, idx: int) =
+  ## `(mem (at (cast (aptr (u bits)) p) idx))` — the `idx`-th `bits`-wide unit at
+  ## `[p]`, i.e. byte offset `idx*bits/8`. The cast is what sizes the access.
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.ab.uintType(bits)
+        g.emReg p
+      g.ab.intLit idx.int64
+
+proc genArepFill*(g: var CodeGen; c: Cursor; p: Reg) =
+  ## Store `(arepconstr T X)` into the array at `[p]`, as a RUNTIME loop: never one
+  ## store per element, which is exactly the blowup the tag exists to avoid. `p` is
+  ## a scratch register the caller owns; the loops advance it, and it is moved
+  ## back before this returns, so an enclosing in-place build can go on using it.
+  ##
+  ## An all-zero `X` is a fill of `sizeof(T)` zero bytes, the shape `Memset`'s
+  ## lowering has (a quadword loop and a sub-word tail), with the zero as an
+  ## immediate so it costs no register. Any other `X` is stored ONCE, into element
+  ## 0, by the ordinary constructor machinery, and then replicated: each unit is
+  ## copied one element further on, so the copy reads what it wrote `elemSize`
+  ## bytes earlier and every element ends up a copy of the first. `X` is a constant
+  ## by the tag's contract, so building it once IS evaluating it per element.
+  g.bridgeStep("an arepconstr fill", bdTwoInRegs)
+  let sh = arepShape(g.prog, c)
+  let total = sh.count * sh.elemSize
+  if total == 0: return
+  if isZeroConst(sh.elem):
+    let words = total div 8
+    if words > 0:
+      let cnt = g.pickStagingSealed("an arepconstr zero-fill count", ScalarSlot, avoid = p)
+      g.movImm(cnt, words)
+      let done = g.freshLabel()
+      g.emitLoop:
+        g.ab.tree MovX64: (g.emUnitThru(p, 64, 0); g.ab.intLit 0)
+        g.binImm(AddX64, p, 8)
+        g.binImm(SubX64, cnt, 1)
+        g.emJcc(JeX64, done)
+      g.emLab done
+      g.giveBack cnt
+    var off = 0                                         # the tail, relative to `p`
+    var rem = total - words * 8
+    for w in [4, 2, 1]:
+      if rem >= w:
+        g.ab.tree MovX64: (g.emUnitThru(p, w * 8, off div w); g.ab.intLit 0)
+        off += w; rem -= w
+    if words > 0: g.binImm(SubX64, p, words * 8)
+  else:
+    let x = sh.elem
+    if x.kind == TagLit and x.exprKind == OconstrC:
+      g.constrFieldStores(x, regLoc(p, ScalarSlot))    # element 0, field by field
+    else:
+      # `inner` is `(arepconstr B X)`, which reads exactly like the one-element
+      # `(aconstr B X)`: store `X` at index 0.
+      g.aconstrElemStores(sh.inner, i, g.emPtrElemMem(p, sh.elemTy, i))
+    if sh.count > 1:
+      let w = (if sh.elemSize mod 8 == 0: 8
+               elif sh.elemSize mod 4 == 0: 4
+               elif sh.elemSize mod 2 == 0: 2
+               else: 1)                                 # the widest unit tiling an element
+      let cnt = g.pickStagingSealed("an arepconstr replicate count", ScalarSlot, avoid = p)
+      g.movImm(cnt, (total - sh.elemSize) div w)
+      let tmp = g.pickStagingSealed("an arepconstr replicate word", ScalarSlot, avoid = p)
+      let done = g.freshLabel()
+      g.emitLoop:
+        g.ab.tree MovX64: (g.emReg tmp; g.emUnitThru(p, w * 8, 0))
+        g.ab.tree MovX64: (g.emUnitThru(p, w * 8, sh.elemSize div w); g.emReg tmp)
+        g.binImm(AddX64, p, w)
+        g.binImm(SubX64, cnt, 1)
+        g.emJcc(JeX64, done)
+      g.emLab done
+      g.giveBack tmp
+      g.giveBack cnt
+      g.binImm(SubX64, p, total - sh.elemSize)
+
+proc genAggrInPlace*(g: var CodeGen; c: Cursor; p: Reg) =
+  ## Build the constructor `c` — an `oconstr`, `aconstr` or `arepconstr` that
+  ## `containsArepconstr` — straight into the aggregate at `[p]`; `p` holds that
+  ## address again afterwards. A `conv`/`cast` of one is byte-transparent.
+  var x = c
+  while x.kind == TagLit and x.exprKind in {ConvC, CastC}:
+    x = sub(x)
+    skip x                                              # the target type
+  if x.kind != TagLit:
+    raiseAssert "arkham x64n: in-place aggregate build of " & $x.kind
+  case x.exprKind
+  of ArepconstrC: g.genArepFill(x, p)
+  of OconstrC: g.constrFieldStores(x, regLoc(p, ScalarSlot))
+  of AconstrC:
+    var atc = sub(x)                                    # the array type
+    let elemTy = innerType(g.prog, resolveType(g.prog, atc))
+    g.aconstrElemStores(x, i, g.emPtrElemMem(p, elemTy, i))
+  else: raiseAssert "arkham x64n: in-place aggregate build of " & $x.exprKind
+
+proc genArepconstrInto*(g: var CodeGen; c: Cursor; dst: Location) =
+  ## `genArepFill` into a destination given as a `Location`: a stack aggregate
+  ## (`NamedStack`, or a `StackPtr` slot holding its address), or a global /
+  ## thread-local. Reducing it to ONE address register is what makes every
+  ## destination form the same loop.
+  let p = g.pickStagingSealed("an arepconstr destination address", AddrSlot)
+  case dst.kind
+  of NamedStack: g.emAggrHomeAddr(p, dst.name)
+  of StackPtr:
+    g.ab.tree MovX64: (g.emReg p; g.emStackMem(dst.ptrName))
+  of Glob, Tvar: g.emSymAddr(p, dst)
+  else: raiseAssert "arkham x64n: arepconstr into " & $dst.kind
+  g.genArepFill(c, p)
+  g.giveBack p
+
+proc genArepconstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
+  ## The lvalue twin (`genConstrIntoLval`'s shape): `&lhs` into one register, then
+  ## fill through it.
+  let p = g.pickStagingSealed("an arepconstr destination address", AddrSlot)
+  g.aggrAddrInto(lhs, p, AddrSlot, doBind = false)       # premats + releases internally
+  g.freeLvalTemps(lhs)
+  g.genArepFill(c, p)
+  g.giveBack p
 
 proc genBaseobj*(g: var CodeGen; c: Cursor; dst: Location) =
   ## `(baseobj BaseType depth value)` — an object→base up-conversion (slicing). Inheritance
@@ -1802,6 +1954,8 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.genConstr(rhs, dst)                              # build object field-by-field
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       g.genAconstr(rhs, dst)                              # build array element-by-element
+    elif rhs.kind == TagLit and rhs.exprKind == ArepconstrC:
+      g.genArepconstrInto(rhs, dst)                       # a fill loop
     elif rhs.kind == TagLit and rhs.exprKind == CallC:   # call-returned aggregate
       let cc = g.callConvOf(rhs)                         # the CALLEE's result convention
       let hidden = cc.intArgRegs[0]
@@ -1869,6 +2023,8 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       var d = dontCare
       g.emitCall(rhs, d, hiddenPtr = true)               # callee writes through rdi
       g.emCallerSaveClose(w, d)
+    elif rhs.kind == TagLit and rhs.exprKind == ArepconstrC:
+      g.genArepconstrInto(rhs, dst)                      # a fill loop; `X` calls nothing
     else:
       # `spilled`: the address survivor could not get a callee-saved register
       # (totality backstop), so no register holds `&dst` across the build —
@@ -1970,7 +2126,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     # premat staging pick (the dontCare marker) — no survivor, no exhaustion.
     var globScratch = NoReg
     var globHeld = dontCare
-    if (rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC}) and
+    if (rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC, ArepconstrC}) and
        g.lvalueGlobalBase(lhs):
       globHeld = g.takeHeld("a global address")
       globScratch = globHeld.r
@@ -1984,6 +2140,10 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       g.emitLvalue(lhs, globBaseLoc, isStore = true)
       g.genAconstrIntoLval(rhs, lhs)                      # build array element-by-element
+      g.freeLvalTemps(lhs)
+    elif rhs.kind == TagLit and rhs.exprKind == ArepconstrC:
+      g.emitLvalue(lhs, globBaseLoc, isStore = true)
+      g.genArepconstrIntoLval(rhs, lhs)                   # a fill loop through &lhs
       g.freeLvalTemps(lhs)
     else:
       # Evaluate the rhs BEFORE materializing the lhs base. A stack-homed `deref`/`at`

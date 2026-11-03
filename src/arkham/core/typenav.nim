@@ -115,7 +115,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
-       BitnotC, NegC, ConvC, CastC, OconstrC, AconstrC:
+       BitnotC, NegC, ConvC, CastC, OconstrC, AconstrC, ArepconstrC:
       var t = c
       t.into:
         result = t                            # the carried result/target type

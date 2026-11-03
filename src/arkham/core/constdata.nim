@@ -158,7 +158,7 @@ proc isStaticConstInit(c: Cursor): bool =
   if c.kind == StrLit: return true
   if isConstScalarInit(c): return true
   if constAddrSym(c) != NoSymId: return true
-  if c.kind == TagLit and c.exprKind in {AconstrC, OconstrC}:
+  if c.kind == TagLit and c.exprKind in {AconstrC, OconstrC, ArepconstrC}:
     result = true
     var vc = c
     vc.into:
@@ -227,13 +227,31 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     skip et                                  # past element type → length
     let n = if et.kind == IntLit: int(intVal(et)) else: 0
     let (esz, _) = typeSizeAlign(p, elemType)
-    var count = 0
-    var vc = val                             # (aconstr T elem*)
-    vc.into:
-      skip vc                                # the constructed type
-      while vc.hasMore: (constToBytes(p, elemType, vc, buf, relocs); skip vc; inc count)
-    for k in count ..< n:                    # zero-fill trailing elements
-      for i in 0 ..< esz: buf.add '\0'
+    if val.kind == TagLit and val.exprKind == ArepconstrC:
+      # `n` copies of ONE element: encode it once, then repeat its bytes (and
+      # its relocations, shifted by each copy's offset). The repetition is the
+      # image's, not the IR's — that is the whole point of the tag.
+      var x = sub(val)
+      skip x                                 # the constructed type
+      if isZeroConst(x):
+        for i in 0 ..< n * esz: buf.add '\0'
+      else:
+        let start = buf.len
+        let relocStart = relocs.len
+        constToBytes(p, elemType, x, buf, relocs)
+        let relocEnd = relocs.len
+        for k in 1 ..< n:
+          for i in start ..< start + esz: buf.add buf[i]
+          for r in relocStart ..< relocEnd:
+            relocs.add (relocs[r][0] + k * esz, relocs[r][1])
+    else:
+      var count = 0
+      var vc = val                           # (aconstr T elem*)
+      vc.into:
+        skip vc                              # the constructed type
+        while vc.hasMore: (constToBytes(p, elemType, vc, buf, relocs); skip vc; inc count)
+      for k in count ..< n:                  # zero-fill trailing elements
+        for i in 0 ..< esz: buf.add '\0'
   of ObjectT:
     # Match each `(oconstr … (kv field value) …)` value to a type field
     # *positionally* (hexer emits constructor fields in declaration order). This
@@ -339,6 +357,8 @@ proc genGlobalInitValue*(g: var CodeGen; name: SymId; typ, val: Cursor; hasValue
   ## module's init proc (`lengcgen`'s `trToplevel`), so it reaches arkham as an
   ## ordinary statement and never as a gvar value. Say so rather than guess.
   if not hasValue: return
+  if val.kind == TagLit and val.exprKind == ArepconstrC and isZeroConst(val):
+    return                                   # no value: the slot is zero-filled (`.bss`)
   if isConstScalarInit(val):
     g.ab.intLit cast[int64](constScalarBits(g.prog, typ, val))
   else:

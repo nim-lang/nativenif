@@ -415,7 +415,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         skip n                                       # depth
         g.emitLvalWalk(n, globBase, isStore, heldBase, asBase)
         while n.hasMore: skip n
-    of AconstrC, OconstrC:
+    of AconstrC, OconstrC, ArepconstrC:
       # A constructor base: `prematLval`'s consumer builds it into its aggtmp
       # via the (fused) genStore — nothing to decide here.
       skip n

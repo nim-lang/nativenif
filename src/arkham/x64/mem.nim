@@ -914,7 +914,7 @@ proc emLvalAddr*(g: var CodeGen; c: Cursor) =
         else:
           g.emLvalAddr(cc)                                # transparent (inherited fields flatten)
         while cc.hasMore: skip cc
-    of AconstrC, OconstrC:
+    of AconstrC, OconstrC, ArepconstrC:
       # A constructor base materialized into `aggtmp<pos>` by `prematLval`: address it as
       # an ordinary stack-var base.
       let pos = cursorToPosition(g.buf[], c)
@@ -1295,7 +1295,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         skip n                                       # depth
         g.emitLvalWalk(n, globBase, isStore, heldBase) # the inner lvalue
         while n.hasMore: skip n
-    of AconstrC, OconstrC:
+    of AconstrC, OconstrC, ArepconstrC:
       # A constructor used as an lvalue base (`[a,b][i]`): nothing to decide
       # here — `prematLval` builds it into its `aggtmp<pos>` slot via the
       # (fused) `genStore`, whose single-use temps are decided there.

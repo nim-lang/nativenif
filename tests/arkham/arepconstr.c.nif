@@ -1,0 +1,47 @@
+(.nif27)
+(stmts
+ (type :Arr5.0 .
+  (array (i 32) 5))
+ (type :Pt.0 .
+  (object .
+   (fld :px.0 . (i 32))
+   (fld :py.0 . (i 8))))
+ (type :PtArr3.0 .
+  (array Pt.0 3))
+ (type :Nest.0 .
+  (array Arr5.0 4))
+ (type :Holder.0 .
+  (object .
+   (fld :tag.0 . (i 32))
+   (fld :arr.0 . Arr5.0)))
+ (type :Bytes7.0 .
+  (array (u 8) 7))
+ (gvar :g.0 . Arr5.0 .)
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :a.0 . Arr5.0 (arepconstr Arr5.0 7))
+   (var :z.0 . Arr5.0 (aconstr Arr5.0 9 9 9 9 9))
+   (asgn z.0 (arepconstr Arr5.0 0))
+   (var :p.0 . PtArr3.0 (arepconstr PtArr3.0 (oconstr Pt.0 (kv px.0 3) (kv py.0 2))))
+   (var :n.0 . Nest.0 (arepconstr Nest.0 (arepconstr Arr5.0 1)))
+   (var :h.0 . Holder.0 (oconstr Holder.0 (kv tag.0 4) (kv arr.0 (arepconstr Arr5.0 2))))
+   (var :b.0 . Bytes7.0 (arepconstr Bytes7.0 3))
+   (asgn g.0 (arepconstr Arr5.0 5))
+   (call exit.0
+    (add (i 32)
+     (add (i 32)
+      (add (i 32) (at a.0 0) (at a.0 4))
+      (add (i 32) (add (i 32) (at z.0 0) (at z.0 4)) (dot (at p.0 2) px.0)))
+     (add (i 32)
+      (add (i 32) (conv (i 32) (dot (at p.0 2) py.0)) (at (at n.0 3) 4))
+      (add (i 32)
+       (add (i 32) (at (dot h.0 arr.0) 4) (dot h.0 tag.0))
+       (add (i 32) (at g.0 4) (conv (i 32) (at b.0 6))))))))))

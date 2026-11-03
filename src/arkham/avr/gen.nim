@@ -38,7 +38,8 @@ import std / assertions
 import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
-                    context, typeutil, regbind, diag, mirrors, analyser]
+                    context, typeutil, regbind, diag, mirrors, analyser,
+                    constdata]
 import machine
 import emit
 
@@ -427,7 +428,7 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       let slot = g.mintAggrSlot(g.aggrSize(c))
       g.emitCall(c, ValueBridge, wantResult = false, aggrDst = slot)
       Lval(kind: lvSlot, slot: slot)
-    of OconstrC, AconstrC:
+    of OconstrC, AconstrC, ArepconstrC:
       # A constructor used as a VALUE — a returned one, a call argument, or the
       # value of an enclosing constructor's field. It has no home of its own, so
       # it gets one: a minted slot, built in place, handed back as an lvalue like
@@ -906,6 +907,73 @@ proc destOfSym(g: var CodeGen; name: SymId; pos: int): Reg =
   let home = g.plan.locationOfSym(name, pos)
   if home.kind == InReg: home.r else: ValueBridge
 
+proc emitElemStores(g: var CodeGen; c: Cursor; slot: SymId) =
+  ## The elements of `(aconstr T v…)` into the array slot, one at a time. Also
+  ## element 0 of `(arepconstr T X)`, which reads exactly like `(aconstr T X)`.
+  var e = c
+  var i = 0
+  e.into:
+    skip e                                       # the type
+    while e.hasMore:
+      if g.exprSlot(e).cls == AMem:
+        let size = g.aggrSize(e)
+        let srcLv = g.emitLval(e, ValueBridge)
+        g.emLeaElem(StagingBridge, slot, i)
+        g.emitAggrCopy(Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 1),
+                       srcLv, size)
+      else:
+        let w = g.accessWidth(e)
+        g.emitValue(e, ValueBridge)
+        g.emStoreElem(slot, i, ValueBridge, w)
+      inc i
+      skip e
+
+proc emitArepFill(g: var CodeGen; c: Cursor; slot: SymId) =
+  ## `(arepconstr T X)` into the array slot as a RUNTIME byte loop, never one
+  ## store per element. An all-zero `X` stores `r1` — the zero register, see
+  ## `emCmpImm16` — over every byte. Any other `X` is built ONCE into element 0,
+  ## then each byte is copied one element further on, so the copy reads what it
+  ## wrote `elemSize` bytes earlier. Z walks the slot, the value bridge counts,
+  ## and the staging bridge carries the byte.
+  let total = g.aggrSize(c)
+  if total == 0: return
+  let done = g.freshLabel("arep")
+  if isZeroConst(c):
+    g.emLeaSlot(ProduceBridge, slot)
+    g.emLdi16(ValueBridge, total)
+    g.ab.tree LoopAvr:
+      g.ab.tree StmtsAvr:
+        g.ab.tree StbAvr:
+          g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit 0)
+          g.ab.regNamed "r1"
+        discard g.emAdiw(ProduceBridge, 1)
+        discard g.emBinImm16(boSub, ValueBridge, 1)
+        g.emBranch(acEq, done)
+    g.emLab(done)
+    return
+  var tc = c; inc tc                             # the array type
+  let (esz, _) = typeSizeAlign(g.prog, innerType(g.prog, resolveType(g.prog, tc)))
+  g.emitElemStores(c, slot)                      # element 0
+  if total == esz: return
+  if esz > 63:
+    # `std Z+q` reaches 63 bytes, and the copy addresses element `k+1` as an
+    # offset from element `k`.
+    refuse(c, "an `arepconstr` whose element is " & $esz & " bytes (at most 63)")
+  g.emLeaSlot(ProduceBridge, slot)
+  g.emLdi16(ValueBridge, total - esz)
+  g.ab.tree LoopAvr:
+    g.ab.tree StmtsAvr:
+      g.ab.tree LdbAvr:
+        g.emLo StagingBridge
+        g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit 0)
+      g.ab.tree StbAvr:
+        g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit esz)
+        g.emLo StagingBridge
+      discard g.emAdiw(ProduceBridge, 1)
+      discard g.emBinImm16(boSub, ValueBridge, 1)
+      g.emBranch(acEq, done)
+  g.emLab(done)
+
 proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
   ## `(oconstr T (kv f v)…)` / `(aconstr T v…)` into a frame slot, one field or
   ## element at a time.
@@ -941,23 +1009,9 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
           g.emStoreField(slot, fieldName, ValueBridge, w)
         skip f
   of AconstrC:
-    var e = c
-    var i = 0
-    e.into:
-      skip e                                     # the type
-      while e.hasMore:
-        if g.exprSlot(e).cls == AMem:
-          let size = g.aggrSize(e)
-          let srcLv = g.emitLval(e, ValueBridge)
-          g.emLeaElem(StagingBridge, slot, i)
-          g.emitAggrCopy(Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 1),
-                         srcLv, size)
-        else:
-          let w = g.accessWidth(e)
-          g.emitValue(e, ValueBridge)
-          g.emStoreElem(slot, i, ValueBridge, w)
-        inc i
-        skip e
+    g.emitElemStores(c, slot)
+  of ArepconstrC:
+    g.emitArepFill(c, slot)
   else:
     refuse(c, "this aggregate initializer")
 
@@ -1025,7 +1079,7 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
     lengError c, "AVR: the local `" & g.spelling(name) & "` was given no storage",
               lengInfo(c)
   if v.hasMore and v.kind != DotToken:
-    if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}) and
+    if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC, ArepconstrC}) and
        g.exprSlot(v).cls == AMem:
       if home.kind != NamedStack:
         lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
@@ -1037,7 +1091,7 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
       let srcLv = g.emitLval(v, StagingBridge)
       g.emitAggrCopy(Lval(kind: lvSlot, slot: home.name), srcLv, g.aggrSize(v))
       return
-    if v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}:
+    if v.kind == TagLit and v.exprKind in {OconstrC, AconstrC, ArepconstrC}:
       if home.kind != NamedStack:
         lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
       g.emitAggrInit(v, home.name)
