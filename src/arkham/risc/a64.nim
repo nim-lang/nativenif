@@ -184,12 +184,13 @@ proc rejectReservedPin*(g: var CodeGen; at: Cursor; name: string; r: Reg) =
 
 proc variadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
                      fixed: int): SymId =
-  ## The symbol a Darwin call to the `{.varargs.}` extern `asmName` goes through:
-  ## the extern's own name with the variadic tail's SHAPE folded in, registered in
+  ## The symbol a call to the `{.varargs.}` extern `asmName` goes through: the
+  ## extern's own name with the variadic tail's SHAPE folded in, registered in
   ## `g.variadicExterns` so the driver declares it. Two calls with the same shape
-  ## share one declaration; the slots are 8-byte words on Apple's stack (a double,
-  ## an integer or pointer, a ≤16B aggregate's words, a larger one's pointer), so
-  ## that is all the shape records.
+  ## share one declaration. On Darwin the slots are 8-byte words on Apple's stack
+  ## (a double, an integer or pointer, a ≤16B aggregate's words, a larger one's
+  ## pointer), so that is all the shape records; on Linux the same classes pick
+  ## the tail's registers (`emitSignature`).
   var key = ""
   for s in slots.toOpenArray(fixed, slots.len - 1):
     case s.kind

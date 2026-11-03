@@ -402,40 +402,48 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result = g.ab.render("." & g.prog.thisModuleSuffix)
 
 proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  linux = false): string =
+                  linux = false; crtEntry = false): string =
   ## Compile a parsed Leng module to AArch64 asm-NIF text — Darwin/Mach-O by
   ## default, or Linux/ELF when `linux` (svc-based syscalls, static, no dyld/TLV),
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
+  ## `crtEntry` (Linux only, `arkham --crt`): the program is linked with libc by
+  ## the system linker instead. crt's `_start` CALLS the entry as `main`, which
+  ## returns its status; every `importc` is libc's; and a thread-local is a real
+  ## one in libc's static TLS block (threads are pthreads), not a `.bss` global.
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
   setTargetWord Word64             # AArch64: 8-byte pointers, 8-byte platform int
   var g = newCodeGen(buf, aarch64MachineA, machine.regName)
+  let crt = linux and crtEntry
   g.a64Linux = linux
-  g.entryExits = linux
-  g.oneThread = linux
+  g.entryExits = linux and not crt
+  g.oneThread = linux and not crt
   g.ab.arch = "a64"                # BodyLib entries this target may splice
-  g.prog = collect(buf, inputPath, tags, darwin = not linux)
+  g.prog = collect(buf, inputPath, tags, darwin = not linux, crtEntry = crt)
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")
-    if not linux:
-      # Darwin: thread-local vars resolve their TLV descriptor thunk against
-      # libSystem (`__tlv_bootstrap`), so the dylib must be loaded even without
-      # extern calls. Each extern is a dynamic import. (On Linux all externs lower
-      # to `svc` syscalls — the static ELF needs no imports.)
-      if g.prog.needsLibSystem or g.tvars.len > 0:
-        g.ab.tree ImpD: g.ab.str DarwinLibSystem
-      # Each extern carries its FULL AAPCS64 signature, so a call to it goes
-      # through the declarative `(arg pN)`/`(res ret.0)` path like any other call
-      # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
-      # only; the variadic tail is Apple's stack-passed one, which the call site
-      # lays out itself (see `emitCallInner`).
-      for i in 0 ..< g.prog.externOrder.len:
-        let ex = g.prog.externOrder[i]
-        g.ab.tree ExtprocD:
-          g.ab.symDef ex.asmName
-          g.ab.str ex.extName
-          g.emitSignature(ex.decl)
+    # Darwin: thread-local vars resolve their TLV descriptor thunk against
+    # libSystem (`__tlv_bootstrap`), so the dylib must be loaded even without
+    # extern calls. Each extern is a dynamic import.
+    if not linux and (g.prog.needsLibSystem or g.tvars.len > 0):
+      g.ab.tree ImpD: g.ab.str DarwinLibSystem
+    # Each extern carries its FULL AAPCS64 signature, so a call to it goes
+    # through the declarative `(arg pN)`/`(res ret.0)` path like any other call
+    # and nifasm checks it. A `{.varargs.}` extern declares its fixed params
+    # only; on Darwin the variadic tail is Apple's stack-passed one, which the
+    # call site lays out itself (see `emitCallInner`).
+    # Linux: an `importc` the syscall table does not know is a symbol of libc or
+    # of a foreign object. It is declared like Darwin's, without an import
+    # library: the system linker binds it (`--crt`), and a static image rejects
+    # the call with a diagnostic (nifasm's `writeElf`) — undeclared, it was a raw
+    # "Unknown symbol" that named only the mangled asm name.
+    for i in 0 ..< g.prog.externOrder.len:
+      let ex = g.prog.externOrder[i]
+      g.ab.tree ExtprocD:
+        g.ab.symDef ex.asmName
+        g.ab.str ex.extName
+        g.emitSignature(ex.decl)
     for i in 0 ..< g.prog.mainTypeList.len:
       let (name, decl) = g.prog.mainTypeList[i]
       g.genType(name, decl)

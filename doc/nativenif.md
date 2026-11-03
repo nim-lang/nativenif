@@ -43,7 +43,7 @@ suffix, generic instances are deduplicated across modules, unreferenced symbols
 are never generated, and the finished image is written directly: a static,
 libc-free ELF on Linux, a Mach-O linked against libSystem on macOS, a PE with an
 import table on Windows. `--emit-obj` produces a relocatable object for the
-system linker instead (macOS arm64, Linux x86-64, Windows x86-64).
+system linker instead (macOS arm64, Linux x86-64 and arm64, Windows x86-64).
 
 On Linux x86-64 that is how a program links foreign objects (Nimony's
 `.compile`/`.link`) and libc: `nimony n -d:useLibc` runs `arkham --crt` and
@@ -58,6 +58,15 @@ entry as crt's `main` (called, so biased like any callee, and returning its
 status), declares each `importc` as a SysV `(extproc …)` and calls libc for it
 rather than lowering it to a syscall. A static executable refuses an extern call
 instead of leaving it unbound.
+
+Linux arm64 is the same pipeline (`arkham -a:linux_arm64 --crt`). A global's
+`adrp` is `R_AARCH64_ADR_PREL_PG_HI21` and its `add` or folded `ldr`/`str` the
+matching `_LO12_NC`, an extern's `bl` is `R_AARCH64_CALL26`, an absolute address
+`R_AARCH64_ABS64`. A thread-local is a real one there (the freestanding image
+makes it a `.bss` global, having one thread): `mrs tpidr_el0` plus an `add`
+pair carrying `R_AARCH64_TLSLE_ADD_TPREL_HI12`/`_LO12_NC`. A `{.varargs.}`
+extern is called through a declaration of its call's shape, as on Darwin, but
+its tail takes registers like any AAPCS64 argument.
 
 Windows x86-64 works the same way, with MinGW's gcc or clang as the system
 linker: `arkham -a:win_x64 --crt`, `nifasm --emit-obj` (a COFF object,

@@ -64,19 +64,29 @@ proc layoutCode*(a: var GenContext; extra: var seq[int]) =
     remapSites(a, shortenX64Jumps(a.buf, alignLabels), extra)
     remapSites(a, alignCodeX64(a.buf, alignLabels), extra)
 
+proc rejectExternCall(name: string) {.noreturn.} =
+  quit "nifasm: `" & name & "` is an external symbol, which a static " &
+       "executable cannot bind; link with the system linker (--emit-obj; " &
+       "`nimony n -d:useLibc` on Linux)"
+
 proc rejectExternCalls(a: GenContext) =
   ## A static executable has no loader to bind an extern: a call to one (an
   ## `(extproc …)` that is not a syscall) needs the system linker, i.e. a
-  ## relocatable object (`--emit-obj`). Left in, its `call [rip+slot]` would jump
-  ## through a slot nothing ever fills.
+  ## relocatable object (`--emit-obj`). Left in, its `call [rip+slot]` (x86-64)
+  ## would jump through a slot nothing ever fills, its `bl` (AArch64) to itself.
   for r in a.buf.relocs:
     if r.kind == rkIatCall:
       var name = "?"
       for ext in a.extProcs:
         if ext.gotSlot == int(r.target): name = ext.extName
-      quit "nifasm: `" & name & "` is an external symbol, which a static " &
-           "executable cannot bind; link with the system linker (--emit-obj; " &
-           "`nimony n -d:useLibc` on Linux)"
+      rejectExternCall(name)
+  for ext in a.extProcs:
+    if ext.callSites.len > 0: rejectExternCall(ext.extName)
+  # Linux/AArch64 thread-locals are only declared for a program linked with libc
+  # (whose thread pointer they are relative to); a static image has none.
+  if a.target.cpu == Cpu.Arm64 and a.tlvSites.len > 0:
+    quit "nifasm: a thread-local variable needs libc's TLS on linux_arm64 " &
+         "(--emit-obj; `nimony n -d:useLibc`)"
 
 proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
   rejectExternCalls(a)

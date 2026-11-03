@@ -226,7 +226,8 @@ type
                                   # `gvarSites` is — the value is a final-layout fact, and
                                   # the MOVW+MOVT pair it patches is a fixed 8 bytes
                                   # whatever the number turns out to be.
-    tlvSites*: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS)
+    tlvSites*: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS);
+                                   # Linux/arm64 objects: (position of the TPREL `add` pair, tvar symbol)
     tlvSyms*: seq[Symbol]          # thread-local vars in descriptor order (arm64/macOS); sym.offset = descriptor index, sym.size = byte offset within the per-thread region
     tlvData*: seq[byte]            # the __thread_data init template (concatenated per-thread initial values, arm64/macOS)
     tlsOffset*: int  # Current TLS offset for thread-local variables (x86)

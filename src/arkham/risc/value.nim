@@ -3194,10 +3194,13 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   # Darwin-only. The call goes through a declaration of its own SHAPE whose tail
   # is `(s)` parameters (`a64.variadicTarget`), so the tail is marshalled exactly
   # like any other stack argument — no count limit, floats and aggregates alike.
+  # Linux/AAPCS64 passes the tail like any other argument, but the call still
+  # goes through a shape declaration: the extern's own decl names its fixed
+  # params only, and nifasm checks every `(arg pN)` against the signature.
   let variadicFrom = if tgt.isVarargs and g.md.arch == Arm64 and not g.a64Linux: tgt.fixedParams
                      else: -1
-  if variadicFrom >= 0:
-    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, variadicFrom)
+  if variadicFrom >= 0 or (tgt.isVarargs and g.md.arch == Arm64 and tgt.extern):
+    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, tgt.fixedParams)
   let plan = planCall(g.md, callArgSlots, retByRef = false, variadicFrom)
   if doTail:
     for pa in plan.args:

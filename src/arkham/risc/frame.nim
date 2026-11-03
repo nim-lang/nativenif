@@ -722,8 +722,10 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
   ## always the convention's, derived here (never per-proc precomputed), which
   ## is reliable across modules.
   ##
-  ## `tail` is a Darwin variadic call shape's tail (see `VariadicExtern`): one `(s)`
-  ## word-slotted parameter per slot, after the declared ones.
+  ## `tail` is a variadic call shape's tail (see `VariadicExtern`), after the
+  ## declared params. On Darwin each slot is one `(s)` word-slotted parameter
+  ## (Apple's stack-passed tail); on Linux, AAPCS64 places the tail exactly like
+  ## any other argument, so each slot takes its register (or `(s)` past them).
   block:
     var c = decl
     c.into:
@@ -743,8 +745,9 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
           # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
           # argument file, so the plan is never shifted (retByRef=false).
           let fixedSlots = paramSlots(g.prog, c)
+          let appleTail = tail.len > 0 and not g.a64Linux
           let plan = planCall(g.md, withTail(fixedSlots, tail), retByRef = false,
-                              variadicFrom = (if tail.len > 0: fixedSlots.len else: -1))
+                              variadicFrom = (if appleTail: fixedSlots.len else: -1))
           var pIdx = 0
           c.into:
             while c.hasMore:
@@ -828,7 +831,15 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; tail: openArray[AsmSlot] = [])
             let pl = plan.args[fixedSlots.len + k]
             g.ab.tree ParamD:
               g.ab.symDef g.paramName(pl.ord)
-              g.ab.keyword SO
+              if pl.onStack:
+                g.ab.keyword SO
+              elif pl.isFloat:
+                g.ab.freg(g.md.floatArgRegs[pl.fpIndex], 64)
+              elif pl.isAgg and not pl.byRef:
+                g.ab.tree RegsD:
+                  for w in 0 ..< pl.words: g.ab.rawReg g.md.gprAt(pl, w)
+              else:
+                g.ab.rawReg g.md.gprAt(pl)
               if pl.isFloat: g.ab.floatType(64)
               elif pl.isAgg and not pl.byRef:
                 g.ab.arrayType: (g.ab.uintType(64); g.ab.intLit int64(pl.words))
