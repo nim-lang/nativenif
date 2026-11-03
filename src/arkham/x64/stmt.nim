@@ -97,7 +97,8 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
           let srcSym = copyCastSrcSym(cc)
           if srcSym.kind == Symbol:
             let sh = g.plan.locationOfSym(srcSym.symId, cursorToPosition(g.buf[], srcSym))
-            if sh.kind == InReg and sh.r == loc.r: skipInit = true
+            if sh.kind == InReg and sh.r == loc.r and sameRegRepr(sh.typ, loc.typ):
+              skipInit = true
         if not skipInit: g.genStore(cc, loc)   # the one general store path
         if callInit:
           # The result is in the register now; bind the name to it. `emRegLocalVar`

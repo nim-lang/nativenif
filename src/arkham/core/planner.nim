@@ -438,6 +438,13 @@ proc getSym(b: var Builder; name: SymId; slot: AsmSlot; props: VarProps): Locati
       # than miscompiling.
       f = takeFReg(b.freeVolF, b.md.floatTempRegs)
       if f != NoFReg: return fregLoc(f, slot)
+    if AllRegs in props and slot.size <= 8:
+      # The float twin of the `intLocalTempRegs` grant below: no call in this
+      # local's interval, so a volatile ARGUMENT register keeps it. These are
+      # outside the emitter's float scratch (`floatTempRegs`), so lending one out
+      # starves nothing — which is what rules the scratch pool out above.
+      f = takeFReg(b.freeVolF, b.md.floatLocalTempRegs)
+      if f != NoFReg: return fregLoc(f, slot)
     return b.spillTo(name, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spillTo(name, slot)
@@ -959,7 +966,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           let srcName = srcSym.symId
           let sh = b.homeOf(srcName)
           let svi = b.an.vars.getOrDefault(srcName)
-          if sh.kind == InReg and not sh.typ.isFloat and sh.typ.size == slot.size and
+          if sh.kind == InReg and not sh.typ.isFloat and sameRegRepr(sh.typ, slot) and
              svi.defs == 1 and svi.lastUsePos <= b.posOf(srcSym) and
              (sh.r in b.md.intCalleeSavedSet or AllRegs in props) and
              b.fixedRoleOk(sh.r, props):
@@ -1221,7 +1228,9 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 else:
                   loc = b.spillTo(name, effSlot)
               else:
-                loc = fregLoc(b.entryMd.floatArgRegs[pl.fpIndex], effSlot)
+                let f = b.entryMd.floatArgRegs[pl.fpIndex]
+                b.freeVolF.excl f              # persistently occupied: not a local home
+                loc = fregLoc(f, effSlot)
             else:
               loc = b.spillTo(name, effSlot)     # >8 float args: stack-passed (TODO)
           elif not effSlot.inRegClass:
@@ -1400,6 +1409,9 @@ proc seedPools(b: var Builder) =
     b.freeVol.incl b.md.intRetReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
+  # Drawn only through `getSym`'s `AllRegs` candidate list; a leaf float param
+  # that stays in its argument register is removed again in `allocParams`.
+  for f in b.md.floatLocalTempRegs: b.freeVolF.incl f
   for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f
 
 proc findReturnedVarImpl(n: var Cursor): SymId =

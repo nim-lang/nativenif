@@ -714,6 +714,10 @@ proc emitBr(dest: var Bytes; rn: Register) =
   let instr = 0xD61F0000'u32 or (encodeReg(rn) shl 5)
   dest.addUint32(instr)
 
+proc emitMrsTpidrEl0*(dest: var Bytes; rt: Register) =
+  ## `MRS rt, TPIDR_EL0` — the thread pointer (Linux local-exec TLS).
+  dest.addUint32(0xD53BD040'u32 or encodeReg(rt))
+
 proc emitBlr*(dest: var Bytes; rn: Register) =
   ## Emit BLR instruction: BLR rn (branch-with-link to address in register).
   ## Used for the macOS TLV thunk call (`blr x16`).
@@ -869,6 +873,9 @@ proc emitFdiv*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
 
 proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E614000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFsqrt*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E61C000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
 proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E602000'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))

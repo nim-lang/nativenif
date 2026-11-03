@@ -2219,7 +2219,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of AddsdX64, AddssX64, SubsdX64, SubssX64,
      MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
-     ComisdX64, ComissX64:
+     SqrtsdX64, SqrtssX64, ComisdX64, ComissX64:
     # Scalar SSE op on two XMM registers: `(op (xmmD) (xmmS))` → dest = dest op src
     # (or just sets EFLAGS for comisd/comiss).
     let it = instTag
@@ -2238,6 +2238,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
       of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
       of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
+      of SqrtsdX64:  x86.emitSqrtsd(ctx.buf.data, d, s)
+      of SqrtssX64:  x86.emitSqrtss(ctx.buf.data, d, s)
       of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
       of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
       else: discard
@@ -2257,6 +2259,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         of DivssX64:    (0xF3u8, 0x5Eu8)
         of Cvtsd2ssX64: (0xF2u8, 0x5Au8)
         of Cvtss2sdX64: (0xF3u8, 0x5Au8)
+        of SqrtsdX64:   (0xF2u8, 0x51u8)
+        of SqrtssX64:   (0xF3u8, 0x51u8)
         of ComisdX64:   (0x66u8, 0x2Fu8)
         else:           (0x00u8, 0x2Fu8)   # ComissX64
       x86.emitSseOpMem(ctx.buf.data, prefix, opcode, d, s.mem)

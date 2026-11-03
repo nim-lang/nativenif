@@ -252,7 +252,8 @@ proc allocTlsSlotX64*(ctx: var GenContext; sym: Symbol; decl: Cursor) =
   # arrangement the psABI's TCB uses, for the same reason. Reserving the slot
   # lazily (here, at the first thread-local) keeps a program with no
   # thread-locals carrying no block at all.
-  if ctx.tlsOffset == 0: ctx.tlsOffset = TlsSelfSlotBytes
+  # (AArch64 has `tpidr_el0` + an `add` pair, so it reserves nothing.)
+  if ctx.tlsOffset == 0 and ctx.target.cpu == Cpu.Amd64: ctx.tlsOffset = TlsSelfSlotBytes
   sym.offset = ctx.tlsOffset
   ctx.tlsOffset += stackslots.alignedSize(sym.typ)
   var dn = decl

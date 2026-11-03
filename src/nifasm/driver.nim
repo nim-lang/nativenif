@@ -684,8 +684,8 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       except:
         quit "nifasm: cannot write " & outfile
     of ImageFormat.Firmware:
-      quit "nifasm: --emit-obj is only supported for macOS arm64 and x86-64 " &
-           "Linux and Windows"
+      quit "nifasm: --emit-obj is only supported for macOS arm64, Linux " &
+           "x86-64 and arm64, and Windows x86-64"
   else:
     # A memory map describes a BOARD, and only the firmware target has one. Every
     # other arch is handed its address space by a loader, so honouring the flags

@@ -736,7 +736,19 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if dest.kind == okMem: error("ADR destination must be register", n)
-    if op.tlvSym != nil:
+    if op.tlvSym != nil and ctx.target.format == ImageFormat.Elf:
+      # Thread-local variable (Linux/arm64, linked with libc — `--emit-obj`): the
+      # local-exec model. The thread pointer is `tpidr_el0`; the variable sits at
+      # a link-time constant offset from it, split into the two 12-bit halves of
+      # an `add` pair (`R_AARCH64_TLSLE_ADD_TPREL_HI12` / `_LO12_NC`, recorded at
+      # the first `add`). Only `dest` is written.
+      #   mrs dest, tpidr_el0 ; add dest, dest, #hi, lsl 12 ; add dest, dest, #lo
+      arm64.emitMrsTpidrEl0(ctx.buf.data, dest.reg)
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAddImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)
+      arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
+      ctx.tlvSites.add (pos, op.tlvSym)
+    elif op.tlvSym != nil:
       # Thread-local variable (macOS/arm64): obtain its address through the TLV
       # descriptor thunk. The descriptor lives in __DATA/__thread_vars; its first
       # word is a function pointer that, called with the descriptor address in
@@ -1520,6 +1532,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let single = isA64FpSingle(n, ctx)
     let rd = parseFloatOperandA64(n, ctx)
     arm64.emitFneg(ctx.buf.data, rd, rd, single)
+
+  of FsqrtA64:
+    inc n
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rs = parseFloatOperandA64(n, ctx)
+    arm64.emitFsqrt(ctx.buf.data, rd, rs, single)
 
   of FcmpA64:
     inc n

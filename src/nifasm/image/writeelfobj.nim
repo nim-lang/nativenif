@@ -5,7 +5,7 @@
 #    See the file "license.txt", included in this distribution.
 #
 
-## The ELF64 relocatable-object writer (`--emit-obj`, x86-64 Linux).
+## The ELF64 relocatable-object writer (`--emit-obj`, x86-64 and AArch64 Linux).
 ##
 ## A program that links a foreign object (`{.compile.}`, `{.link.}`) is finished
 ## by the SYSTEM linker, so nifasm hands it an object instead of an executable.
@@ -31,6 +31,23 @@
 ## program's thread-locals are one `.tdata` section, i.e. one module of the
 ## executable's static TLS block, reached through `R_X86_64_TPOFF32`.
 ##
+## AArch64 tracks the same things and maps them to its own relocations:
+##
+## ==========================================  =================================
+## what nifasm tracks                          relocation
+## ==========================================  =================================
+## a global's `adrp` + `add`/folded `ldr`/`str`  `R_AARCH64_ADR_PREL_PG_HI21` +
+## (`gvarSites`)                               `_ADD_ABS_LO12_NC` / `_LDSTn_ABS_LO12_NC`
+## an extern's `bl` (`ExtProcInfo.callSites`)   `R_AARCH64_CALL26` against the
+##                                             undefined symbol
+## a thread-local's `add` pair after           `R_AARCH64_TLSLE_ADD_TPREL_HI12` +
+## `mrs tpidr_el0` (`tlvSites`)                `_LO12_NC` against `.tdata`
+## an absolute symbol address                  `R_AARCH64_ABS64`
+## ==========================================  =================================
+##
+## crt's `_start` passes argc/argv/envp in x0/x1/x2, which is again `main.0`'s
+## own signature.
+##
 ## A rodata blob lives in `.text`, so its absolute address fields are text
 ## relocations: the object must be linked into a non-PIE executable.
 
@@ -51,6 +68,17 @@ const
   SecNoteStack = 8
   SecShstrtab = 9
 
+  R_AARCH64_ABS64 = 257'u32
+  R_AARCH64_ADR_PREL_PG_HI21 = 275'u32
+  R_AARCH64_ADD_ABS_LO12_NC = 277'u32
+  R_AARCH64_LDST8_ABS_LO12_NC = 278'u32
+  R_AARCH64_CALL26 = 283'u32
+  R_AARCH64_LDST16_ABS_LO12_NC = 284'u32
+  R_AARCH64_LDST32_ABS_LO12_NC = 285'u32
+  R_AARCH64_LDST64_ABS_LO12_NC = 286'u32
+  R_AARCH64_TLSLE_ADD_TPREL_HI12 = 549'u32
+  R_AARCH64_TLSLE_ADD_TPREL_LO12_NC = 551'u32
+
   SymText = 1       # the local symbols every object has, in `.symtab` order
   SymData = 2
   SymTls = 3
@@ -63,6 +91,7 @@ type
     relaData: seq[Elf64_Rela]
     labelPos: Table[int, int]
     undef: Table[string, int]    # external name -> symbol index
+    abs64: uint32                # the target's 64-bit absolute relocation
 
 proc addName(w: var ObjWriter; name: string): Elf64_Word =
   result = Elf64_Word(w.strtab.len)
@@ -105,7 +134,7 @@ proc absReloc(w: var ObjWriter; a: GenContext; dest: var seq[Elf64_Rela];
     quit "nifasm: --emit-obj: a " & $size & "-byte symbol address is not supported"
   var found = false
   let (s, addend) = w.target(a, sym, found)
-  if found: dest.add rela(offset, s, R_X86_64_64, addend)
+  if found: dest.add rela(offset, s, w.abs64, addend)
 
 proc undefSym(w: var ObjWriter; extName: string): int =
   result = w.undef.getOrDefault(extName, -1)
@@ -124,19 +153,40 @@ proc addSeq[T](dest: var seq[byte]; xs: seq[T]) =
 proc alignTo(dest: var seq[byte]; alignment: int) =
   while dest.len mod alignment != 0: dest.add 0'u8
 
+proc readWord(code: Bytes; pos: int): uint32 =
+  uint32(code[pos]) or (uint32(code[pos+1]) shl 8) or
+    (uint32(code[pos+2]) shl 16) or (uint32(code[pos+3]) shl 24)
+
 proc writeElfObject*(a: var GenContext; outfile: string) {.canRaise.} =
-  if a.target.cpu != Cpu.Amd64 or a.target.format != ImageFormat.Elf:
-    quit "nifasm: --emit-obj writes an ELF object for x86-64 only"
+  let a64 = a.target.cpu == Cpu.Arm64
+  if a.target.cpu notin {Cpu.Amd64, Cpu.Arm64} or a.target.format != ImageFormat.Elf:
+    quit "nifasm: --emit-obj writes an ELF object for x86-64 and AArch64 only"
   # The thread-local sites were recorded by the encoder; the layout passes move
-  # code, so take them out first and carry them through the same maps.
+  # code, so take them out first and carry them through the same maps. AArch64
+  # adds the sites nothing else remaps: an extern's `bl` and a thread-local's
+  # `add` pair. They ride in the same `extra` list, in a known order.
   var tlsSites = a.buf.data.tlsSites
+  let nX64Tls = tlsSites.len
+  for ext in a.extProcs:
+    for cs in ext.callSites: tlsSites.add cs
+  for (pos, _) in a.tlvSites: tlsSites.add pos
   layoutCode(a, tlsSites)
+  block:
+    var k = nX64Tls
+    for e in 0 ..< a.extProcs.len:
+      for i in 0 ..< a.extProcs[e].callSites.len:
+        a.extProcs[e].callSites[i] = tlsSites[k]
+        inc k
+    for i in 0 ..< a.tlvSites.len:
+      a.tlvSites[i] = (tlsSites[k], a.tlvSites[i][1])
+      inc k
+    tlsSites.setLen nX64Tls
   fillTraceTable(a)
   finalize(a.buf)
   finalize(a.bssBuf)
   var code = a.buf.data
 
-  var w = ObjWriter()
+  var w = ObjWriter(abs64: (if a64: R_AARCH64_ABS64 else: R_X86_64_64))
   for ld in a.buf.labels: w.labelPos[int(ld.id)] = ld.position
   w.strtab.add 0'u8
   w.syms.add Elf64_Sym()                                           # index 0: null
@@ -156,10 +206,38 @@ proc writeElfObject*(a: var GenContext; outfile: string) {.canRaise.} =
                      uint64(w.labelPos.getOrDefault(a.entrySym.offset)), 0)
 
   # ── .text relocations ──────────────────────────────────────────────────────
+  if a64:
+    # A global's `adrp` + its low-12 consumer at +4: an address-taking `add`, or a
+    # folded unsigned-offset `ldr`/`str` (bits[29:24] == 0x39) whose imm12 is
+    # scaled by the access size in bits[31:30] — the same test `writeElf` makes.
+    for (pos, sym) in a.gvarSites:
+      w.relaText.add rela(pos, SymData, R_AARCH64_ADR_PREL_PG_HI21, int64(sym.size))
+      let lo = readWord(code, pos + 4)
+      let lowKind =
+        if ((lo shr 24) and 0x3F'u32) == 0x39'u32:
+          case (lo shr 30) and 0x3'u32
+          of 0: R_AARCH64_LDST8_ABS_LO12_NC
+          of 1: R_AARCH64_LDST16_ABS_LO12_NC
+          of 2: R_AARCH64_LDST32_ABS_LO12_NC
+          else: R_AARCH64_LDST64_ABS_LO12_NC
+        else: R_AARCH64_ADD_ABS_LO12_NC
+      w.relaText.add rela(pos + 4, SymData, lowKind, int64(sym.size))
+    # An extern's `bl` placeholder: the linker supplies the target, or a PLT stub.
+    for ext in a.extProcs:
+      if ext.callSites.len > 0:
+        let s = w.undefSym(ext.extName)
+        for cs in ext.callSites:
+          w.relaText.add rela(cs, s, R_AARCH64_CALL26, 0)
+    # A thread-local's offset from the thread pointer (`sym.offset` in nifasm's
+    # block is its offset in `.tdata`), split over the `add` pair.
+    for (pos, sym) in a.tlvSites:
+      w.relaText.add rela(pos, SymTls, R_AARCH64_TLSLE_ADD_TPREL_HI12, int64(sym.offset))
+      w.relaText.add rela(pos + 4, SymTls, R_AARCH64_TLSLE_ADD_TPREL_LO12_NC, int64(sym.offset))
   # A global's RIP-relative access: disp32 at +3, RIP at +7 (`emitLeaRipPlaceholder`
   # and `emitMovRipPlaceholder` are laid out alike), so A = offset - 4.
-  for (pos, sym) in a.gvarSites:
-    w.relaText.add rela(pos + 3, SymData, R_X86_64_PC32, int64(sym.size) - 4)
+  if not a64:
+    for (pos, sym) in a.gvarSites:
+      w.relaText.add rela(pos + 3, SymData, R_X86_64_PC32, int64(sym.size) - 4)
   # An extern's `call [rip+disp32]` (FF 15): the linker supplies the GOT slot, or
   # relaxes the call to a direct one.
   var extBySlot = initTable[int, string]()
@@ -205,7 +283,7 @@ proc writeElfObject*(a: var GenContext; outfile: string) {.canRaise.} =
         tdataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
 
   # ── the file: header, section contents, then the section header table ───────
-  var ehdr = initHeader(0, EM_X86_64)
+  var ehdr = initHeader(0, (if a64: EM_AARCH64 else: EM_X86_64))
   ehdr.e_type = ET_REL
   ehdr.e_phoff = 0
   ehdr.e_phnum = 0

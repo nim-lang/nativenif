@@ -1312,19 +1312,23 @@ proc aggrAddrLoc*(g: var CodeGen; loc: Location; dest: Reg) =
   of Mem: g.aggrAddrInto(loc.cur, dest, addrSlot(), doBind = false)
   else: raiseAssert "arkham a64n: aggrAddrLoc of " & $loc.kind
 
-proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
+proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int;
+                       srcSlot = NoSymId) =
   ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
   ## (`aggrAddrLoc`/`aggrAddrInto`), then `copyAggr`. The allocator reserved
   ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
   ## taken here — both addresses are already in `a[0]`/`a[1]`, so a bridge is free — sparing
   ## a pool GPR so the copy fits under high register pressure.
+  ## `srcSlot`: copy out of that named stack slot instead of `rhs` (the
+  ## `aggtmp` a self-reading constructor was built in; `rhs` is then only the
+  ## constructor, for its type).
   g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   # Emit-time picks: pool temp, else callee-saved survivor, else a staging
   # bridge — the copy crosses no call, so even a bridge-backed address is safe
   # and the acquisition is total. (When both bridges serve as addresses, the
   # transfer register falls back to the produce bridge x16 below.)
   let srcPair =
-    if rhs.kind == Symbol: g.plan.homeOfSym(rhs.symId) else: noLoc
+    if rhs.kind == Symbol and srcSlot == NoSymId: g.plan.homeOfSym(rhs.symId) else: noLoc
   if dst.kind == InRegPair or srcPair.kind == InRegPair:
     var tn = NoTypeSym
     if rhs.kind == Symbol: tn = g.varType.getOrDefault(rhs.symId, NoTypeSym)
@@ -1341,7 +1345,9 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
         if d != s: g.movReg(d, s)
     elif dst.kind == InRegPair:
       let addrR = g.takeBridge()
-      if rhs.kind == Symbol:
+      if srcSlot != NoSymId:
+        g.ab.tree LeaA64: (g.emReg addrR; g.ab.sym srcSlot)
+      elif rhs.kind == Symbol:
         g.aggrAddrInto(rhs, addrR, addrSlot(), doBind = true)
       else:
         g.emitLvalue(rhs)
@@ -1404,10 +1410,13 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     else:
       b1 = g.takeBridge(avoid = b0); a1 = b1
   g.bindTemp(a1, ScalarSlot)
-  if rhs.kind == TagLit:
-    g.emitLvalue(rhs)                      # pick the src lvalue's embedded values
-  g.aggrAddrInto(rhs, a1, addrSlot(), doBind = false)  # &rhs
-  if rhs.kind == TagLit: g.freeLvalTemps(rhs)
+  if srcSlot != NoSymId:
+    g.ab.tree LeaA64: (g.emReg a1; g.ab.sym srcSlot)    # &aggtmp
+  else:
+    if rhs.kind == TagLit:
+      g.emitLvalue(rhs)                    # pick the src lvalue's embedded values
+    g.aggrAddrInto(rhs, a1, addrSlot(), doBind = false)  # &rhs
+    if rhs.kind == TagLit: g.freeLvalTemps(rhs)
   var tmp: Reg
   if b0 != NoReg and b1 != NoReg:
     tmp = g.takeProduceBridge(addrSlot())   # both staging bridges gone: r8/x16 serves
@@ -1442,6 +1451,18 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                         # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize)
+    return
+  if dstAggr and rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC} and
+     constrReadsDst(rhs, dst):
+    # A constructor that reads its own destination (`v = V(x: p, y: v.x / p)`):
+    # see the x64 twin. Build into an `aggtmp` slot, then copy it whole.
+    let pos = g.posOf(rhs)
+    let home = g.lengSym(synth("aggtmp") & $pos & ".0")
+    g.emTypedStackVar(home, g.getType(rhs))
+    let t = g.getType(rhs)
+    if t.kind == Symbol: g.varType[home] = t.symId
+    g.genStore(rhs, namedStackLoc(home, g.exprSlot(rhs)))
+    g.genAggrCopyStore(rhs, dst, aggrSize, srcSlot = home)
     return
   if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
      g.exprSlot(rhs).kind == AMem:
@@ -1980,6 +2001,15 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
   checkArithResultType(g.prog, resTypeC, lengInfo(c))
+  if lhsC.kind == Symbol and rhsC.kind == Symbol and lhsC.symId == rhsC.symId and
+     ek in {SubC, BitandC, BitorC}:
+    # `x - x`, `x and x`, `x or x` on one variable: the algebraic result, not the
+    # instruction. `sub r, r` would be a correct `0`, but it is exactly the shape
+    # nifasm rejects as a register collision (a dropped source operand), which is
+    # the check worth keeping. (Integer only: `emitBin` never sees floats.)
+    if ek == SubC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
+    else: g.emitValue(lhsC, dest)
+    return
   if ek == DivC:
     let k = g.pow2Log(rhsC)
     if k > 0:
@@ -2227,6 +2257,24 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind != InFReg: dest = g.takeFTmp(fslot)
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem(c, dest); return
+  if not dest.isTemp and dest.kind == InFReg:
+    # The x64 twin's alias guard: the consumer handed us a local's own home
+    # and the rhs still reads that local (`z = 1.0 - (r - z)`). Compute into
+    # a temp, then move the result home.
+    let lhsIsHome = lHome.kind == InFReg and lHome.f == dest.f
+    if not lhsIsHome and g.exprReadsFReg(rhsC, dest.f):
+      let home = dest
+      let bits = if fslot.size == 4: 32 else: 64
+      var t = g.takeFTmp(fslot)
+      if t.kind == NamedStack:
+        g.produceIntoFMem(c, t)
+        g.emFloatScalarLoad(home.f, t.name, bits)
+      else:
+        g.emitFBin(c, t)
+        g.fmovF(home.f, t.f, bits)
+        g.freeVal(t)
+      dest = home
+      return
   let res = dest
   # The width is the operation's, from its result type, not the temp's the
   # consumer passed (see the x64 twin: a generic 8-byte temp made a float32
@@ -2684,12 +2732,18 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoFMem(c, dest); return
     let res = dest
-    let dstBits = if res.typ.size == 4: 32 else: 64
+    # Both widths come from the TYPES, never from a register slot (the x64
+    # twin's lesson): `dest` and a don't-care operand location are generic
+    # 8-byte floats, so `float64(16777217.0'f32)` materialized the literal as an
+    # f64 and then "converted" it from 32 bits.
+    var tgc = targetCur
+    let dstBits = if slotOf(g.prog, tgc).size == 4: 32 else: 64
     if g.isFloatExpr(inner):
+      let srcBits = g.floatBits(inner)
       var fv = dontCare
+      fv.typ = AsmSlot(cls: AFloat, size: srcBits div 8, align: srcBits div 8)
       g.emitFValue(inner, fv)
       if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, dstBits)
-      let srcBits = g.floatBits(inner)
       if srcBits == dstBits:
         g.ensureFAccum(res.f, fv, dstBits)
       else:
@@ -2726,10 +2780,13 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem(c, dest); return
     let res = dest
+    # The OPERAND's float width (see the x64 twin): a don't-care location is a
+    # generic 8-byte float, so its slot cannot tell an f32 from an f64.
+    let fbits = g.floatBits(inner)
     var fv = dontCare
+    fv.typ = AsmSlot(cls: AFloat, size: fbits div 8, align: fbits div 8)
     g.emitFValue(inner, fv)
     assert fv.kind == InFReg, "arkham a64n: float→int operand " & $fv.kind
-    let fbits = if fv.typ.size == 4: 32 else: 64
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
     if isCast:
       g.fmovToGpr(res.r, fv.f, fbits)
@@ -2744,6 +2801,27 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # ── int↔int / pointer reinterpret. Narrowing over a frozen symbol home
   # forces a fresh temp (copy-then-narrow, source intact).
   block:
+    if inner.kind == TagLit and inner.exprKind in {CastC, ConvC} and
+       dest.kind in {Undef, NeedsReg, RegOrImm}:
+      # A cast CHAIN over a register-homed local: see the x64 twin. The inner
+      # relabel threads the local's home up, and the extend would rewrite it.
+      var root = inner
+      while root.kind == TagLit and root.exprKind in {CastC, ConvC}:
+        inc root; skip root                              # past tag + target type
+      if root.kind == Symbol and
+         g.plan.locationOfSym(root.symId, cursorToPosition(g.buf[], root)).kind == InReg:
+        g.forceRegDest(dest)
+    if inner.kind == Symbol and dest.kind in {Undef, NeedsReg, RegOrImm}:
+      # The same hazard one level down: `cast[int32](u)` over a register-homed
+      # `u: uint32` keeps the width but changes the EXTENSION, and the tail
+      # re-extends whatever register the value is in — `u`'s own. Only a pure
+      # relabel (same register representation) may use the home in place.
+      let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
+      var tgc2 = targetCur
+      let tslot = slotOf(g.prog, tgc2)
+      if sh.kind == InReg and tslot.kind in {ABool, AInt, AUInt} and
+         sh.typ.kind in {ABool, AInt, AUInt} and not sameRegRepr(sh.typ, tslot):
+        g.forceRegDest(dest)
     if inner.kind == Symbol:
       let sh = g.plan.locationOfSym(inner.symId, cursorToPosition(g.buf[], inner))
       var tgc = targetCur
@@ -2786,6 +2864,21 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
   # local receiving an `(i 64)` value is a narrowing move nifasm rejects — rightly:
   # the narrowing is the `lsl`/`lsr` pair that follows, not the move. Zero machine
   # code; only the declared type moves. Mirrors the x86-64 twin.
+  if dest.kind == InReg and not dest.isTemp and g.exprReadsReg(inner, dest.r):
+    # The pre-retype below renames the destination to the INNER's type while the
+    # inner emits — wrong when the inner READS the destination at its own type
+    # (`a = uint64(ord(p * a <= x))` multiplied by a `bool`-typed `a`). Convert
+    # into a temp, then move it home.
+    let home = dest
+    var t = needsReg(home.typ)
+    g.emitCast(c, t)
+    if t.kind == InReg:
+      g.movReg(home.r, t.r)
+      g.freeVal(t)
+    else:
+      g.place(t, home.r)
+    dest = home
+    return
   var preRetyped = NoSymId
   if dest.kind == InReg and not dest.isTemp:
     let nm = g.rb.boundName(dest.r)
@@ -3101,10 +3194,13 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   # Darwin-only. The call goes through a declaration of its own SHAPE whose tail
   # is `(s)` parameters (`a64.variadicTarget`), so the tail is marshalled exactly
   # like any other stack argument — no count limit, floats and aggregates alike.
+  # Linux/AAPCS64 passes the tail like any other argument, but the call still
+  # goes through a shape declaration: the extern's own decl names its fixed
+  # params only, and nifasm checks every `(arg pN)` against the signature.
   let variadicFrom = if tgt.isVarargs and g.md.arch == Arm64 and not g.a64Linux: tgt.fixedParams
                      else: -1
-  if variadicFrom >= 0:
-    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, variadicFrom)
+  if variadicFrom >= 0 or (tgt.isVarargs and g.md.arch == Arm64 and tgt.extern):
+    tgt.asmName = a64.variadicTarget(g, tgt.asmName, callArgSlots, tgt.fixedParams)
   let plan = planCall(g.md, callArgSlots, retByRef = false, variadicFrom)
   if doTail:
     for pa in plan.args:
@@ -3724,6 +3820,23 @@ when declared(FldrqOp):
     else:
       raiseAssert "arkham a64n: not a vector op: " & IntrinsicNames[op]
 
+proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
+  ## A float-valued `(instr SYM x)`: an FP-to-FP row (`fsqrt d, d`). No call
+  ## point, no fixed register, no flags — the twin of the `NegC` arm.
+  var arg = c
+  inc arg                                        # past the tag
+  skip arg                                       # past the callee
+  if dest.kind != InFReg:
+    dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: g.exprSlot(c))
+    if dest.kind == NamedStack:
+      g.produceIntoFMem(c, dest); return
+  let bits = if dest.typ.size == 4: 32 else: 64
+  var iv = dest                                    # dest-thread into the operand
+  g.emitFValue(arg, iv)
+  if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
+  g.ensureFAccum(dest.f, iv, bits)
+  g.ab.tree FsqrtA64: (g.emFReg(dest.f, bits); g.emFReg(dest.f, bits))
+
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
   ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
@@ -3753,6 +3866,9 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
               "guard the call with a `when`"
   if tgt.op.isMemOp:
     g.emitMemInstr(c, tgt.op, dest)
+    return
+  if tgt.op == SqrtOp:
+    g.emitFloatInstr(c, dest)
     return
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps and SimdVector notin g.md.caps:
