@@ -47,7 +47,7 @@ Options:
                            Forwarded into the asm-NIF so nifasm places segments
                            from the same description rather than reading the file
                            a second time
-  --crt                    linux/amd64, windows/amd64: the program is linked with
+  --crt                    linux/amd64, linux/arm64, windows/amd64: the program is linked with
                            the C runtime by the system linker (see nifasm
                            --emit-obj): the entry proc is CALLED as `main`, and an
                            `importc` binds to libc (Windows: an `importc` without
@@ -143,7 +143,7 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
              of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
-             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
+             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true, crtEntry = crt)
              of "cortex_m", "cortexm", "thumbm":
                generateCortexM(buf, input, tags, board)
              of "avr": generateAvr(buf, input, tags)
