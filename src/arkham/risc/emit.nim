@@ -1372,6 +1372,22 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
               " in proc " & g.curProcName & " (nothing to spill), picked: " &
               $g.pickedRegs
 
+proc takeFillReg*(g: var CodeGen; what: string): Reg =
+  ## A register an all-zero fill (`genZeroFill`) or an in-place aggregate build
+  ## holds for its whole run, bound as a scratch. Nothing inside such a build
+  ## calls, so a volatile temp serves as well as a survivor; `pickTempReg` falls
+  ## back to a free callee-saved one, and `takeHeld`'s second chance (judged by
+  ## LIVE bindings) is the last resort. Never a bridge: the build under it may
+  ## need them all.
+  result = g.pickTempReg()
+  if result == NoReg: result = g.takeHeld(what).r
+  g.pickedRegs.incl result
+  g.bindTemp(result, ScalarSlot)
+
+proc dropFillReg*(g: var CodeGen; r: Reg) =
+  g.pickedRegs.excl r
+  g.unbindTemp(r)
+
 proc tryTakeHeld*(g: var CodeGen): Location =
   ## `takeHeld` for a caller that HAS another answer when no survivor is free:
   ## reports exhaustion as an `Undef` Location instead of asserting. Reserves the

@@ -906,6 +906,25 @@ proc destOfSym(g: var CodeGen; name: SymId; pos: int): Reg =
   let home = g.plan.locationOfSym(name, pos)
   if home.kind == InReg: home.r else: ValueBridge
 
+proc emitZeroFill(g: var CodeGen; slot: SymId; total: int) =
+  ## The empty `(aconstr T)` — the all-zero array — into the array slot as a
+  ## RUNTIME byte loop, never one store per element: `r1` (the zero register,
+  ## see `emCmpImm16`) over every byte. Z walks the slot and the value bridge
+  ## counts.
+  if total == 0: return
+  let done = g.freshLabel("zfill")
+  g.emLeaSlot(ProduceBridge, slot)
+  g.emLdi16(ValueBridge, total)
+  g.ab.tree LoopAvr:
+    g.ab.tree StmtsAvr:
+      g.ab.tree StbAvr:
+        g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit 0)
+        g.ab.regNamed "r1"
+      discard g.emAdiw(ProduceBridge, 1)
+      discard g.emBinImm16(boSub, ValueBridge, 1)
+      g.emBranch(acEq, done)
+  g.emLab(done)
+
 proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
   ## `(oconstr T (kv f v)…)` / `(aconstr T v…)` into a frame slot, one field or
   ## element at a time.
@@ -941,6 +960,9 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
           g.emStoreField(slot, fieldName, ValueBridge, w)
         skip f
   of AconstrC:
+    if isEmptyAconstr(c):
+      g.emitZeroFill(slot, g.aggrSize(c))
+      return
     var e = c
     var i = 0
     e.into:
