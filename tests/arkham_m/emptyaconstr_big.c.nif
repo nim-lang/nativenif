@@ -1,0 +1,64 @@
+(.nif27)
+(stmts
+ (type :Big.0 .
+  (array (i 32) 3000))
+ (type :BigHolder.0 .
+  (object .
+   (fld :tag.0 . (i 32))
+   (fld :big.0 . Big.0)
+   (fld :tail.0 . (i 32))))
+ (gvar :gb.0 . Big.0 .)
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas (importc "exit"))
+  (stmts .))
+ (proc :fill.0
+  (params
+   (param :x.0 . (ptr Big.0))
+   (param :v.0 . (i 32))) .
+  (pragmas)
+  (stmts
+   (var :i.0 . (i 32) 0)
+   (while (lt i.0 3000)
+    (stmts
+     (asgn (at (deref x.0) i.0) v.0)
+     (asgn i.0 (add (i 32) i.0 1))))))
+ (proc :nonzero.0
+  (params
+   (param :x.0 . (ptr Big.0)))
+  (i 32)
+  (pragmas)
+  (stmts
+   (var :i.0 . (i 32) 0)
+   (var :n.0 . (i 32) 0)
+   (while (lt i.0 3000)
+    (stmts
+     (if (elif (neq (at (deref x.0) i.0) 0)
+      (stmts (asgn n.0 (add (i 32) n.0 1)))))
+     (asgn i.0 (add (i 32) i.0 1))))
+   (ret n.0)))
+ (proc :check.0
+  (params)
+  (i 32)
+  (pragmas)
+  (stmts
+   (var :b.0 . Big.0 .)
+   (call fill.0 (addr b.0) 7)
+   (asgn b.0 (aconstr Big.0))
+   (var :r.0 . (i 32) (call nonzero.0 (addr b.0)))
+   (var :h.0 . BigHolder.0 .)
+   (call fill.0 (addr (dot h.0 big.0)) 9)
+   (asgn h.0 (oconstr BigHolder.0 (kv tag.0 3) (kv big.0 (aconstr Big.0)) (kv tail.0 4)))
+   (var :r2.0 . (i 32) (call nonzero.0 (addr (dot h.0 big.0))))
+   (ret (add (i 32) (add (i 32) r.0 r2.0) (add (i 32) (dot h.0 tag.0) (dot h.0 tail.0))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (call fill.0 (addr gb.0) 5)
+   (asgn gb.0 (aconstr Big.0))
+   (var :g.0 . (i 32) (call nonzero.0 (addr gb.0)))
+   (var :c.0 . (i 32) (call check.0))
+   (call exit.0 (add (i 32) g.0 c.0)))))

@@ -1,0 +1,35 @@
+(.nif27)
+(stmts
+ (type :Arr5.0 .
+  (array (i 32) 5))
+ (type :Big.0 .
+  (array (i 32) 3000))
+ (type :Holder.0 .
+  (object .
+   (fld :tag.0 . (i 32))
+   (fld :arr.0 . Arr5.0)))
+ (type :BigHolder.0 .
+  (object .
+   (fld :tag.0 . (i 32))
+   (fld :big.0 . Big.0)))
+ (const :c.0 . Arr5.0 (aconstr Arr5.0))
+ (gvar :g3.0 . Arr5.0 (aconstr Arr5.0))
+ (gvar :gb.0 . Big.0 (aconstr Big.0))
+ (gvar :gbh.0 . BigHolder.0 (oconstr BigHolder.0 (kv tag.0 0) (kv big.0 (aconstr Big.0))))
+ (gvar :gh.0 . Holder.0 (oconstr Holder.0 (kv tag.0 5) (kv arr.0 (aconstr Arr5.0))))
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (call exit.0
+    (add (i 32)
+     (add (i 32) (add (i 32) (at c.0 4) (at g3.0 3)) (conv (i 32) (at gb.0 2999)))
+     (add (i 32)
+      (add (i 32) (conv (i 32) (dot gbh.0 tag.0)) (conv (i 32) (at (dot gbh.0 big.0) 1234)))
+      (add (i 32) (dot gh.0 tag.0) (at (dot gh.0 arr.0) 4))))))))

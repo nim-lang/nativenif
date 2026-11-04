@@ -1,0 +1,39 @@
+(.nif27)
+(stmts
+ (type :Arr5.0 .
+  (array (i 16) 5))
+ (type :Bytes7.0 .
+  (array (u 8) 7))
+ (type :Holder.0 .
+  (object .
+   (fld :tag.0 . (i 16))
+   (fld :arr.0 . Arr5.0)))
+ (proc :dirty.0
+  (params)
+  (i 16)
+  (pragmas)
+  (stmts
+   (var :d.0 . Arr5.0 (aconstr Arr5.0 9 9 9 9 9))
+   (var :e.0 . Holder.0 (oconstr Holder.0 (kv tag.0 9) (kv arr.0 (aconstr Arr5.0 9 9 9 9 9))))
+   (ret (add (i 16) (at d.0 4) (at (dot e.0 arr.0) 4)))))
+ (proc :check.0
+  (params)
+  (i 16)
+  (pragmas)
+  (stmts
+   (var :a.0 . Bytes7.0 (aconstr Bytes7.0))
+   (var :z.0 . Arr5.0 (aconstr Arr5.0 9 9 9 9 9))
+   (asgn z.0 (aconstr Arr5.0))
+   (var :h.0 . Holder.0 (oconstr Holder.0 (kv tag.0 4) (kv arr.0 (aconstr Arr5.0))))
+   (ret
+    (add (i 16)
+     (add (i 16) (add (i 16) (conv (i 16) (at a.0 0)) (conv (i 16) (at a.0 6))) (add (i 16) (at z.0 0) (at z.0 4)))
+     (add (i 16) (at (dot h.0 arr.0) 4) (dot h.0 tag.0))))))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :r.0 . (i 16) (call dirty.0))
+   (var :c.0 . (i 16) (call check.0))
+   (ret c.0))))

@@ -1,0 +1,94 @@
+(.nif27)
+(stmts
+ (type :Arr5.0 .
+  (array (i 32) 5))
+ (type :Bytes7.0 .
+  (array (u 8) 7))
+ (type :Pair.0 .
+  (array Arr5.0 2))
+ (type :Holder.0 .
+  (object .
+   (fld :tag.0 . (i 32))
+   (fld :arr.0 . Arr5.0)
+   (fld :bytes.0 . Bytes7.0)))
+ (type :Outer.0 .
+  (object .
+   (fld :k.0 . (i 32))
+   (fld :h.0 . Holder.0)))
+ (gvar :g.0 . Arr5.0 .)
+ (gvar :gh.0 . Holder.0 .)
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas (importc "exit"))
+  (stmts .))
+ (proc :sum5.0
+  (params
+   (param :x.0 . (ptr Arr5.0)))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret
+    (add (i 32)
+     (add (i 32) (add (i 32) (at (deref x.0) 0) (at (deref x.0) 1))
+      (add (i 32) (at (deref x.0) 2) (at (deref x.0) 3)))
+     (at (deref x.0) 4)))))
+ (proc :dirty.0
+  (params)
+  (i 32)
+  (pragmas)
+  (stmts
+   (var :d.0 . Pair.0 (aconstr Pair.0 (aconstr Arr5.0 9 9 9 9 9) (aconstr Arr5.0 9 9 9 9 9)))
+   (var :e.0 . Holder.0 (oconstr Holder.0 (kv tag.0 9) (kv arr.0 (aconstr Arr5.0 9 9 9 9 9))
+                                  (kv bytes.0 (aconstr Bytes7.0 9 9 9 9 9 9 9))))
+   (var :f.0 . Outer.0 (oconstr Outer.0 (kv k.0 9) (kv h.0 e.0)))
+   (ret (add (i 32) (at (at d.0 1) 4) (dot (dot f.0 h.0) tag.0)))))
+ (proc :check.0
+  (params)
+  (i 32)
+  (pragmas)
+  (stmts
+   (var :a.0 . Arr5.0 (aconstr Arr5.0))
+   (var :p.0 . Pair.0 (aconstr Pair.0 (aconstr Arr5.0) (aconstr Arr5.0 1 1 1 1 1)))
+   (var :h.0 . Holder.0 (oconstr Holder.0 (kv tag.0 4) (kv arr.0 (aconstr Arr5.0))
+                                  (kv bytes.0 (aconstr Bytes7.0))))
+   (var :o.0 . Outer.0 (oconstr Outer.0 (kv k.0 2)
+                         (kv h.0 (oconstr Holder.0 (kv tag.0 1) (kv arr.0 (aconstr Arr5.0))
+                                   (kv bytes.0 (aconstr Bytes7.0))))))
+   (var :z.0 . Arr5.0 (aconstr Arr5.0 9 9 9 9 9))
+   (asgn z.0 (aconstr Arr5.0))
+   (var :b.0 . Bytes7.0 (aconstr Bytes7.0 9 9 9 9 9 9 9))
+   (asgn b.0 (aconstr Bytes7.0))
+   (var :q.0 . Holder.0 (oconstr Holder.0 (kv tag.0 9) (kv arr.0 (aconstr Arr5.0 9 9 9 9 9))
+                                  (kv bytes.0 (aconstr Bytes7.0 9 9 9 9 9 9 9))))
+   (asgn (dot q.0 arr.0) (aconstr Arr5.0))
+   (var :s1.0 . (i 32) (call sum5.0 (addr a.0)))
+   (var :s2.0 . (i 32) (call sum5.0 (addr (at p.0 0))))
+   (var :s3.0 . (i 32) (call sum5.0 (addr (dot h.0 arr.0))))
+   (var :s4.0 . (i 32) (call sum5.0 (addr (dot (dot o.0 h.0) arr.0))))
+   (var :s5.0 . (i 32) (call sum5.0 (addr z.0)))
+   (var :s6.0 . (i 32) (call sum5.0 (addr (dot q.0 arr.0))))
+   (var :s.0 . (i 32)
+    (add (i 32) (add (i 32) (add (i 32) s1.0 s2.0) (add (i 32) s3.0 s4.0)) (add (i 32) s5.0 s6.0)))
+   (asgn s.0 (add (i 32) s.0 (add (i 32) (conv (i 32) (at b.0 6)) (conv (i 32) (at (dot h.0 bytes.0) 6)))))
+   (asgn s.0 (add (i 32) s.0 (conv (i 32) (at (dot (dot o.0 h.0) bytes.0) 3))))
+   (asgn s.0 (add (i 32) s.0 (add (i 32) (dot h.0 tag.0) (add (i 32) (dot o.0 k.0) (dot (dot o.0 h.0) tag.0)))))
+   (asgn s.0 (add (i 32) s.0 (dot q.0 tag.0)))
+   (ret s.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :r.0 . (i 32) (call dirty.0))
+   (asgn (at g.0 4) 5)
+   (asgn g.0 (aconstr Arr5.0))
+   (asgn gh.0 (oconstr Holder.0 (kv tag.0 7) (kv arr.0 (aconstr Arr5.0 3 3 3 3 3))
+                                  (kv bytes.0 (aconstr Bytes7.0 3 3 3 3 3 3 3))))
+   (asgn gh.0 (oconstr Holder.0 (kv tag.0 6) (kv arr.0 (aconstr Arr5.0))
+                                  (kv bytes.0 (aconstr Bytes7.0))))
+   (var :c.0 . (i 32) (call check.0))
+   (var :t.0 . (i 32) (call sum5.0 (addr (dot gh.0 arr.0))))
+   (call exit.0
+    (add (i 32) (add (i 32) c.0 t.0)
+     (add (i 32) (add (i 32) (at g.0 4) (dot gh.0 tag.0)) (conv (i 32) (at (dot gh.0 bytes.0) 6))))))))
