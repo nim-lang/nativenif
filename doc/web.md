@@ -162,8 +162,9 @@ meaningful (`write`, `exit`), and trap loudly otherwise.
   twice or from two splices, are the same function, so
   `removeEventListener` matches. Not bridged, and refused by name: a plain
   aggregate as a splice RESULT (an aggregate argument is the address of a
-  copy), a `var`/`lent` string or `cstring` anywhere on the boundary, and a
-  `.raises` proc (nimsem). A scalar a JS caller omits reaches a callback as
+  copy), which includes a `.raises` proc (its result is lowered to an
+  error-code tuple), and a `var`/`lent` string or `cstring` anywhere on the
+  boundary. A scalar a JS caller omits reaches a callback as
   `undefined`. A `sink` parameter of an `importjs` proc is accepted but does
   not transfer ownership: the template cannot destroy a Nim string, so hexer
   treats the argument as borrowed and the caller destroys it after the call.
@@ -195,11 +196,12 @@ meaningful (`write`, `exit`), and trap loudly otherwise.
   does a `ref` the program allocated itself (`new`) when it is passed to an
   `importjs` proc: only a value that came from JS is a handle, and nothing at
   compile time tells the two apart.
-  A `{.closure.}` proc cannot cross (jorogumo carries no environment): the
-  front end (nimsem) refuses one as a parameter or result of an `importjs`
-  proc, or nested in a callback's own signature, with the parameter's source
-  location. The back end never sees one. A `nimcall` proc, named or held in
-  a variable, is a callback.
+  A `{.closure.}` proc cannot cross (jorogumo carries no environment). Leng
+  lowers a closure to a plain `(fn, env)` object, so the back end cannot tell
+  it from a struct: as a result it is refused like any aggregate, and as a
+  parameter it is NOT refused but reaches the template as the address of a
+  copy, so a template that calls it fails at run time (`... is not a
+  function`). A `nimcall` proc, named or held in a variable, is a callback.
   The wasm target refuses `importjs` by name.
 
 ## Intrinsics: `(instr …)` rows
