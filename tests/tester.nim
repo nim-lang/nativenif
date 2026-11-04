@@ -659,6 +659,8 @@ const webRunDivergent: seq[string] = @[
   "positioned_file",  # raw Linux file syscalls have no web host implementation
   "scope_slot_reuse", # reads a dead scope's slot — the answer 7 is arkham's
                       # stack layout, not a language guarantee
+  "emptyaconstr_big", # 2.4 MB array LOCALS: past the 1 MB web shadow stack
+                      # (`ShadowStackSize`) — a frame limit, not a codegen one
 ]
 
 proc webTests() =
@@ -2422,6 +2424,12 @@ const cortexMUnsupported: seq[string] = @[
   # any OTHER failure is fatal and a fixture that starts working is reported.
   # Every one of them refuses BY NAME (a compile-time error from arkham or
   # nifasm); the single exception is called out at the bottom.
+
+  # ── memory size ─────────────────────────────────────────────────────────────
+  # 2.4 MB arrays: nifasm refuses globals that reach the stack top of the
+  # mps2's 64 KB SRAM. `tests/arkham_m/emptyaconstr_{big,data}` are their
+  # scaled-down twins, and run here.
+  "emptyaconstr_big", "emptyaconstr_data",
 
   # ── float64 ─────────────────────────────────────────────────────────────────
   # Missing HARDWARE, not a missing feature: Cortex-M4F's FPv4-SP is single
