@@ -4370,6 +4370,15 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
         g.ab.tree MovX64:
           g.emReg RAX
           g.ab.tree ResX: g.ab.sym g.lengSym(synth("ret.0"))
+        # A sub-64-bit integer lives in its register EXTENDED to 64 bits
+        # (`sameRegRepr`), and arkham's own callees keep that promise. Foreign
+        # code does not: neither Win64 nor SysV defines rax's upper bits for a
+        # narrow result (`MulDiv(-6, 1, 2)` left 0x00000000FFFFFFFD, so
+        # `== -3'i32` was false). Normalize once, here, as `frame` does for
+        # the incoming parameters of a proc C calls.
+        if (tgt.extern or tgt.foreignAbi) and resSlot.kind in {AInt, AUInt, ABool} and
+            resSlot.size < 8:
+          g.extendTo(RAX, resSlot.size * 8, signed = resSlot.kind == AInt)
   g.rb.unsealAccums(sealedArgs)
   for f in sealedFArgs: g.rb.unsealF f
   if hiddenPtr: g.rb.unsealAccums {amd.intArgRegs[0]}     # the early seal (indirect target)
