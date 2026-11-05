@@ -19,6 +19,7 @@ import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import core/lengdecl             # createLengTagPool
 import core/layout               # the --layout: board file
+import core/ovfsnap              # `(ovf)` read as a value: snapshot after each keepovf
 import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
                                 # which is why it reads as an unused import
 import risc/driver               # every load/store target: AArch64 (Darwin/Linux),
@@ -138,6 +139,7 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
+  snapshotOvfValues(buf)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)

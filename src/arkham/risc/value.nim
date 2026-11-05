@@ -1936,7 +1936,7 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
         (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
       if isConst: g.emitLeafImm(dest, immLoc(cval, ScalarSlot))
       else: g.emitMod(c, dest)
-    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue(c, dest)
+    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC: g.emitCondValue(c, dest)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad(c, dest)
     of AddrC, HaddrC: g.emitAddr(c, dest)
     of CastC, ConvC: g.emitCast(c, dest)
@@ -2586,24 +2586,37 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   else: g.freeVal(aD)
   if fused: result = NoA64Inst
 
+proc emitOvfCmp(g: var CodeGen): tuple[onOvf, noOvf: RiscInst] =
+  ## The `cmp` that turns the predicate the preceding `keepovf` left in its
+  ## bridges (see genStmt's KeepovfS) into NZCV; answers the branch tags that
+  ## fire with and without overflow. The caller reads the flags, then calls
+  ## `releaseOvf`.
+  case g.ovfMode
+  of OvfSign:
+    g.ab.tree CmpA64: (g.emReg g.ovfReg; g.ab.intLit 0)
+    result = (BltA64, BgeA64)
+  of OvfCmpLo:
+    g.ab.tree CmpA64: (g.emReg g.ovfReg; g.emReg g.ovfReg2)
+    result = (BloA64, BhsA64)
+  of OvfNeqZero:
+    g.ab.tree CmpA64: (g.emReg g.ovfReg; g.ab.intLit 0)
+    result = (BneA64, BeqA64)
+  of OvfNone:
+    raiseAssert "arkham a64n: (ovf) with no preceding keepovf"
+
+proc releaseOvf(g: var CodeGen) =
+  ## The `(ovf)` read consumed the predicate: free its bridges. Exactly once per
+  ## `keepovf`.
+  for r in g.ovfBridges: g.dropBridge r
+  g.ovfBridges = @[]
+  g.ovfMode = OvfNone
+
 proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
   ## FUSED branch test — the a64 twin of x64's emitCond.
   if c.kind == TagLit and c.exprKind == OvfC:
-    case g.ovfMode
-    of OvfSign:
-      g.ab.tree CmpA64: (g.emReg g.ovfReg; g.ab.intLit 0)
-      g.emBr(if whenTrue: BltA64 else: BgeA64, toLabel)
-    of OvfCmpLo:
-      g.ab.tree CmpA64: (g.emReg g.ovfReg; g.emReg g.ovfReg2)
-      g.emBr(if whenTrue: BloA64 else: BhsA64, toLabel)
-    of OvfNeqZero:
-      g.ab.tree CmpA64: (g.emReg g.ovfReg; g.ab.intLit 0)
-      g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
-    of OvfNone:
-      raiseAssert "arkham a64n: (ovf) with no preceding keepovf"
-    for r in g.ovfBridges: g.dropBridge r
-    g.ovfBridges = @[]
-    g.ovfMode = OvfNone
+    let tags = g.emitOvfCmp()
+    g.emBr(if whenTrue: tags.onOvf else: tags.noOvf, toLabel)
+    g.releaseOvf()
     return
   if c.kind == TagLit and c.exprKind in {AndC, OrC, NotC}:
     let ek = c.exprKind
@@ -2703,6 +2716,30 @@ proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   let res = dest
   assert res.kind == InReg, "arkham a64n: cond-value result " & $res.kind
   if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
+  if c.kind == TagLit and c.exprKind == OvfC:
+    # The `(asgn tmp (ovf))` snapshot `snapshotOvfValues` puts right after a
+    # `keepovf`: the only `(ovf)` value, so its bridges are still the op's. Test
+    # FIRST, then write `res`: `res` may be the home of the op's destination,
+    # which the carry form (`OvfCmpLo`) compares.
+    let tags = g.emitOvfCmp()
+    if CondSelect in g.md.caps:
+      let cset = case tags.onOvf
+                 of BltA64: CsetltA64
+                 of BloA64: CsetloA64
+                 else: CsetneA64
+      g.ab.tree cset: g.emReg res.r
+    else:
+      let lNo = g.freshLabel()
+      let lEnd = g.freshLabel()
+      g.emBr(tags.noOvf, lNo)
+      g.movImm(res.r, 1)
+      g.emBr(BA64, lEnd)
+      g.emLab(lNo)
+      g.movImm(res.r, 0)
+      g.emLab(lEnd)
+    g.releaseOvf()
+    dest = res
+    return
   let lEnd = g.freshLabel()
   if not res.isTemp and g.exprReadsReg(c, res.r):
     # `b = not b`: the destination is a home the condition READS, so the

@@ -1009,6 +1009,7 @@ proc cmpSetccTag*(jcc: X64Inst): X64Inst =
   of JbeX64: SetbeX64
   of JaX64:  SetaX64
   of JaeX64: SetaeX64
+  of JoX64:  SetoX64                           # `(ovf)` of a signed keepovf
   else: raiseAssert "arkham x64: no setcc for " & $jcc
 
 proc mirrorJcc*(jcc: X64Inst): X64Inst =

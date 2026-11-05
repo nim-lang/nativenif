@@ -1,0 +1,57 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :addOvf.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (bool) .
+  (stmts
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (ret (ovf))))
+ (proc :subOvf.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (bool) .
+  (stmts
+   (var :r.0 . (i 32) .)
+   (keepovf (sub (i 32) a.0 b.0) r.0)
+   (var :res.0 . (bool) .)
+   (asgn res.0 (ovf))
+   (ret res.0)))
+ (proc :afterCmp.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (bool) .
+  (stmts
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (var :lt.0 . (bool) (lt r.0 b.0))
+   (var :res.0 . (bool) (ovf))
+   (ret (and lt.0 res.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 . (i 32) 0)
+   (if (elif (call addOvf.0 2147483647 1)
+     (stmts (asgn r.0 (add (i 32) r.0 1)))))
+   (if (elif (not (call addOvf.0 40 2))
+     (stmts (asgn r.0 (add (i 32) r.0 2)))))
+   (if (elif (call subOvf.0 (neg (i 32) 2147483647) 2)
+     (stmts (asgn r.0 (add (i 32) r.0 4)))))
+   (if (elif (not (call subOvf.0 5 7))
+     (stmts (asgn r.0 (add (i 32) r.0 8)))))
+   (if (elif (call afterCmp.0 2147483647 1)
+     (stmts (asgn r.0 (add (i 32) r.0 16)))))
+   (call exit.0 r.0))))
