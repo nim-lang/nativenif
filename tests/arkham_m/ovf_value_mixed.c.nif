@@ -1,0 +1,78 @@
+(.nif27)
+(stmts
+ (type :Res.0 .
+  (object .
+   (fld :val.0 . (i 32))
+   (fld :flag.0 . (bool))))
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32))) .
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :eqTrue.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (bool) .
+  (stmts
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (ret (eq (true) (ovf)))))
+ (proc :checkedAdd.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  Res.0 .
+  (stmts
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (ret (oconstr Res.0 (kv val.0 r.0) (kv flag.0 (ovf))))))
+ (proc :fieldStore.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (bool) .
+  (stmts
+   (var :p.0 . Res.0 .)
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (asgn (dot p.0 flag.0) (ovf))
+   (asgn (dot p.0 val.0) r.0)
+   (ret (dot p.0 flag.0))))
+ (proc :twoOps.0
+  (params
+   (param :a.0 . (i 32))
+   (param :b.0 . (i 32)))
+  (i 32) .
+  (stmts
+   (var :res.0 . (i 32) 0)
+   (var :r.0 . (i 32) .)
+   (keepovf (add (i 32) a.0 b.0) r.0)
+   (var :first.0 . (bool) (ovf))
+   (keepovf (sub (i 32) a.0 b.0) r.0)
+   (if (elif (ovf) (stmts (asgn res.0 (add (i 32) res.0 100)))))
+   (if (elif first.0 (stmts (asgn res.0 (add (i 32) res.0 1)))))
+   (if (elif (not (ovf)) (stmts (asgn res.0 (add (i 32) res.0 2)))))
+   (if (elif (and (ovf) (lt a.0 b.0)) (stmts (asgn res.0 (add (i 32) res.0 100)))))
+   (if (elif (and (lt b.0 a.0) (not (ovf))) (stmts (asgn res.0 (add (i 32) res.0 4)))))
+   (ret res.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 . (i 32) 0)
+   (if (elif (call eqTrue.0 2147483647 1)
+     (stmts (asgn r.0 (add (i 32) r.0 1)))))
+   (if (elif (not (call eqTrue.0 1 1))
+     (stmts (asgn r.0 (add (i 32) r.0 2)))))
+   (var :c.0 . Res.0 (call checkedAdd.0 2147483647 1))
+   (if (elif (dot c.0 flag.0)
+     (stmts (asgn r.0 (add (i 32) r.0 4)))))
+   (if (elif (call fieldStore.0 2147483647 1)
+     (stmts (asgn r.0 (add (i 32) r.0 8)))))
+   (if (elif (eq (call twoOps.0 2147483647 1) 7)
+     (stmts (asgn r.0 (add (i 32) r.0 16)))))
+   (call exit.0 r.0))))

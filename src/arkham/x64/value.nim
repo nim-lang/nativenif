@@ -861,11 +861,10 @@ proc emitValue*(g: var CodeGen; c: Cursor; dest: var Location) =
           g.bindTemp(dest.r, g.exprSlot(c))       # displace the stale int-typed name
         g.ab.tree MovX64: (g.emReg dest.r; g.ab.nilValue())
     of OvfC:
-      # Wrapping arithmetic: `(ovf)` is always false as a VALUE; materializing
-      # it into a register would be a flag-read hazard — reject like before.
-      g.resolveDest(dest, immLoc(0, ScalarSlot))
-      if dest.kind == InReg:
-        raiseAssert "arkham x64n: (ovf) is only valid as an if/ite condition right after keepovf"
+      # The `(asgn tmp (ovf))` snapshot `snapshotOvfValues` puts right after a
+      # `keepovf` — the only `(ovf)` value that reaches here, and the flags it
+      # reads are still the op's. `emitCondValue` turns it into `seto`/`setb`.
+      g.emitCondValue(c, dest)
     of SizeofC:
       var t = c; var sz = 0'i64
       t.into:
@@ -3035,16 +3034,22 @@ proc emitCondValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## that case keeps the branch form — consuming the very same live flags via the
   ## `jcc` tag `emitScalarCmp` handed back.
   block setccFastPath:
-    if c.kind != TagLit or c.exprKind notin {EqC, NeqC, LtC, LeC}: break setccFastPath
-    var aC, bC: Cursor
-    block:
-      var cc = c
-      cc.into:
-        aC = cc; skip cc
-        bC = cc; skip cc
-        while cc.hasMore: skip cc
-    if g.isFloatExpr(aC): break setccFastPath   # comisd + the xmm dance: unchanged
-    let tag = g.emitScalarCmp(aC, bC, c.exprKind, whenTrue = true)
+    var tag: X64Inst
+    if c.kind == TagLit and c.exprKind == OvfC:
+      # The keepovf op right before already left the answer in OF (signed) or CF
+      # (unsigned): no compare to emit.
+      tag = if g.ovfSigned: JoX64 else: JbX64
+    else:
+      if c.kind != TagLit or c.exprKind notin {EqC, NeqC, LtC, LeC}: break setccFastPath
+      var aC, bC: Cursor
+      block:
+        var cc = c
+        cc.into:
+          aC = cc; skip cc
+          bC = cc; skip cc
+          while cc.hasMore: skip cc
+      if g.isFloatExpr(aC): break setccFastPath   # comisd + the xmm dance: unchanged
+      tag = g.emitScalarCmp(aC, bC, c.exprKind, whenTrue = true)
     if dest.kind in {Undef, NeedsReg, RegOrImm}: dest = g.takeTmp(ScalarSlot)
     if dest.kind == NamedStack and dest.spillTemp:
       let lT = g.freshLabel()
