@@ -1,0 +1,159 @@
+(.nif27)
+(stmts@,1,tsplice.nim
+ (type :string.0.tsplice .
+  (object .
+   (fld :bytes.0 .
+    (u 32))
+   (fld :more.0 .
+    (ptr
+     (u 8)))))
+ (type :Pair.0.tsplice .
+  (object .
+   (fld :a.0 .
+    string.0.tsplice)
+   (fld :b.0 .
+    string.0.tsplice)))
+ (type :Three.0.tsplice .
+  (object .
+   (fld :f0.0 .
+    (i 32))
+   (fld :f1.0 .
+    (i 32))
+   (fld :f2.0 .
+    (i 32))))
+ (gvar :bump.0 . (i 32) 1048576)
+ (gvar :allocs.0 . (i 32) 0)
+ (gvar :begins.0 . (i 32) 0)
+ (gvar :ends.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0.
+  (params
+   (param :s.0 . (ptr string.0.tsplice))
+   (param :n.0 . (i 32)))
+  (ptr
+   (u 8))
+  (pragmas
+   (exportc "nimStrBeginStore"))
+  (stmts
+   (asgn begins.0
+    (add
+     (i 32) begins.0 1))
+   (if
+    (elif
+     (le n.0 6)
+     (stmts
+      (asgn
+       (dot
+        (deref s.0) bytes.0 0) n.0)
+      (ret
+       (cast
+        (ptr
+         (u 8))
+        (add
+         (i 32)
+         (cast
+          (i 32) s.0) 1)))))
+    (else
+     (stmts
+      (var :p.0 . (i 32) bump.0)
+      (asgn bump.0
+       (add
+        (i 32) bump.0
+        (add
+         (i 32) n.0 12)))
+      (asgn allocs.0
+       (add
+        (i 32) allocs.0 1))
+      (asgn
+       (deref
+        (cast
+         (ptr
+          (i 32)) p.0)) n.0)
+      (asgn
+       (dot
+        (deref s.0) bytes.0 0) 255)
+      (asgn
+       (dot
+        (deref s.0) more.0 0)
+       (cast
+        (ptr
+         (u 8)) p.0))
+      (ret
+       (cast
+        (ptr
+         (u 8))
+        (add
+         (i 32) p.0 12))))))))
+ (proc :nimStrEndStore.0.
+  (params
+   (param :s.0 . (ptr string.0.tsplice)))
+  .
+  (pragmas
+   (exportc "nimStrEndStore"))
+  (stmts
+   (asgn ends.0
+    (add
+     (i 32) ends.0 1))))
+ (proc :s.0.
+  (params)
+  string.0.tsplice
+  (pragmas
+   (importjs "'xyz'"))
+  (stmts .))
+ (proc :len.0.
+  (params
+   (param :v.0 .
+    string.0.tsplice))
+  (i 32)
+  (pragmas
+   (importjs "#.length"))
+  (stmts .))
+ (proc :sum3.0.
+  (params
+   (param :o.0 .
+    Three.0.tsplice))
+  (i 32) .
+  (stmts
+   (ret
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (dot o.0 f0.0 0)
+      (dot o.0 f1.0 0))
+     (dot o.0 f2.0 0)))))
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32)))
+  .
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    string.0.tsplice
+    (call s.0.))
+   (var :k.0 .
+    Pair.0.tsplice
+    (oconstr Pair.0.tsplice
+     (kv a.0 x.0)
+     (kv b.0 x.0)))
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (call len.0.
+       (dot k.0 a.0 0))
+      (call len.0.
+       (dot k.0 b.0 0)))
+     (call sum3.0.
+      (oconstr Three.0.tsplice
+       (kv f0.0 5)
+       (kv f1.0 7)
+       (kv f2.0 11)))))
+   (ret 0))))

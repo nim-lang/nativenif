@@ -1,0 +1,74 @@
+(.nif27)
+(stmts@,1,toomstr.nim
+ (type :string.0.toomstr .
+  (object .
+   (fld :bytes.0 .
+    (u 32))
+   (fld :more.0 .
+    (ptr
+     (u 8)))))
+ (gvar :ends.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0.
+  (params
+   (param :s.0 . (ptr string.0.toomstr))
+   (param :n.0 . (i 32)))
+  (ptr
+   (u 8))
+  (pragmas
+   (exportc "nimStrBeginStore"))
+  (stmts
+   (asgn
+    (dot
+     (deref s.0) bytes.0 0) 1296125702)
+   (ret
+    (cast
+     (ptr
+      (u 8)) 0))))
+ (proc :nimStrEndStore.0.
+  (params
+   (param :s.0 . (ptr string.0.toomstr)))
+  .
+  (pragmas
+   (exportc "nimStrEndStore"))
+  (stmts
+   (asgn ends.0
+    (add
+     (i 32) ends.0 1))))
+ (proc :s.0.
+  (params)
+  string.0.toomstr
+  (pragmas
+   (importjs "'abcdefghij'"))
+  (stmts .))
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32)))
+  .
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    string.0.toomstr
+    (call s.0.))
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (dot x.0 bytes.0 0)
+      (mul
+       (i 32) ends.0 1000))
+     (mul
+      (i 32)
+      (deref
+       (cast
+        (ptr
+         (i 32)) 0))
+      1000000)))
+   (ret 0))))

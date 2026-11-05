@@ -1,0 +1,24 @@
+(.nif27)
+(stmts@,1,tsplice_aggret.nim
+ (type :Pt.0.tsplice_aggret .
+  (object .
+   (fld :x.0 .
+    (i 32))
+   (fld :y.0 .
+    (i 32))))
+ (proc :mk.0.
+  (params)
+  Pt.0.tsplice_aggret
+  (pragmas
+   (importjs "({x:1,y:2})"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 .
+    Pt.0.tsplice_aggret
+    (call mk.0.))
+   (ret 0))))

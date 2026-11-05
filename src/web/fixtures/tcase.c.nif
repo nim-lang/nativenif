@@ -1,0 +1,52 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :top.0 .
+    (u 64) (suf 18446744073709551615u "u64"))
+   (var :odd.0 .
+    (u 64) (suf 9007199254740993u "u64"))
+   (var :near.0 .
+    (u 64) (suf 9007199254740992u "u64"))
+   (var :r.0 .
+    (i 32) 0)
+   (case top.0
+    (of
+     (ranges
+      (range (suf 18446744073709551610u "u64") (suf 18446744073709551615u "u64")))
+     (stmts
+      (asgn r.0 (add (i 32) r.0 1))))
+    (else
+     (stmts
+      (asgn r.0 (add (i 32) r.0 100)))))
+   (case odd.0
+    (of
+     (ranges
+      (suf 9007199254740993u "u64"))
+     (stmts
+      (asgn r.0 (add (i 32) r.0 2))))
+    (else
+     (stmts
+      (asgn r.0 (add (i 32) r.0 100)))))
+   (case near.0
+    (of
+     (ranges
+      (suf 9007199254740993u "u64"))
+     (stmts
+      (asgn r.0 (add (i 32) r.0 100))))
+    (else
+     (stmts
+      (asgn r.0 (add (i 32) r.0 4)))))
+   (call exit.0 r.0)
+   (ret 0))))

@@ -1,0 +1,82 @@
+(.nif27)
+(stmts@,1,thandle.nim
+ (type :Obj.0.thandle .
+  (object .
+   (fld :x.0 . (i 32))))
+ (type :H.0.thandle .
+  (ptr Obj.0.thandle))
+ (gvar :acc.0 . (i 32) 0)
+ (proc :getG.0.
+  (params)
+  H.0.thandle
+  (pragmas
+   (importjs "globalThis"))
+  (stmts .))
+ (proc :mk.0.
+  (params)
+  H.0.thandle
+  (pragmas
+   (importjs "({})"))
+  (stmts .))
+ (proc :ident.0.
+  (params
+   (param :h.0 . H.0.thandle))
+  H.0.thandle
+  (pragmas
+   (importjs "#"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :g.0 . H.0.thandle (call getG.0.))
+   (if
+    (elif
+     (eq g.0 (call getG.0.))
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 1)))))
+   (if
+    (elif
+     (not
+      (eq (call mk.0.) (call mk.0.)))
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 2)))))
+   (if
+    (elif
+     (eq
+      (call ident.0. g.0) g.0)
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 4)))))
+   (asgn
+    (dot
+     (deref g.0) x.0 0) 5)
+   (discard (call getG.0.))
+   (if
+    (elif
+     (eq
+      (dot
+       (deref g.0) x.0 0) 1073741824)
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 8)))))
+   (if
+    (elif
+     (eq
+      (bitand
+       (i 32)
+       (cast
+        (i 32) g.0) 15) 0)
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 16)))))
+   (ret acc.0))))

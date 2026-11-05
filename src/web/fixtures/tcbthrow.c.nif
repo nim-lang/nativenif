@@ -1,0 +1,42 @@
+(.nif27)
+(stmts@,1,tcbthrow.nim
+ (type :Cb.0.tcbthrow .
+  (proctype .
+   (params
+    (param :s.0 . (aptr (c 8)))) . .))
+ (type :Big.0.tcbthrow .
+  (array
+   (i 32)1024))
+ (proc :boom.0.
+  (params)
+  .
+  (pragmas
+   (importjs "(() => { throw new Error('boom'); })()"))
+  (stmts .))
+ (proc :fireAll.0.
+  (params
+   (param :cb.0 . Cb.0.tcbthrow))
+  (i 32)
+  (pragmas
+   (importjs "((f) => { const sp = SP; for (let i = 0; i < 1000; ++i) { try { f('abc'); } catch (e) { if (e.message !== 'boom') throw e; } } return SP === sp ? 1 : 0; })(#)"))
+  (stmts .))
+ (proc :probe.0.
+  (params
+   (param :s.0 . (aptr (c 8))))
+  .
+  .
+  (stmts
+   (var :big.0 . Big.0.tcbthrow)
+   (asgn
+    (at big.0 3) 7)
+   (call boom.0.)))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (add
+     (i 32)
+     (call fireAll.0. probe.0.) 4)))))

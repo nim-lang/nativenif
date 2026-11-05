@@ -25,7 +25,7 @@ jobs:
         include:
           - target:
               os: linux
-            builder: ubuntu-24.04
+            builder: ubuntu-26.04
           - target:
               os: macos
             builder: macos-15
@@ -70,7 +70,7 @@ jobs:
           # Installed on Linux only: these run an emulated image either way, so
           # repeating them on the macOS and Windows runners would be the same
           # coverage three times.
-          sudo apt-get install -y valgrind gcc-14 g++-14 qemu-system-arm qemu-user
+          sudo apt-get install -y valgrind qemu-system-arm qemu-user
           # `qemu-system-riscv32` ships in `qemu-system-misc` up to Ubuntu 24.04
           # and in `qemu-system-riscv` from Debian trixie / Ubuntu 25.04 onward.
           # Ask for whichever this runner packages rather than pinning a name that
@@ -80,7 +80,6 @@ jobs:
           else
             sudo apt-get install -y qemu-system-misc
           fi
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60 --slave /usr/bin/g++ g++ /usr/bin/g++-14
 
       - name: Install dependencies (Linux i386)
         if: runner.os == 'Linux' && matrix.target.cpu == 'i386'

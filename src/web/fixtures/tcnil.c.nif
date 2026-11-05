@@ -1,0 +1,113 @@
+(.nif27)
+(stmts@,1,tcnil.nim
+ (type :Cb.0.tcnil .
+  (proctype .
+   (params
+    (param :s.0 . (aptr (c 8)))) . .))
+ (gvar :acc.0 . (i 32) 0)
+ (gvar :slot.0 . Cb.0.tcnil
+  (nil))
+ (gvar :live.0 . Cb.0.tcnil
+  (nil))
+ (proc :fireNull.0.
+  (params
+   (param :cb.0 . Cb.0.tcnil))
+  .
+  (pragmas
+   (importjs "#(null)"))
+  (stmts .))
+ (proc :fireText.0.
+  (params
+   (param :cb.0 . Cb.0.tcnil))
+  .
+  (pragmas
+   (importjs "((f) => { f('abc'); f('abc'); f('abc'); })(#)"))
+  (stmts .))
+ (proc :isNull.0.
+  (params
+   (param :cb.0 . Cb.0.tcnil))
+  (i 32)
+  (pragmas
+   (importjs "(# === null ? 1 : 0)"))
+  (stmts .))
+ (proc :nullCs.0.
+  (params)
+  (aptr (c 8))
+  (pragmas
+   (importjs "null"))
+  (stmts .))
+ (proc :csIsNull.0.
+  (params
+   (param :s.0 . (aptr (c 8))))
+  (i 32)
+  (pragmas
+   (importjs "(# === null ? 1 : 0)"))
+  (stmts .))
+ (proc :same.0.
+  (params
+   (param :a.0 . Cb.0.tcnil)
+   (param :b.0 . Cb.0.tcnil))
+  (i 32)
+  (pragmas
+   (importjs "(# === # ? 1 : 0)"))
+  (stmts .))
+ (proc :probe.0.
+  (params
+   (param :s.0 . (aptr (c 8))))
+  .
+  .
+  (stmts
+   (if
+    (elif
+     (eq s.0
+      (nil))
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 1))))
+    (else
+     (stmts
+      (if
+       (elif
+        (and
+         (eq
+          (pat s.0 0) 'a')
+         (eq
+          (pat s.0 3) 0))
+        (stmts
+         (asgn acc.0
+          (add
+           (i 32) acc.0 2))))))))))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn live.0 probe.0.)
+   (call fireNull.0. probe.0.)
+   (call fireText.0. live.0)
+   (asgn acc.0
+    (add
+     (i 32) acc.0
+     (mul
+      (i 32)
+      (add
+       (i 32)
+       (call isNull.0. slot.0)
+       (add
+        (i 32)
+        (mul
+         (i 32)
+         (call csIsNull.0. (nil)) 2)
+        (mul
+         (i 32)
+         (call csIsNull.0. (call nullCs.0.)) 4)))
+      16)))
+   (asgn acc.0
+    (add
+     (i 32) acc.0
+     (mul
+      (i 32)
+      (call same.0. live.0 probe.0.) 128)))
+   (ret acc.0))))
