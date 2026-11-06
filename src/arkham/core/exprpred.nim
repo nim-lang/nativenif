@@ -312,6 +312,31 @@ proc tailCallLeaksFrame*(g: var CodeGen; args: openArray[Cursor]): bool =
           skip it
   false
 
+when not declared(nifcore.sameTree):
+  # Transitional: nimony master's nifcore does not export `sameTree` yet, and
+  # this repo's CI builds against it. Delete once that nimony change has landed.
+  proc sameTree*(a, b: Cursor): bool =
+    if a.hasMore != b.hasMore: return false
+    if not a.hasMore: return true
+    if a.kind != b.kind: return false
+    case a.kind
+    of TagLit:
+      if cursorTagId(a) != cursorTagId(b): return false
+      var ca = childCursor(a)
+      var cb = childCursor(b)
+      while ca.hasMore and cb.hasMore:
+        if not sameTree(ca, cb): return false
+        skip ca
+        skip cb
+      result = ca.hasMore == cb.hasMore
+    of Symbol, SymbolDef: result = symId(a) == symId(b)
+    of IntLit: result = intVal(a) == intVal(b)
+    of UIntLit: result = uintVal(a) == uintVal(b)
+    of FloatLit: result = floatVal(a) == floatVal(b)
+    of StrLit, Ident: result = strId(a) == strId(b)
+    of CharLit: result = charLit(a) == charLit(b)
+    else: result = true
+
 proc calleeParamSlots*(g: var CodeGen; fsym: SymId; tgt: CallTarget): seq[AsmSlot] =
   ## The DECLARED parameter slots of a call target, from its `(proctype …)`
   ## signature — empty when the target carries none (an indirect call built
