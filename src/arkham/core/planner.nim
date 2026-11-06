@@ -360,6 +360,24 @@ proc takeReg(sealed: set[Reg]; pool: var set[Reg]; cands: set[Reg]): Reg =
       return r
   result = NoReg
 
+const FloatScratchReserve = 5
+  ## float scratch registers a borrowing local must leave to the emitter
+
+proc countFree(pool: set[FReg]; cands: openArray[FReg]): int =
+  result = 0
+  for f in cands:
+    if f in pool: inc result
+
+proc takeFRegFromTop(pool: var set[FReg]; cands: openArray[FReg]): FReg =
+  ## Take the LAST free register of `cands`: the emitter picks its scratch
+  ## from the front, so borrowed homes stay out of its way.
+  for i in countdown(cands.len - 1, 0):
+    let f = cands[i]
+    if f in pool:
+      excl pool, f
+      return f
+  result = NoFReg
+
 proc takeFReg(pool: var set[FReg]; cands: openArray[FReg]): FReg =
   ## Take the first free SIMD register from `cands` out of `pool`.
   for f in cands:
@@ -445,6 +463,16 @@ proc getSym(b: var Builder; name: SymId; slot: AsmSlot; props: VarProps): Locati
       # starves nothing — which is what rules the scratch pool out above.
       f = takeFReg(b.freeVolF, b.md.floatLocalTempRegs)
       if f != NoFReg: return fregLoc(f, slot)
+      # Out of argument registers: borrow from the emitter's float scratch, as
+      # a vector local does, but leave `FloatScratchReserve` of it untouched.
+      # The scratch pool is seven wide on SysV and an expression peaks at two
+      # or three; a float-heavy leaf (a ray-sphere test) otherwise spilled its
+      # seventh local to the stack and reloaded it on every use while half the
+      # pool sat idle. `pickFTempReg` already skips a register that homes a
+      # local (`fregHoldsHome`), so lending one out needs no emitter change.
+      if countFree(b.freeVolF, b.md.floatTempRegs) > FloatScratchReserve:
+        f = takeFRegFromTop(b.freeVolF, b.md.floatTempRegs)
+        if f != NoFReg: return fregLoc(f, slot)
     return b.spillTo(name, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spillTo(name, slot)
