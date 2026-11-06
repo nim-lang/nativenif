@@ -39,6 +39,9 @@ type
     label*: LabelId
     gvarSym*: Symbol           # non-nil when the operand is a global's address; the
                               # ELF backend patches its `lea` against the .bss segment
+    idxScratch*: bool          # `mem.index` is an `at`'s stride SCRATCH register (it
+                              # holds `index*stride` and nothing else), so a nested
+                              # access may fold `base+index` into it with one `lea`
 
 proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
   result = default(Operand)
@@ -78,6 +81,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       var baseIndex: x86.Register
       var baseScale = 1
       var baseHasIndex = false
+      var baseIdxScratch = false
       var seg = segNone
       var fieldName: string
 
@@ -128,12 +132,17 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
             baseIndex = baseOp.mem.index
             baseScale = baseOp.mem.scale
             seg = baseOp.mem.seg
+            baseIdxScratch = baseOp.idxScratch
           else:
             baseReg = baseOp.reg
         elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
           objType = baseOp.typ
           baseReg = baseOp.mem.base
           baseDisp = baseOp.mem.displacement
+          baseHasIndex = baseOp.mem.hasIndex
+          baseIndex = baseOp.mem.index
+          baseScale = baseOp.mem.scale
+          baseIdxScratch = baseOp.idxScratch
         elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
              baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
           # A stack-resident object/union named DIRECTLY: `(dot p.0 x.0)`. The slot
@@ -172,6 +181,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         hasIndex: baseHasIndex,
         seg: seg
       )
+      result.idxScratch = baseHasIndex and baseIdxScratch
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
 
     elif t == AtTagId:
@@ -191,6 +201,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         var baseIndex: x86.Register
         var baseScale: int = 0
         var baseHasIndex = false
+        var baseIdxScratch = false
         var indexOp: Operand
 
         if n.kind == TagLit and rawTagIsX64Reg(n.tag):
@@ -229,12 +240,17 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
               baseIndex = baseOp.mem.index
               baseScale = baseOp.mem.scale
               baseHasIndex = baseOp.mem.hasIndex
+              baseIdxScratch = baseOp.idxScratch
             else:
               baseReg = baseOp.reg
           elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
             elemType = baseOp.typ.elem
             baseReg = baseOp.mem.base
             baseDisp = baseOp.mem.displacement
+            baseIndex = baseOp.mem.index
+            baseScale = baseOp.mem.scale
+            baseHasIndex = baseOp.mem.hasIndex
+            baseIdxScratch = baseOp.idxScratch
           elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
                baseOp.typ.offType.kind == TypeKind.ArrayT:
             # A stack-resident array named DIRECTLY: `(at arr.0 (rcx))`. The slot
@@ -249,6 +265,21 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
 
         if not isIntegerType(indexOp.typ):
           error("Array index must be integer type, got " & $indexOp.typ, n)
+
+        template foldScratchBase() =
+          # The base is an outer access `base + scratch*scale + disp` whose index
+          # register is that access's own stride scratch: fold it into one
+          # register so this level's index has a slot. The scratch held only
+          # `index*stride`, so overwriting it with the full address is free.
+          if baseHasIndex and baseIdxScratch and
+              not (indexOp.kind == okReg and indexOp.reg == baseIndex):
+            x86.emitLea(ctx.buf.data, baseIndex,
+              x86.MemoryOperand(base: baseReg, index: baseIndex, scale: baseScale,
+                                displacement: baseDisp, hasIndex: true))
+            baseReg = baseIndex
+            baseDisp = 0
+            baseHasIndex = false
+            baseIdxScratch = false
 
         # Optional third operand: an arkham-supplied scratch register for a stride
         # that can't be a SIB scale.
@@ -276,6 +307,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
           # by the current arkham).
           if indexOp.kind != okReg:
             error("at: 3-operand form expects a register index", n)
+          foldScratchBase()
           if baseHasIndex:
             error("at: 3-operand form cannot extend a base that already has an index", n)
           # Disjointness: the stride scratch must not alias the base register. The
@@ -318,19 +350,26 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
               x86.emitLea(ctx.buf.data, scratchReg,                 # scratch += index*hi
                 x86.MemoryOperand(base: scratchReg, index: indexOp.reg, scale: hiScale,
                                   displacement: 0, hasIndex: true))
+            result.kind = okMem
+            result.mem = x86.MemoryOperand(base: scratchReg, displacement: 0, hasIndex: false)
           else:
-            x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)      # scratch = index
+            # scratch = index*stride, and the CONSUMER addresses `base + scratch +
+            # disp` itself: no `lea` to materialize the element address (a field
+            # load is one instruction, not two), and a 3-operand `imul` when the
+            # scratch is not the index register (no `mov` either).
             if stride > 0 and (stride and (stride - 1)) == 0:
+              x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)    # scratch = index
               var sh = 0
               while (1 shl sh) < stride: inc sh
               x86.emitShl(ctx.buf.data, scratchReg, sh)             # scratch <<= log2(stride)
+            elif scratchReg != indexOp.reg:
+              x86.emitImulImm3(ctx.buf.data, scratchReg, indexOp.reg, int32(stride), 64)
             else:
               x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))
-            x86.emitLea(ctx.buf.data, scratchReg,                   # scratch = base + disp + scratch
-              x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
-                                displacement: baseDisp, hasIndex: true))
-          result.kind = okMem
-          result.mem = x86.MemoryOperand(base: scratchReg, displacement: 0, hasIndex: false)
+            result.kind = okMem
+            result.mem = x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
+                                           displacement: baseDisp, hasIndex: true)
+            result.idxScratch = true
         elif indexOp.kind == okImm:
           # Immediate index: fold into the displacement (any stride).
           let offset = indexOp.immVal * asmSizeOf(elemType)
@@ -338,12 +377,14 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
           result.mem = x86.MemoryOperand(
             base: baseReg, index: baseIndex, scale: baseScale,
             displacement: baseDisp + int32(offset), hasIndex: baseHasIndex)
+          result.idxScratch = baseHasIndex and baseIdxScratch
         elif indexOp.kind == okMem:
           error("Array index cannot be memory operand", n)
         else:
           # Register index folded as a SIB scale. arkham only emits the 2-operand
           # form when the stride is a legal scale and the base has no index, so these
           # are invariants here (kept as asserts).
+          foldScratchBase()
           if baseHasIndex:
             error("at: two register indices cannot fold into one memory operand", n)
           # Disjointness: in the folded SIB `[base + index*scale]`, base and index are
