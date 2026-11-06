@@ -143,6 +143,8 @@ type
     retIsFloat*: bool                        ## current proc returns a float (in v0)
     retFloatBits*: int                       ## width (32/64) of the float return type
     rodata*: seq[(SymId, string)]            ## module-level string literals
+    floatPool*: Table[(int, int64), SymId]   ## x64: (bits, bit pattern) -> its pooled
+                                             ## `rodata` blob, loaded RIP-relative
     hasFrame*: bool                          ## current proc needs a stack frame
     frameRegs*: seq[Reg]                     ## callee-saved GPRs the allocator handed out.
                                              ## BlockFrame stores each at its own offset and
