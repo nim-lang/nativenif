@@ -4915,6 +4915,18 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     # `giveBack` would kill a binding and break a seal this row never made.
     if d.kind == InReg and d.isTemp and d.r != res.r: g.giveBack d.r
   dest = res
+proc floatConst*(g: var CodeGen; pattern: int64; bits: int): SymId =
+  ## The pooled `(rodata …)` blob holding a float constant's bits.
+  let key = (bits, pattern)
+  result = g.floatPool.getOrDefault(key, SymId(0))
+  if result == SymId(0):
+    result = g.lengSym("fc." & $g.floatPool.len & "." & g.prog.thisModuleSuffix)
+    var bytes = newString(bits div 8)
+    for i in 0 ..< bits div 8:
+      bytes[i] = char((cast[uint64](pattern) shr (8*i)) and 0xFF)
+    g.rodata.add (result, bytes)
+    g.floatPool[key] = result
+
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED SIMD value: resolve `dest` (an xmm constraint / fixed register /
   ## `eftmp` slot) against `c` and materialize the float value there.
@@ -4929,12 +4941,14 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
         g.produceIntoFMem(c, dest); return
     let bits = if dest.typ.size == 4: 32 else: 64
     if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
-    let gpr = g.pickStagingSealed("a float literal bit pattern",
-                                  AsmSlot(cls: AInt, size: 8, align: 8))
-    if bits == 32: g.movImm(gpr, int64(cast[uint32](float32(floatVal(c)))))
-    else: g.movImm(gpr, cast[int64](floatVal(c)))
-    g.fmovFromGpr(dest.f, gpr, bits)
-    g.giveBack gpr
+    # One RIP-relative load from the module's constant pool — what gcc emits —
+    # instead of `mov gpr, imm64` + `movq xmm, gpr`: one instruction, no GPR.
+    let pattern = if bits == 32: int64(cast[uint32](float32(floatVal(c))))
+                  else: cast[int64](floatVal(c))
+    let cst = g.floatConst(pattern, bits)
+    g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+      g.emFReg dest.f
+      g.ab.sym cst
   of Symbol:
     # Store forwarding matters most here: SysV has no callee-saved xmm, so EVERY
     # float local is stack-homed and every read of one is a reload unless the
