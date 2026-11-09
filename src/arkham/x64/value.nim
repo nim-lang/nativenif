@@ -1876,7 +1876,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     g.genAggrCopyStore(rhs, dst, aggrSize)
     return
   if dstAggr and rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC} and
-     constrReadsDst(rhs, dst):
+     constrReadsDst(rhs, dst, ordered = constrIsOrdered(g.prog, rhs)):
     # `v = V(x: p, y: v.x / p)`: the constructor is evaluated before the store,
     # but building it field by field INTO `v` overwrites `v.x` before `y` reads
     # it. Build into a fresh `aggtmp` slot, then copy the whole aggregate.

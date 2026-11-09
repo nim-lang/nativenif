@@ -400,3 +400,51 @@ proc constrReadsDst*(rhs: Cursor; dst: Location): bool =
         skip m
     false
   result = walk(rhs, root, throughPtr)
+
+proc readsWrittenField(n: Cursor; root: SymId; written: seq[SymId]): bool =
+  ## Does `n` read `root` other than as `(dot root f …)` of a field `f` not in
+  ## `written`? A call may read `root` through an escaped address, so it counts.
+  case n.kind
+  of Symbol: result = n.symId == root
+  of TagLit:
+    if n.exprKind == DotC:
+      var b = n
+      inc b                                       # the base
+      if b.kind == Symbol and b.symId == root:
+        skip b
+        return b.kind != Symbol or b.symId in written
+    if n.exprKind == CallC or n.stmtKind == CallS: return true
+    result = false
+    var m = n
+    m.into:
+      while m.hasMore:
+        if readsWrittenField(m, root, written): return true
+        skip m
+  else: result = false
+
+proc constrReadsDst*(rhs: Cursor; dst: Location; ordered: bool): bool =
+  ## `constrReadsDst`, for a destination that is built field by field in the
+  ## constructor's `kv` order (`ordered`: not a union, whose constructor zeroes
+  ## the whole extent first). Then a value that reads a field of a plain named
+  ## slot is harmless as long as that field was not stored yet:
+  ## `v = Vec3(x: v.x * a, y: v.y * b, z: v.z * c)` -- every inlined
+  ## `multiply(v, w)` / `scale(v, k)` assigned back to `v` -- needs no `aggtmp`
+  ## and no copy of it.
+  result = constrReadsDst(rhs, dst)
+  if not result or not ordered or dst.kind != NamedStack: return
+  if rhs.kind != TagLit or rhs.exprKind != OconstrC: return
+  var written: seq[SymId] = @[]
+  var c = rhs
+  c.into:
+    skip c                                        # the constructed type
+    while c.hasMore:
+      if c.kind != TagLit or c.substructureKind != KvU: return true
+      var f = c
+      inc f                                       # the field name
+      if f.kind != Symbol: return true
+      let field = f.symId
+      skip f                                      # the value
+      if readsWrittenField(f, dst.name, written): return true
+      written.add field
+      skip c
+  result = false
