@@ -222,6 +222,8 @@ type
     freeVol, freeCallee: set[Reg]
     freeVolF: set[FReg]               ## caller-saved SIMD/FP scratch pool (v16–v31)
     freeCalleeF: set[FReg]            ## callee-saved SIMD pool (v8–v15)
+    borrowedF: seq[SymId]             ## float locals homed in the emitter's scratch
+                                      ## pool (`settleFloatBorrows` may take them back)
     scopeVars: seq[seq[SymId]]        ## register-eligible locals per open scope
                                       ## (steal candidates; freed by current loc)
     pendingFree: seq[tuple[pos: int; name: SymId]]  ## locals to free at their
@@ -470,9 +472,16 @@ proc getSym(b: var Builder; name: SymId; slot: AsmSlot; props: VarProps): Locati
       # seventh local to the stack and reloaded it on every use while half the
       # pool sat idle. `pickFTempReg` already skips a register that homes a
       # local (`fregHoldsHome`), so lending one out needs no emitter change.
-      if countFree(b.freeVolF, b.md.floatTempRegs) > FloatScratchReserve:
+      # Only where there is no callee-saved float pool to take first (SysV x64):
+      # the RISC emitter stages every spilled float result through its one
+      # bridge (v31), which is not re-entrant, so a scratch pool shrunk by
+      # borrowing turns a deep nest into a clobbered bridge there.
+      if b.md.floatCalleeSaved.len == 0 and
+         countFree(b.freeVolF, b.md.floatTempRegs) > FloatScratchReserve:
         f = takeFRegFromTop(b.freeVolF, b.md.floatTempRegs)
-        if f != NoFReg: return fregLoc(f, slot)
+        if f != NoFReg:
+          b.borrowedF.add name
+          return fregLoc(f, slot)
     return b.spillTo(name, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spillTo(name, slot)
@@ -1462,6 +1471,103 @@ proc findReturnedVar(body: Cursor): SymId =
   var c = body
   findReturnedVarImpl(c)
 
+proc locationOfSym*(plan: Plan; name: SymId; pos: int): Location {.inline.}
+
+proc foldableFloatLeaf(b: Builder; c: Cursor): bool =
+  ## The emitter's `foldableFloatLeaf`, asked of the finished plan.
+  c.kind == Symbol and b.plan.symPos.hasKey(c.symId) and
+    b.plan.locationOfSym(c.symId, cursorToPosition(b.buf[], c)).kind in {InFReg, NamedStack}
+
+proc floatInReg(b: Builder; c: Cursor): bool =
+  ## A local whose home is a float register: it folds in place, costing nothing.
+  c.kind == Symbol and b.plan.symPos.hasKey(c.symId) and
+    b.plan.locationOfSym(c.symId, cursorToPosition(b.buf[], c)).kind == InFReg
+
+proc floatHome(b: Builder; c: Cursor): FReg =
+  ## The float register `c` (a local's name or a use of it) is homed in.
+  result = NoFReg
+  if c.kind in {Symbol, SymbolDef} and b.plan.symPos.hasKey(c.symId):
+    let loc = b.plan.locationOfSym(c.symId, cursorToPosition(b.buf[], c))
+    if loc.kind == InFReg: result = loc.f
+
+proc readsFHome(b: Builder; n: Cursor; f: FReg): bool =
+  ## The planner's `exprReadsFReg`.
+  if n.kind == Symbol: return b.floatHome(n) == f
+  if n.kind != TagLit: return false
+  var c = n
+  c.into:
+    while c.hasMore:
+      if b.readsFHome(c, f): return true
+      skip c
+  result = false
+
+proc floatRegsNeeded(b: Builder; n: Cursor): int =
+  ## How many float registers evaluating `n` holds at once, following
+  ## `emitFBin`: `(op T a b)` computes `a` into the result register and `b` into
+  ## one more, unless `b` is a register-homed local, which folds in place; an
+  ## `add`/`mul` whose `a` is a foldable leaf and whose `b` is not computes `b`
+  ## into the result instead and folds `a`, staging it when it is spilled. A
+  ## Horner polynomial therefore costs one or two, not its depth.
+  result = 0
+  if n.kind != TagLit: return
+  var c = n
+  let ek = c.exprKind
+  c.into:
+    if ek in {AddC, SubC, MulC, DivC} and c.kind == TagLit and c.typeKind == FT:
+      skip c                             # the type
+      let lhs = c
+      skip c
+      let rhs = c
+      while c.hasMore: skip c
+      let ra = max(1, b.floatRegsNeeded(lhs))
+      let rb = max(1, b.floatRegsNeeded(rhs))
+      if ek in {AddC, MulC} and b.foldableFloatLeaf(lhs) and not b.foldableFloatLeaf(rhs):
+        result = if b.floatInReg(lhs): rb else: max(rb, 2)
+      elif b.floatInReg(rhs):
+        result = ra
+      else:
+        result = max(ra, 1 + rb)
+    elif n.stmtKind in {VarS, AsgnS}:
+      # A value stored into a float register home is computed straight into that
+      # home, which the capacity does not count, unless it reads the home itself.
+      let target = c
+      if n.stmtKind == VarS:
+        skip c; skip c                   # name, pragmas → type
+      skip c                             # → value
+      let h = b.floatHome(target)
+      while c.hasMore:
+        let v = b.floatRegsNeeded(c)
+        result = max(result, if h != NoFReg and not b.readsFHome(c, h): v - 1 else: v)
+        skip c
+    else:
+      while c.hasMore:
+        result = max(result, b.floatRegsNeeded(c))
+        skip c
+
+proc floatStagingCapacity(b: var Builder): int =
+  ## The float registers a nest can occupy at once: the scratch pool and the
+  ## argument registers the emitter may stage through, minus every register that
+  ## homes a local ANYWHERE in the proc (both picks are flow-insensitive, see
+  ## `fregHoldsHome` and `regHoldsLiveFLoc`), plus the reserved staging bridge.
+  rebuildHomes(b.plan)
+  result = 1
+  for f in b.md.floatTempRegs:
+    if f notin b.plan.homeFRegs: inc result
+  for f in b.md.floatArgRegs:
+    if f notin b.plan.homeFRegs: inc result
+
+proc settleFloatBorrows(b: var Builder; procDecl: Cursor) =
+  ## A borrowed scratch register is one fewer for the emitter, and when the
+  ## argument registers are homes too a deep float nest has nowhere left to stage
+  ## (`pickFStagingSealed`). Give borrowed registers back, latest first, until the
+  ## most demanding expression fits.
+  let need = b.floatRegsNeeded(procDecl)
+  var i = b.borrowedF.len - 1
+  while i >= 0 and need > b.floatStagingCapacity():
+    let name = b.borrowedF[i]
+    if name notin b.inheritedHomes: b.demoteToStack name
+    dec i
+
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md, entryMd: MachineDesc; tc: TypeCtx;
                    presealed: set[Reg] = {}): Plan =
@@ -1583,6 +1689,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
       b.returnedVar = findReturnedVar(n)
     planStmt(b, n)                                # body
   b.closeScope()
+  if b.borrowedF.len > 0: b.settleFloatBorrows(procDecl)
   result = ensureMove b.plan
 
 # ── lookup API (used by codegen) ────────────────────────────────────────────
