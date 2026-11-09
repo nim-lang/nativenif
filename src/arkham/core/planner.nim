@@ -1122,6 +1122,10 @@ proc planStmt(b: var Builder; n: var Cursor) =
       while n.hasMore:
         planStmt(b, n)
         flushFree(b, b.posOf(n))
+  of ConstructS:                              # its statements; `D` is not evaluated
+    n.into:
+      skip n
+      while n.hasMore: planStmt(b, n)
   of RetS:
     skip n
   of CallS, InstrS:

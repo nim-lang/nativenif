@@ -651,6 +651,12 @@ proc analyse(c: var Context; n: var Cursor) =
         iterStmts(c, n): analyse(c, n)
     of StmtsS:                          # statement grouping only — shares the scope frame
       iterStmts(c, n): analyse(c, n)
+    of ConstructS:
+      # `(construct D (stmts …))`: its statements. The destination `D` names the
+      # storage the stores fill and is never evaluated.
+      n.into:
+        skip n
+        while n.hasMore: analyse(c, n)
     of CallS:
       # Every `(call …)` is a real call point now that the atomics are `(instr …)`.
       # They used to need an exception here — an inlined atomic clobbers a handful of

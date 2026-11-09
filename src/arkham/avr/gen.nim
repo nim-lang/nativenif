@@ -1248,6 +1248,11 @@ proc genStmt(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       while cc.hasMore: (g.genStmt(cc); skip cc)
+  of ConstructS:                       # its statements; `D` emits no code
+    var cc = c
+    cc.into:
+      skip cc
+      while cc.hasMore: (g.genStmt(cc); skip cc)
   of VarS: g.genVarDecl(c)
   of AsgnS: g.genAsgn(c)
   of RetS: g.genRet(c)

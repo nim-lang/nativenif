@@ -325,6 +325,13 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       while cc.hasMore:
         var nx = cc; skip nx
         g.genStmt(cc, listFlags(flags, nx)); skip cc
+  of ConstructS:
+    # `(construct D (stmts …))` is its statements: the destination `D` names the
+    # storage they fill and emits no code.
+    var cc = c
+    cc.into:
+      skip cc
+      while cc.hasMore: (g.genStmt(cc, flags); skip cc)
   of ScopeS:
     # Forward Leng's scope to nifasm as a `(scope …)`: a `(stmts …)` with a
     # RECLAIMABLE slot arena. Every `(s)` slot declared inside is freed when it

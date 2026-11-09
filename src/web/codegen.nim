@@ -3473,6 +3473,13 @@ proc genStmt(g: var WebGen; c: var Cursor) =
     return
   case c.stmtKind
   of StmtsS, ScopeS: genStmtList(g, c)
+  of ConstructS:
+    # `(construct D (stmts …))` is its statements; the destination `D` is no
+    # statement, and a region declares no label (control leaves only at its end).
+    var body = c
+    body.into:
+      skip body
+      while body.hasMore: genStmt(g, body)
   of VarS: genVar(g, c)
   of AsgnS: genAsgn(g, c)
   of KeepovfS: genKeepovf(g, c)
