@@ -1368,6 +1368,15 @@ proc typeSymIsUnion*(p: var Program; s: SymId): bool =
   if body.kind == Symbol: return typeSymIsUnion(p, body.symId)
   result = body.kind == TagLit and body.typeKind == UnionT
 
+
+proc constrIsOrdered*(p: var Program; rhs: Cursor): bool =
+  ## An `(oconstr T …)` that the back ends build field by field in `kv` order:
+  ## any but a union's, which zeroes its whole extent first.
+  if rhs.kind != TagLit or rhs.exprKind != OconstrC: return false
+  var t = rhs
+  inc t                                         # the constructed type
+  result = t.kind == Symbol and not typeSymIsUnion(p, t.symId)
+
 proc typeSymIsPacked*(p: var Program; s: SymId): bool =
   ## `(type :name <pragmas> <body>)` — the flag lives on the DECLARATION, while
   ## every layout walk below is handed the BODY. This is the bridge.

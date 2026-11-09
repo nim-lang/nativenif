@@ -1553,7 +1553,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     g.genAggrCopyStore(rhs, dst, aggrSize)
     return
   if dstAggr and rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC} and
-     constrReadsDst(rhs, dst):
+     constrReadsDst(rhs, dst, ordered = constrIsOrdered(g.prog, rhs)):
     # A constructor that reads its own destination (`v = V(x: p, y: v.x / p)`):
     # see the x64 twin. Build into an `aggtmp` slot, then copy it whole.
     let pos = g.posOf(rhs)
