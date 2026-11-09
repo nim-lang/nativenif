@@ -2069,6 +2069,27 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     else: discard
     if glbStaging != NoReg: g.giveBack glbStaging
     elif v.isTemp: g.unbindTemp(v.r)
+  elif dst.kind == Mem and dstAggr and rhs.kind == TagLit and rhs.exprKind == CallC:
+    # A call's AGGREGATE result into a path, built in place: `&path` is the hidden
+    # result pointer. Only where `inplace.nim` proved the callee cannot observe the
+    # path — a region field, or the home of a folded temp. Any other call into a
+    # path arrives bound to a temp (nimony's `LowerCasts` binds every one), and
+    # must: the path's base would be read AFTER the call, past the last use the
+    # analyser saw at its token position.
+    let cc = g.callConvOf(rhs)
+    assert cursorToPosition(g.buf[], rhs) in g.plan.inPlace.calls and
+           cc.passesByRef(aggrSize),
+      "arkham x64n: an aggregate call result stored into a path must be bound to a temp"
+    block:
+      let hidden = cc.intArgRegs[0]
+      let w = g.emCallerSaveOpen()                       # before rdi is written: see above
+      g.dropStaleBinding(hidden)
+      g.emitLvalue(dst.cur, globBase = regLoc(hidden, AddrSlot))
+      g.aggrAddrInto(dst.cur, hidden, AddrSlot, doBind = false)
+      g.freeLvalTemps(dst.cur)
+      var d = dontCare
+      g.emitCall(rhs, d, hiddenPtr = true)               # the callee writes through it
+      g.emCallerSaveClose(w, d)
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     let wr = g.pairFieldReg(dst.cur)
     if wr != NoReg:

@@ -1665,6 +1665,18 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.storeReg(dst, vr)
       if vb != NoReg: g.dropBridge vb
       elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+  elif dst.kind == Mem and dstAggr and rhs.kind == TagLit and rhs.exprKind == CallC:
+    # A call's AGGREGATE result into a path, built in place — see the x64 twin for
+    # why nothing else may arrive here. `&path` goes in `indirectResultReg`, a
+    # register in no pool, so nothing below disturbs it.
+    assert g.posOf(rhs) in g.plan.inPlace.calls and g.md.passesByRef(aggrSize),
+      "arkham risc: an aggregate call result stored into a path must be bound to a temp"
+    block:
+      g.emitLvalue(dst.cur, globBase = regLoc(g.indirectResultReg, addrSlot()))
+      g.aggrAddrInto(dst.cur, g.indirectResultReg, addrSlot(), doBind = false)
+      g.freeLvalTemps(dst.cur)
+      var d = dontCare
+      g.emitCall(rhs, d, hiddenPtr = true)                 # the callee writes through it
   elif dst.kind == Mem:                                      # store through complex lvalue
     let wr = g.pairFieldReg(dst.cur)
     if wr != NoReg:

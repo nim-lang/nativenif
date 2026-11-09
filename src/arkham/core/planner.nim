@@ -89,6 +89,8 @@ let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
 import nifcore, nifcdecl, asmslots, machinedesc, analyser, programs, typenav
 import abi
+import inplace
+export inplace
 from stress import envInt
 export abi         # CallPlan / planCall / ParamPlace: the one ABI classifier the
                    # allocator and both emitters consume (see abi.nim)
@@ -148,6 +150,9 @@ type
                                       ## allocator reserved a callee-saved reg for the
                                       ## emitter's `stackArgBaseReg` (single source of
                                       ## truth; the emitter must NOT re-classify)
+    inPlace*: InPlace                 ## aggregate call results built straight into their
+                                      ## destination (`inplace.nim`): the folded temps'
+                                      ## `Mem` homes and the copies that become nothing
     aliasable*: HashSet[SymId]        ## locals whose ADDRESS is taken. They are the ones
                                       ## a store through a pointer — or a callee handed
                                       ## that pointer — can write behind the emitter's
@@ -979,8 +984,14 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
       # early `return` here: that would skip the `into` epilogue and desync.)
-      b.recordSym(pos, name, namedStackLoc(name, slot))
-      b.plan.hasStackVars = true
+      let folded = b.plan.inPlace.homes.getOrDefault(pos)
+      if not cursorIsNil(folded):
+        # A folded temp (`inplace.nim`): the call builds the value where the copy
+        # after it would have put it, so the temp has no storage of its own.
+        b.recordSym(pos, name, memLoc(folded, slot))
+      else:
+        b.recordSym(pos, name, namedStackLoc(name, slot))
+        b.plan.hasStackVars = true
     else:
       let props = b.an.vars.getOrDefault(name).props
       # ── same-width cast/copy home inheritance ──────────────────────────────────
@@ -1610,6 +1621,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                   aux: initTable[int, ExprAux](),
                   symPos: initTable[SymId, int]())
   b.plan.sealed = presealed
+  b.plan.inPlace = findInPlace(buf, procDecl, prog, md, tc)
   b.plan.divRegClobbered = an.clobbersDivReg
   b.plan.shiftRegClobbered = an.clobbersShiftReg
   # The alias set, straight from the analyser's per-var props: the emitter's

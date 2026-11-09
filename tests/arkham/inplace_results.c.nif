@@ -1,0 +1,146 @@
+(.nif27)
+(stmts
+ (type :Vec3.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :y.0 .
+    (i 64))
+   (fld :z.0 .
+    (i 64))))
+ (type :Small.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))))
+ (type :Vecs.0 .
+  (array Vec3.0 2))
+ (type :Outer.0 .
+  (object .
+   (fld :tag.0 .
+    (i 64))
+   (fld :v.0 . Vec3.0)
+   (fld :arr.0 . Vecs.0)
+   (fld :small.0 . Small.0)))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :mk.0
+  (params
+   (param :base.0 .
+    (i 64))) Vec3.0
+  (pragmas (noinline))
+  (stmts
+   (var :r.0 . Vec3.0 .)
+   (asgn
+    (dot r.0 x.0) base.0)
+   (asgn
+    (dot r.0 y.0)
+    (add
+     (i 64) base.0 1))
+   (asgn
+    (dot r.0 z.0)
+    (add
+     (i 64) base.0 2))
+   (ret r.0)))
+ (proc :swap.0
+  (params
+   (param :p.0 .
+    (ptr Vec3.0))) Vec3.0
+  (pragmas (noinline))
+  (stmts
+   (var :r.1 . Vec3.0 .)
+   (asgn
+    (dot r.1 x.0)
+    (dot
+     (deref p.0) z.0))
+   (asgn
+    (dot r.1 y.0)
+    (dot
+     (deref p.0) y.0))
+   (asgn
+    (dot r.1 z.0)
+    (dot
+     (deref p.0) x.0))
+   (ret r.1)))
+ (proc :mks.0
+  (params) Small.0
+  (pragmas (noinline))
+  (stmts
+   (var :s.0 . Small.0 .)
+   (asgn
+    (dot s.0 a.0) 11)
+   (asgn
+    (dot s.0 b.0) 12)
+   (ret s.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :o.0 . Outer.0 .)
+   (var :o2.0 . Outer.0 .)
+   (construct o.0
+    (stmts
+     (asgn
+      (dot o.0 tag.0) 1)
+     (var :t.2 . Vec3.0
+      (call mk.0 5))
+     (asgn
+      (dot o.0 v.0) t.2)
+     (asgn
+      (dot o.0 arr.0)
+      (aconstr Vecs.0
+       (oconstr Vec3.0 (kv x.0 0) (kv y.0 0) (kv z.0 0))
+       (oconstr Vec3.0 (kv x.0 0) (kv y.0 0) (kv z.0 0))))
+     (var :s.1 . Small.0
+      (call mks.0))
+     (asgn
+      (dot o.0 small.0) s.1)))
+   (var :t.0 . Vec3.0
+    (call mk.0 7))
+   (asgn
+    (at
+     (dot o.0 arr.0) 1) t.0)
+   (var :p.1 .
+    (ptr Outer.0)
+    (addr o2.0))
+   (var :t.3 . Vec3.0
+    (call mk.0 3))
+   (asgn
+    (dot
+     (deref p.1) v.0) t.3)
+   (var :t.1 . Vec3.0
+    (call swap.0
+     (haddr
+      (dot o.0 v.0))))
+   (asgn
+    (dot o.0 v.0) t.1)
+   (call mk.0 9)
+   (call exit.0
+    (conv
+     (i 32)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (dot o.0 tag.0)
+        (dot
+         (dot o.0 v.0) x.0))
+       (add
+        (i 64)
+        (dot
+         (at
+          (dot o.0 arr.0) 1) y.0)
+        (dot
+         (dot o2.0 v.0) z.0)))
+      (dot
+       (dot o.0 small.0) b.0)))))))

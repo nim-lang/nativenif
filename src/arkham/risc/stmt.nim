@@ -12,7 +12,7 @@
 ## and leaves the ordinary path to it when the shape is not exactly right, which
 ## is what keeps the recogniser honest about what it does not handle.
 
-import std / [assertions, tables]
+import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, constdata, exprpred,
@@ -51,6 +51,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
       g.emTypedStackVar(nm, typeCur)                         # one route; dispatches on slot class
       if loc.typ.kind == AMem and typeCur.kind == Symbol:
         g.varType[nm] = typeCur.symId                     # aggregate field layout
+    of Mem: discard            # a folded temp (`inplace.nim`): it lives in its path
     else: raiseAssert "arkham a64n: var home " & $loc.kind
     if hasVal: g.genStore(cc, loc)
     while cc.hasMore: skip cc
@@ -173,6 +174,18 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl(c)
   of CallS:
+    block:
+      # A discarded result that travels through a hidden pointer still needs
+      # storage: the callee writes it whether anyone reads it or not.
+      let rt = g.getType(c)
+      if not retIsVoid(rt):
+        let rs = slotOf(g.prog, rt)
+        if rs.kind == AMem and g.md.passesByRef(rs.size):
+          let home = g.lengSym(synth("calltmp") & $g.posOf(c) & ".0")
+          g.emTypedStackVar(home, rt)
+          if rt.kind == Symbol: g.varType[home] = rt.symId
+          g.genStore(c, namedStackLoc(home, rs))
+          return
     var d = dontCare                   # a statement call: result unused
     # A bare call at the END of a void proc is a tail call, and it is the shape the
     # `(ret (call …))` encoding cannot reach: a void proc has no `ret` for shoggoth's
@@ -190,6 +203,8 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     assert g.loopEnds.len > 0, "arkham a64n: `break` outside a loop"
     g.emBr(BA64, g.loopEnds[^1])
   of AsgnS:
+    if g.posOf(c) in g.plan.inPlace.elided:
+      return                     # a folded temp's copy: the call built it in place
     var cc = c
     cc.into:
       let asgnPos = g.posOf(c)

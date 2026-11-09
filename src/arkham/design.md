@@ -582,6 +582,18 @@ expression evaluator:
   (x8 on AArch64 / a synthetic first parameter in rdi on x86-64), which the
   prologue parks in a callee-saved register for the body to fill.
 
+  The CALLER side: a call whose result travels by reference builds it at its
+  destination's address when that is sound — a symbol (local, parameter,
+  global), or a path the planner proved the callee cannot observe
+  (`core/inplace.nim`): a field of a nimony `construct` region's destination, or
+  the home of a folded temp. nimony binds every call into a path to a temp,
+  `(var t T (call f …)) (asgn path t)`; when the two are adjacent, `t` is used
+  once and `path` is rooted at a local whose address never escapes (or at a
+  region's destination), the planner homes `t` AT `path` (a `Mem` location) and
+  the copy becomes nothing. The emitters' `genStore` then has one `Mem` arm for
+  it: `&path` into rdi/rcx on x86-64, into `indirectResultReg` on the RISC
+  targets. A discarded by-reference result gets a temp of its own.
+
 - **The frame is fixed.** The prologue saves the used callee-saved registers
   (AArch64 pairs them with fp/lr via `stp`) and lowers SP **once**, by an amount
   that already includes the local/`etmp` slots **and** the largest outgoing

@@ -86,6 +86,7 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
         of NamedStack:
           g.emTypedStackVar(nm, typeCur)
           if typeCur.kind == Symbol: g.varType[nm] = typeCur.symId  # aggregate field layout
+        of Mem: discard          # a folded temp (`inplace.nim`): it lives in its path
         else: raiseAssert "arkham x64n: var home " & $loc.kind
       if hasVal:
         # Same-width cast/copy inheritance (see `allocVarDecl`): when the value is just
@@ -360,6 +361,18 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       g.exitScope()
   of VarS, ConstS: g.genVarDecl(c)     # a local const = an immutable var with a literal init
   of CallS:
+    block:
+      # A discarded result that travels through a hidden pointer still needs
+      # storage: the callee writes it whether anyone reads it or not.
+      let rt = g.getType(c)
+      if not retIsVoid(rt):
+        let rs = slotOf(g.prog, rt)
+        if rs.kind == AMem and g.callConvOf(c).passesByRef(rs.size):
+          let home = g.lengSym(synth("calltmp") & $cursorToPosition(g.buf[], c) & ".0")
+          g.emTypedStackVar(home, rt)
+          if rt.kind == Symbol: g.varType[home] = rt.symId
+          g.genStore(c, namedStackLoc(home, rs))
+          return
     var d = dontCare                   # a statement call: result unused
     # A bare call at the END of a void proc is a tail call, and it is the shape the
     # `(ret (call …))` encoding cannot reach: a void proc has no `ret` for shoggoth's
@@ -382,6 +395,8 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     assert g.loopEnds.len > 0, "arkham x64n: `break` outside a loop"
     g.emJmp(g.loopEnds[^1])
   of AsgnS:
+    if cursorToPosition(g.buf[], c) in g.plan.inPlace.elided:
+      return                     # a folded temp's copy: the call built it in place
     var cc = c
     cc.into:
       let asgnPos = cursorToPosition(g.buf[], c)
