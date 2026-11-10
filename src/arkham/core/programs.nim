@@ -18,7 +18,7 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions, sets, syncio]
+import std / [tables, assertions, sets, syncio, strutils]
 import nifcore, nifcdecl, nifcoreparse
 import asmslots, nifmodules
 import "../../../../nimony/src/lib" / [symparser, nifreader, intrinsics]
@@ -1133,6 +1133,39 @@ proc lookupForeignDecl*(p: var Program; sym: SymId; found: var bool): Cursor =
   result = getDecl(m, name, p.tags, p.pool)
   p.requestedForeign.add (sym, result)
   found = true
+
+proc exportcName(decl: Cursor): string =
+  ## The `exportc` name in a `(proc …)` declaration's pragmas, or "".
+  result = ""
+  var importcN = ""
+  var d = decl
+  d.into:
+    inc d                                     # name
+    skip d                                    # params
+    skip d                                    # return type
+    parsePragmas(d, importcN, result)
+    while d.hasMore: skip d
+
+proc procByExportc*(p: var Program; module, base, cname: string): SymId =
+  ## The proc of module `module` named `base.<n>.<module>` whose `exportc` is
+  ## `cname` (`=destroy` for `string` is `nimStrDestroy`), or `SymId(0)`. A
+  ## hook's overload number is the owning module's business, so the exportc
+  ## name is what identifies it. The module being compiled is searched in its
+  ## own proc list; any other by its index keys alone, parsing a decl once its
+  ## name matches.
+  result = SymId(0)
+  if module == p.scheme.name:
+    for pi in p.procs:
+      if exportcName(pi.decl) == cname:
+        var d = pi.decl
+        return takeProcDecl(d).name.symId
+  else:
+    let m = loadModule(p, module)
+    let pre = base & "."
+    for name in uncheckedBorrow(m.index).keys:
+      if name.startsWith(pre) and name.endsWith("." & module) and
+          exportcName(getDecl(m, name, p.tags, p.pool)) == cname:
+        return symId(p.pool, name)
 
 proc gvarAsmName*(p: Program; sym: SymId): SymId =
   ## The asm-NIF symbol for a global reference: an importc/exportc gvar uses its

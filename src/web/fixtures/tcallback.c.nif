@@ -1,0 +1,97 @@
+(.nif27)
+(stmts@,1,tcallback.nim
+ (type :Obj.0.tcallback .
+  (object .
+   (fld :x.0 .
+    (i 32))))
+ (type :H.0.tcallback .
+  (ptr Obj.0.tcallback))
+ (type :Cb.0.tcallback .
+  (proctype .
+   (params
+    (param :p.0 . H.0.tcallback)) . .))
+ (gvar :acc.0 . (i 32) 0)
+ (gvar :slot.0 . Cb.0.tcallback
+  (nil))
+ (proc :fireNull.0.
+  (params
+   (param :cb.0 . Cb.0.tcallback))
+  .
+  (pragmas
+   (importjs "#(null)"))
+  (stmts .))
+ (proc :fireUndef.0.
+  (params
+   (param :cb.0 . Cb.0.tcallback))
+  .
+  (pragmas
+   (importjs "#(undefined)"))
+  (stmts .))
+ (proc :fireObj.0.
+  (params
+   (param :cb.0 . Cb.0.tcallback))
+  .
+  (pragmas
+   (importjs "#({})"))
+  (stmts .))
+ (proc :fireFn.0.
+  (params
+   (param :cb.0 . Cb.0.tcallback))
+  .
+  (pragmas
+   (importjs "#(function () {})"))
+  (stmts .))
+ (proc :fireNum.0.
+  (params
+   (param :cb.0 . Cb.0.tcallback))
+  .
+  (pragmas
+   (importjs "#(7)"))
+  (stmts .))
+ (proc :probe.0.
+  (params
+   (param :p.0 . H.0.tcallback))
+  .
+  .
+  (stmts
+   (if
+    (elif
+     (eq p.0
+      (nil))
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 1))))
+    (else
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 2)))))))
+ (proc :probeNum.0.
+  (params
+   (param :p.0 . H.0.tcallback))
+  .
+  .
+  (stmts
+   (if
+    (elif
+     (eq
+      (cast
+       (i 32) p.0) 7)
+     (stmts
+      (asgn acc.0
+       (add
+        (i 32) acc.0 16)))))))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn slot.0 probe.0.)
+   (call fireNull.0. probe.0.)
+   (call fireUndef.0. slot.0)
+   (call fireObj.0. probe.0.)
+   (call fireFn.0. slot.0)
+   (call fireNum.0. probeNum.0.)
+   (ret acc.0))))

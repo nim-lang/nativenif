@@ -1,0 +1,28 @@
+(.nif27)
+(stmts@,1,tsplice_strptr.nim
+ (type :string.0.tsplice_strptr .
+  (object .
+   (fld :bytes.0 .
+    (u 32))
+   (fld :more.0 .
+    (ptr
+     (u 8)))))
+ (proc :show.0.
+  (params
+   (param :s.0 .
+    (ptr string.0.tsplice_strptr)))
+  .
+  (pragmas
+   (importjs "console.log(#)"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :z.0 .
+    string.0.tsplice_strptr)
+   (call show.0.
+    (haddr z.0))
+   (ret 0))))

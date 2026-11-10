@@ -1,0 +1,39 @@
+(.nif27)
+(stmts@,1,tgrowstore.nim
+ (type :Obj.0.tgrowstore .
+  (object .
+   (fld :x.0 .
+    (i 32))))
+ (gvar :h.0 . (ptr Obj.0.tgrowstore)
+  (nil))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :mk.0.
+  (params)
+  (ptr Obj.0.tgrowstore)
+  (pragmas
+   (importjs "({})"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn h.0
+    (call mk.0.))
+   (if
+    (elif
+     (eq h.0
+      (nil))
+     (stmts
+      (call exit.0 3)))
+    (else
+     (stmts
+      (call exit.0 5))))
+   (ret 0))))
