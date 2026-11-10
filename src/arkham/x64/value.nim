@@ -440,6 +440,7 @@ proc place*(g: var CodeGen; src: Location; dest: Reg) =
 proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
 proc genConstr*(g: var CodeGen; c: Cursor; dst: Location)
 proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location)
+proc genAggrInPlace*(g: var CodeGen; c: Cursor; p: Reg)
 proc binMemLval(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
 proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
@@ -1151,6 +1152,28 @@ proc genFieldStore*(g: var CodeGen; dst: Location; valC: Cursor) =
     if fty.kind != Symbol:
       raiseAssert "arkham x64n: nested aggregate field of non-nominal type"
     g.genAggrCopyStore(valC, dst, aggrByteSize(g.prog, fty.symId))
+  elif dst.typ.kind == AMem and containsEmptyAconstr(valC):
+    # Built in place: through a temp it would cost a stack slot as big as the
+    # field and a copy over every word of it — for an empty `(aconstr T)` (or a
+    # constructor holding one) that is a size the IR does not show (a closure
+    # env's 16 MB array). Holding the field address across the build is sound:
+    # field values are flat operands (xelim hoisted the calls).
+    if dst.base.kind == FbReg and g.rb.isBoundTemp(dst.base.reg):
+      # The base is a scratch of the build itself — an enclosing in-place
+      # build's address. Move it onto the field and back rather than taking a
+      # register per nesting level.
+      let r = dst.base.reg
+      let off = fieldByteOffset(g.prog, dst.aggrType, dst.field)
+      if off != 0: g.binImm(AddX64, r, off)
+      g.genAggrInPlace(valC, r)
+      if off != 0: g.binImm(SubX64, r, off)
+    else:
+      let (d, gbTmp) = g.materializeGlobBase(dst, NoReg)
+      let fptr = g.pickStagingSealed("an in-place field address", AddrSlot)
+      g.emFieldAddr(d, fptr)
+      g.genAggrInPlace(valC, fptr)
+      g.giveBack fptr
+      if gbTmp != NoReg: g.giveBack gbTmp
   elif dst.typ.kind == AMem:                            # nested aggregate field
     # Build the value into its own stack temp FIRST, holding nothing (see
     # `buildNestedAggrTemp`), and only then derive the field address for the copy.
@@ -1338,6 +1361,46 @@ proc genConstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
 when not defined(nimony):
   {.pragma: untyped.}
 
+proc genZeroFill*(g: var CodeGen; p: Reg; total: int) =
+  ## Write `total` zero bytes at `[p]` — an empty `(aconstr T)`, the all-zero
+  ## array — as a RUNTIME quadword loop plus a sub-word tail, never one store per
+  ## element. The zero is an immediate, so it costs no register. `p` is a scratch
+  ## the caller owns; the loop advances it and moves it back before returning, so
+  ## an enclosing in-place build can go on using it.
+  g.bridgeStep("an all-zero array fill", bdTwoInRegs)
+  if total <= 0: return
+  let words = total div 8
+  template zstore(bits, idx: int) =
+    g.ab.tree MovX64:
+      g.ab.tree MemX:
+        g.ab.tree AtX:
+          g.ab.tree CastX:
+            g.ab.aptrType: g.ab.uintType(bits)
+            g.emReg p
+          g.ab.intLit idx.int64
+      g.ab.intLit 0
+  let looped = words > 8
+  if looped:
+    let cnt = g.pickStagingSealed("an all-zero fill count", ScalarSlot, avoid = p)
+    g.movImm(cnt, words)
+    let done = g.freshLabel()
+    g.emitLoop:
+      zstore(64, 0)
+      g.binImm(AddX64, p, 8)
+      g.binImm(SubX64, cnt, 1)
+      g.emJcc(JeX64, done)
+    g.emLab done
+    g.giveBack cnt
+  var off = (if looped: 0 else: words * 8)            # the tail, relative to `p`
+  if not looped:
+    for k in 0 ..< words: zstore(64, k)
+  var rem = total - words * 8
+  for w in [4, 2, 1]:
+    if rem >= w:
+      zstore(w * 8, off div w)
+      off += w; rem -= w
+  if looped: g.binImm(SubX64, p, words * 8)
+
 template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp: untyped) {.untyped.} =
   ## The ONE element-store loop behind `genAconstr`/`genAconstrIntoLval`: walk
   ## `(aconstr ArrayT e0 e1 …)`, emit each (bare) element value and store it at the
@@ -1345,6 +1408,8 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp: untyped) {.unt
   ## index `i`, which the template injects). nifasm sizes each store from the array's
   ## element type; a pointer element is reinterpreted via `(cast (ptr …) reg)` for
   ## nifasm's strict typing. The array twin of `constrFieldStores`.
+  ## An EMPTY `(aconstr T)` never gets here: every caller fills it through one
+  ## address register with `genZeroFill`.
   block:
     var tc = c; inc tc                                  # the array type
     let elemTyRaw = innerType(g.prog, resolveType(g.prog, tc))  # nominal element type
@@ -1357,6 +1422,15 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp: untyped) {.unt
       var i {.inject.} = 0
       while cc.hasMore:
         let valC = cc
+        if elemSlot.kind == AMem and containsEmptyAconstr(valC):
+          # Built in place, for the reason `genFieldStore` gives.
+          let eptr = g.pickStagingSealed("an in-place element address", AddrSlot)
+          g.ab.tree LeaX64: (g.emReg eptr; destOp)   # &element[i]
+          g.genAggrInPlace(valC, eptr)
+          g.giveBack eptr
+          inc i
+          skip cc
+          continue
         if elemSlot.kind == AMem:                       # nested aggregate element
           # Build first, lea `&element[i]` after — the field twin's depth-independence
           # (see `buildNestedAggrTemp`) applies to array elements just the same.
@@ -1412,6 +1486,14 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; i, destOp: untyped) {.unt
 proc genAconstrIntoLval*(g: var CodeGen; c: Cursor; lhs: Cursor) =
   ## Emit `(aconstr ArrayT e0 e1 …)` straight into the array addressed by lvalue `lhs`.
   ## The address-targeted twin of `genAconstr` (cf. `genConstrIntoLval` for objects).
+  if isEmptyAconstr(c):
+    # The all-zero array: `&lhs` into one register, then fill through it.
+    let p = g.pickStagingSealed("an all-zero array address", AddrSlot)
+    g.aggrAddrInto(lhs, p, AddrSlot, doBind = false)    # premats + releases internally
+    g.freeLvalTemps(lhs)
+    g.genZeroFill(p, typeSizeAlign(g.prog, sub(c))[0])
+    g.giveBack p
+    return
   g.prematLval(lhs)                                      # the lvalue's base/index regs, once
   g.aconstrElemStores(c, i, g.emLvalElemMem(lhs, i))
   g.unbindLvalTemps(lhs)                                 # release the lvalue's base/index temps
@@ -1434,7 +1516,16 @@ proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location) =
   ## the second case would write the elements over the pointer's own 8 bytes and on up
   ## the stack, so load the pointer and store through it — exactly what
   ## `constrFieldStores` does for the `oconstr` twin.
-  if dst.kind == StackPtr:
+  if isEmptyAconstr(c):
+    # The all-zero array: its address into one register, then fill through it.
+    let p = g.pickStagingSealed("an all-zero array address", AddrSlot)
+    if dst.kind == StackPtr:
+      g.ab.tree MovX64: (g.emReg p; g.emStackMem(dst.ptrName))
+    else:
+      g.emAggrHomeAddr(p, dst.name)
+    g.genZeroFill(p, typeSizeAlign(g.prog, sub(c))[0])
+    g.giveBack p
+  elif dst.kind == StackPtr:
     let base = g.pickStagingSealed("an aconstr spilled by-ref base", AddrSlot)
     g.ab.tree MovX64: (g.emReg base; g.emStackMem(dst.ptrName))
     var atc = c; inc atc                                # the array type
@@ -1443,6 +1534,27 @@ proc genAconstr*(g: var CodeGen; c: Cursor; dst: Location) =
     g.giveBack base
   else:
     g.aconstrElemStores(c, i, g.emAggrElemMem(dst.name, i))
+
+proc genAggrInPlace*(g: var CodeGen; c: Cursor; p: Reg) =
+  ## Build the constructor `c` — an `oconstr` or `aconstr` that
+  ## `containsEmptyAconstr` — straight into the aggregate at `[p]`; `p` holds that
+  ## address again afterwards. A `conv`/`cast` of one is byte-transparent.
+  var x = c
+  while x.kind == TagLit and x.exprKind in {ConvC, CastC}:
+    x = sub(x)
+    skip x                                              # the target type
+  if x.kind != TagLit:
+    raiseAssert "arkham x64n: in-place aggregate build of " & $x.kind
+  case x.exprKind
+  of OconstrC: g.constrFieldStores(x, regLoc(p, ScalarSlot))
+  of AconstrC:
+    var atc = sub(x)                                    # the array type
+    if isEmptyAconstr(x):
+      g.genZeroFill(p, typeSizeAlign(g.prog, atc)[0])  # straight through `p`
+      return
+    let elemTy = innerType(g.prog, resolveType(g.prog, atc))
+    g.aconstrElemStores(x, i, g.emPtrElemMem(p, elemTy, i))
+  else: raiseAssert "arkham x64n: in-place aggregate build of " & $x.exprKind
 
 proc genBaseobj*(g: var CodeGen; c: Cursor; dst: Location) =
   ## `(baseobj BaseType depth value)` — an object→base up-conversion (slicing). Inheritance
@@ -1764,7 +1876,7 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     g.genAggrCopyStore(rhs, dst, aggrSize)
     return
   if dstAggr and rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC} and
-     constrReadsDst(rhs, dst):
+     constrReadsDst(rhs, dst, ordered = constrIsOrdered(g.prog, rhs)):
     # `v = V(x: p, y: v.x / p)`: the constructor is evaluated before the store,
     # but building it field by field INTO `v` overwrites `v.x` before `y` reads
     # it. Build into a fresh `aggtmp` slot, then copy the whole aggregate.
@@ -1894,7 +2006,10 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
         g.emSymAddr(addrT, dst)
         var atc = rhs; inc atc                            # the array type
         let elemTy = innerType(g.prog, resolveType(g.prog, atc))
-        g.aconstrElemStores(rhs, i, g.emPtrElemMem(addrT, elemTy, i))
+        if isEmptyAconstr(rhs):
+          g.genZeroFill(addrT, typeSizeAlign(g.prog, atc)[0])  # the all-zero array
+        else:
+          g.aconstrElemStores(rhs, i, g.emPtrElemMem(addrT, elemTy, i))
         if spilled: g.giveBack addrT else: g.unbindTemp(addrT)
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in rax:rdx
         var d = dontCare
@@ -4255,6 +4370,15 @@ proc emitCallInner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = fa
         g.ab.tree MovX64:
           g.emReg RAX
           g.ab.tree ResX: g.ab.sym g.lengSym(synth("ret.0"))
+        # A sub-64-bit integer lives in its register EXTENDED to 64 bits
+        # (`sameRegRepr`), and arkham's own callees keep that promise. Foreign
+        # code does not: neither Win64 nor SysV defines rax's upper bits for a
+        # narrow result (`MulDiv(-6, 1, 2)` left 0x00000000FFFFFFFD, so
+        # `== -3'i32` was false). Normalize once, here, as `frame` does for
+        # the incoming parameters of a proc C calls.
+        if (tgt.extern or tgt.foreignAbi) and resSlot.kind in {AInt, AUInt, ABool} and
+            resSlot.size < 8:
+          g.extendTo(RAX, resSlot.size * 8, signed = resSlot.kind == AInt)
   g.rb.unsealAccums(sealedArgs)
   for f in sealedFArgs: g.rb.unsealF f
   if hiddenPtr: g.rb.unsealAccums {amd.intArgRegs[0]}     # the early seal (indirect target)
@@ -4791,6 +4915,18 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     # `giveBack` would kill a binding and break a seal this row never made.
     if d.kind == InReg and d.isTemp and d.r != res.r: g.giveBack d.r
   dest = res
+proc floatConst*(g: var CodeGen; pattern: int64; bits: int): SymId =
+  ## The pooled `(rodata …)` blob holding a float constant's bits.
+  let key = (bits, pattern)
+  result = g.floatPool.getOrDefault(key, SymId(0))
+  if result == SymId(0):
+    result = g.lengSym("fc." & $g.floatPool.len & "." & g.prog.thisModuleSuffix)
+    var bytes = newString(bits div 8)
+    for i in 0 ..< bits div 8:
+      bytes[i] = char((cast[uint64](pattern) shr (8*i)) and 0xFF)
+    g.rodata.add (result, bytes)
+    g.floatPool[key] = result
+
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED SIMD value: resolve `dest` (an xmm constraint / fixed register /
   ## `eftmp` slot) against `c` and materialize the float value there.
@@ -4805,12 +4941,14 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
         g.produceIntoFMem(c, dest); return
     let bits = if dest.typ.size == 4: 32 else: 64
     if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
-    let gpr = g.pickStagingSealed("a float literal bit pattern",
-                                  AsmSlot(cls: AInt, size: 8, align: 8))
-    if bits == 32: g.movImm(gpr, int64(cast[uint32](float32(floatVal(c)))))
-    else: g.movImm(gpr, cast[int64](floatVal(c)))
-    g.fmovFromGpr(dest.f, gpr, bits)
-    g.giveBack gpr
+    # One RIP-relative load from the module's constant pool — what gcc emits —
+    # instead of `mov gpr, imm64` + `movq xmm, gpr`: one instruction, no GPR.
+    let pattern = if bits == 32: int64(cast[uint32](float32(floatVal(c))))
+                  else: cast[int64](floatVal(c))
+    let cst = g.floatConst(pattern, bits)
+    g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+      g.emFReg dest.f
+      g.ab.sym cst
   of Symbol:
     # Store forwarding matters most here: SysV has no callee-saved xmm, so EVERY
     # float local is stack-homed and every read of one is a reload unless the

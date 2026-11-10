@@ -659,6 +659,8 @@ const webRunDivergent: seq[string] = @[
   "positioned_file",  # raw Linux file syscalls have no web host implementation
   "scope_slot_reuse", # reads a dead scope's slot — the answer 7 is arkham's
                       # stack layout, not a language guarantee
+  "emptyaconstr_big", # 2.4 MB array LOCALS: past the 1 MB web shadow stack
+                      # (`ShadowStackSize`) — a frame limit, not a codegen one
 ]
 
 proc webTests() =
@@ -2423,6 +2425,12 @@ const cortexMUnsupported: seq[string] = @[
   # Every one of them refuses BY NAME (a compile-time error from arkham or
   # nifasm); the single exception is called out at the bottom.
 
+  # ── memory size ─────────────────────────────────────────────────────────────
+  # 2.4 MB arrays: nifasm refuses globals that reach the stack top of the
+  # mps2's 64 KB SRAM. `tests/arkham_m/emptyaconstr_{big,data}` are their
+  # scaled-down twins, and run here.
+  "emptyaconstr_big", "emptyaconstr_data",
+
   # ── float64 ─────────────────────────────────────────────────────────────────
   # Missing HARDWARE, not a missing feature: Cortex-M4F's FPv4-SP is single
   # precision and has no `.f64` instruction at all. `float32` works (M5) — see
@@ -2752,8 +2760,7 @@ when defined(linux) and defined(amd64):
 # run: no host here can execute it, but the Darwin-only code — every `importc` is
 # a libSystem extern with a signature, thread-locals go through TLV descriptors —
 # has to keep emitting and assembling. A stem in the known list is x86-64-pinned;
-# anything else failing is new breakage. (The foreign-module fixtures resolve
-# because the earlier passes left the `mod_*` modules in the same nimcache.)
+# anything else failing is new breakage.
 const arkhamDarwinAssembleKnown: seq[string] = @[
   "assembler_x64", "intrinsics_x64", "naked_stacktrace_x64",   # x86-64-pinned
   # This pass consults only its own list — it is the one that does not honour
@@ -2767,8 +2774,15 @@ const arkhamDarwinAssembleKnown: seq[string] = @[
 proc arkhamDarwinAssembleTests() =
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
-  let workDir = "tests" / "arkham" / "nimcache"
+  # Its own nimcache: the cross-module fixtures auto-import `mod_*.asm.nif` from
+  # here, and the other passes leave theirs built for other targets.
+  let workDir = "tests" / "arkham" / "nimcache_darwin"
   createDir workDir
+  for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
+    let base = extractFilename(file)
+    let name = base[0 ..< base.len - ".c.nif".len]
+    exec quoteShell(arkham) & " -a:arm64 -o:" &
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
   var total, passed, expectedFail = 0
   var newFailures: seq[string] = @[]
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):

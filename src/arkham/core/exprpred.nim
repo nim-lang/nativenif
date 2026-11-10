@@ -312,37 +312,30 @@ proc tailCallLeaksFrame*(g: var CodeGen; args: openArray[Cursor]): bool =
           skip it
   false
 
-proc sameTree*(a, b: Cursor): bool =
-  ## Structural equality of two expression subtrees, ignoring the sparse line-info
-  ## suffixes (they are not iterated as children). The nifcore twin of nimony's
-  ## `sameTrees`, which lives in `nimony_model` and is not on arkham's import path.
-  ##
-  ## Used to recognize a read-modify-write: `(asgn L (add T L v))` is one only if the
-  ## `L` under the `add` is the SAME location as the assignment's target, and "same"
-  ## here has to mean same tokens — arkham has no value numbering to appeal to. That
-  ## is sound because hexer un-nests, so an lvalue's embedded values are symbol or
-  ## immediate loads: two identical trees name one location at one program point.
-  if a.hasMore != b.hasMore: return false
-  if not a.hasMore: return true
-  let ka = a.kind
-  if ka != b.kind: return false
-  case ka
-  of TagLit:
-    if cursorTagId(a) != cursorTagId(b): return false
-    var ca = childCursor(a)
-    var cb = childCursor(b)
-    while ca.hasMore and cb.hasMore:
-      if not sameTree(ca, cb): return false
-      skip ca
-      skip cb
-    result = ca.hasMore == cb.hasMore
-  of Symbol, SymbolDef: result = symId(a) == symId(b)
-  of IntLit:            result = intVal(a) == intVal(b)
-  of UIntLit:           result = uintVal(a) == uintVal(b)
-  of FloatLit:          result = floatVal(a) == floatVal(b)
-  of StrLit, Ident:     result = strId(a) == strId(b)
-  of CharLit:           result = charLit(a) == charLit(b)
-  else:                 result = true
+when not declared(nifcore.sameTree):
+  # Transitional: nimony master's nifcore does not export `sameTree` yet, and
+  # this repo's CI builds against it. Delete once that nimony change has landed.
+  proc sameTree*(a, b: Cursor): bool =
+    if a.hasMore != b.hasMore: return false
+    if not a.hasMore: return true
+    if a.kind != b.kind: return false
+    case a.kind
+    of TagLit:
+      if cursorTagId(a) != cursorTagId(b): return false
+      var ca = childCursor(a)
+      var cb = childCursor(b)
+      while ca.hasMore and cb.hasMore:
+        if not sameTree(ca, cb): return false
+        skip ca
+        skip cb
+      result = ca.hasMore == cb.hasMore
+    of Symbol, SymbolDef: result = symId(a) == symId(b)
+    of IntLit: result = intVal(a) == intVal(b)
+    of UIntLit: result = uintVal(a) == uintVal(b)
+    of FloatLit: result = floatVal(a) == floatVal(b)
+    of StrLit, Ident: result = strId(a) == strId(b)
+    of CharLit: result = charLit(a) == charLit(b)
+    else: result = true
 
 proc calleeParamSlots*(g: var CodeGen; fsym: SymId; tgt: CallTarget): seq[AsmSlot] =
   ## The DECLARED parameter slots of a call target, from its `(proctype …)`
@@ -407,3 +400,51 @@ proc constrReadsDst*(rhs: Cursor; dst: Location): bool =
         skip m
     false
   result = walk(rhs, root, throughPtr)
+
+proc readsWrittenField(n: Cursor; root: SymId; written: seq[SymId]): bool =
+  ## Does `n` read `root` other than as `(dot root f …)` of a field `f` not in
+  ## `written`? A call may read `root` through an escaped address, so it counts.
+  case n.kind
+  of Symbol: result = n.symId == root
+  of TagLit:
+    if n.exprKind == DotC:
+      var b = n
+      inc b                                       # the base
+      if b.kind == Symbol and b.symId == root:
+        skip b
+        return b.kind != Symbol or b.symId in written
+    if n.exprKind == CallC or n.stmtKind == CallS: return true
+    result = false
+    var m = n
+    m.into:
+      while m.hasMore:
+        if readsWrittenField(m, root, written): return true
+        skip m
+  else: result = false
+
+proc constrReadsDst*(rhs: Cursor; dst: Location; ordered: bool): bool =
+  ## `constrReadsDst`, for a destination that is built field by field in the
+  ## constructor's `kv` order (`ordered`: not a union, whose constructor zeroes
+  ## the whole extent first). Then a value that reads a field of a plain named
+  ## slot is harmless as long as that field was not stored yet:
+  ## `v = Vec3(x: v.x * a, y: v.y * b, z: v.z * c)` -- every inlined
+  ## `multiply(v, w)` / `scale(v, k)` assigned back to `v` -- needs no `aggtmp`
+  ## and no copy of it.
+  result = constrReadsDst(rhs, dst)
+  if not result or not ordered or dst.kind != NamedStack: return
+  if rhs.kind != TagLit or rhs.exprKind != OconstrC: return
+  var written: seq[SymId] = @[]
+  var c = rhs
+  c.into:
+    skip c                                        # the constructed type
+    while c.hasMore:
+      if c.kind != TagLit or c.substructureKind != KvU: return true
+      var f = c
+      inc f                                       # the field name
+      if f.kind != Symbol: return true
+      let field = f.symId
+      skip f                                      # the value
+      if readsWrittenField(f, dst.name, written): return true
+      written.add field
+      skip c
+  result = false

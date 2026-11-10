@@ -339,6 +339,8 @@ proc genGlobalInitValue*(g: var CodeGen; name: SymId; typ, val: Cursor; hasValue
   ## module's init proc (`lengcgen`'s `trToplevel`), so it reaches arkham as an
   ## ordinary statement and never as a gvar value. Say so rather than guess.
   if not hasValue: return
+  if val.kind == TagLit and val.exprKind in {AconstrC, OconstrC} and isZeroConst(val):
+    return                                   # all zero (an empty aconstr): stays `.bss`
   if isConstScalarInit(val):
     g.ab.intLit cast[int64](constScalarBits(g.prog, typ, val))
   else:

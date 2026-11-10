@@ -1401,6 +1401,15 @@ proc typeSymIsUnion*(p: var Program; s: SymId): bool =
   if body.kind == Symbol: return typeSymIsUnion(p, body.symId)
   result = body.kind == TagLit and body.typeKind == UnionT
 
+
+proc constrIsOrdered*(p: var Program; rhs: Cursor): bool =
+  ## An `(oconstr T …)` that the back ends build field by field in `kv` order:
+  ## any but a union's, which zeroes its whole extent first.
+  if rhs.kind != TagLit or rhs.exprKind != OconstrC: return false
+  var t = rhs
+  inc t                                         # the constructed type
+  result = t.kind == Symbol and not typeSymIsUnion(p, t.symId)
+
 proc typeSymIsPacked*(p: var Program; s: SymId): bool =
   ## `(type :name <pragmas> <body>)` — the flag lives on the DECLARATION, while
   ## every layout walk below is handed the BODY. This is the bridge.
@@ -1770,6 +1779,62 @@ proc innerType*(p: var Program; t: Cursor): Cursor =
       while tc.hasMore: skip tc
   else: raiseAssert "arkham: deref/index of a non-pointer/array type"
 
+proc isEmptyAconstr*(c: Cursor): bool =
+  ## `(aconstr T)` with no element: by `doc/tags.md` the all-zero array of type
+  ## `T`, whatever its length. Nimony emits it for a zero default, so a huge
+  ## array stays one node in the IR; a back end fills `sizeof(T)` zero bytes
+  ## with a loop rather than storing element by element.
+  if c.kind != TagLit or c.exprKind != AconstrC: return false
+  var x = sub(c)
+  skip x                                       # the array type
+  result = not x.hasMore
+
+proc isZeroConst*(c: Cursor): bool =
+  ## Is the constant `c` all-zero bits? `-0.0` is not, and neither is a
+  ## constructor with a positional child (an inherited base's RTTI slot,
+  ## `(addr vt)`). An empty `(aconstr T)` is. The twin of nimony's
+  ## `lengc/typenav.isZeroConst`.
+  case c.kind
+  of IntLit: result = intVal(c) == 0
+  of UIntLit: result = uintVal(c) == 0'u64
+  of FloatLit: result = cast[uint64](floatVal(c)) == 0'u64
+  of CharLit: result = charLit(c) == '\0'
+  of TagLit:
+    case c.exprKind
+    of FalseC, NilC: result = true
+    of SufC, ParC:
+      result = isZeroConst(sub(c))
+    of ConvC, CastC:
+      var x = sub(c)
+      skip x                                   # the target type
+      result = isZeroConst(x)
+    of AconstrC, OconstrC:
+      var x = sub(c)
+      skip x                                   # the constructed type
+      result = true
+      while result and x.hasMore:
+        if x.kind == TagLit and x.substructureKind == KvU:
+          var kv = sub(x)
+          skip kv                              # the field
+          result = isZeroConst(kv)
+        else:
+          result = isZeroConst(x)
+        skip x
+    else: result = false
+  else: result = false
+
+proc containsEmptyAconstr*(c: Cursor): bool =
+  ## Does the subtree `c` contain an empty `(aconstr T)`? A constructor that
+  ## does is one whose SIZE is no longer proportional to its IR, so a back end
+  ## builds it in place rather than in a temp that is then copied word by word.
+  if c.kind != TagLit: return false
+  if isEmptyAconstr(c): return true
+  var x = sub(c)
+  while x.hasMore:
+    if containsEmptyAconstr(x): return true
+    skip x
+  result = false
+
 proc aggrWordCount*(p: var Program; typeSym: SymId): int =
   ## Number of GPRs a small aggregate occupies (1 or 2), at the TARGET's word
   ## size — 8 bytes on the 64-bit targets, 4 on Cortex-M. A two-`int32` struct is
@@ -1865,6 +1930,14 @@ proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & symString(p.pool, typeSym)
   layoutObjBody(p, body, 0, result, typeSymIsPacked(p, typeSym))
+
+proc fieldByteOffset*(p: var Program; typeSym, field: SymId): int =
+  ## The byte offset of `typeSym.field` (inherited fields included, as
+  ## `aggrLayout` flattens them).
+  for f in aggrLayout(p, typeSym):
+    if f.name == field: return f.off
+  raiseAssert "arkham: no field " & symString(p.pool, field) & " in " &
+              symString(p.pool, typeSym)
 
 proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   ## True when every field is a full 8-byte integer/pointer word at an 8-byte

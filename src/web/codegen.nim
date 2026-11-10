@@ -1338,6 +1338,16 @@ proc genCtorInto(g: var WebGen; destOff: int; c: Cursor) =
       else:
         storeSlot(g, off, widthOf(scalOf(g, vt)), val)
       skip t
+    if isFirst and rt.typeKind == ArrayT:
+      # An EMPTY `(aconstr T)`: the all-zero array, whatever its length — one
+      # `memfill` over `sizeof(T)`, never a store per element.
+      let total = byteSize(g, ty)
+      if total > 0:
+        g.outp.openTree MemFill
+        slotAddr(g, destOff)
+        g.outp.numLit 0
+        g.outp.numLit int64(total)
+        g.outp.closeTag
     slotAddr(g, destOff)                     # the sequence's value
     g.outp.closeTag
 
@@ -1531,6 +1541,15 @@ proc planNode(g: var WebGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
         planNode(g, pl, init, initNeeds)
       while t.hasMore: skip t
     return
+  if c.stmtKind == AsgnS:
+    var dst = sub(c)
+    var rhs = dst
+    skip rhs
+    if isEmptyAconstr(rhs):
+      # `assignTo` fills the destination IN PLACE with one `memfill`: the
+      # all-zero array needs no temporary (it may be megabytes).
+      planNode(g, pl, dst, needsTemp)
+      return
   if c.stmtKind == OnerrS:
     # `(onerr ACTION FN ARGS…)` performs a CALL, so an aggregate result needs
     # an sret destination exactly as for `(call …)` — reserved HERE, before
@@ -3011,7 +3030,14 @@ proc assignTo(g: var WebGen; dst, src: Cursor) =
       g.genExprCoerced(src, widthOf(scalOf(g, symType)))
     return
   let ty = lvalueType(g, dst)
-  if isAggType(g, ty):
+  if isAggType(g, ty) and isEmptyAconstr(src):
+    # The all-zero array (`planNode` reserved no temporary for it).
+    g.outp.openTree MemFill
+    genAddr(g, dst)
+    g.outp.numLit 0
+    g.outp.numLit int64(byteSize(g, ty))
+    g.outp.closeTag
+  elif isAggType(g, ty):
     g.outp.openTree MemCopy
     genAddr(g, dst)
     genExpr(g, src)                            # an aggregate value IS an address

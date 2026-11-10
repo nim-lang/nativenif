@@ -2252,6 +2252,24 @@ proc emitLea*(dest: var Buffer; reg: Register; target: LabelId) =
   dest.data.addt32(0) # Placeholder
   dest.addReloc(pos, target, rkLea, 7)
 
+proc emitSseLoadRipLabel*(dest: var Buffer; prefix, opcode: byte; reg: XmmRegister;
+                          target: LabelId) =
+  ## `[prefix] [REX.R] 0F <opcode> xmm, [RIP + target]` — a scalar float load
+  ## from a pooled constant. It rides on the `rkLea` relocation, which patches a
+  ## disp32 at `position + 3` measured from `position + 7`: anchoring the reloc
+  ## one byte (the prefix) or two (prefix + REX) into the instruction lines both
+  ## up exactly — `0F op modrm disp32` is the `48 8D modrm disp32` shape.
+  let start = dest.data.getCurrentPosition()
+  dest.data.add(prefix)
+  var anchor = start + 1
+  if int(reg) >= 8:
+    dest.data.add(encodeRex(RexPrefix(r: true)))
+    anchor = start + 2
+  dest.data.add(0x0F); dest.data.add(opcode)
+  dest.data.add(encodeModRM(amIndirect, int(reg) and 7, 5)) # Mod=00, RM=101 (RIP-rel)
+  dest.data.addt32(0)
+  dest.addReloc(anchor, target, rkLea, 7)
+
 proc emitLeaRipPlaceholder*(dest: var Buffer; reg: Register): int =
   ## Emit `LEA reg, [RIP + disp32]` with a zero placeholder displacement and NO
   ## relocation; returns the instruction's start position. Used for a global whose

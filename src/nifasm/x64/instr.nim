@@ -2127,8 +2127,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
           else:   x86.emitMovss(ctx.buf.data, d, s)
       else:
         let s = parseOperand(n, ctx)
-        if s.kind != okMem: error("movsd/movss source must be xmm or memory", n)
-        if isD: x86.emitMovsdLoad(ctx.buf.data, d, s.mem)
+        if s.kind == okLabel and s.gvarSym == nil:
+          # `(movsd (xmmD) C)` with `C` a `(rodata …)` blob: a pooled float
+          # constant, loaded RIP-relative in one instruction.
+          x86.emitSseLoadRipLabel(ctx.buf, (if isD: 0xF2'u8 else: 0xF3'u8), 0x10, d, s.label)
+        elif s.kind != okMem: error("movsd/movss source must be xmm or memory", n)
+        elif isD: x86.emitMovsdLoad(ctx.buf.data, d, s.mem)
         else:   x86.emitMovssLoad(ctx.buf.data, d, s.mem)
     else:
       let d = parseOperand(n, ctx)
