@@ -23,6 +23,7 @@
 import std / [tables, sets]
 import nifcore
 import asmslots, machinedesc, planner, programs
+import scalarmem
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
 import diag                               # `userName`: the spelling a DIAGNOSTIC shows
@@ -411,6 +412,10 @@ type
                                              ## a call to one is not a liveness call point.
                                              ## Computed once, alongside `cleanSigProcs`.
     cleanSigComputed*: bool
+    memCallNames*: Table[SymId, string]      ## direct callee → the C mem* function it
+                                             ## lowers as ("" = none); memo across procs
+    scalarMemOps*: Table[int, ScalarMemOp]   ## this proc's `ProcAnalysis.scalarMemOps`:
+                                             ## mem calls the emitter lowers as moves
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval

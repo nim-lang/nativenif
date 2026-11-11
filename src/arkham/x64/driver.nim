@@ -89,11 +89,23 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.noReturnProcs = noReturnProcs(g.prog)
     g.prog.memIntrinsics = memIntrinsicProcs(g.prog)
     g.cleanSigComputed = true
+  # Direct callees that lower as a C mem* function: a statement `memcpy`/`memset`
+  # on the address of a scalar local is a move, not a call (`core/scalarmem.nim`).
+  var memCalls = initTable[SymId, string]()
+  for t in directCalleeTokens(info.decl):
+    let s = t.symId
+    if not g.memCallNames.hasKey(s):
+      g.memCallNames[s] = (if g.typeCtx.lookupSym(s).cat == scProc:
+                             g.directCallTarget(s).memIntrin else: "")
+    let nm = g.memCallNames.getOrDefault(s, "")
+    if nm.len > 0: memCalls[s] = nm
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
-                       memCallees = g.prog.memIntrinsics)
+                       memCallees = g.prog.memIntrinsics,
+                       memCalls = memCalls)
+  g.scalarMemOps = an.scalarMemOps
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false

@@ -4436,6 +4436,49 @@ proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Locatio
   else: dest = Location(kind: Undef)            # no value: nothing consumes this node
   g.emCallerSaveClose(w, dest)
 
+proc loadScalarBits(g: var CodeGen; sCur: Cursor; bytes: int): Location =
+  ## A fresh 64-bit temp holding the bits of the scalar symbol `sCur` in its low
+  ## `bytes` bytes (what is above them is not specified).
+  result = g.takeTmp(ScalarSlot)
+  assert result.kind == InReg, "arkham x64n: no temp for a scalar memcmp"
+  g.bindTemp(result.r, ScalarSlot)
+  if g.isFloatExpr(sCur):
+    var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: bytes, align: bytes))
+    g.emitFValue(sCur, fv)
+    assert fv.kind == InFReg, "arkham x64n: scalar memcmp float operand " & $fv.kind
+    g.fmovToGpr(result.r, fv.f, bytes * 8)
+    g.freeVal(fv)
+  else:
+    g.place(g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur)), result.r)
+
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; dest: var Location) =
+  ## `memcmp(addr A, addr B, N)` on scalars (`core/scalarmem.nim`) as a compare.
+  ## memcmp orders the bytes as they lie in memory — least significant first on
+  ## this little-endian target — so byte-reverse each operand (`bswap`, then shift
+  ## the N bytes down from the top, which also discards whatever was above them)
+  ## and compare UNSIGNED. The result is `(a > b) - (a < b)`: memcmp's sign, which
+  ## is all its contract promises.
+  var ta = g.loadScalarBits(op.dst, op.bytes)
+  var tb = g.loadScalarBits(op.src, op.bytes)
+  for t in [ta.r, tb.r]:
+    g.ab.tree BswapX64: (g.emReg t; g.ab.intLit 64)
+    if op.bytes < 8: g.binImm(ShrX64, t, int64(64 - 8 * op.bytes))
+  g.binReg(CmpX64, ta.r, tb.r)
+  g.ab.tree SetaX64: g.emReg ta.r              # setcc leaves the flags alone …
+  g.ab.tree SetbX64: g.emReg tb.r
+  g.binImm(AndX64, ta.r, 1)                     # … and writes only the low byte
+  g.binImm(AndX64, tb.r, 1)
+  g.binReg(SubX64, ta.r, tb.r)                  # -1 / 0 / 1, sign-extended
+  g.freeVal(tb)
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = ta
+  of InReg:
+    g.movReg(dest.r, ta.r)
+    g.freeVal(ta)
+  else:
+    g.storeScalar(dest, ta)
+
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
   ## Caller-save wrapper: every caller-saved local bound right now is stored before
@@ -4450,6 +4493,15 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   ## hidden result pointer in rdi) must open the window itself — see
   ## `emCallerSaveOpen`; this one then finds everything already active and adds
   ## nothing.
+  if g.scalarMemOps.len > 0:
+    # `memcmp` on two scalar locals is a compare, not a call: the analyser counted
+    # no call point here, so no caller-save window may open (`core/scalarmem.nim`).
+    let pos = cursorToPosition(g.buf[], c)
+    if g.scalarMemOps.hasKey(pos):
+      let op = g.scalarMemOps.getOrDefault(pos)
+      if op.kind == smCmp:
+        g.emitScalarMemCmp(op, dest)
+        return
   when defined(arkhamCallerSaveDbg):
     if g.plan.callerSaveHomes.len > 0:
       var bound, act: seq[tuple[reg: Reg, name: SymId]] = @[]
@@ -5054,3 +5106,76 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitFValue(inner, dest)
     else: raiseAssert "arkham x64n: emitFValue(fused) expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitFValue(fused) kind " & $c.kind
+
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp) =
+  ## A statement `memcpy(addr D, addr S, sizeof D)` / `memset(addr D, 0, sizeof D)`
+  ## on scalar locals (`core/scalarmem.nim`), emitted as the move it is. The analyser
+  ## did not mark `D`/`S` address-taken and did not count the call as a call point,
+  ## so neither the address nor the caller-save window may appear here — and `D` may
+  ## be in a register of either class, or (address-taken elsewhere) on the stack.
+  let dCur = op.dst
+  let dLoc = g.plan.locationOfSym(dCur.symId, cursorToPosition(g.buf[], dCur))
+  let slot = dLoc.typ
+  let bits = op.bytes * 8
+  let intSlot = AsmSlot(cls: AUInt, size: op.bytes, align: op.bytes)
+  template intoFloatHome(ivReg: Reg) =
+    ## `D` (a float) receives the bits of the GPR `ivReg`.
+    if dLoc.kind == InFReg:
+      g.fmovFromGpr(dLoc.f, ivReg, bits)
+    else:
+      var ft = g.takeFTmp(slot)
+      assert ft.kind == InFReg, "arkham x64n: no float temp for a scalar mem op"
+      g.bindFTmp(ft.f)
+      g.fmovFromGpr(ft.f, ivReg, bits)
+      g.storeScalar(dLoc, ft)
+  case op.kind
+  of smNone, smCmp: discard                      # a compare as a statement: dead
+  of smZero:
+    if slot.isFloat:
+      var t = g.takeTmp(intSlot)
+      assert t.kind == InReg, "arkham x64n: no temp for a scalar memset"
+      g.bindTemp(t.r, intSlot)
+      g.movImm(t.r, 0)
+      intoFloatHome(t.r)
+      g.freeVal(t)
+    elif dLoc.kind == InReg:
+      g.storeScalar(dLoc, immLoc(0, slot))
+    else:
+      var t = g.takeTmp(slot)
+      assert t.kind == InReg, "arkham x64n: no temp for a scalar memset"
+      g.bindTemp(t.r, slot)
+      g.movImm(t.r, 0)
+      g.storeScalar(dLoc, t)
+  of smCopy:
+    let sCur = op.src
+    let sFloat = g.isFloatExpr(sCur)
+    if slot.isFloat == sFloat:
+      g.genStore(sCur, dLoc)                       # same type: `D = S`
+    elif sFloat:
+      # int `D` ← the bits of float `S`: `movq`, as `cast[uint64](f)` emits.
+      var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: op.bytes, align: op.bytes))
+      g.emitFValue(sCur, fv)
+      assert fv.kind == InFReg, "arkham x64n: scalar memcpy float source " & $fv.kind
+      if dLoc.kind == InReg:
+        g.killMirror(dLoc.r)
+        g.fmovToGpr(dLoc.r, fv.f, bits)
+      else:
+        var t = g.takeTmp(slot)
+        assert t.kind == InReg, "arkham x64n: no temp for a scalar memcpy"
+        g.bindTemp(t.r, slot)
+        g.fmovToGpr(t.r, fv.f, bits)
+        g.storeScalar(dLoc, t)
+      g.freeVal(fv)
+    else:
+      # float `D` ← the bits of int `S`.
+      let sLoc = g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur))
+      var iv = needsReg(sLoc.typ)
+      g.emitValue(sCur, iv)
+      if iv.kind == InReg:
+        intoFloatHome(iv.r)
+        g.freeVal(iv)
+      else:
+        let s = g.pickStagingSealed("a scalar memcpy source", iv.typ)
+        g.emitLoadLoc(iv, s)
+        intoFloatHome(s)
+        g.giveBack s

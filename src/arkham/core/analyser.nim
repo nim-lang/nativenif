@@ -30,6 +30,8 @@ import std / [tables, sets, assertions, os, strutils, envvars]
 import nifcore
 import nifcdecl
 import asmslots
+import scalarmem
+export scalarmem
 
 include compat2   # getOrQuit on host Nim
 
@@ -115,6 +117,11 @@ type
 
   ProcAnalysis* = object
     vars*: Table[SymId, VarInfo]
+    scalarMemOps*: Table[int, ScalarMemOp]  ## statement `memcpy`/`memset` calls on the
+                                ## address of a scalar local, keyed by the call's token
+                                ## position: NOT call points, and their `(addr D)` does
+                                ## not make `D` address-taken. The emitters lower each
+                                ## one as a move (`core/scalarmem.nim`).
     hasCall*: bool              ## a call exists — params cannot stay in clobbered arg
                                 ## regs; AllRegs / ArgResident consult this, and the
                                 ## fp/lr frame decision is this same question
@@ -217,6 +224,13 @@ type
                                ## one is NOT a call point for liveness: it never returns, so
                                ## nothing textually after it is reachable *through* it and no
                                ## value has to survive it. See `sawNoReturnCall`.
+    memCalls: Table[SymId, string] ## direct callees that lower as the C mem*
+                               ## function of that name (`CallTarget.memIntrin`)
+    scalarMemMaxBytes: int     ## `matchScalarMemCall`'s target limits
+    scalarMemCrossClass: bool
+    scalarMemCmp: bool
+    scalarTypes: Table[SymId, Cursor] ## declared type of every scalar LOCAL
+                               ## (`scalarTypeBytes` > 0)
     memCallees: HashSet[SymId] ## the `Memset`/`Memcpy`/`Memcmp` intrinsic procs this
                                ## module applies (`Program.memIntrinsics`). An `(instr …)`
                                ## on one is a call point: see `analyseMemInstr`.
@@ -327,10 +341,13 @@ proc classifyInit(n: Cursor): InitClass =
 proc analyseVarDecl(c: var Context; n: var Cursor) =
   ## `(var :name pragmas type value)` (also gvar/tvar/const).
   let declPos = posOf(c, n)
+  let isLocalVar = n.stmtKind == VarS
   n.into:
     assert n.kind == SymbolDef
     let vn = n.symId; inc n
     skip n                       # pragmas
+    if isLocalVar:
+      if scalarTypeBytes(n) > 0: c.scalarTypes[vn] = n
     skip n                       # type
     let hasValue = n.kind != DotToken
     let inLoop = c.inLoops > 0
@@ -475,6 +492,47 @@ proc analyseMemInstr(c: var Context; n: var Cursor) =
     while n.hasMore: analyse(c, n)
   discard c.openCalls.pop()
   inc c.completedCalls
+
+proc analyseScalarMemCall(c: var Context; n: var Cursor): bool =
+  ## A statement `memcpy(addr D, addr S, sizeof D)` / `memset(addr D, 0, sizeof D)`
+  ## on scalar locals (`core/scalarmem.nim`) is the move `D = S` / `D = 0`: record
+  ## it, account `D` as a definition and `S` as a use — no `AddrTaken`, no call
+  ## point — and consume the call.
+  result = false
+  let callee = sub(n)
+  if callee.kind != Symbol: return
+  let memName = c.memCalls.getOrDefault(callee.symId, "")
+  if memName.len == 0: return
+  let op = matchScalarMemCall(n, memName, c.scalarTypes,
+                              c.scalarMemMaxBytes, c.scalarMemCrossClass, c.scalarMemCmp)
+  if op.kind == smNone: return
+  # A copy/fill is a statement (its value, the destination pointer, is dead); a
+  # compare is a value and stands wherever its consumer put it.
+  let stmtPos = c.stmtStart.len > 0 and c.stmtStart[^1] == posOf(c, n)
+  if op.kind != smCmp and not stmtPos: return
+  let oldA = c.inAddr; let oldT = c.inAsgnTarget; let oldX = c.inArrayIndex
+  c.inAddr = 0; c.inArrayIndex = 0
+  if op.kind == smCmp:
+    c.inAsgnTarget = 0
+    var a = op.dst
+    analyse(c, a)
+    var b = op.src
+    analyse(c, b)
+    c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
+    c.res.scalarMemOps[posOf(c, n)] = op
+    skip n
+    return true
+  if op.kind == smCopy:
+    c.inAsgnTarget = 0
+    var s = op.src
+    analyse(c, s)                       # the source is READ first …
+  c.inAsgnTarget = 1
+  var d = op.dst
+  analyse(c, d)                         # … then the destination is written
+  c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
+  c.res.scalarMemOps[posOf(c, n)] = op
+  skip n
+  result = true
 
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
@@ -652,6 +710,7 @@ proc analyse(c: var Context; n: var Cursor) =
     of StmtsS:                          # statement grouping only — shares the scope frame
       iterStmts(c, n): analyse(c, n)
     of CallS:
+      if c.memCalls.len > 0 and analyseScalarMemCall(c, n): return
       # Every `(call …)` is a real call point now that the atomics are `(instr …)`.
       # They used to need an exception here — an inlined atomic clobbers a handful of
       # registers, not the caller-saved file — and modelling that took a name set, a
@@ -774,7 +833,10 @@ proc analyseParams(c: var Context; params: var Cursor) =
         c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int),
                                  paramIdx: (if c.procIsClean: idx else: -1))
         inc idx
-        while params.hasMore: skip params   # pragmas, type
+        skip params                         # pragmas
+        if params.hasMore and scalarTypeBytes(params) > 0:
+          c.scalarTypes[vn] = params        # a scalar mem op may read or write it too
+        while params.hasMore: skip params   # type
         # (rest consumed by into epilogue)
 
 when defined(arkhamPeakLive) or defined(arkhamSSAStats):
@@ -862,12 +924,17 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
-                  memCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
+                  memCallees: HashSet[SymId] = initHashSet[SymId]();
+                  memCalls: Table[SymId, string] = initTable[SymId, string]();
+                  scalarMemMaxBytes = 8; scalarMemCrossClass = true;
+                  scalarMemCmp = true): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   noReturnCallees: noReturnCallees, memCallees: memCallees,
+                  memCalls: memCalls, scalarMemMaxBytes: scalarMemMaxBytes,
+                  scalarMemCrossClass: scalarMemCrossClass, scalarMemCmp: scalarMemCmp,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS

@@ -168,6 +168,7 @@ proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; dest: var Location)
 proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location)
@@ -3095,6 +3096,14 @@ proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Locatio
 
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
+  if g.scalarMemOps.len > 0:
+    # `memcmp` on two scalar locals is a compare, not a call (`core/scalarmem.nim`).
+    let pos = cursorToPosition(g.buf[], c)
+    if g.scalarMemOps.hasKey(pos):
+      let op = g.scalarMemOps.getOrDefault(pos)
+      if op.kind == smCmp:
+        g.emitScalarMemCmp(op, dest)
+        return
   ## A call: every argument expression runs, each register-passed word becomes a
   ## move into its ABI register, and the moves are performed as one parallel move
   ## (see the phases below); the result settles from x0/v0.
@@ -4746,3 +4755,110 @@ proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): SymId =
 # block would only restate an ABI that is fixed here. What that DOES cost is the
 # frame: `bl` overwrites lr, so a proc that looked like a leaf until it divided
 # has to be told (see `helperCalls`).
+
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp) =
+  ## A statement `memcpy(addr D, addr S, sizeof D)` / `memset(addr D, 0, sizeof D)`
+  ## on scalar locals (`core/scalarmem.nim`), emitted as the move it is — the x86-64
+  ## twin's contract: no address, no call, and `D` in a register of either class or
+  ## (address-taken elsewhere) on the stack. A float↔GPR copy reaches here only on
+  ## AArch64 (`scalarMemCrossClass`).
+  let dCur = op.dst
+  let dLoc = g.plan.locationOfSym(dCur.symId, cursorToPosition(g.buf[], dCur))
+  let slot = dLoc.typ
+  let bits = op.bytes * 8
+  let intSlot = AsmSlot(cls: AUInt, size: op.bytes, align: op.bytes)
+  template intoFloatHome(ivReg: Reg) =
+    ## `D` (a float) receives the bits of the GPR `ivReg`.
+    if dLoc.kind == InFReg:
+      g.fmovFromGpr(dLoc.f, ivReg, bits)
+    else:
+      var ft = g.takeFTmp(slot)
+      assert ft.kind == InFReg, "arkham a64n: no float temp for a scalar mem op"
+      g.bindFTmp(ft.f, bits)
+      g.fmovFromGpr(ft.f, ivReg, bits)
+      g.storeScalar(dLoc, ft)
+  case op.kind
+  of smNone, smCmp: discard                      # a compare as a statement: dead
+  of smZero:
+    if slot.isFloat:
+      let b = g.takeBridge(intSlot)
+      g.movImm(b, 0)
+      intoFloatHome(b)
+      g.dropBridge b
+    else:
+      g.storeScalar(dLoc, immLoc(0, slot))       # a stack home bridges the immediate
+  of smCopy:
+    let sCur = op.src
+    let sFloat = g.isFloatExpr(sCur)
+    if slot.isFloat == sFloat:
+      g.genStore(sCur, dLoc)                       # same type: `D = S`
+    elif sFloat:
+      # int `D` ← the bits of float `S`: `fmov x, d`, as `cast[uint64](f)` emits.
+      var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: op.bytes, align: op.bytes))
+      g.emitFValue(sCur, fv)
+      assert fv.kind == InFReg, "arkham a64n: scalar memcpy float source " & $fv.kind
+      if dLoc.kind == InReg:
+        g.killMirror(dLoc.r)
+        g.fmovToGpr(dLoc.r, fv.f, bits)
+      else:
+        let b = g.takeBridge(slot)
+        g.fmovToGpr(b, fv.f, bits)
+        g.storeScalar(dLoc, regLoc(b, slot))
+        g.dropBridge b
+      g.freeVal(fv)
+    else:
+      # float `D` ← the bits of int `S`.
+      let sLoc = g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur))
+      var iv = needsReg(sLoc.typ)
+      g.emitValue(sCur, iv)
+      if iv.kind == InReg:
+        intoFloatHome(iv.r)
+        g.freeVal(iv)
+      else:
+        let b = g.takeBridge(iv.typ)
+        g.place(iv, b)
+        intoFloatHome(b)
+        g.dropBridge b
+
+proc loadScalarBits(g: var CodeGen; sCur: Cursor; bytes: int): Location =
+  ## A fresh 64-bit temp holding the bits of the scalar symbol `sCur` in its low
+  ## `bytes` bytes (what is above them is not specified).
+  result = g.takeTmp(ScalarSlot)
+  assert result.kind == InReg, "arkham a64n: no temp for a scalar memcmp"
+  g.bindTemp(result.r, ScalarSlot)
+  if g.isFloatExpr(sCur):
+    var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: bytes, align: bytes))
+    g.emitFValue(sCur, fv)
+    assert fv.kind == InFReg, "arkham a64n: scalar memcmp float operand " & $fv.kind
+    g.fmovToGpr(result.r, fv.f, bytes * 8)
+    g.freeVal(fv)
+  else:
+    g.place(g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur)), result.r)
+
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; dest: var Location) =
+  ## `memcmp(addr A, addr B, N)` on scalars as a compare — the x86-64 twin's
+  ## scheme: byte-reverse (`rev`), shift the N bytes down, compare unsigned, and
+  ## produce `(a > b) - (a < b)`. AArch64 only (`scalarMemCmp`).
+  var ta = g.loadScalarBits(op.dst, op.bytes)
+  var tb = g.loadScalarBits(op.src, op.bytes)
+  for t in [ta.r, tb.r]:
+    g.ab.tree RevA64: (g.emReg t; g.emReg t; g.ab.intLit 64)
+    if op.bytes < 8: g.binImm(LsrA64, t, int64(64 - 8 * op.bytes))
+  g.ab.tree CmpA64: (g.emReg ta.r; g.emReg tb.r)
+  g.ab.tree CsethiA64: g.emReg ta.r
+  g.ab.tree CsetloA64: g.emReg tb.r
+  g.binReg(SubA64, ta.r, tb.r)                  # -1 / 0 / 1
+  g.freeVal(tb)
+  if dest.kind notin {Undef, NeedsReg, RegOrImm} and dest.typ.size > 0:
+    # A64's `movReg` spells no cast, and memcmp's result is usually an `(i 32)`:
+    # retype the temp to the destination (zero code — -1/0/1 is canonical at any
+    # width) so the move or store below type-checks.
+    g.bindTemp(ta.r, dest.typ)
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = ta
+  of InReg:
+    g.movReg(dest.r, ta.r)
+    g.freeVal(ta)
+  else:
+    g.storeScalar(dest, ta)

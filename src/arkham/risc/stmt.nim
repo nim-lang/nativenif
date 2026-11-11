@@ -166,6 +166,11 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl(c)
   of CallS:
+    if g.scalarMemOps.len > 0:
+      let pos = cursorToPosition(g.buf[], c)
+      if g.scalarMemOps.hasKey(pos):     # `memcpy`/`memset` on a scalar local: a move
+        g.emitScalarMemOp(g.scalarMemOps.getOrDefault(pos))
+        return
     var d = dontCare                   # a statement call: result unused
     # A bare call at the END of a void proc is a tail call, and it is the shape the
     # `(ret (call …))` encoding cannot reach: a void proc has no `ret` for shoggoth's
