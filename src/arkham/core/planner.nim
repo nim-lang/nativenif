@@ -844,7 +844,7 @@ let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
 
 proc initHasCallImpl(n: var Cursor; memCallees: HashSet[SymId]): bool =
   ## Advances `n` past the subtree; true iff it contains a call anywhere — a
-  ## `Memset`/`Memcpy`/`Memcmp` row included (an inline call, see the analyser).
+  ## block-memory row included (an inline call, see the analyser).
   if n.kind == TagLit:
     if n.exprKind == CallC or isMemInstr(n, memCallees): return true
     n.into:

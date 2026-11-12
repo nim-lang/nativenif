@@ -2189,6 +2189,38 @@ proc genMemIntrin(g: var WebGen; name: string; t: var Cursor; wantValue: bool) =
   else:
     err g, "mem intrinsic not supported yet: " & name
 
+proc genMemRow(g: var WebGen; op: IntrinsicOp; t: var Cursor; wantValue: bool) =
+  ## A block-memory row: its operands are LOCATIONS, spelled `(haddr L)` (whose
+  ## value is L's address), and the byte count is optional — absent, it is the
+  ## size of the first location's type. Lowered like the C function of that name.
+  var loc0 = t
+  if loc0.kind == TagLit and loc0.exprKind == HaddrC: inc loc0
+  let size = byteSize(g, lengType(g, loc0))
+  let nLoc = memLocOperands(op)
+  case op
+  of ZeroMemOp:
+    if wantValue: err g, "zeroMemIns has no value"
+    g.outp.openTree MemFill
+  of CopyMemOp:
+    if wantValue: err g, "copyMemIns has no value"
+    g.outp.openTree MemCopy
+  else:
+    g.needMemcmp = true
+    g.outp.openTree Call
+    g.outp.symUse g.memcmpFn
+  for i in 0 ..< nLoc:
+    g.genExprCoerced(t, wU32)
+    skip t
+    if op == ZeroMemOp:
+      g.intLitAs(0, false, wI32)              # the fill byte
+  if t.hasMore:
+    g.genExprCoerced(t, wI32)                 # the explicit byte count
+    skip t
+  else:
+    g.intLitAs(size, false, wI32)
+  while t.hasMore: skip t
+  g.outp.closeTag
+
 proc newTemp(g: var WebGen; w: WidthCode): SymId =
   ## A generator temporary: a local of width `w`, declared with the others.
   result = tmpName(g)
@@ -2221,9 +2253,7 @@ proc genInstr(g: var WebGen; c: Cursor; wantValue: bool) =
     let it = instrTargetOf(g.prog, nm)
     skip t
     case it.op
-    of MemsetOp: genMemIntrin(g, "memset", t, wantValue)
-    of MemcpyOp: genMemIntrin(g, "memcpy", t, wantValue)
-    of MemcmpOp: genMemIntrin(g, "memcmp", t, wantValue)
+    of ZeroMemOp, CopyMemOp, CmpMemOp: genMemRow(g, it.op, t, wantValue)
     of AtomicLoadOp:
       let w = widthOf(scalOf(g, lengType(g, c)))
       g.outp.tree HLoad:

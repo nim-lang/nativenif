@@ -93,7 +93,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
-                       memCallees = g.prog.memIntrinsics)
+                       memCallees = g.prog.memIntrinsics,
+                       memOps = g.prog.memIntrinsicOps)
+  g.scalarMemOps = an.scalarMemOps
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false

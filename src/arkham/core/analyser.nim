@@ -30,6 +30,9 @@ import std / [tables, sets, assertions, os, strutils, envvars]
 import nifcore
 import nifcdecl
 import asmslots
+import scalarmem
+import "../../../../nimony/src/lib" / intrinsics
+export scalarmem
 
 include compat2   # getOrQuit on host Nim
 
@@ -115,6 +118,10 @@ type
 
   ProcAnalysis* = object
     vars*: Table[SymId, VarInfo]
+    scalarMemOps*: Table[int, ScalarMemOp]  ## block-memory rows in REGISTER form
+                                ## (`core/scalarmem.nim`), keyed by the instruction's
+                                ## token position: NOT call points, and their
+                                ## `(haddr …)` operands are a plain def/use.
     hasCall*: bool              ## a call exists — params cannot stay in clobbered arg
                                 ## regs; AllRegs / ArgResident consult this, and the
                                 ## fp/lr frame decision is this same question
@@ -217,7 +224,13 @@ type
                                ## one is NOT a call point for liveness: it never returns, so
                                ## nothing textually after it is reachable *through* it and no
                                ## value has to survive it. See `sawNoReturnCall`.
-    memCallees: HashSet[SymId] ## the `Memset`/`Memcpy`/`Memcmp` intrinsic procs this
+    memOps: Table[SymId, IntrinsicOp] ## the block-memory row each of `memCallees`
+                               ## applies (`Program.memIntrinsicOps`)
+    scalarMemMaxBytes: int     ## `matchScalarMemInstr`'s target limits
+    scalarMemCmp: bool
+    scalarTypes: Table[SymId, Cursor] ## declared type of every scalar local and param
+                               ## (`scalarTypeBytes` > 0)
+    memCallees: HashSet[SymId] ## the block-memory row procs (`zeroMemIns` …) this
                                ## module applies (`Program.memIntrinsics`). An `(instr …)`
                                ## on one is a call point: see `analyseMemInstr`.
     noReturnPositions: seq[int] ## token position of every DIVERGING call. Kept out of
@@ -298,7 +311,7 @@ proc analyseInstr(c: var Context; n: var Cursor) =
         analyse(c, n)
 
 proc isMemInstr*(n: Cursor; memCallees: HashSet[SymId]): bool =
-  ## Is `n` an `(instr SYM …)` whose row is `Memset`/`Memcpy`/`Memcmp`?
+  ## Is `n` an `(instr SYM …)` whose row is a block-memory row (`zeroMemIns` …)?
   if memCallees.len == 0 or n.kind != TagLit: return false
   if n.stmtKind != InstrS and n.exprKind != InstrC: return false
   let callee = sub(n)
@@ -327,10 +340,13 @@ proc classifyInit(n: Cursor): InitClass =
 proc analyseVarDecl(c: var Context; n: var Cursor) =
   ## `(var :name pragmas type value)` (also gvar/tvar/const).
   let declPos = posOf(c, n)
+  let isLocalVar = n.stmtKind == VarS
   n.into:
     assert n.kind == SymbolDef
     let vn = n.symId; inc n
     skip n                       # pragmas
+    if isLocalVar:
+      if scalarTypeBytes(n) > 0: c.scalarTypes[vn] = n
     skip n                       # type
     let hasValue = n.kind != DotToken
     let inLoop = c.inLoops > 0
@@ -454,11 +470,35 @@ proc endsDiverging(c: Context; branch: Cursor): bool =
     cur = last
 
 proc analyseMemInstr(c: var Context; n: var Cursor) =
-  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row is lowered by the very
-  ## inline loop a call to the importc'd C function of that name gets: the operands
-  ## are marshalled into the first three argument registers and the loop's scratch
-  ## takes volatiles. So each is a call point exactly like that call, minus the
-  ## callee — and never a diverging one.
+  ## A block-memory row (`core/scalarmem.nim`). In REGISTER form it is a move or a
+  ## compare: the destination is defined, the sources are read, and nothing is a
+  ## call point or address-taken. In MEMORY form it is lowered by the very inline
+  ## loop a call to the importc'd C function gets — the locations' addresses are
+  ## marshalled into the first argument registers and the loop's scratch takes
+  ## volatiles — so it is a call point exactly like that call, minus the callee,
+  ## and its `(haddr L)` operands are real addresses that pin L's root to memory.
+  let callee = sub(n)
+  let op = if callee.kind == Symbol: c.memOps.getOrDefault(callee.symId, NoIntrinsicOp)
+           else: NoIntrinsicOp
+  let reg = matchScalarMemInstr(n, op, c.scalarTypes, c.scalarMemMaxBytes, c.scalarMemCmp)
+  if reg.kind != smNone:
+    let oldA = c.inAddr; let oldT = c.inAsgnTarget; let oldX = c.inArrayIndex
+    c.inAddr = 0; c.inArrayIndex = 0
+    c.inAsgnTarget = 0
+    if reg.kind != smZero:
+      var s = reg.src
+      analyse(c, s)                     # the source is READ first …
+    if reg.kind == smCmp:
+      var a = reg.dst
+      analyse(c, a)                     # (a compare only reads)
+    else:
+      c.inAsgnTarget = 1
+      var d = reg.dst
+      analyse(c, d)                     # … then the destination is written
+    c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
+    c.res.scalarMemOps[posOf(c, n)] = reg
+    skip n
+    return
   c.callPositions.add posOf(c, n)
   if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
   var probe = n
@@ -774,7 +814,10 @@ proc analyseParams(c: var Context; params: var Cursor) =
         c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int),
                                  paramIdx: (if c.procIsClean: idx else: -1))
         inc idx
-        while params.hasMore: skip params   # pragmas, type
+        skip params                         # pragmas
+        if params.hasMore and scalarTypeBytes(params) > 0:
+          c.scalarTypes[vn] = params        # a scalar mem op may read or write it too
+        while params.hasMore: skip params   # type
         # (rest consumed by into epilogue)
 
 when defined(arkhamPeakLive) or defined(arkhamSSAStats):
@@ -862,12 +905,16 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
-                  memCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
+                  memCallees: HashSet[SymId] = initHashSet[SymId]();
+                  memOps: Table[SymId, IntrinsicOp] = initTable[SymId, IntrinsicOp]();
+                  scalarMemMaxBytes = 8; scalarMemCmp = true): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   noReturnCallees: noReturnCallees, memCallees: memCallees,
+                  memOps: memOps, scalarMemMaxBytes: scalarMemMaxBytes,
+                  scalarMemCmp: scalarMemCmp,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS

@@ -149,7 +149,7 @@ proc subtreeHasCall*(n: Cursor; memCallees: HashSet[SymId]): bool =
   ## allocator's `subtreeHasCall`.)
   if n.kind != TagLit: return false
   if n.exprKind == CallC: return true
-  # a `Memset`/`Memcpy`/`Memcmp` row: an inline call (see the analyser)
+  # a block-memory row (`zeroMemIns` …): an inline call (see the analyser)
   if isMemInstr(n, memCallees): return true
   var cc = n
   cc.into:

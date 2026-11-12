@@ -168,6 +168,9 @@ proc emitAddr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; resSlot: AsmSlot;
+                       dest: var Location)
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp)
 proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc produceIntoMem*(g: var CodeGen; c: Cursor; dst: Location)
@@ -3071,21 +3074,35 @@ type
     freads: set[FReg]
 
 proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
-  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row: lowered exactly like
-  ## a call to the importc'd C function of that name (the `memIntrin` arm of
-  ## `emitCall`) — the analyser records each as a call point for that reason.
+  ## A block-memory row (`core/scalarmem.nim`): in register form a move or a
+  ## compare; otherwise lowered exactly like a call to the importc'd C function of
+  ## that name (the `memIntrin` arm of `emitCall`) — the analyser records that form
+  ## as a call point for that reason. See the x86-64 twin.
+  let pos = cursorToPosition(g.buf[], c)
+  if g.scalarMemOps.hasKey(pos):
+    let reg = g.scalarMemOps.getOrDefault(pos)
+    if reg.kind == smCmp:
+      # the row's declared result type (`int32`), which the result temp is given
+      let callee = sub(c)
+      let resSlot = slotOf(g.prog, instrTargetOf(g.prog, callee.symId).retType)
+      g.emitScalarMemCmp(reg, resSlot, dest)
+    else:
+      g.emitScalarMemOp(reg)
+      dest = Location(kind: Undef)
+    return
   g.killAllMirrors()
-  var argCurs: seq[Cursor] = @[]
-  var cc = c
-  cc.into:
-    skip cc                                     # the callee symbol
-    while cc.hasMore: (argCurs.add cc; skip cc)
+  var first = c
+  inc first; skip first                         # past the tag and the callee
+  var loc0 = first
+  if loc0.kind == TagLit and loc0.exprKind == HaddrC: inc loc0
+  var lits = createTokenBuf(4, sharedPool = c.pool, sharedTags = c.tags)
+  let argCurs = memRowArgs(c, op, g.exprSlot(loc0).size, lits)
   let builtin = case op
-                of MemsetOp: "memset"
-                of MemcpyOp: "memcpy"
+                of ZeroMemOp: "memset"
+                of CopyMemOp: "memcpy"
                 else: "memcmp"
   g.emitMemIntrin(argCurs, builtin)
-  if op != MemcmpOp:
+  if op != CmpMemOp:
     dest = Location(kind: Undef)                # no value: nothing consumes this node
     return
   if not (dest.kind == InReg and not dest.isTemp):
@@ -4746,3 +4763,81 @@ proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): SymId =
 # block would only restate an ABI that is fixed here. What that DOES cost is the
 # frame: `bl` overwrites lr, so a proc that looked like a leaf until it divided
 # has to be told (see `helperCalls`).
+
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp) =
+  ## `zeroMemIns`/`copyMemIns` in register form (`core/scalarmem.nim`): `D = 0` /
+  ## `D = S` — the x86-64 twin's contract: no address, no call, and `D` in a
+  ## register of either class or (address-taken elsewhere) on the stack.
+  let dCur = op.dst
+  let dLoc = g.plan.locationOfSym(dCur.symId, cursorToPosition(g.buf[], dCur))
+  let slot = dLoc.typ
+  let bits = op.bytes * 8
+  let intSlot = AsmSlot(cls: AUInt, size: op.bytes, align: op.bytes)
+  template intoFloatHome(ivReg: Reg) =
+    ## `D` (a float) receives the bits of the GPR `ivReg`.
+    if dLoc.kind == InFReg:
+      g.fmovFromGpr(dLoc.f, ivReg, bits)
+    else:
+      var ft = g.takeFTmp(slot)
+      assert ft.kind == InFReg, "arkham a64n: no float temp for a scalar mem op"
+      g.bindFTmp(ft.f, bits)
+      g.fmovFromGpr(ft.f, ivReg, bits)
+      g.storeScalar(dLoc, ft)
+  case op.kind
+  of smNone, smCmp: discard                      # (a compare is `emitScalarMemCmp`)
+  of smZero:
+    if slot.isFloat:
+      let b = g.takeBridge(intSlot)
+      g.movImm(b, 0)
+      intoFloatHome(b)
+      g.dropBridge b
+    else:
+      g.storeScalar(dLoc, immLoc(0, slot))       # a stack home bridges the immediate
+  of smCopy:
+    g.genStore(op.src, dLoc)                       # one scalar type: `D = S`
+
+proc loadScalarBits(g: var CodeGen; sCur: Cursor; bytes: int): Location =
+  ## A fresh 64-bit temp holding the bits of the scalar symbol `sCur` in its low
+  ## `bytes` bytes (what is above them is not specified).
+  result = g.takeTmp(ScalarSlot)
+  assert result.kind == InReg, "arkham a64n: no temp for a scalar memcmp"
+  g.bindTemp(result.r, ScalarSlot)
+  if g.isFloatExpr(sCur):
+    var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: bytes, align: bytes))
+    g.emitFValue(sCur, fv)
+    assert fv.kind == InFReg, "arkham a64n: scalar memcmp float operand " & $fv.kind
+    g.fmovToGpr(result.r, fv.f, bytes * 8)
+    g.freeVal(fv)
+  else:
+    g.place(g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur)), result.r)
+
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; resSlot: AsmSlot;
+                       dest: var Location) =
+  ## `memcmp(addr A, addr B, N)` on scalars as a compare — the x86-64 twin's
+  ## scheme: byte-reverse (`rev`), shift the N bytes down, compare unsigned, and
+  ## produce `(a > b) - (a < b)`. AArch64 only (`scalarMemCmp`).
+  var ta = g.loadScalarBits(op.dst, op.bytes)
+  var tb = g.loadScalarBits(op.src, op.bytes)
+  for t in [ta.r, tb.r]:
+    g.ab.tree RevA64: (g.emReg t; g.emReg t; g.ab.intLit 64)
+    if op.bytes < 8: g.binImm(LsrA64, t, int64(64 - 8 * op.bytes))
+  g.ab.tree CmpA64: (g.emReg ta.r; g.emReg tb.r)
+  g.ab.tree CsethiA64: g.emReg ta.r
+  g.ab.tree CsetloA64: g.emReg tb.r
+  g.binReg(SubA64, ta.r, tb.r)                  # -1 / 0 / 1
+  g.freeVal(tb)
+  # Retype the temp (zero code; -1/0/1 is canonical at any width) to the row's
+  # result type `resSlot` — or, for a fixed destination, to that destination's
+  # type, since A64's `movReg` spells no cast — so the consumer type-checks.
+  let rs = if dest.kind notin {Undef, NeedsReg, RegOrImm} and dest.typ.size > 0: dest.typ
+           else: resSlot
+  g.bindTemp(ta.r, rs)
+  ta.typ = rs
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = ta
+  of InReg:
+    g.movReg(dest.r, ta.r)
+    g.freeVal(ta)
+  else:
+    g.storeScalar(dest, ta)

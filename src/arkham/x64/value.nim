@@ -77,6 +77,9 @@ proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false)
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location)
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp)
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; resSlot: AsmSlot;
+                       dest: var Location)
 proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location)
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
 
@@ -4412,29 +4415,89 @@ when defined(arkhamCallerSaveDbg):
       " unbound=" & unbound & "\n"
 
 proc emitMemInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
-  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row, e.g. what Shoggoth's
-  ## `memidioms` emits for a recognized fill/copy loop. It lowers through the very
-  ## inline loop a call to the importc'd C function of that name gets
-  ## (`emitMemIntrin`), inside the same caller-save window `emitCall` opens: the
-  ## operands go to the first three argument registers and the loop's scratch
-  ## takes volatiles, which is why the analyser records each as a call point.
-  ## Never diverging, never a tail call.
+  ## A block-memory row (`core/scalarmem.nim`). The REGISTER form — the analyser
+  ## recorded it — is a move or a compare. The MEMORY form lowers through the very
+  ## inline loop a call to the importc'd C function gets (`emitMemIntrin`), inside
+  ## the same caller-save window `emitCall` opens: the locations' addresses go to
+  ## the first argument registers and the loop's scratch takes volatiles, which is
+  ## why the analyser records it as a call point. Never diverging, never a tail call.
+  let pos = cursorToPosition(g.buf[], c)
+  if g.scalarMemOps.hasKey(pos):
+    let reg = g.scalarMemOps.getOrDefault(pos)
+    if reg.kind == smCmp:
+      # the row's declared result type (`int32`), which the result temp is given
+      let callee = sub(c)
+      let resSlot = slotOf(g.prog, instrTargetOf(g.prog, callee.symId).retType)
+      g.emitScalarMemCmp(reg, resSlot, dest)
+    else:
+      g.emitScalarMemOp(reg)
+      dest = Location(kind: Undef)
+    return
   g.killAllMirrors()
   let w = g.emCallerSaveOpen()
   g.bridgeStep("a call", bdTwoInRegs)
-  var argCurs: seq[Cursor] = @[]
-  var cc = c
-  cc.into:
-    skip cc                                     # the callee symbol
-    while cc.hasMore: (argCurs.add cc; skip cc)
+  var first = c
+  inc first; skip first                         # past the tag and the callee
+  var loc0 = first
+  if loc0.kind == TagLit and loc0.exprKind == HaddrC: inc loc0
+  var lits = createTokenBuf(4, sharedPool = c.pool, sharedTags = c.tags)
+  let argCurs = memRowArgs(c, op, g.exprSlot(loc0).size, lits)
   let builtin = case op
-                of MemsetOp: "memset"
-                of MemcpyOp: "memcpy"
+                of ZeroMemOp: "memset"
+                of CopyMemOp: "memcpy"
                 else: "memcmp"
   g.emitMemIntrin(argCurs, builtin)
-  if op == MemcmpOp: g.settleResultReg(dest, RAX)
+  if op == CmpMemOp: g.settleResultReg(dest, RAX)
   else: dest = Location(kind: Undef)            # no value: nothing consumes this node
   g.emCallerSaveClose(w, dest)
+
+proc loadScalarBits(g: var CodeGen; sCur: Cursor; bytes: int): Location =
+  ## A fresh 64-bit temp holding the bits of the scalar symbol `sCur` in its low
+  ## `bytes` bytes (what is above them is not specified).
+  result = g.takeTmp(ScalarSlot)
+  assert result.kind == InReg, "arkham x64n: no temp for a scalar memcmp"
+  g.bindTemp(result.r, ScalarSlot)
+  if g.isFloatExpr(sCur):
+    var fv = Location(kind: Undef, typ: AsmSlot(cls: AFloat, size: bytes, align: bytes))
+    g.emitFValue(sCur, fv)
+    assert fv.kind == InFReg, "arkham x64n: scalar memcmp float operand " & $fv.kind
+    g.fmovToGpr(result.r, fv.f, bytes * 8)
+    g.freeVal(fv)
+  else:
+    g.place(g.plan.locationOfSym(sCur.symId, cursorToPosition(g.buf[], sCur)), result.r)
+
+proc emitScalarMemCmp*(g: var CodeGen; op: ScalarMemOp; resSlot: AsmSlot;
+                       dest: var Location) =
+  ## `cmpMemIns(a, b)` in register form (`core/scalarmem.nim`): a compare.
+  ## memcmp orders the bytes as they lie in memory — least significant first on
+  ## this little-endian target — so byte-reverse each operand (`bswap`, then shift
+  ## the N bytes down from the top, which also discards whatever was above them)
+  ## and compare UNSIGNED. The result is `(a > b) - (a < b)`: memcmp's sign, which
+  ## is all its contract promises.
+  var ta = g.loadScalarBits(op.dst, op.bytes)
+  var tb = g.loadScalarBits(op.src, op.bytes)
+  for t in [ta.r, tb.r]:
+    g.ab.tree BswapX64: (g.emReg t; g.ab.intLit 64)
+    if op.bytes < 8: g.binImm(ShrX64, t, int64(64 - 8 * op.bytes))
+  g.binReg(CmpX64, ta.r, tb.r)
+  g.ab.tree SetaX64: g.emReg ta.r              # setcc leaves the flags alone …
+  g.ab.tree SetbX64: g.emReg tb.r
+  g.binImm(AndX64, ta.r, 1)                     # … and writes only the low byte
+  g.binImm(AndX64, tb.r, 1)
+  g.binReg(SubX64, ta.r, tb.r)                  # -1 / 0 / 1, sign-extended
+  g.freeVal(tb)
+  # Retype the temp to the row's result type `resSlot` (zero code — -1/0/1 is
+  # canonical at any width) so whatever consumes it type-checks.
+  g.bindTemp(ta.r, resSlot)
+  ta.typ = resSlot
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = ta
+  of InReg:
+    g.movReg(dest.r, ta.r)
+    g.freeVal(ta)
+  else:
+    g.storeScalar(dest, ta)
 
 proc emitCall*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                tail = false) =
@@ -5054,3 +5117,44 @@ proc emitFValue*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitFValue(inner, dest)
     else: raiseAssert "arkham x64n: emitFValue(fused) expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitFValue(fused) kind " & $c.kind
+
+proc emitScalarMemOp*(g: var CodeGen; op: ScalarMemOp) =
+  ## `zeroMemIns`/`copyMemIns` in register form (`core/scalarmem.nim`): `D = 0` /
+  ## `D = S`. The analyser marked nothing address-taken and counted no call point,
+  ## so neither an address nor the caller-save window may appear here — and `D` may
+  ## be in a register of either class, or (address-taken elsewhere) on the stack.
+  let dCur = op.dst
+  let dLoc = g.plan.locationOfSym(dCur.symId, cursorToPosition(g.buf[], dCur))
+  let slot = dLoc.typ
+  let bits = op.bytes * 8
+  let intSlot = AsmSlot(cls: AUInt, size: op.bytes, align: op.bytes)
+  template intoFloatHome(ivReg: Reg) =
+    ## `D` (a float) receives the bits of the GPR `ivReg`.
+    if dLoc.kind == InFReg:
+      g.fmovFromGpr(dLoc.f, ivReg, bits)
+    else:
+      var ft = g.takeFTmp(slot)
+      assert ft.kind == InFReg, "arkham x64n: no float temp for a scalar mem op"
+      g.bindFTmp(ft.f)
+      g.fmovFromGpr(ft.f, ivReg, bits)
+      g.storeScalar(dLoc, ft)
+  case op.kind
+  of smNone, smCmp: discard                      # (a compare is `emitScalarMemCmp`)
+  of smZero:
+    if slot.isFloat:
+      var t = g.takeTmp(intSlot)
+      assert t.kind == InReg, "arkham x64n: no temp for a scalar memset"
+      g.bindTemp(t.r, intSlot)
+      g.movImm(t.r, 0)
+      intoFloatHome(t.r)
+      g.freeVal(t)
+    elif dLoc.kind == InReg:
+      g.storeScalar(dLoc, immLoc(0, slot))
+    else:
+      var t = g.takeTmp(slot)
+      assert t.kind == InReg, "arkham x64n: no temp for a scalar memset"
+      g.bindTemp(t.r, slot)
+      g.movImm(t.r, 0)
+      g.storeScalar(dLoc, t)
+  of smCopy:
+    g.genStore(op.src, dLoc)                       # one scalar type: `D = S`
