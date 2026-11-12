@@ -1476,6 +1476,17 @@ proc emitDivss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest,
 proc emitDivsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x5E, int(destReg), int(srcReg))
 proc emitSqrtss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x51, int(destReg), int(srcReg))
 proc emitSqrtsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x51, int(destReg), int(srcReg))
+proc emitRoundSse*(dest: var Bytes; destReg, srcReg: XmmRegister; single: bool; imm: byte) =
+  ## SSE4.1 `roundsd`/`roundss`: `66 [REX] 0F 3A 0B|0A /r ib`. The three-byte
+  ## opcode is why `emitSseRR` (one opcode byte after `0F`) does not fit.
+  dest.add(0x66)
+  var rex = RexPrefix()
+  if int(destReg) >= 8: rex.r = true
+  if int(srcReg) >= 8: rex.b = true
+  if rex.r or rex.b: dest.add(encodeRex(rex))
+  dest.add(0x0F); dest.add(0x3A); dest.add(if single: 0x0A'u8 else: 0x0B'u8)
+  dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
+  dest.add(imm)
 proc emitComiss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x2F, int(destReg), int(srcReg))
 proc emitComisd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x2F, int(destReg), int(srcReg))
 proc emitCvtss2sd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5A, int(destReg), int(srcReg))

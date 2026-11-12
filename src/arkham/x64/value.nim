@@ -4769,11 +4769,11 @@ when declared(FldrqOp):
     else:
       lengError c, "not a vector row"
 
-proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
-  ## A float-valued `(instr SYM x)`: an XMM-to-XMM row. No call point, no fixed
-  ## register, no flags — the operand is produced straight into the result
-  ## register and the instruction runs in place (`sqrtsd d, d`), exactly like
-  ## the precision convert.
+proc emitFloatInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## A float-valued `(instr SYM x)`: an XMM-to-XMM row (`isFloatUnary`). No call
+  ## point, no fixed register, no flags — the operand is produced straight into
+  ## the result register and the instruction runs in place (`sqrtsd d, d`,
+  ## `roundsd d, d, 9`), exactly like the precision convert.
   var arg = c
   inc arg                                                # past the tag
   skip arg                                               # past the callee
@@ -4785,7 +4785,20 @@ proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
   var iv = dest
   g.emitFValue(arg, iv)                                  # operand → dest
   if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
-  g.fbin(SqrtssX64, SqrtsdX64, dest.f, dest.f, bits)
+  if op == SqrtOp:
+    g.fbin(SqrtssX64, SqrtsdX64, dest.f, dest.f, bits)
+  else:
+    # SSE4.1 rounding-control immediates, with bit 3 set: the inexact exception
+    # is suppressed, as C's floor/ceil/trunc specify. (`Round` has no x64 row.)
+    let mode = case op
+      of FloorOp: 9
+      of CeilOp: 10
+      of TruncOp: 11
+      else: raiseAssert "no x86-64 row: " & IntrinsicNames[op]  # `targets` gates it
+    g.ab.tree(if bits == 32: RoundssX64 else: RoundsdX64):
+      g.emFReg dest.f
+      g.emFReg dest.f
+      g.ab.intLit mode
 
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(instr SYM X*)`: allocInstr's operand/result placement decided
@@ -4813,8 +4826,8 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr(c, tgt.op, argCurs, dest)
       return
-  if tgt.op == SqrtOp:
-    g.emitFloatInstr(c, dest)
+  if tgt.op.isFloatUnary:
+    g.emitFloatInstr(c, tgt.op, dest)
     return
   if tgt.op.isMemOp:
     g.emitMemInstr(c, tgt.op, dest)

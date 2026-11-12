@@ -2221,6 +2221,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     x86.emitShufps(ctx.buf.data, d, s, byte(imm))
 
+  of RoundsdX64, RoundssX64:
+    # `(roundsd (xmmD) (xmmS) N)`: D = S rounded to an integral value in mode N
+    # (9 floor, 10 ceil, 11 trunc). Register source only.
+    let it = instTag
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    if n.kind != IntLit: error("roundsd/roundss needs an integer immediate", n)
+    let imm = getInt(n)
+    if imm < 0 or imm > 15: error("roundsd/roundss immediate out of range", n)
+    inc n
+    x86.emitRoundSse(ctx.buf.data, d, s, it == RoundssX64, byte(imm))
+
   of AddsdX64, AddssX64, SubsdX64, SubssX64,
      MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
      SqrtsdX64, SqrtssX64, ComisdX64, ComissX64:

@@ -3940,9 +3940,9 @@ when declared(FldrqOp):
     else:
       raiseAssert "arkham a64n: not a vector op: " & IntrinsicNames[op]
 
-proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
-  ## A float-valued `(instr SYM x)`: an FP-to-FP row (`fsqrt d, d`). No call
-  ## point, no fixed register, no flags — the twin of the `NegC` arm.
+proc emitFloatInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp; dest: var Location) =
+  ## A float-valued `(instr SYM x)`: an FP-to-FP row (`fsqrt d, d`, `frintm d, d`).
+  ## No call point, no fixed register, no flags — the twin of the `NegC` arm.
   var arg = c
   inc arg                                        # past the tag
   skip arg                                       # past the callee
@@ -3955,7 +3955,13 @@ proc emitFloatInstr(g: var CodeGen; c: Cursor; dest: var Location) =
   g.emitFValue(arg, iv)
   if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
   g.ensureFAccum(dest.f, iv, bits)
-  g.ab.tree FsqrtA64: (g.emFReg(dest.f, bits); g.emFReg(dest.f, bits))
+  let tag = case op
+    of FloorOp: FrintmA64
+    of CeilOp: FrintpA64
+    of TruncOp: FrintzA64
+    of RoundOp: FrintaA64
+    else: FsqrtA64
+  g.ab.tree tag: (g.emFReg(dest.f, bits); g.emFReg(dest.f, bits))
 
 proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
@@ -3987,8 +3993,8 @@ proc emitInstr*(g: var CodeGen; c: Cursor; dest: var Location) =
   if tgt.op.isMemOp:
     g.emitMemInstr(c, tgt.op, dest)
     return
-  if tgt.op == SqrtOp:
-    g.emitFloatInstr(c, dest)
+  if tgt.op.isFloatUnary:
+    g.emitFloatInstr(c, tgt.op, dest)
     return
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps and SimdVector notin g.md.caps:

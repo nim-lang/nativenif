@@ -1540,6 +1540,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let rs = parseFloatOperandA64(n, ctx)
     arm64.emitFsqrt(ctx.buf.data, rd, rs, single)
 
+  of FrintmA64, FrintpA64, FrintzA64, FrintaA64:
+    let base = case instTag
+      of FrintmA64: arm64.FrintmBase
+      of FrintpA64: arm64.FrintpBase
+      of FrintzA64: arm64.FrintzBase
+      else: arm64.FrintaBase
+    inc n
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rs = parseFloatOperandA64(n, ctx)
+    arm64.emitFrint(ctx.buf.data, base, rd, rs, single)
+
   of FcmpA64:
     inc n
     let single = isA64FpSingle(n, ctx)

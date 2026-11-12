@@ -877,6 +877,17 @@ proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
 proc emitFsqrt*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E61C000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
+proc emitFrint*(dest: var Bytes; base: uint32; rd, rn: FloatRegister; single = false) =
+  ## FRINTM/FRINTP/FRINTZ/FRINTA: `base` is the double-precision opcode
+  ## (`FrintmBase` …); `fp2` clears the type bit for single precision.
+  dest.addUint32(fp2(base, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+const
+  FrintmBase* = 0x1E654000'u32   ## toward minus infinity
+  FrintpBase* = 0x1E64C000'u32   ## toward plus infinity
+  FrintzBase* = 0x1E65C000'u32   ## toward zero
+  FrintaBase* = 0x1E664000'u32   ## to nearest, ties away from zero
+
 proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister; single = false) =
   dest.addUint32(fp2(0x1E602000'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))
 
