@@ -30,6 +30,8 @@ import std / [tables, sets, assertions, os, strutils, envvars]
 import nifcore
 import nifcdecl
 import asmslots
+import programs                          # the block-memory rows' operand helpers
+import "../../../../nimony/src/lib" / intrinsics
 
 include compat2   # getOrQuit on host Nim
 
@@ -217,8 +219,8 @@ type
                                ## one is NOT a call point for liveness: it never returns, so
                                ## nothing textually after it is reachable *through* it and no
                                ## value has to survive it. See `sawNoReturnCall`.
-    memCallees: HashSet[SymId] ## the `Memset`/`Memcpy`/`Memcmp` intrinsic procs this
-                               ## module applies (`Program.memIntrinsics`). An `(instr …)`
+    memCallees: Table[SymId, IntrinsicOp] ## the block-memory row procs (`zeroMemIns` …)
+                               ## this module applies (`Program.memIntrinsics`). An `(instr …)`
                                ## on one is a call point: see `analyseMemInstr`.
     noReturnPositions: seq[int] ## token position of every DIVERGING call. Kept out of
                                ## `callPositions` (they deny nothing for `AllRegs`), but
@@ -297,12 +299,16 @@ proc analyseInstr(c: var Context; n: var Cursor) =
       else:
         analyse(c, n)
 
-proc isMemInstr*(n: Cursor; memCallees: HashSet[SymId]): bool =
-  ## Is `n` an `(instr SYM …)` whose row is `Memset`/`Memcpy`/`Memcmp`?
+proc isMemInstr*(n: Cursor; memCallees: Table[SymId, IntrinsicOp]): bool =
+  ## Is `n` an `(instr SYM …)` on a block-memory row (`zeroMemIns` …) whose byte
+  ## count is a runtime value? That one runs a loop (`programs.memRowIsLoop`); any
+  ## other application is an instruction like the rest (`analyseInstr`).
   if memCallees.len == 0 or n.kind != TagLit: return false
   if n.stmtKind != InstrS and n.exprKind != InstrC: return false
   let callee = sub(n)
-  result = callee.kind == Symbol and callee.symId in memCallees
+  if callee.kind != Symbol: return false
+  let op = memCallees.getOrDefault(callee.symId, NoIntrinsicOp)
+  result = op != NoIntrinsicOp and memRowIsLoop(n, op)
 
 proc classifyInit(n: Cursor): InitClass =
   ## Peel value-preserving wrappers (`cast`/`conv`/`suf`/`par` — the same set
@@ -454,11 +460,14 @@ proc endsDiverging(c: Context; branch: Cursor): bool =
     cur = last
 
 proc analyseMemInstr(c: var Context; n: var Cursor) =
-  ## `(instr SYM D V N)` for a `Memset`/`Memcpy`/`Memcmp` row is lowered by the very
-  ## inline loop a call to the importc'd C function of that name gets: the operands
-  ## are marshalled into the first three argument registers and the loop's scratch
-  ## takes volatiles. So each is a call point exactly like that call, minus the
-  ## callee — and never a diverging one.
+  ## A block-memory row with a RUNTIME byte count (`isMemInstr`) is lowered by the
+  ## very inline loop a call to the importc'd C function of that name gets: the
+  ## locations' ADDRESSES are marshalled into the first argument registers and the
+  ## loop's scratch takes volatiles. So each is a call point exactly like that call,
+  ## minus the callee — and never a diverging one — and its locations are
+  ## address-taken.
+  let op = c.memCallees.getOrDefault(sub(n).symId, NoIntrinsicOp)
+  let nLoc = memLocOperands(op)
   c.callPositions.add posOf(c, n)
   if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
   var probe = n
@@ -472,7 +481,15 @@ proc analyseMemInstr(c: var Context; n: var Cursor) =
   c.openCalls.add posOf(c, n)
   n.into:
     skip n                              # the callee symbol
-    while n.hasMore: analyse(c, n)
+    var i = 0
+    while n.hasMore:
+      if i < nLoc:
+        inc c.inAddr                    # `(haddr L)` or a bare `L`: its address is taken
+        analyse(c, n)
+        dec c.inAddr
+      else:
+        analyse(c, n)
+      inc i
   discard c.openCalls.pop()
   inc c.completedCalls
 
@@ -862,7 +879,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
-                  memCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
+                  memCallees: Table[SymId, IntrinsicOp] = initTable[SymId, IntrinsicOp]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).

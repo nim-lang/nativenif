@@ -1354,11 +1354,25 @@ proc collectNames(c: Cursor; taken: var HashSet[SymId]) =
         skip t
   else: discard
 
-proc markTaken(c: Cursor; taken: var HashSet[SymId]) =
+proc markTaken(g: var WebGen; c: Cursor; taken: var HashSet[SymId]) =
   ## Every name whose address is taken, at any depth. Such a local cannot live
   ## in a function local: nothing can point at one, and a Nim address is an
-  ## offset into linear memory.
+  ## offset into linear memory. A block-memory row's read locations are bare
+  ## lvalues, but this back end passes their addresses (`genMemRow`).
   if c.kind != TagLit: return
+  if (c.stmtKind == InstrS or c.exprKind == InstrC) and sub(c).kind == Symbol:
+    let op = instrTargetOf(g.prog, sub(c).symId).op
+    if op.isMemOp:
+      var t = c
+      t.into:
+        skip t                                  # the callee
+        var i = 0
+        while t.hasMore:
+          if i < memLocOperands(op): collectNames(t, taken)
+          else: markTaken(g, t, taken)
+          skip t
+          inc i
+      return
   if c.exprKind in {AddrC, HaddrC}:
     # Mark EVERY name in the operand, not just a top-level symbol: the base of
     # `(addr (baseobj …))` / `(addr (dot …))` needs a slot too. The walk
@@ -1373,7 +1387,7 @@ proc markTaken(c: Cursor; taken: var HashSet[SymId]) =
   var t = c
   t.into:
     while t.hasMore:
-      markTaken(t, taken)
+      markTaken(g, t, taken)
       skip t
 
 proc ctorType(g: var WebGen; c: Cursor): Cursor =
@@ -2189,6 +2203,42 @@ proc genMemIntrin(g: var WebGen; name: string; t: var Cursor; wantValue: bool) =
   else:
     err g, "mem intrinsic not supported yet: " & name
 
+proc genMemRow(g: var WebGen; op: IntrinsicOp; t: var Cursor; wantValue: bool) =
+  ## A block-memory row: its operands are LOCATIONS — the written one spelled
+  ## `(haddr L)` (whose value is L's address), the read ones bare lvalues — and
+  ## the byte count is optional: absent, it is the size of the first location's
+  ## type. Lowered like the C function of that name.
+  var loc0 = t
+  if loc0.kind == TagLit and loc0.exprKind == HaddrC: inc loc0
+  let size = byteSize(g, lengType(g, loc0))
+  let nLoc = memLocOperands(op)
+  case op
+  of ZeroMemOp:
+    if wantValue: err g, "zeroMemIns has no value"
+    g.outp.openTree MemFill
+  of CopyMemOp:
+    if wantValue: err g, "copyMemIns has no value"
+    g.outp.openTree MemCopy
+  else:
+    g.needMemcmp = true
+    g.outp.openTree Call
+    g.outp.symUse g.memcmpFn
+  for i in 0 ..< nLoc:
+    if t.kind == TagLit and t.exprKind == HaddrC:
+      g.genExprCoerced(t, wU32)               # `(haddr L)`: L's address
+    else:
+      genAddr(g, t)                           # a bare read location
+    skip t
+    if op == ZeroMemOp:
+      g.intLitAs(0, false, wI32)              # the fill byte
+  if t.hasMore:
+    g.genExprCoerced(t, wI32)                 # the explicit byte count
+    skip t
+  else:
+    g.intLitAs(size, false, wI32)
+  while t.hasMore: skip t
+  g.outp.closeTag
+
 proc newTemp(g: var WebGen; w: WidthCode): SymId =
   ## A generator temporary: a local of width `w`, declared with the others.
   result = tmpName(g)
@@ -2221,9 +2271,7 @@ proc genInstr(g: var WebGen; c: Cursor; wantValue: bool) =
     let it = instrTargetOf(g.prog, nm)
     skip t
     case it.op
-    of MemsetOp: genMemIntrin(g, "memset", t, wantValue)
-    of MemcpyOp: genMemIntrin(g, "memcpy", t, wantValue)
-    of MemcmpOp: genMemIntrin(g, "memcmp", t, wantValue)
+    of ZeroMemOp, CopyMemOp, CmpMemOp: genMemRow(g, it.op, t, wantValue)
     of AtomicLoadOp:
       let w = widthOf(scalOf(g, lengType(g, c)))
       g.outp.tree HLoad:
@@ -3676,7 +3724,7 @@ proc lowerProc(g: var WebGen; sym: SymId; decl: Cursor) =
   let retType = g.p.retType
   g.p.sret = not retType.cursorIsNil and isAggType(g, retType)
   var taken: HashSet[SymId] = default(HashSet[SymId])
-  if body.kind == TagLit: markTaken(body, taken)
+  if body.kind == TagLit: markTaken(g, body, taken)
   planFrame(g, body, params, taken)
 
   var sigParams: seq[(SymId, WidthCode)] = @[]

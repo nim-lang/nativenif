@@ -753,6 +753,8 @@ proc exprText(c: Cursor; indent: int): string =
            else: "BigInt(ftoi(" & v & ", 0, 18446744073709551616))")
     result = if toW == wF32: "(Math.fround(" & s & "))"
              elif toW == wU64: "(" & s & " & 0xFFFF_FFFF_FFFF_FFFFn)"
+             # u64 -> i64 reinterprets the top bit as the sign: 2^63 is minI64.
+             elif toW == wI64 and fromW == wU64: "BigInt.asIntN(64, " & s & ")"
              elif toBig or toFl: "(" & s & ")"
              else: wrapNarrow(s, toW)
   of Reint:

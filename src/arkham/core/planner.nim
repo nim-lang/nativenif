@@ -88,6 +88,7 @@ let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
   ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
 import nifcore, nifcdecl, asmslots, machinedesc, analyser, programs, typenav
+import "../../../../nimony/src/lib" / intrinsics
 import abi
 from stress import envInt
 export abi         # CallPlan / planCall / ParamPlace: the one ABI classifier the
@@ -842,9 +843,9 @@ let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
   ## whose name hashes to `r mod N`, so a miscompile can be halved down to one proc.
   ## See `callerSaveRescue` for what the rescue does and why it is sound.
 
-proc initHasCallImpl(n: var Cursor; memCallees: HashSet[SymId]): bool =
+proc initHasCallImpl(n: var Cursor; memCallees: Table[SymId, IntrinsicOp]): bool =
   ## Advances `n` past the subtree; true iff it contains a call anywhere — a
-  ## `Memset`/`Memcpy`/`Memcmp` row included (an inline call, see the analyser).
+  ## block-memory row included (an inline call, see the analyser).
   if n.kind == TagLit:
     if n.exprKind == CallC or isMemInstr(n, memCallees): return true
     n.into:
@@ -854,7 +855,7 @@ proc initHasCallImpl(n: var Cursor; memCallees: HashSet[SymId]): bool =
     inc n
   return false
 
-proc initHasCall(n: Cursor; memCallees: HashSet[SymId]): bool =
+proc initHasCall(n: Cursor; memCallees: Table[SymId, IntrinsicOp]): bool =
   ## A var whose initializer contains a call is not defined *before* that call — it is
   ## produced BY it. Such a var must never get a caller-saved home: the emitter's save
   ## would read a register that holds nothing yet, and the call's own result is what

@@ -117,8 +117,9 @@ type
     callTarget*: Table[SymId, CallTarget]   ## Leng proc symbol → how to call it
     instrTarget*: Table[SymId, InstrTarget] ## Leng proc symbol → which instruction(s)
                                             ## an `(instr …)` on it emits
-    memIntrinsics*: HashSet[SymId]          ## the `Memset`/`Memcpy`/`Memcmp` procs this
-                                            ## module applies (`memIntrinsicProcs`)
+    memIntrinsics*: Table[SymId, IntrinsicOp] ## the block-memory row procs this
+                                            ## module applies, and the row each one
+                                            ## applies (`memIntrinsicProcs`)
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[SymId, Cursor]          ## global (gvar/const) var symbol → its decl cursor
@@ -1644,13 +1645,12 @@ proc collectInstrCallees(n: Cursor; seen: var HashSet[SymId];
     collectInstrCallees(n, seen, order)
     skip n
 
-proc memIntrinsicProcs*(p: var Program): HashSet[SymId] =
-  ## Pool ids of every intrinsic proc APPLIED in this module whose row is
-  ## `Memset`/`Memcpy`/`Memcmp`. arkham lowers those with the inline loop a call to
-  ## the importc'd C function gets — operands in the argument registers, scratch in
-  ## volatiles — so the analyser and the planner must see each application as a
-  ## call point, and they only get to look at the callee symbol.
-  result = initHashSet[SymId]()
+proc memIntrinsicProcs*(p: var Program): Table[SymId, IntrinsicOp] =
+  ## Every intrinsic proc APPLIED in this module whose row is a block-memory row
+  ## (`zeroMemIns`/`copyMemIns`/`cmpMemIns`), mapped to that row. Only an
+  ## application whose byte count is a RUNTIME value runs a loop
+  ## (`memRowIsLoop`); the analyser and the planner see that one as a call point.
+  result = initTable[SymId, IntrinsicOp]()
   var seen = initHashSet[SymId]()
   var callees: seq[SymId] = @[]
   for pi in p.procs:
@@ -1660,7 +1660,88 @@ proc memIntrinsicProcs*(p: var Program): HashSet[SymId] =
       inc b; skip b; skip b; skip b             # name, params, ret, pragmas
       while b.hasMore: (collectInstrCallees(b, seen, callees); skip b)
   for id in callees:
-    if instrTargetOf(p, id).op.isMemOp: result.incl id
+    let op = instrTargetOf(p, id).op
+    if op.isMemOp: result[id] = op
+
+# ── the block-memory rows ─────────────────────────────────────────────────────
+#
+#   (instr zeroMemIns (haddr D) [N])
+#   (instr copyMemIns (haddr D) S [N])
+#   (instr cmpMemIns  A B [N])                 ; a value: memcmp's sign
+#
+# The operands are LOCATIONS: the written one is spelled `(haddr D)` like every
+# intrinsic's `var` operand, the read ones are the lvalues themselves. The byte
+# count is optional and defaults to the size of the first location's type. They
+# are instructions like any other: `x = 0`, a move, a compare, or straight-line
+# memory operations for an aggregate or a span. Only a count that is not a
+# literal needs a loop, which is lowered like a call to C's `memset`/`memcpy`/
+# `memcmp` and is therefore a call point (`memRowIsLoop`).
+
+proc memRowOperands*(instr: Cursor): seq[Cursor] =
+  ## The operands of the row application `instr`, past the callee.
+  result = @[]
+  var n = instr
+  n.into:
+    skip n                                      # the callee
+    while n.hasMore: (result.add n; skip n)
+
+proc memRowLoc*(n: Cursor): Cursor =
+  ## The location an operand names: `(haddr L)` → `L`, a bare lvalue → itself.
+  result = n
+  if n.kind == TagLit and n.exprKind == HaddrC: inc result
+
+proc isConstCount*(n: Cursor): bool =
+  ## Is the byte count `n` a compile-time constant — a literal, `sizeof`/`alignof`,
+  ## or `+ - *` over integer types of such, through conversions? Syntactic, so the
+  ## analyser can ask it; `constFold` evaluates every such expression (it refuses
+  ## only division by zero, out-of-range shifts and non-integer types, which this
+  ## excludes), so the emitter's fold never disagrees with this answer.
+  case n.kind
+  of IntLit, UIntLit: result = intVal(n) >= 0 or n.kind == UIntLit
+  of TagLit:
+    case n.exprKind
+    of SizeofC, AlignofC: result = true
+    of SufC, ParC:
+      var t = n; inc t
+      result = isConstCount(t)
+    of ConvC, CastC:
+      var t = n; inc t
+      result = t.typeKind in {IT, UT, CT}
+      if result: (skip t; result = isConstCount(t))
+    of AddC, SubC, MulC:
+      var t = n
+      t.into:
+        result = t.typeKind in {IT, UT, CT}
+        skip t                                  # the operation's type
+        while t.hasMore:
+          if result: result = isConstCount(t)
+          skip t
+    else: result = false
+  else: result = false
+
+proc memRowCountArg*(ops: seq[Cursor]; op: IntrinsicOp): Cursor =
+  ## The byte-count operand, or a nil cursor when it is absent (then the count is
+  ## the size of the first location's type).
+  let nLoc = memLocOperands(op)
+  result = if ops.len > nLoc: ops[nLoc] else: default(Cursor)
+
+proc memRowIsLoop*(instr: Cursor; op: IntrinsicOp): bool =
+  ## A row whose byte count is a runtime value: lowered as a loop, a call point.
+  let n = memRowCountArg(memRowOperands(instr), op)
+  not cursorIsNil(n) and not isConstCount(n)
+
+proc memRowArgs*(instr: Cursor; op: IntrinsicOp; lits: var TokenBuf): seq[Cursor] =
+  ## The loop's three operands in the order it takes them — `(dest, 0, n)` for a
+  ## fill, `(dest, src, n)` / `(a, b, n)` otherwise; the first `memLocOperands(op)`
+  ## are LOCATIONS, of which the emitter passes the address. The fill byte is a
+  ## literal in `lits`, which the caller keeps alive while the cursors are in use
+  ## (a literal needs no position lookup, so a cursor into another buffer is fine
+  ## there).
+  let args = memRowOperands(instr)
+  lits.addIntLit 0
+  result = @[args[0]]
+  result.add(if op == ZeroMemOp: cursorAt(lits, 0) else: args[1])
+  result.add args[memLocOperands(op)]
 
 proc aggrByteSize*(p: var Program; typeSym: SymId): int =
   var d = lookupType(p, typeSym)

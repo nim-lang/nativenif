@@ -165,6 +165,8 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(cvtss2sd D S)`       | X64Inst                  | scalar single -> scalar double convert |
 | `(sqrtsd D S)`         | X64Inst                  | scalar double square root (D = sqrt(S)), correctly rounded |
 | `(sqrtss D S)`         | X64Inst                  | scalar single square root (D = sqrt(S)), correctly rounded |
+| `(roundsd D S N)`      | X64Inst                  | SSE4.1 scalar double round to integral (D = round(S)); immediate N is the mode: 9 floor, 10 ceil, 11 trunc (bit 3 suppresses the inexact exception) |
+| `(roundss D S N)`      | X64Inst                  | SSE4.1 scalar single round to integral, immediate mode as `roundsd` |
 | `(comisd D S)`         | X64Inst                  | compare scalar double, set EFLAGS |
 | `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
 | `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops) |
@@ -565,6 +567,10 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(fdiv D S)`        | A64Inst, MInst, RvInst | fp divide (D = D / S) |
 | `(fneg D)`          | A64Inst, MInst, RvInst | fp negate (D = -D) |
 | `(fsqrt D S)`       | A64Inst                 | fp square root (D = sqrt(S)), correctly rounded |
+| `(frintm D S)`      | A64Inst                 | fp round to integral toward minus infinity (floor) |
+| `(frintp D S)`      | A64Inst                 | fp round to integral toward plus infinity (ceil) |
+| `(frintz D S)`      | A64Inst                 | fp round to integral toward zero (trunc) |
+| `(frinta D S)`      | A64Inst                 | fp round to integral, ties away from zero (round) |
 | `(fcmp D S)`        | A64Inst, MInst, RvInst | fp compare |
 | `(fldr D S)`        | A64Inst, MInst, RvInst | fp load register |
 | `(fstr D S)`        | A64Inst, MInst, RvInst | fp store register |

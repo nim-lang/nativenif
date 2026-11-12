@@ -222,6 +222,15 @@ block cvt_narrow_forms:
   expect "big to u16 narrows unsigned", render(b2),
          "(x = (Number(BigInt.asUintN(16, 65541n)) << 16 >>> 16));"
 
+  var b3 = createTop()
+  b3.tree ExprStmt:
+    b3.tree Assign:
+      b3.symUse "x"
+      b3.cvtNode(wU64, wI64):
+        b3.bigIntLit "9223372036854775808"
+  expect "u64 to i64 takes the sign bit", render(b3),
+         "(x = BigInt.asIntN(64, 9223372036854775808n));"
+
 block neg_forms:
   # `-` spliced before a negative literal reads as a decrement of it, even
   # inside outer parens; the operand carries its own.
