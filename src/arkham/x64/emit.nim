@@ -1605,9 +1605,7 @@ proc variadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
     of AFloat: key.add 'f'
     of AMem: key.add(if win64Machine.passesByRef(s.size): 'r' else: 'a')
     else: key.add 'i'
-  var ex = default(Extern)
-  for e in g.prog.externOrder:
-    if e.asmName == asmName: ex = e
+  let ex = externOf(g.prog, asmName)
   assert ex.asmName != NoSymId, "arkham x64: a variadic call to an unknown extern " & g.spelling(asmName)
   result = g.lengSym(derivedName(g.prog.cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
                      thisModuleSuffix(g.prog))

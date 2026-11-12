@@ -114,6 +114,10 @@ type
 
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
+    foreignVarargs*: seq[Extern]            ## `{.varargs.}` externs OTHER modules declare that
+                                            ## this one calls (e.g. after cross-module inlining):
+                                            ## not declared here, only the source of a call's
+                                            ## variadic shape decl (`variadicTarget`)
     callTarget*: Table[SymId, CallTarget]   ## Leng proc symbol → how to call it
     instrTarget*: Table[SymId, InstrTarget] ## Leng proc symbol → which instruction(s)
                                             ## an `(instr …)` on it emits
@@ -1150,6 +1154,15 @@ proc isForeignSym*(p: Program; sym: SymId): bool =
   let module = symModuleId(p.pool, sym)
   module != StrId(0) and module != p.thisModule
 
+proc externOf*(p: Program; asmName: SymId): Extern =
+  ## The extern `asmName` names: one this module declares, or a foreign
+  ## `{.varargs.}` one it calls. `asmName == NoSymId` when there is none.
+  result = default(Extern)
+  for e in p.externOrder:
+    if e.asmName == asmName: return e
+  for e in p.foreignVarargs:
+    if e.asmName == asmName: return e
+
 proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its
   ## declaration from the owning module's embedded index. The asm symbol is the
@@ -1201,7 +1214,16 @@ proc foreignCallTarget*(p: var Program; sym: SymId): CallTarget =
     # is the module-qualified name the foreign module's extern decl uses (see
     # the externOrder naming in `collect`).
     p.needsLibSystem = true
-    result = CallTarget(asmName: p.lengSym(extprocAsmName(importcN, s.module)), extern: true, retFloat: retFloat,
+    let asmN = p.lengSym(extprocAsmName(importcN, s.module))
+    # A variadic extern must be called through a declaration of the call's shape,
+    # exactly as in the owning module — inlined into another module it is still
+    # `printf`/`ioctl`, and Darwin AArch64 still wants its tail on the stack.
+    let fixed = fixedParamCount(declCur)
+    if fixed >= 0 and externOf(p, asmN).asmName == NoSymId:
+      p.foreignVarargs.add Extern(asmName: asmN, decl: declCur, dll: dllN,
+                                  extName: (if p.darwin: "_" & importcN else: importcN))
+    result = CallTarget(asmName: asmN, extern: true, retFloat: retFloat,
+                        isVarargs: fixed >= 0, fixedParams: fixed,
                         retType: retType, sigType: sigType,
                         missingImportLib: missingImportLib(p, importcN, dllN))
   else:
