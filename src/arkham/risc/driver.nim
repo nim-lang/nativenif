@@ -57,13 +57,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
-                       memCallees = g.prog.memIntrinsics,
-                       memOps = g.prog.memIntrinsicOps,
-                       # One register holds 8 bytes only on AArch64; and `rev` is
-                       # AArch64's (RV32 has no byte reverse without Zbb).
-                       scalarMemMaxBytes = (if g.md.arch == Arm64: 8 else: 4),
-                       scalarMemCmp = g.md.arch == Arm64)
-  g.scalarMemOps = an.scalarMemOps
+                       memCallees = g.prog.memIntrinsics)
   g.varType.clear()
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false

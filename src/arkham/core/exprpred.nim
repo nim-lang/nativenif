@@ -17,6 +17,7 @@ import std / [tables, sets, assertions, algorithm]
 
 import nifcore, nifcdecl
 import asmslots, machinedesc, analyser, planner, programs, abi
+import "../../../../nimony/src/lib" / intrinsics
 import regbind, context
 
 
@@ -141,7 +142,7 @@ proc fixedRegsClobberedBy*(g: var CodeGen; n: Cursor): set[Reg] =
         stack.add ch
         skip ch
 
-proc subtreeHasCall*(n: Cursor; memCallees: HashSet[SymId]): bool =
+proc subtreeHasCall*(n: Cursor; memCallees: Table[SymId, IntrinsicOp]): bool =
   ## Does this expression subtree contain a CALL? Read-only. An `(at base idx)`
   ## whose INDEX calls — a bounds check, say — evaluates the base FIRST and
   ## reads it back AFTER the call, so the base's scratch must be a callee-saved

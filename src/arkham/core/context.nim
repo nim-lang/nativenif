@@ -23,7 +23,6 @@
 import std / [tables, sets]
 import nifcore
 import asmslots, machinedesc, planner, programs
-import scalarmem
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
 import diag                               # `userName`: the spelling a DIAGNOSTIC shows
@@ -412,8 +411,6 @@ type
                                              ## a call to one is not a liveness call point.
                                              ## Computed once, alongside `cleanSigProcs`.
     cleanSigComputed*: bool
-    scalarMemOps*: Table[int, ScalarMemOp]   ## this proc's `ProcAnalysis.scalarMemOps`:
-                                             ## block-memory rows in register form
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval
