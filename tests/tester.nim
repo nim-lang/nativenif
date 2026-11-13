@@ -2460,7 +2460,7 @@ const cortexMUnsupported: seq[string] = @[
   # These are the fixtures it cannot serve, each parked under the reason, so that
   # any OTHER failure is fatal and a fixture that starts working is reported.
   # Every one of them refuses BY NAME (a compile-time error from arkham or
-  # nifasm); the single exception is called out at the bottom.
+  # nifasm); the exceptions are called out at the bottom.
 
   # ── memory size ─────────────────────────────────────────────────────────────
   # 2.4 MB arrays: nifasm refuses globals that reach the stack top of the
@@ -2578,12 +2578,18 @@ const cortexMUnsupported: seq[string] = @[
   "assembler_a64",
 
   # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
-  # The one entry that does not refuse: it runs and returns the wrong exit code,
+  # An entry that does not refuse: it runs and returns the wrong exit code,
   # because what it asserts is not true of this target. `stack_array_align`
   # checks `addr big and 15 == 0` — a 16-byte stack alignment that SysV and
   # AAPCS64 happen to give it. AAPCS32 promises 8, and over-aligning every frame
   # to buy it back would cost stack on a device that has kilobytes of it.
   "stack_array_align",
+
+  # ── MISCOMPILE, parked ──────────────────────────────────────────────────────
+  # A `case` on a 64-bit selector compares only the low 32 bits of the selector
+  # and its labels (planetis-m/nimony-bugs-llms#233): two labels that differ only
+  # in the high word are taken (exit 242, not 42).
+  "case_suffixed_labels",
 ]
 
 proc arkhamCortexM64Tests() =

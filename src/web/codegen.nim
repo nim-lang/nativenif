@@ -32,7 +32,7 @@
 import std / [tables, sets, strutils, assertions, algorithm]
 import nifcore, nifcdecl
 import webnif, diag
-import "../arkham/core" / [asmslots, programs, typenav, typeutil]
+import "../arkham/core" / [asmslots, programs, typenav, typeutil, constdata]
 
 include compat2   # getOrQuit on host Nim
 
@@ -3214,21 +3214,13 @@ proc genRet(g: var WebGen; c: Cursor) =
 
 proc genStmt(g: var WebGen; c: var Cursor)   # mutually recursive with genCase
 
-proc widthLit(g: var WebGen; w: WidthCode; v: int64) =
-  ## A constant in the scrutinee's world: BigInt for the 64-bit widths, Number
-  ## for the rest, so a comparison never straddles the two.
-  if w in {wI64, wU64}: g.outp.bigIntLit $v
-  else: g.outp.numLit v
-
 proc caseValue(g: var WebGen; r: Cursor): int64 =
-  ## The literal a case branch selects on. Only numbers and chars are labels;
-  ## anything else (a symbol constant, a range of them) is refused rather than
-  ## guessed at.
-  case r.kind
-  of IntLit: intVal(r)
-  of CharLit: int64(ord(charLit(r)))
-  else:
-    err g, "unsupported case label: " & $r.kind
+  ## The constant a case branch selects on, read as arkham reads it: a number,
+  ## a char, `(true)`/`(false)`, or one wrapped in `(suf ...)`, `(conv ...)`,
+  ## `(cast ...)`, `(neg ...)`. A symbol constant is refused rather than guessed at.
+  if r.kind == Symbol: err g, "unsupported case label: " & $r.kind
+  var t = r
+  result = branchImm(t)
 
 proc caseRangeTest(g: var WebGen; w: WidthCode; scrutinee: SymId; r: Cursor) =
   ## One `BranchRange` — a value, or `(range LO HI)` — as a test on the bound
@@ -3245,20 +3237,20 @@ proc caseRangeTest(g: var WebGen; w: WidthCode; scrutinee: SymId; r: Cursor) =
     g.outp.width wI32                       # vacuous, but every op node carries one
     g.outp.openTree Le
     g.outp.width w
-    widthLit(g, w, caseValue(g, lo))
+    intLitAs(g, caseValue(g, lo), false, w)
     g.outp.symUse scrutinee
     g.outp.closeTag
     g.outp.openTree Le
     g.outp.width w
     g.outp.symUse scrutinee
-    widthLit(g, w, caseValue(g, hi))
+    intLitAs(g, caseValue(g, hi), false, w)
     g.outp.closeTag
     g.outp.closeTag
   else:
     g.outp.openTree Eq
     g.outp.width w
     g.outp.symUse scrutinee
-    widthLit(g, w, caseValue(g, r))
+    intLitAs(g, caseValue(g, r), false, w)
     g.outp.closeTag
 
 proc genCaseBranch(g: var WebGen; w: WidthCode; scrutinee: SymId;
@@ -3324,7 +3316,7 @@ proc genCase(g: var WebGen; c: Cursor) =
     elseBody = elseBody.sub()
   let ty = lengType(g, scrutinee)
   if isAggType(g, ty): err g, "case on an aggregate discriminant"
-  let w = widthOf(scalOf(g, ty))
+  let w = litWidth(g, scrutinee)   # a `(suf ...)` selector's width is its suffix
   if branches.len == 0:
     if not elseBody.cursorIsNil and elseBody.kind == TagLit:
       var eb = elseBody
