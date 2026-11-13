@@ -316,7 +316,7 @@ proc floatBits*(g: var CodeGen; c: Cursor): int =
 proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool] =
   ## Best-effort source scalar (bit width, signedness) of the expression at `c`,
   ## *without* consuming it — used to pick sign- vs zero-extension when a
-  ## conversion *widens*. Unknown → (64, true): treated as full register width,
+  ## conversion *widens*. Unknown width → 64: treated as full register width,
   ## i.e. no widening extension is applied (the pre-source-aware behaviour).
   case c.kind
   of Symbol:
@@ -350,8 +350,11 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
       t.into:
         return g.srcWidthSigned(t)
     of TrueC, FalseC: return (64, false)
-    else: return (64, true)
-  else: return (64, true)
+    else: discard
+  else: discard
+  # Any other shape (`at`, `dot`, `deref`, a call): the width stays unknown, but
+  # the signedness is its type's, so `float(a[i])` of a `uint64` is unsigned.
+  result = (64, slotWidthSigned(g.exprSlot(c)).signed)
 
 proc literalArrivesNormalized(lit: Cursor; width: int; signed: bool): bool =
   ## Is the integer literal at `lit` already in the canonical 64-bit register form
@@ -392,7 +395,7 @@ proc arrivesNormalized*(g: var CodeGen; src: Cursor; width: int; signed: bool): 
   #    invariant `normalizeBinWidth` restores after `add`/`sub`/`mul`/`shl` and that
   #    it relies on when it skips the fixup for `and`/`or`/`xor`/`shr`. Re-extending
   #    to a width the value already has is a pure no-op. `srcWidthSigned` answers
-  #    (64, true) for anything it cannot classify — a call result included, whose
+  #    width 64 for anything it cannot classify — a call result included, whose
   #    upper half neither ABI promises — and 64 never equals `width` here, so an
   #    unknown source is excluded rather than assumed.
   let (sw, ss) = g.srcWidthSigned(src)
