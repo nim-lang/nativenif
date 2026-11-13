@@ -2309,7 +2309,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let it = instTag
     inc n
     let d = parseXmmOperand(n, ctx)
-    let s = parseOperand(n, ctx).reg
+    let srcPos = n
+    let src = parseOperand(n, ctx)
+    if src.kind != okReg: error("cvtsi2sd/cvtsi2ss source must be a register", srcPos)
+    let s = src.reg
     if it == Cvtsi2sdX64: x86.emitCvtsi2sd(ctx.buf.data, d, s)
     else:                 x86.emitCvtsi2ss(ctx.buf.data, d, s)
 
@@ -2317,7 +2320,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # float -> int (truncating): `(cvttsd2si gprD (xmmS))`; GPR dest may be a local.
     let it = instTag
     inc n
-    let d = parseDest(n, ctx).reg
+    let dstPos = n
+    let dst = parseDest(n, ctx)
+    if dst.kind != okReg: error("cvttsd2si/cvttss2si destination must be a register", dstPos)
+    let d = dst.reg
     let s = parseXmmOperand(n, ctx)
     if it == Cvttsd2siX64: x86.emitCvttsd2si(ctx.buf.data, d, s)
     else:                  x86.emitCvttss2si(ctx.buf.data, d, s)
@@ -2337,11 +2343,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         let s = parseXmmOperand(n, ctx)
         x86.emitMovqXmmToXmm(ctx.buf.data, d, s)
       else:
-        let s = parseOperand(n, ctx).reg
+        let srcPos = n
+        let src = parseOperand(n, ctx)
+        if src.kind != okReg: error("movfq/movfd source must be a register", srcPos)
+        let s = src.reg
         if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
         else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
     else:
-      let d = parseDest(n, ctx).reg
+      let dstPos = n
+      let dst = parseDest(n, ctx)
+      if dst.kind != okReg: error("movfq/movfd destination must be a register", dstPos)
+      let d = dst.reg
       let s = parseXmmOperand(n, ctx)
       if it == MovfqX64: x86.emitMovqXmmToGpr(ctx.buf.data, d, s)
       else:              x86.emitMovdXmmToGpr(ctx.buf.data, d, s)
@@ -2577,22 +2589,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     x86.emitClflushopt(ctx.buf.data, op.reg)
-  of Prefetcht0X64:
+  of Prefetcht0X64, Prefetcht1X64, Prefetcht2X64, PrefetchntaX64:
+    # `0F 18 /digit m8`: a register operand would encode a hint NOP instead.
+    let it = instTag
     inc n
+    let opPos = n
     let op = parseDest(n, ctx)
-    x86.emitPrefetchT0(ctx.buf.data, op.reg)
-  of Prefetcht1X64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchT1(ctx.buf.data, op.reg)
-  of Prefetcht2X64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchT2(ctx.buf.data, op.reg)
-  of PrefetchntaX64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchNta(ctx.buf.data, op.reg)
+    if op.kind != okMem: error("prefetch operand must be a memory operand", opPos)
+    let digit = case it
+                of Prefetcht0X64: 1
+                of Prefetcht1X64: 2
+                of Prefetcht2X64: 3
+                else: 0
+    x86.emit0FGroupMem(ctx.buf.data, 0x18, digit, op.mem)
 
 proc genInstNodeX64*(n: var Cursor; ctx: var GenContext) =
   withListingRow(ctx, n): genInstX64(n, ctx)

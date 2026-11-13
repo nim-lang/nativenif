@@ -1312,6 +1312,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "U
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
 # A float parameter is checked for assignment like a GPR one.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_float_sig_missing.nif", "Missing argument: p0.0")
+# A gpr<->xmm convert or move takes a REGISTER on its gpr side, and a prefetch a
+# MEMORY operand: the other kind is refused, not encoded against rax / as a nop.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_cvtsi2sd_mem.nif", "cvtsi2sd/cvtsi2ss source must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_cvttsd2si_mem.nif", "cvttsd2si/cvttss2si destination must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_load.nif", "movfq/movfd source must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_store.nif", "movfq/movfd destination must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_prefetch_reg.nif", "prefetch operand must be a memory operand")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.

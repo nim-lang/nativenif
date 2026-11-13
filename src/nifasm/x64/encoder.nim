@@ -1653,59 +1653,16 @@ proc emitClflushopt*(dest: var Bytes; reg: Register) =
   dest.add(0xAE)  # CLFLUSHOPT opcode
   dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
 
-# Prefetch operations
-proc emitPrefetchT0*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT0 instruction: PREFETCHT0 reg (prefetch for all caches)
+proc emit0FGroupMem*(dest: var Bytes; opc: byte; digit: int; mem: MemoryOperand) =
+  ## `0F opc /digit` on a memory operand: prefetch (0F 18), clflush (0F AE /7).
+  emitSegPrefix(dest, mem)
   var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
-
-proc emitPrefetchT1*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT1 instruction: PREFETCHT1 reg (prefetch for L2 cache)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
-
-proc emitPrefetchT2*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT2 instruction: PREFETCHT2 reg (prefetch for L3 cache)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
-
-proc emitPrefetchNta*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHNTA instruction: PREFETCHNTA reg (prefetch non-temporal)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
-
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x: dest.add(encodeRex(rex))
+  dest.add(0x0F)
+  dest.add(opc)
+  dest.emitMem(digit, mem)
 
 # Conditional set instructions
 proc emitSetcc(dest: var Bytes; code: byte; reg: Register) =
