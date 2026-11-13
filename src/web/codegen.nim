@@ -1112,13 +1112,19 @@ proc genAddr(g: var WebGen; c: Cursor) =
   else:
     err g, "cannot take the address of this expression"
 
+proc floatLitAs(g: var WebGen; v: float64; want: WidthCode) =
+  ## A float literal at the width its position demands: an f32 one is rounded
+  ## to single, as its machine representation is, since a JS Number or a wasm
+  ## f64 would otherwise keep digits no float32 holds.
+  g.outp.floatLit(if want == wF32: float64(float32(v)) else: v)
+
 proc intLitAs(g: var WebGen; v: int64; unsignedSrc: bool; want: WidthCode) =
   ## An integer literal emitted straight at the width its position demands —
   ## Leng's bare literals carry no width, the CONTEXT types them — in the
   ## canonical form of that width (a u32 is non-negative, an i8 sign-extended).
   case want
   of wF32, wF64:
-    g.outp.floatLit(if unsignedSrc: float64(cast[uint64](v)) else: float64(v))
+    floatLitAs(g, (if unsignedSrc: float64(cast[uint64](v)) else: float64(v)), want)
   of wI64: g.outp.bigIntLit $v
   of wU64: g.outp.bigIntLit $cast[uint64](v)
   of wI32: g.outp.numLit int64(cast[int32](v))
@@ -1139,7 +1145,7 @@ proc genExprCoerced(g: var WebGen; c: Cursor; want: WidthCode) =
   of CharLit: intLitAs(g, int64(ord(charLit(c))), true, want); return
   of FloatLit:
     if want.isFloat:
-      g.outp.floatLit floatVal(c)
+      floatLitAs(g, floatVal(c), want)
       return
   of TagLit:
     case c.exprKind
@@ -1756,7 +1762,7 @@ proc genSufLit(g: var WebGen; c: Cursor) =
   var t = c
   inc t
   if w.isFloat:
-    g.outp.floatLit sufFloatVal(g, t)
+    floatLitAs(g, sufFloatVal(g, t), w)
   else:
     case t.kind
     of IntLit: intLitAs(g, intVal(t), false, w)

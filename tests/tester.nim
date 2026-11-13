@@ -2478,7 +2478,7 @@ const cortexMUnsupported: seq[string] = @[
   "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
-  "store_forward", "uint_literal_to_float",
+  "store_forward", "uint_literal_to_float", "f32_literal_rounded",
   # The stack-passed-float fixtures are double precision; `tests/arkham_m/p32_*`
   # are their single-precision, 32-bit-int twins, and run here.
   "float_stack_args", "float_stack_forward", "float_stack_indirect",
