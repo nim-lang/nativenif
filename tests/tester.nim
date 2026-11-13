@@ -1210,6 +1210,7 @@ exec "nim c -r src/nifasm/nifasm tests/jcc_sign.nif"
 exec "nim c -r src/nifasm/nifasm tests/ite_multi_stmt.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_subwidth.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
+exec "nim c -r src/nifasm/nifasm tests/lock_subwidth.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
@@ -1269,6 +1270,8 @@ when defined(linux) and defined(amd64):
   # Sized mem±reg ALU (32/8-bit add/or into a cast-typed slot; reg += mem32)
   # and rotate-by-CL.
   execRun "tests/alu_memreg"
+  # `(lock …)` RMW on a cast-sized memory operand touches only that width.
+  execRun "tests/lock_subwidth"
   # `(lenient)` proc pragma: backward jump, raw r11, bare (call P), tail (jmp P)
   # inside one ported proc, called normally from a strict main.
   execRun "tests/lenient_port"

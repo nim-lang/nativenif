@@ -2368,7 +2368,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x00, 0x01, intMemAccess(dest.typ).bits)
     of SubX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2385,7 +2385,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitSub(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x28, 0x29, intMemAccess(dest.typ).bits)
     of AndX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2402,7 +2402,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x20, 0x21, intMemAccess(dest.typ).bits)
     of OrX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2419,7 +2419,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitOr(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x08, 0x09, intMemAccess(dest.typ).bits)
     of XorX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2436,35 +2436,35 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitXor(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x30, 0x31, intMemAccess(dest.typ).bits)
     of IncX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock inc", start)
       if dest.kind != okMem: error("Atomic INC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitInc(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xFE, 0xFF, 0, intMemAccess(dest.typ).bits)
     of DecX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock dec", start)
       if dest.kind != okMem: error("Atomic DEC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitDec(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xFE, 0xFF, 1, intMemAccess(dest.typ).bits)
     of NotX64:
       inc n
       let dest = parseDest(n, ctx)
       checkBitwiseType(dest.typ, "lock not", start)
       if dest.kind != okMem: error("Atomic NOT requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitNot(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xF6, 0xF7, 2, intMemAccess(dest.typ).bits)
     of NegX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock neg", start)
       if dest.kind != okMem: error("Atomic NEG requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitNeg(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xF6, 0xF7, 3, intMemAccess(dest.typ).bits)
     of XaddX64:
       # `lock xadd [mem], reg` — atomic exchange-and-add; reg receives the old value.
       inc n
