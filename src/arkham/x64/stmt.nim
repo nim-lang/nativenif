@@ -50,7 +50,11 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
     let declaredCur = cc; skip cc                        # type (`.` when shoggoth omitted it)
     let typeCur = g.declType(declaredCur, cc)            # infer from the initializer
     g.symType[nm] = typeCur                              # record the type for getType (conds)
-    if nm in g.plan.aliasedCasts:
+    if nm == g.plan.nrvoSym:
+      # Built in the caller's buffer and bound at entry (see `emitProcBody`); it has
+      # no initializer (`nrvoLocal` requires that), so there is nothing to emit.
+      while cc.hasMore: skip cc
+    elif nm in g.plan.aliasedCasts:
       # Identity-cast value alias (see `allocVarDecl`): `nm` has NO home of its own — its
       # `symPos` points at the source `c1`, so every use resolves to `c1`'s live register
       # and field/deref uses auto-emit `(cast T nm→c1)`. Emit NEITHER a decl NOR a store
@@ -99,7 +103,10 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
             let sh = g.plan.locationOfSym(srcSym.symId, cursorToPosition(g.buf[], srcSym))
             if sh.kind == InReg and sh.r == loc.r and sameRegRepr(sh.typ, loc.typ):
               skipInit = true
-        if not skipInit: g.genStore(cc, loc)   # the one general store path
+        if not skipInit:
+          g.initDecl = nm
+          g.genStore(cc, loc)                  # the one general store path
+          g.initDecl = NoSymId
         if callInit:
           # The result is in the register now; bind the name to it. `emRegLocalVar`
           # emits only the `(var :nm (reg) T)` declaration — no machine code — so
@@ -525,7 +532,8 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             g.varType[srcName] = g.retAggrSym
             g.genStore(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)))
           if g.retIndirect:                                # >16B: copy through the hidden ptr
-            g.copyStructThroughPtr(srcName, g.retAggrSym, g.indirectReg)
+            if srcName != g.plan.nrvoSym:                  # unless it was built in place
+              g.copyStructThroughPtr(srcName, g.retAggrSym, g.indirectReg)
             g.movReg(RAX, g.indirectReg)                   # SysV: return the buffer pointer in rax
           else:
             g.releaseRetRegs()
@@ -924,7 +932,13 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # …)` writing the result buffer out. It has no `symPos` entry, so it was not even
     # in the `regHoldsHome` union; only `rawHomeRegs` reserved it. `framePop` kills the
     # binding before the pops (`indirectReg` is RBX, always a frame register here).
-    if g.retAggrSym != NoTypeSym:
+    if g.plan.nrvoSym != NoSymId:
+      # The result local IS the buffer (`lengaa.nrvoLocal`): the pointer is bound
+      # under its name, so every access to it goes through the register, the shape
+      # of a by-ref aggregate param.
+      g.emRegAggrPtrVar(g.plan.nrvoSym, g.indirectReg, g.retAggrSym)
+      g.varType[g.plan.nrvoSym] = g.retAggrSym
+    elif g.retAggrSym != NoTypeSym:
       g.emRegAggrPtrVar(g.lengSym(synth("retptr.0")), g.indirectReg, g.retAggrSym)
     else:
       g.rawHomeRegs.incl g.indirectReg

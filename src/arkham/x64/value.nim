@@ -20,7 +20,7 @@
 import std / envvars
 import std / syncio
 import std / [assertions, tables, sets, os, strutils, sequtils]
-import nifcore, nifcdecl
+import nifcore, nifcdecl, lengaa
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     stress, context, diag, typeutil, constdata,
                     mirrors, temps, exprpred, abi, divmagic]
@@ -1870,6 +1870,23 @@ proc tryRmwStore*(g: var CodeGen; lhs: Cursor): bool =
   elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
   return true
 
+proc resultBufferObservable(g: CodeGen; dst: Location; call: Cursor): bool =
+  ## May the callee of `call` reach `dst` other than as its result buffer?
+  ## `lengaa` answers for the program's own variables; a back-end temp (a
+  ## `NamedStack` name the facts do not declare) is fresh, and a global or
+  ## thread-local is always reachable.
+  case dst.kind
+  of NamedStack:
+    # A declaration's own initializer: nothing can point at storage that does
+    # not exist yet (a pointer kept from a previous loop iteration is dangling).
+    result = dst.name != g.initDecl and g.aaFacts.declares(dst.name) and
+             g.aaFacts.symMayBeObserved(dst.name, call)
+  of StackPtr: result = g.aaFacts.symMayBeObserved(dst.ptrName, call)
+  of Mem:
+    result = dst.cur.kind != Symbol or
+             g.aaFacts.symMayBeObserved(dst.cur.symId, call)
+  else: result = true
+
 proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
   ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
@@ -1900,6 +1917,42 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
     g.giveBack tmp
     g.giveBack dstAddr
     return
+  if dstAggr and rhs.kind == TagLit and rhs.exprKind == CallC and
+     g.callConvOf(rhs).passesByRef(aggrSize):
+    # A >16B result travels through a hidden pointer, and the callee may build it
+    # IN PLACE (`lengaa.nrvoLocal`), writing the buffer before it is done reading
+    # its inputs. So the buffer must be something the callee cannot reach — the C
+    # ABI's rule, and the caller half of `lengaa`'s contract. A destination that
+    # cannot promise that gets a fresh temp and a copy.
+    if g.resultBufferObservable(dst, rhs):
+      let pos = cursorToPosition(g.buf[], rhs)
+      let home = g.lengSym(synth("restmp") & $pos & ".0")
+      let tcur = g.getType(rhs)
+      g.emTypedStackVar(home, tcur)
+      if tcur.kind == Symbol: g.varType[home] = tcur.symId
+      g.genStore(rhs, namedStackLoc(home, g.exprSlot(rhs)))   # a temp: unobservable
+      if dst.kind == Mem: g.emitLvalue(dst.cur)
+      var dstAddr = NoReg
+      let dstE = g.aggrDstEnd(dst, dstAddr)
+      if dst.kind == Mem: g.freeLvalTemps(dst.cur)
+      var tmp = g.pickStagingSealed("a call result copy", AddrSlot)
+      g.copyAggr(dstE, AggrEnd(slot: home, reg: NoReg), aggrSize, tmp)
+      g.giveBack tmp
+      g.giveBack dstAddr
+      return
+    if dst.kind == Mem and dst.cur.kind == Symbol:
+      # A pointer-homed aggregate (a by-ref param, or this proc's own result built
+      # in place): its register already holds the buffer address to pass on.
+      let home = g.plan.homeOfSym(dst.cur.symId)
+      if home.kind == InReg:
+        let hidden = g.callConvOf(rhs).intArgRegs[0]
+        let w = g.emCallerSaveOpen()                       # see the NamedStack arm below
+        g.dropStaleBinding(hidden)
+        g.movReg(hidden, home.r)
+        var d = dontCare
+        g.emitCall(rhs, d, hiddenPtr = true)
+        g.emCallerSaveClose(w, d)
+        return
   if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
      g.exprSlot(rhs).kind == AMem:
     # A distinct / representation-preserving conversion of an AGGREGATE (`Path(s)` for
