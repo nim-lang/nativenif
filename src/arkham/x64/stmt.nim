@@ -451,6 +451,44 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         while cc.hasMore: (g.genStmt(cc); skip cc)      # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
+  of LoopS:
+    # `(loop (stmts … (continue .X)))`: nifasm emits the back-edge after the body; a
+    # `(continue X)` leaves to `lEnd` first when `X` is false (see `ContinueS`).
+    let lEnd = g.freshLabel()
+    g.loopEnds.add lEnd
+    g.emitLoop:
+      var cc = c
+      cc.into:
+        while cc.hasMore: (g.genStmt(cc); skip cc)
+    g.emLab(lEnd)
+    discard g.loopEnds.pop()
+  of ContinueS:
+    var cc = c
+    cc.into:
+      if cc.kind != DotToken:
+        g.emitCond(cc, g.loopEnds[^1], whenTrue = false)   # repeat only while it holds
+      while cc.hasMore: skip cc
+  of IteS:
+    # `(ite C T E|.)`. Same rules as the `IfS` arm below: a fused condition skips the
+    # cmov attempt, an arm in tail position may return instead of jumping to `lEnd`.
+    let fusedSym = g.condFuseSym(c)
+    let isFused = fusedSym != NoSymId and g.condFuse.tag.hasKey(fusedSym)
+    if isFused or not g.tryEmitCmov(c):
+      var condC, thenC, elseC = default(Cursor)
+      discard twoWayParts(c, condC, thenC, elseC)
+      var endC = c; skip endC                          # nothing follows the arms
+      let tailFlags = armFlags(flags, endC)
+      let lElse = g.freshLabel()
+      g.emitCond(condC, lElse, whenTrue = false)
+      g.genStmt(thenC, tailFlags)
+      if hasArm(elseC):
+        let lEnd = g.freshLabel()
+        if not (TailPos in flags and g.emReturnHere()): g.emJmp(lEnd)
+        g.emLab(lElse)
+        g.genStmt(elseC, tailFlags)
+        g.emLab(lEnd)
+      else:
+        g.emLab(lElse)
   of IfS:
     # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
     # select on — the answer is in the flags and only `emitCond` knows how to spend it.
@@ -709,9 +747,17 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   else: raiseAssert "arkham x64n: genStmt " & $c.stmtKind
 
 proc condFuseSym(g: CodeGen; c: Cursor): SymId =
-  ## The bool symbol an `(if …)`'s FIRST branch tests, when that branch's condition is
-  ## a bare symbol — the only shape `scanCondFusions` fuses.
+  ## The bool symbol an `(if …)`'s FIRST branch (an `(ite …)`'s condition) tests,
+  ## when that condition is a bare symbol — the only shape `scanCondFusions` fuses.
   result = NoSymId
+  if c.kind == TagLit and c.stmtKind == IteS:
+    var t = sub(c)
+    var guard = 0
+    while t.kind == TagLit and t.exprKind == NotC and guard < 8:   # see below
+      inc t
+      inc guard
+    if t.kind == Symbol: result = t.symId
+    return
   if c.kind != TagLit or c.stmtKind != IfS: return
   var cc = c
   cc.into:
@@ -868,7 +914,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
             pendingSym = NoSymId
           skip c
           continue
-        of IfS:
+        of IfS, IteS:
           let s = g.condFuseSym(c)
           if s != NoSymId and s == pendingSym:
             g.condFuse.cmp.incl pendingPos

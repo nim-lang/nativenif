@@ -213,6 +213,40 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         while cc.hasMore: (g.genStmt(cc); skip cc)      # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
+  of LoopS:
+    # `(loop (stmts … (continue .X)))` — see the x64 twin.
+    let lEnd = g.freshLabel()
+    g.loopEnds.add lEnd
+    g.emitLoop:
+      var cc = c
+      cc.into:
+        while cc.hasMore: (g.genStmt(cc); skip cc)
+    g.emLab(lEnd)
+    discard g.loopEnds.pop()
+  of ContinueS:
+    var cc = c
+    cc.into:
+      if cc.kind != DotToken:
+        g.emitCond(cc, g.loopEnds[^1], whenTrue = false)   # repeat only while it holds
+      while cc.hasMore: skip cc
+  of IteS:
+    # `(ite C T E|.)` — the `IfS` arm below with exactly one condition.
+    if CondSelect notin g.md.caps or not g.tryEmitCsel(c):
+      var condC, thenC, elseC = default(Cursor)
+      discard twoWayParts(c, condC, thenC, elseC)
+      var endC = c; skip endC                          # nothing follows the arms
+      let tailFlags = armFlags(flags, endC)
+      let lElse = g.freshLabel()
+      g.emitCond(condC, lElse, whenTrue = false)
+      g.genStmt(thenC, tailFlags)
+      if hasArm(elseC):
+        let lEnd = g.freshLabel()
+        if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
+        g.emLab(lElse)
+        g.genStmt(elseC, tailFlags)
+        g.emLab(lEnd)
+      else:
+        g.emLab(lElse)
   of IfS:
     # `csel` is AArch64's. ARMv7-M has no conditional select at all — its
     # equivalent is an IT block, which is a different shape and not one this

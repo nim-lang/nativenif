@@ -745,7 +745,17 @@ proc analyse(c: var Context; n: var Cursor) =
       analyseChildren(c, n)             # normal usage/liveness accounting
     of ProcS, TypeS:
       skip n                            # nested decls: not our locals
-    of WhileS:
+    of IteS:
+      # `(ite C T E|.)`: the arms get the cold-branch treatment `elif`/`else` get (see
+      # `endsDiverging` in the `NoExpr` case); the condition runs on the hot path.
+      n.into:
+        analyse(c, n)                   # the condition
+        while n.hasMore:
+          let cold = n.kind == TagLit and endsDiverging(c, n)
+          if cold: inc c.inCold
+          analyse(c, n)
+          if cold: dec c.inCold
+    of WhileS, LoopS:
       # Treat `while cond: body` as `loop: (if cond: body else break)` — condition and
       # body are one loop body under a back-edge (no prepass; the traversal just reads it
       # that way). Walk it as usual, then resolve the back-edge at the frame.
