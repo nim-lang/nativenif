@@ -455,16 +455,19 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of LoopS:
-    # `(loop (stmts … (continue .X)))`. When `X` is one integer relation (under any
-    # number of `not`s) the loop is BOTTOM-TESTED: its `cmp` ends the body and the
-    # back-edge is nifasm's conditional `(loop (stmts …) (jcc))` — one taken branch
-    # per iteration. Otherwise nifasm emits an unconditional back-edge and a
-    # `(continue X)` leaves to `lEnd` first when `X` is false (see `ContinueS`).
+    # `(loop (stmts … (continue .X)))`. When `X` is one relation (under any number of
+    # `not`s) the loop is BOTTOM-TESTED: its compare ends the body and the back-edge
+    # is nifasm's conditional `(loop (stmts …) (jcc))` — one taken branch per
+    # iteration. A float `==` adds a `jp lEnd`, a forward exit for NaN. The one
+    # exception is a float `!=`, which repeats on "unordered" too: two backward
+    # branches (`floatParityTaken`). It, and any other `X`, keeps the unconditional
+    # back-edge, with `(continue X)` leaving to `lEnd` first (see `ContinueS`).
     let lEnd = g.freshLabel()
     g.loopEnds.add lEnd
     var a, b = default(Cursor)
     var ek = EqC
-    var bottom = false                               # `X` is one integer relation
+    var bottom = false                               # `X` is one relation
+    var isFloat = false
     var whenTrue = true
     block bottomTest:
       var body = c.childCursor                       # (stmts …)
@@ -480,8 +483,9 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       var ops = x.childCursor
       a = ops; skip ops
       b = ops
-      if g.isFloatExpr(a): break bottomTest       # unordered needs a second branch
       ek = x.exprKind
+      isFloat = g.isFloatExpr(a)
+      if isFloat and floatParityTaken(ek, whenTrue): break bottomTest
       bottom = true
     if bottom and not rotateDisabled:
       g.killAllMirrors()                             # the head is a merge point (`emitLoop`)
@@ -492,7 +496,12 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           cc.into:
             while cc.hasMore:
               if cc.kind == TagLit and cc.stmtKind == ContinueS:
-                tag = g.emitScalarCmp(a, b, ek, whenTrue)   # the flags the back-edge reads
+                # the flags the back-edge reads
+                if isFloat:
+                  var exitUsed = false
+                  tag = g.emitFloatCmp(a, b, ek, whenTrue, lEnd, exitUsed)
+                else:
+                  tag = g.emitScalarCmp(a, b, ek, whenTrue)
               else:
                 g.genStmt(cc)
               skip cc

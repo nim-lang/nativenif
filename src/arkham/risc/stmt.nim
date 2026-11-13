@@ -218,7 +218,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     discard g.loopEnds.pop()
   of LoopS:
     # `(loop (stmts … (continue .X)))` — see the x64 twin, including the
-    # BOTTOM-TESTED form for one integer relation: `cmp` ends the body and nifasm's
+    # BOTTOM-TESTED form for one relation (a float one too: `emitFloatCmp`): `cmp` ends the body and nifasm's
     # `(loop (stmts …) (b<cc>))` is the conditional back-edge. AArch64 only: the
     # RV32 and Cortex-M nifasm loops do not take the trailing condition.
     let lEnd = g.freshLabel()
@@ -226,6 +226,7 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     var a, b = default(Cursor)
     var ek = EqC
     var bottom = false
+    var isFloat = false
     var whenTrue = true
     block bottomTest:
       if g.md.arch != Arm64: break bottomTest
@@ -241,8 +242,8 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       var ops = x.childCursor
       a = ops; skip ops
       b = ops
-      if g.isFloatExpr(a): break bottomTest
       ek = x.exprKind
+      isFloat = g.isFloatExpr(a)                     # one `b.cond` either way
       bottom = true
     if bottom and not rotateDisabled:
       g.killAllMirrors()                             # the head is a merge point
@@ -253,7 +254,9 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           cc.into:
             while cc.hasMore:
               if cc.kind == TagLit and cc.stmtKind == ContinueS:
-                tag = g.emitScalarCmp(a, b, ek, whenTrue)   # the flags the back-edge reads
+                # the flags the back-edge reads
+                tag = (if isFloat: g.emitFloatCmp(a, b, ek, whenTrue)
+                       else: g.emitScalarCmp(a, b, ek, whenTrue))
               else:
                 g.genStmt(cc)
               skip cc
