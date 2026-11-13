@@ -1189,6 +1189,7 @@ exec "nim c -r src/nifasm/nifasm tests/hello.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_switch.nif"
 exec "nim c -r src/nifasm/nifasm tests/atomic_ops.nif"
+exec "nim c -r src/nifasm/nifasm tests/cmpxchg8b.nif"
 exec "nim c -r src/nifasm/nifasm tests/bitops_rotate_scan.nif"
 exec "nim c -r src/nifasm/nifasm tests/bitops_bittest.nif"
 exec "nim c -r src/nifasm/nifasm tests/unique_bind.nif"
@@ -1241,6 +1242,9 @@ when defined(linux) and defined(amd64):
   # binaries have been built for linux only:
   exec "tests/hello"
   exec "tests/atomic_ops"
+  # cmpxchg8b without REX.W (which would make it cmpxchg16b): EDX:EAX matches the
+  # qword, so ZF is set; exits 0 only then.
+  execRun "tests/cmpxchg8b"
   # The new x86-64 bit instructions (rol/ror/rcl/rcr/bsf/bsr/bt/bts/btr/btc):
   # both binaries compute their checks and exit 0 only when every result matches.
   execRun "tests/bitops_rotate_scan"

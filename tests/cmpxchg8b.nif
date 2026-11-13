@@ -1,0 +1,38 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (sub
+    (rsp)16)
+   (var :m.0
+    (s)
+    (i 64))
+   (mov
+    (rax)8589934593)
+   (mov
+    (mem
+     (rsp)m.0)
+    (rax))
+   (mov
+    (rax)1)
+   (mov
+    (rdx)2)
+   (mov
+    (rbx)5)
+   (mov
+    (rcx)6)
+   (mov
+    (rdi)1)
+   (cmpxchg8b
+    (mem
+     (rsp)m.0))
+   (jne exit.0)
+   (mov
+    (rdi)0)
+   (lab :exit.0)
+   (mov
+    (rax)60)
+   (syscall))))

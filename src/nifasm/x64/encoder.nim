@@ -1624,14 +1624,14 @@ proc emitCmpxchg8b*(dest: var Bytes; reg: Register) =
   dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
 
 proc emitCmpxchg8b*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit CMPXCHG8B instruction: CMPXCHG8B mem
-  ## Note: With REX.W this is actually CMPXCHG16B on 64-bit processors
+  ## Emit CMPXCHG8B instruction: CMPXCHG8B mem. No REX.W: with it, the same
+  ## opcode is CMPXCHG16B (16 bytes, RDX:RAX, 16-byte alignment).
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  var rex = RexPrefix()
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
 
-  if rex.b or rex.x or rex.w:
+  if rex.b or rex.x:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
