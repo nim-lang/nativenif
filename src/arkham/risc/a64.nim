@@ -199,12 +199,8 @@ proc variadicTarget*(g: var CodeGen; asmName: SymId; slots: openArray[AsmSlot];
       if s.size > g.md.aggrByRefThreshold: key.add 'r'
       else: key.add 'a' & $((s.size + 7) div 8)
     else: key.add 'i'
-  let ex = block:
-    var found = -1
-    for i, e in g.prog.externOrder:
-      if e.asmName == asmName: found = i
-    assert found >= 0, "arkham a64: a variadic call to an unknown extern " & g.spelling(asmName)
-    g.prog.externOrder[found]
+  let ex = externOf(g.prog, asmName)
+  assert ex.asmName != NoSymId, "arkham a64: a variadic call to an unknown extern " & g.spelling(asmName)
   result = g.lengSym(derivedName(g.prog.cNameOfAsmName(asmName) & ".0", "cva" & key) & "." &
                      thisModuleSuffix(g.prog))
   for v in g.variadicExterns:
