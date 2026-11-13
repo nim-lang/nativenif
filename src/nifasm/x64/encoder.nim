@@ -1626,33 +1626,6 @@ proc emitPause*(dest: var Bytes) =
   dest.add(0x90)  # NOP opcode
 
 # Memory ordering operations
-proc emitClflush*(dest: var Bytes; reg: Register) =
-  ## Emit CLFLUSH instruction: CLFLUSH reg (cache line flush)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0xAE)  # CLFLUSH opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-
-proc emitClflushopt*(dest: var Bytes; reg: Register) =
-  ## Emit CLFLUSHOPT instruction: CLFLUSHOPT reg (cache line flush optimized)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x66)  # CLFLUSHOPT prefix
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0xAE)  # CLFLUSHOPT opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-
 proc emit0FGroupMem*(dest: var Bytes; opc: byte; digit: int; mem: MemoryOperand) =
   ## `0F opc /digit` on a memory operand: prefetch (0F 18), clflush (0F AE /7).
   emitSegPrefix(dest, mem)

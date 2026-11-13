@@ -2569,26 +2569,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     x86.emitPause(ctx.buf.data)
 
-  of ClflushX64:
+  of ClflushX64, ClflushoptX64:
+    # `[66] 0F AE /7 m8`: CLFLUSH has no register form (mod=11 is another opcode).
+    let it = instTag
     inc n
+    let opPos = n
     let op = parseDest(n, ctx)
-    if op.kind == okMem: error("CLFLUSH expects memory operand via register?", n)
-    # emitClflush(Register). x86.nim takes Register. CLFLUSH m8. ModRM encodes address.
-    # So it takes a register which holds the address? No, it takes an address.
-    # x86.nim implementation: emitClflush(reg) -> 0F AE /7 (CLFLUSH m8).
-    # encodeModRM(amDirect, 7, int(reg)).
-    # amDirect means register mode (11).
-    # CLFLUSH requires memory operand (ModRM != 11).
-    # So emitClflush in x86.nim is BUGGY if it uses amDirect!
-    # It should use amIndirect or whatever.
-    # If emitClflush(reg) means "flush address in reg", it should be [reg].
-    # I'll leave it for now but this looks suspicious.
-    x86.emitClflush(ctx.buf.data, op.reg)
-
-  of ClflushoptX64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitClflushopt(ctx.buf.data, op.reg)
+    if op.kind != okMem: error("clflush operand must be a memory operand", opPos)
+    if it == ClflushoptX64: ctx.buf.data.add(0x66)
+    x86.emit0FGroupMem(ctx.buf.data, 0xAE, 7, op.mem)
   of Prefetcht0X64, Prefetcht1X64, Prefetcht2X64, PrefetchntaX64:
     # `0F 18 /digit m8`: a register operand would encode a hint NOP instead.
     let it = instTag

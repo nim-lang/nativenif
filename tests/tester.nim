@@ -1211,6 +1211,7 @@ exec "nim c -r src/nifasm/nifasm tests/ite_multi_stmt.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_subwidth.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
 exec "nim c -r src/nifasm/nifasm tests/lock_subwidth.nif"
+exec "nim c -r src/nifasm/nifasm tests/x64_clflush_mem.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
@@ -1272,6 +1273,8 @@ when defined(linux) and defined(amd64):
   execRun "tests/alu_memreg"
   # `(lock …)` RMW on a cast-sized memory operand touches only that width.
   execRun "tests/lock_subwidth"
+  # `(clflush (mem …))` is CLFLUSH m8 (the register form does not exist).
+  execRun "tests/x64_clflush_mem"
   # `(lenient)` proc pragma: backward jump, raw r11, bare (call P), tail (jmp P)
   # inside one ported proc, called normally from a strict main.
   execRun "tests/lenient_port"
@@ -1319,6 +1322,7 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_cvttsd2si_mem.nif", "cvt
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_load.nif", "movfq/movfd source must be a register")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_store.nif", "movfq/movfd destination must be a register")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_prefetch_reg.nif", "prefetch operand must be a memory operand")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_clflush_reg.nif", "clflush operand must be a memory operand")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.
