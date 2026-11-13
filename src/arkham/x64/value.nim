@@ -1931,6 +1931,8 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.emTypedStackVar(home, tcur)
       if tcur.kind == Symbol: g.varType[home] = tcur.symId
       g.genStore(rhs, namedStackLoc(home, g.exprSlot(rhs)))   # a temp: unobservable
+      # The copy holds `&dst` and a data word at once (`genAggrCopyStore`'s budget).
+      g.bridgeRaise(bdTwoInRegs, "a call result copy")
       if dst.kind == Mem: g.emitLvalue(dst.cur)
       var dstAddr = NoReg
       let dstE = g.aggrDstEnd(dst, dstAddr)
