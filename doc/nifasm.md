@@ -412,6 +412,23 @@ This is what keeps "every `jmp` is forward, every back edge is a `loop`" true of
 the whole input, which in turn is what makes the assembler's validation passes
 cheap.
 
+A loop can also be **bottom-tested**: a trailing condition after the body makes
+the back edge conditional, on the flags the body's last instruction left, and
+falling through it leaves the loop:
+
+```
+(loop
+  (stmts
+    (dec (rcx))
+    (cmp (rcx) 0))
+  (jg))           # repeat while rcx > 0; x64: je jne jg jge jl jle ja jae jb jbe
+```
+
+On AArch64 the condition is spelled as the branch, `(bgt)` and its siblings
+(`beq bne blt ble bgt bge blo bls bhi bhs`). It is still the loop's only back
+edge, emitted by the assembler: what a `while` costs per iteration is one taken
+conditional branch instead of a test, a not-taken exit and an unconditional jump.
+
 ### Control flow variables (legacy)
 
 **Nothing generates these any more.** `cfvar`/`jtrue` are the older *no-jumps*

@@ -19,7 +19,7 @@
 ## flags and the `setcc` that would materialise them never happens.
 
 import std / syncio
-import std / [assertions, tables, sets, algorithm]
+import std / [assertions, tables, sets, algorithm, envvars]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, typeutil, constdata,
@@ -320,6 +320,9 @@ proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## jump it would skip is dead either way.
   if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
 
+let rotateDisabled = existsEnv("ARKHAM_NO_ROTATE")
+  ## Bisection switch: every `(continue X)` leaves through a forward exit again.
+
 proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
   # `flags` is OUR tail position; children get whatever `listFlags`/`armFlags` says
@@ -452,14 +455,53 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of LoopS:
-    # `(loop (stmts … (continue .X)))`: nifasm emits the back-edge after the body; a
+    # `(loop (stmts … (continue .X)))`. When `X` is one integer relation (under any
+    # number of `not`s) the loop is BOTTOM-TESTED: its `cmp` ends the body and the
+    # back-edge is nifasm's conditional `(loop (stmts …) (jcc))` — one taken branch
+    # per iteration. Otherwise nifasm emits an unconditional back-edge and a
     # `(continue X)` leaves to `lEnd` first when `X` is false (see `ContinueS`).
     let lEnd = g.freshLabel()
     g.loopEnds.add lEnd
-    g.emitLoop:
-      var cc = c
-      cc.into:
-        while cc.hasMore: (g.genStmt(cc); skip cc)
+    var a, b = default(Cursor)
+    var ek = EqC
+    var bottom = false                               # `X` is one integer relation
+    var whenTrue = true
+    block bottomTest:
+      var body = c.childCursor                       # (stmts …)
+      var last = default(Cursor)
+      var it = body.childCursor
+      while it.hasMore: (last = it; skip it)
+      if cursorIsNil(last) or last.kind != TagLit or last.stmtKind != ContinueS: break bottomTest
+      var x = last.childCursor
+      while x.kind == TagLit and x.exprKind == NotC:
+        whenTrue = not whenTrue
+        x = x.childCursor
+      if x.kind != TagLit or x.exprKind notin {EqC, NeqC, LtC, LeC}: break bottomTest
+      var ops = x.childCursor
+      a = ops; skip ops
+      b = ops
+      if g.isFloatExpr(a): break bottomTest       # unordered needs a second branch
+      ek = x.exprKind
+      bottom = true
+    if bottom and not rotateDisabled:
+      g.killAllMirrors()                             # the head is a merge point (`emitLoop`)
+      var tag = JmpX64
+      g.ab.tree LoopX64:
+        g.ab.tree StmtsX64:
+          var cc = c.childCursor
+          cc.into:
+            while cc.hasMore:
+              if cc.kind == TagLit and cc.stmtKind == ContinueS:
+                tag = g.emitScalarCmp(a, b, ek, whenTrue)   # the flags the back-edge reads
+              else:
+                g.genStmt(cc)
+              skip cc
+        g.ab.tree tag: discard
+    else:
+      g.emitLoop:
+        var cc = c
+        cc.into:
+          while cc.hasMore: (g.genStmt(cc); skip cc)
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of ContinueS:

@@ -324,6 +324,7 @@ proc genIteA64(n: var Cursor; ctx: var GenContext) =
   ctx.clobberedA64 = thenClobberedA64 + elseClobberedA64
 
 proc genLoopA64(n: var Cursor; ctx: var GenContext) =
+  let loopNode = n                   # bounds the children: `n` itself is not
   inc n
   # Bare infinite-loop form `(loop (stmts …))` — the back-edge is emitted INTERNALLY here,
   # so no backward branch reaches the input; the body carries a FORWARD branch to a break/
@@ -333,6 +334,25 @@ proc genLoopA64(n: var Cursor; ctx: var GenContext) =
     let lStart = ctx.buf.createLabel()
     ctx.buf.defineLabel(lStart)
     genStmtA64(n, ctx)                 # the body (contains the forward break/exit branch)
+    # `(loop (stmts …) (blt))`: bottom-tested, see the x64 twin.
+    var kids = sub(loopNode)
+    skip kids                          # the body
+    if kids.hasMore:
+      let cc = tagToA64Inst(n.tag)
+      case cc
+      of BeqA64: ctx.buf.emitBeq(lStart)
+      of BneA64: ctx.buf.emitBne(lStart)
+      of BltA64: ctx.buf.emitBlt(lStart)
+      of BleA64: ctx.buf.emitBle(lStart)
+      of BgtA64: ctx.buf.emitBgt(lStart)
+      of BgeA64: ctx.buf.emitBge(lStart)
+      of BloA64: ctx.buf.emitBlo(lStart)
+      of BlsA64: ctx.buf.emitBls(lStart)
+      of BhiA64: ctx.buf.emitBhi(lStart)
+      of BhsA64: ctx.buf.emitBhs(lStart)
+      else: error("Unsupported loop back-edge condition", n)
+      inc n
+      return
     ctx.buf.emitB(lStart)           # the loop back-edge — emitted by nifasm, not the input
     return
 
