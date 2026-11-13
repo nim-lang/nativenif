@@ -22,6 +22,7 @@
 
 import std / [tables, sets]
 import nifcore
+import lengaa                             # LocalFacts: the hidden-result contract
 import asmslots, machinedesc, planner, programs
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
@@ -229,6 +230,10 @@ type
                                              ## type, `NoTypeSym` when the result is not an
                                              ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
+    aaFacts*: LocalFacts                     ## `lengaa` owned-ness of this proc's locals:
+                                             ## may a call's hidden result pointer be &dst?
+    initDecl*: SymId                         ## the local whose declaration `genStore` is
+                                             ## initializing: nothing can reach it yet
     isEntryProc*: bool                       ## the proc currently emitted is the entry
     variadicExterns*: seq[VariadicExtern]    ## Darwin: every variadic call shape used,
                                              ## declared after the procs (see `a64.variadicTarget`)

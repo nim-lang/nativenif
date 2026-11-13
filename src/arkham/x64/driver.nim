@@ -15,13 +15,17 @@
 
 import std / syncio
 import std / [tables, sets]
-import nifcore, nifcdecl
+import std / envvars
+import nifcore, nifcdecl, lengaa
 import "../core" / [asmslots, machinedesc, analyser, planner, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind]
 import machine as machine_x64
 import emit, value, frame, stmt, asmproc
 import asmproc
+
+let nrvoDisabled = existsEnv("ARKHAM_NO_NRVO")
+  ## Bisection switch: every >16B result goes through a stack local and a copy again.
 
 proc recordVarType(g: var CodeGen; c: Cursor) =
   ## `(param :nm . type)` / `(var :nm pragmas type …)` → record `symType[nm] = type`.
@@ -135,8 +139,15 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
+  # The result built in place: the hidden pointer's register is its home (the
+  # callee half of the contract `lengaa` states; callers keep the other half in
+  # `genStore`).
+  g.aaFacts = analyseLocals(info.decl)
+  let nrvoSym = if g.retIndirect and g.retAggrSym != NoTypeSym and
+                   not nrvoDisabled: nrvoLocal(info.decl)
+                else: NoSymId
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.entryMd,
-                        g.typeCtx, preseal)
+                        g.typeCtx, preseal, nrvo = (nrvoSym, RBX))
   g.curProcName = g.spelling(info.asmName)
   # Can an address into THIS frame exist at all? Only a stack-homed symbol has one —
   # a spilled scalar, an aggregate, an address-taken local (`AddrTaken` spills by

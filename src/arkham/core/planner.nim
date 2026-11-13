@@ -127,6 +127,12 @@ type
     data*: seq[Location]
 
   Plan* = object
+    nrvoSym*: SymId                   ## the local built in place in the caller's hidden
+                                      ## result buffer (`lengaa.nrvoLocal`), `NoSymId` for
+                                      ## none: homed at `nrvoReg`, which holds the buffer's
+                                      ## address for the whole proc, exactly as a by-ref
+                                      ## aggregate param's pointer does
+    nrvoReg*: Reg
     locs: LocSpan                     ## indexed by cursorToPosition. Currently filled
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
@@ -976,7 +982,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
     # emitter follows the recorded Location, so this one fix keeps both in sync.
     if typeIsOmitted and hasValue:
       slot = b.tc.exprSlot(valCur)
-    if slot.kind == AMem:
+    if slot.kind == AMem and name == b.plan.nrvoSym:
+      # The result local, built in the caller's buffer: its home is the register
+      # holding that buffer's address, the by-ref param shape. No slot.
+      b.recordSym(pos, name, regLoc(b.plan.nrvoReg, addrSlot()))
+    elif slot.kind == AMem:
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
       # early `return` here: that would skip the `into` epilogue and desync.)
@@ -1571,7 +1581,8 @@ proc settleFloatBorrows(b: var Builder; procDecl: Cursor) =
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md, entryMd: MachineDesc; tc: TypeCtx;
-                   presealed: set[Reg] = {}): Plan =
+                   presealed: set[Reg] = {};
+                   nrvo: tuple[sym: SymId; reg: Reg] = (NoSymId, NoReg)): Plan =
   ## Allocate storage for the params and locals of `procDecl` in a SINGLE walk
   ## over the tree (the decl-only pre-pass of the fused value core; expression
   ## temporaries are decided at emission). The model (codegen.c + optimistic
@@ -1607,6 +1618,8 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                   aux: initTable[int, ExprAux](),
                   symPos: initTable[SymId, int]())
   b.plan.sealed = presealed
+  b.plan.nrvoSym = nrvo.sym
+  b.plan.nrvoReg = nrvo.reg
   b.plan.divRegClobbered = an.clobbersDivReg
   b.plan.shiftRegClobbered = an.clobbersShiftReg
   # The alias set, straight from the analyser's per-var props: the emitter's
