@@ -1,0 +1,91 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :below.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))
+   (param :q.0 .
+    (ptr
+     (i 64))))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ite
+    (lt p.0 q.0)
+    (stmts
+     (ret 1))
+    (stmts
+     (ret 0)))))
+ (proc :belowEq.0
+  (params
+   (param :p.1 .
+    (ptr
+     (i 64)))
+   (param :q.1 .
+    (ptr
+     (i 64))))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ite
+    (le p.1 q.1)
+    (stmts
+     (ret 2))
+    (stmts
+     (ret 0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (array
+     (i 64)4).)
+   (var :lo.0 .
+    (ptr
+     (i 64))
+    (addr
+     (at a.0 0)))
+   (var :hi.0 .
+    (ptr
+     (i 64))
+    (addr
+     (at a.0 2)))
+   (var :r1.0 .
+    (i 64)
+    (call below.0 lo.0 hi.0))
+   (var :r2.0 .
+    (i 64)
+    (call below.0 hi.0 lo.0))
+   (var :r3.0 .
+    (i 64)
+    (call belowEq.0 hi.0 hi.0))
+   (var :r4.0 .
+    (i 64)
+    (call belowEq.0 hi.0 lo.0))
+   (var :r.0 .
+    (i 64)
+    (add
+     (i 64)
+     (add
+      (i 64)r1.0
+      (mul
+       (i 64)r2.0 4))
+     (add
+      (i 64)
+      (mul
+       (i 64)r3.0 4)
+      (mul
+       (i 64)r4.0 8))))
+   (call exit.0
+    (conv
+     (i 32)r.0)))))
