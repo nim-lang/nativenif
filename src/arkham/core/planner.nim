@@ -773,13 +773,13 @@ proc trySteal(b: var Builder; curName: SymId; curSlot: AsmSlot;
   ## `curName` takes its register. Returns `curName`'s chosen location.
   let calleeOnly = AllRegs notin curProps   # cross-call var needs callee-saved
   let thiefDepth = b.an.vars.getOrDefault(curName).declLoopDepth
-  # NOT loop-carried-aware. `weight` counts STATIC uses × loop depth, so a loop
-  # COUNTER read twice in the condition (every iteration, unconditionally) looks
-  # colder than a body temp read five times under a guard, and `addTree`'s counter
-  # duly ends up on the stack — 28.6 M executed instructions. Both repairs measured
-  # WORSE: refusing such a victim outright is nifbench −0.21 % / nimsem **+3.44 %**,
-  # and merely PREFERRING another is nifbench **+0.17 %**. The victim `weight` picks
-  # really is the coldest one available; the alternative is hotter still.
+  # NOT loop-carried-aware. `weight` counts STATIC uses, each scaled by
+  # `LoopWeight^depth` (analyser `useWeight`), so a loop COUNTER read twice in the condition
+  # (every iteration, unconditionally) looks colder than a body temp read five
+  # times under a guard. Measured when the scaling was still linear in the depth:
+  # `addTree`'s counter ended up on the stack — 28.6 M executed instructions — and
+  # both repairs were WORSE: refusing such a victim outright was nifbench −0.21 % /
+  # nimsem **+3.44 %**, merely PREFERRING another nifbench **+0.17 %**.
   let bestV = b.coldestVictim(b.weightOf(curName), b.rangeLen(curName), thiefDepth,
                               calleeOnly, wantFloat = false)
   if bestV == NoSymId:

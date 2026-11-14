@@ -1175,7 +1175,12 @@ proc cmpOperandUnsigned*(g: var CodeGen; c: Cursor): bool =
   case c.kind
   of UIntLit, CharLit: result = true
   of IntLit: result = false
-  else: result = not isSignedType(resolveType(g.prog, g.getType(c)))
+  else:
+    # An address compares unsigned: `isSignedType` calls everything that is not
+    # `(u N)`/`(c N)` signed, so a `(lt p pend)` the induction-variable pass
+    # writes would otherwise get `jl` — wrong once the top bit is set.
+    let t = resolveType(g.prog, g.getType(c))
+    result = isPtrType(t) or not isSignedType(t)
 
 proc freeLvalTemps*(g: var CodeGen; c: Cursor; addrIntact = false)
 

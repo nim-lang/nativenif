@@ -48,7 +48,7 @@ let deathPointOff = existsEnv("ARKHAM_NO_DEATHPOINT")
 type
   VarInfo* = object
     defs*, usages*: int        ## how often the variable is defined / used
-    weight*: int               ## usages, but loop bodies count `LoopWeight`×
+    weight*: int               ## usages, each scaled by `LoopWeight^depth` (saturating)
     props*: VarProps
     freeAfter*: int            ## token position after which the variable is dead:
                                ## its PRECISE last-use position (max token position over
@@ -243,8 +243,28 @@ type
                                ## that call, so a param consumed by the first call qualifies.
 
 const
-  LoopWeight = 3   ## assume a loop body runs ~3× for weighting purposes
+  LoopWeight = 3   ## a use one loop deeper counts this many times more
+  WeightCap = 1 shl 40  ## saturation point for a use's weight and for a sum
 
+proc useWeight(depth: int): int =
+  ## `LoopWeight^depth`, saturating at `WeightCap`: a use in a loop runs once per
+  ## iteration of every loop around it, so its weight multiplies per level. The
+  ## old linear `1 + 3·depth` let one use in an innermost loop (depth 3: 10) lose
+  ## its register to a value used twice one level out (2·7): matmul's `ikj` loop
+  ## reloaded a row base from the stack every iteration (`tiled` −35–46 %,
+  ## rex_perf −11 %; nifbench unchanged). Ranking deeper uses strictly first
+  ## instead gave most of that back on rex_perf (−2 %): many shallow uses must
+  ## be able to outweigh a few deep ones.
+  result = 1
+  var d = 0
+  while d < depth and result < WeightCap:
+    result = min(result * LoopWeight, WeightCap)
+    inc d
+
+proc addWeight(w: var int; x: int) {.inline.} =
+  ## Saturating `w += x`: however much code and however deep the nesting, the
+  ## sum stays an ordinary comparable int.
+  w = min(w + x, WeightCap)
 
 proc posOf(c: Context; cur: Cursor): int {.inline.} =
   cursorToPosition(c.buf[], cur)
@@ -501,10 +521,10 @@ proc analyse(c: var Context; n: var Cursor) =
       let e = addr c.res.vars.getOrQuit(vn)
       if c.inAsgnTarget > 0: inc e.defs
       else: inc e.usages
-      # each use counts; uses inside loops count `LoopWeight`× per nesting level —
+      # each use counts; uses inside loops count `LoopWeight`× more per nesting level —
       # and a use on a COLD path (a branch that ends in a diverging call) counts for
       # nothing, loop or not.
-      if c.inCold == 0: inc e.weight, 1 + c.inLoops * LoopWeight
+      if c.inCold == 0: addWeight(e.weight, useWeight(c.inLoops))
       # Extend the live range to this occurrence's PRECISE position — its own token
       # position, not the enclosing statement's end. Freeing strictly after the
       # textually-last use is safe for branches: no control-flow path can read the
