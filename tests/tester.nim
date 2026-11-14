@@ -740,6 +740,39 @@ proc webTests() =
   echo emitted, " web modules emitted over ", total, " fixtures x 2 targets (",
        refused, " refused as expected); ", ran, " of them ran and matched the oracle"
 
+proc arkhamPtrCmpTests() =
+  ## `tests/arkham/ptr_cmp_unsigned.c.nif`: an ordered comparison of two
+  ## pointers must branch on the UNSIGNED condition codes. `isSignedType` calls
+  ## every type but `(u N)`/`(c N)` signed, so `(lt p q)` used to come out as
+  ## `jge`/`bge`, which is wrong for addresses with the top bit set and is what
+  ## shoggoth's pointer loop test `(lt p pend)` (induction variables) relies on.
+  ## The run (exit 9) cannot tell: user-space addresses never have that bit.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  var checked = 0
+  for (arch, signed) in [("x64", @["(jl", "(jge", "(jle", "(jg"]),
+                         ("linux_arm64", @["(blt", "(bge", "(ble", "(bgt"])]:
+    let asmNif = workDir / ("ptr_cmp_unsigned_" & arch & ".asm.nif")
+    exec quoteShell(arkham) & " -a:" & arch & " -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / "arkham" / "ptr_cmp_unsigned.c.nif")
+    let text = readFile(asmNif)
+    for name in ["below.0", "belowEq.0"]:
+      # one proc's text: from its header to the next proc, in whatever order
+      # the backend emitted them
+      let a = text.find("(proc :" & name & "\n")
+      if a < 0: quit "FAILURE ptr_cmp_unsigned " & arch & ": proc " & name & " not found"
+      var b = text.find("(proc :", a + 1)
+      if b < 0: b = text.len
+      let body = text[a ..< b]
+      for op in signed:
+        for tail in [" ", "\n", "@", "~", ")"]:
+          if (op & tail) in body:
+            quit "FAILURE ptr_cmp_unsigned " & arch & ": " & name &
+                 " compares pointers with signed `" & op[1 .. ^1] & "`"
+      inc checked
+  echo checked, " / ", checked, " arkham pointer-compare signedness checks successful"
+
 proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
                  runner = ""; label = "") =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -2699,6 +2732,7 @@ arkhamAvrRejections()
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+  arkhamPtrCmpTests()
   # The same corpus again, against a starved register file. Every argument is
   # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes
   # the same known set and level as the qemu `linux_arm64` pass below.
