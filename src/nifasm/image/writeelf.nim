@@ -20,6 +20,10 @@ import "../core" / [context, sem, relocs, buffers, listing]
 import "../x64/relax"                 # the rel32 -> rel8 shrink and the 16-byte pad
 import elf, dwarf, writecommon
 
+const ElfHeadersSize = 64 + 56 * 3
+  ## ELF header + the three program headers; `.text` byte 0 follows them, so a
+  ## code offset `o` is the address `0x400000 + ElfHeadersSize + o`.
+
 include compat2   # canRaise
 
 proc remapSites(a: var GenContext; map: seq[int]; extra: var seq[int]) =
@@ -62,7 +66,7 @@ proc layoutCode*(a: var GenContext; extra: var seq[int]) =
       if sym.kind == skProc: alignLabels.add sym.offset
     for id in backwardBranchTargets(a.buf): alignLabels.add id
     remapSites(a, shortenX64Jumps(a.buf, alignLabels), extra)
-    remapSites(a, alignCodeX64(a.buf, alignLabels), extra)
+    remapSites(a, alignCodeX64(a.buf, alignLabels, base = ElfHeadersSize), extra)
 
 proc rejectExternCall(name: string) {.noreturn.} =
   quit "nifasm: `" & name & "` is an external symbol, which a static " &
@@ -123,7 +127,7 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
   if a.symMap:
     var labelPos = initTable[int, int]()
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
-    let hdrBytes = 64 + 56 * 3
+    let hdrBytes = ElfHeadersSize
     var rows = default(seq[(int, string)])
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
@@ -133,11 +137,11 @@ proc writeElf*(a: var GenContext; outfile: string) {.canRaise.} =
   if a.listing:
     # `.text` byte 0 lands right after the ELF header + the three program headers,
     # the same arithmetic `--symmap` above does.
-    a.writeListing(a.listingPath, 0x400000 + 64 + 56 * 3)
+    a.writeListing(a.listingPath, 0x400000 + ElfHeadersSize)
   fillTraceTable(a)
   var code = a.buf.data
   let baseAddr = 0x400000.uint64
-  let headersSize = 64 + (56 * 3)  # ELF header + 3 program headers
+  let headersSize = ElfHeadersSize
   let pageSize = 0x1000.uint64
 
   # Calculate addresses and sizes

@@ -143,7 +143,8 @@ proc crossesAlignPoint(points: seq[int]; a, b: int): bool {.inline.} =
   let i = upperBound(points, lo)          # first point > lo
   i < points.len and points[i] <= hi
 
-proc alignCodeX64*(buf: var Buffer; alignLabels: seq[int]; alignment = 16): seq[int] =
+proc alignCodeX64*(buf: var Buffer; alignLabels: seq[int]; alignment = 16;
+                   base = 0): seq[int] =
   ## Pad the positions of `alignLabels` (proc entries, loop heads) to `alignment`
   ## with multi-byte NOPs, rewriting `buf` in place. Returns the old→new byte-
   ## position map (length `data.len + 1`) for the caller's external offsets, the
@@ -153,16 +154,19 @@ proc alignCodeX64*(buf: var Buffer; alignLabels: seq[int]; alignment = 16): seq[
   ## pass was given: the shortener keeps every jump whose displacement window
   ## crosses one of these points in rel32 form (a tracked reloc `finalize` patches
   ## from the remapped labels), so the rel8 jumps it patched inline are exactly
-  ## the ones whose distances a pad here cannot change. The code base offset in
-  ## the executable must itself be `alignment`-aligned for offset alignment to be
-  ## address alignment (the static ELF's text starts at 0x400000+176, 176 = 16·11).
+  ## the ones whose distances a pad here cannot change.
+  ##
+  ## `base` is where code byte 0 lands relative to an `alignment`-aligned
+  ## address: the static ELF puts it right after its headers, at
+  ## `0x400000 + ElfHeadersSize`. Padding the OFFSETS alone aligned every entry
+  ## and loop head to 8 mod 16 there, paying the NOPs for a guaranteed miss.
   let points = alignPointPositions(buf, alignLabels)
   let oldLen = buf.data.len
   # Pad size per point, in ascending order (earlier pads shift later points).
   var pads = newSeq[int](points.len)
   var shift = 0
   for i in 0 ..< points.len:
-    pads[i] = (alignment - (points[i] + shift) mod alignment) mod alignment
+    pads[i] = (alignment - (base + points[i] + shift) mod alignment) mod alignment
     shift += pads[i]
   # Rebuild the bytes with the pads in, building the old→new map alongside.
   result = newSeq[int](oldLen + 1)
