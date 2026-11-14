@@ -3538,23 +3538,39 @@ proc genStmt(g: var WebGen; c: var Cursor) =
       while t.hasMore: skip t
     g.outp.closeTag
   of LoopS:
-    # `(loop PRE COND BODY AFTER?)`: PRE runs before every test, so the test
-    # sits inside the loop; AFTER runs once, past it.
+    # `(loop (stmts … (continue .X)))`: an endless JS loop whose last statement,
+    # the `continue`, breaks out unless its condition holds (see `ContinueS`).
     g.outp.openTree While
     g.outp.lit TrueLit
     var t = c
     t.into:
-      genStmt(g, t)                            # pre-condition block
-      g.outp.tree If:
-        g.outp.tree Not:
-          g.outp.width wI32
-          genExpr(g, t)
-        g.outp.tree Break: discard
-      skip t
-      genStmt(g, t)                            # body
-      g.outp.closeTag                          # While
-      if t.hasMore: genStmt(g, t)              # the `after` part
+      genStmt(g, t)                            # the body
       while t.hasMore: skip t
+    g.outp.closeTag
+  of ContinueS:
+    var t = c
+    t.into:
+      if t.kind != DotToken:
+        g.outp.tree If:
+          g.outp.tree Not:
+            g.outp.width wI32
+            genExpr(g, t)
+          g.outp.tree Break: discard
+      while t.hasMore: skip t
+  of IteS:
+    # `(ite C T E|.)` → `if (C) T else E`.
+    g.outp.openTree If
+    var t = c
+    t.into:
+      genExpr(g, t)                            # the condition
+      skip t
+      genStmt(g, t)                            # then
+      if t.hasMore and t.kind != DotToken:
+        g.outp.openTree Else
+        genStmt(g, t)                          # else
+        g.outp.closeTag
+      while t.hasMore: skip t
+    g.outp.closeTag
   of BreakS:
     # An unnamed break: the innermost enclosing JS loop, which is the innermost
     # enclosing Leng loop because a `case` became an `if` chain.

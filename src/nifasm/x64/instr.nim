@@ -518,6 +518,7 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
   ctx.clobbered = thenClobbered + elseClobbered
 
 proc genLoopX64(n: var Cursor; ctx: var GenContext) =
+  let loopNode = n                   # bounds the children: `n` itself is not
   inc n
 
   # Bare infinite-loop form `(loop (stmts …))` — the body is a single statement block. The
@@ -529,6 +530,27 @@ proc genLoopX64(n: var Cursor; ctx: var GenContext) =
     let lStart = ctx.buf.createLabel()
     ctx.buf.defineLabel(lStart)
     genStmtX64(n, ctx)                 # the body (contains the forward break/exit jmp)
+    # `(loop (stmts …) (jl))`: a BOTTOM-TESTED loop. The back-edge is the named
+    # conditional jump, on the flags the body's last instruction left; falling
+    # through it leaves the loop. Still the only backward branch, still ours.
+    var kids = sub(loopNode)
+    skip kids                          # the body
+    if kids.hasMore:
+      let cc = tagToX64Inst(n.tag)
+      case cc
+      of JeX64: ctx.buf.emitJe(lStart)
+      of JneX64: ctx.buf.emitJne(lStart)
+      of JgX64: ctx.buf.emitJg(lStart)
+      of JgeX64: ctx.buf.emitJge(lStart)
+      of JlX64: ctx.buf.emitJl(lStart)
+      of JleX64: ctx.buf.emitJle(lStart)
+      of JaX64: ctx.buf.emitJa(lStart)
+      of JaeX64: ctx.buf.emitJae(lStart)
+      of JbX64: ctx.buf.emitJb(lStart)
+      of JbeX64: ctx.buf.emitJbe(lStart)
+      else: error("Unsupported loop back-edge condition", n)
+      inc n
+      return
     ctx.buf.emitJmp(lStart)         # the loop back-edge — emitted by nifasm, not the input
     return
 

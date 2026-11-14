@@ -2591,6 +2591,39 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   else: g.freeVal(aD)
   if fused: result = NoA64Inst
 
+proc emitFloatCmp*(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool): RiscInst =
+  ## The float twin of `emitScalarCmp`: emit `fcmp` and return the `b.cond` taken
+  ## when the relation holds as `whenTrue`. Unlike x86, AArch64 needs no second
+  ## branch for NaN: `fcmp` leaves an unordered pair as C=1 V=1 Z=0 N=0, which
+  ## every one of `lo`/`ls`/`eq` reads as false and `ne` as true — IEEE's answers.
+  let fbits = g.floatBits(aC)
+  result =
+    case ek
+    of EqC:  (if whenTrue: BeqA64 else: BneA64)
+    of NeqC: (if whenTrue: BneA64 else: BeqA64)
+    of LtC:  (if whenTrue: BloA64 else: BhsA64)
+    of LeC:  (if whenTrue: BlsA64 else: BhiA64)
+    else: raiseAssert "arkham a64n: float cond " & $ek
+  # Both operands are seeded with the compare's OWN float slot rather
+  # than `dontCare`. `emitFValue` picks a float LITERAL's bit pattern
+  # from the destination slot, so an unseeded one builds the DOUBLE
+  # pattern — and the `fcmp` below, correctly `fbits` wide, then reads
+  # the wrong half of it. That is why `f > 1.4'f32` compared garbage
+  # while `f > g` with a `float32` variable was right: only the literal
+  # operand had no width to go on. Same lesson as the `Mem` destination
+  # in `genStore` and the field destination in `genFieldStore`.
+  let cmpSlot = g.exprSlot(aC)
+  let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
+              else: dontCare)
+  var fa = seed
+  g.emitFValue(aC, fa)
+  var fb = seed
+  g.emitFValue(bC, fb)
+  assert fa.kind == InFReg and fb.kind == InFReg, "arkham a64n: float cmp operands"
+  g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
+  g.freeVal(fb)
+  g.freeVal(fa)
+
 proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
   ## FUSED branch test — the a64 twin of x64's emitCond.
   if c.kind == TagLit and c.exprKind == OvfC:
@@ -2651,34 +2684,7 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
         bC = cc; skip cc
         while cc.hasMore: skip cc
     if g.isFloatExpr(aC):
-      let fbits = g.floatBits(aC)
-      let tag =
-        case ek
-        of EqC:  (if whenTrue: BeqA64 else: BneA64)
-        of NeqC: (if whenTrue: BneA64 else: BeqA64)
-        of LtC:  (if whenTrue: BloA64 else: BhsA64)
-        of LeC:  (if whenTrue: BlsA64 else: BhiA64)
-        else: raiseAssert "arkham a64n: float cond " & $ek
-      # Both operands are seeded with the compare's OWN float slot rather
-      # than `dontCare`. `emitFValue` picks a float LITERAL's bit pattern
-      # from the destination slot, so an unseeded one builds the DOUBLE
-      # pattern — and the `fcmp` below, correctly `fbits` wide, then reads
-      # the wrong half of it. That is why `f > 1.4'f32` compared garbage
-      # while `f > g` with a `float32` variable was right: only the literal
-      # operand had no width to go on. Same lesson as the `Mem` destination
-      # in `genStore` and the field destination in `genFieldStore`.
-      let cmpSlot = g.exprSlot(aC)
-      let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
-                  else: dontCare)
-      var fa = seed
-      g.emitFValue(aC, fa)
-      var fb = seed
-      g.emitFValue(bC, fb)
-      assert fa.kind == InFReg and fb.kind == InFReg, "arkham a64n: float cmp operands"
-      g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
-      g.emBr(tag, toLabel)
-      g.freeVal(fb)
-      g.freeVal(fa)
+      g.emBr(g.emitFloatCmp(aC, bC, ek, whenTrue), toLabel)
       return
     let tag = g.emitScalarCmp(aC, bC, ek, whenTrue, fuseBranchTo = toLabel)
     if tag != NoA64Inst: g.emBr(tag, toLabel)      # NoA64Inst: fused into a cbz/cbnz

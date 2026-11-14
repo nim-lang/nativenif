@@ -1931,6 +1931,8 @@ proc genStore*(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.emTypedStackVar(home, tcur)
       if tcur.kind == Symbol: g.varType[home] = tcur.symId
       g.genStore(rhs, namedStackLoc(home, g.exprSlot(rhs)))   # a temp: unobservable
+      # The copy holds `&dst` and a data word at once (`genAggrCopyStore`'s budget).
+      g.bridgeRaise(bdTwoInRegs, "a call result copy")
       if dst.kind == Mem: g.emitLvalue(dst.cur)
       var dstAddr = NoReg
       let dstE = g.aggrDstEnd(dst, dstAddr)
@@ -2921,6 +2923,67 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   if cmpStaging != NoReg: g.giveBack cmpStaging
   g.freeVal(lD)
 
+proc floatParityTaken*(ek: LengExpr; whenTrue: bool): bool {.inline.} =
+  ## Does the branch `emitFloatCmp` returns need a second one, `jp` to the SAME
+  ## target, because "unordered" also means taken? Only `!=`-taken (= `==`-not-
+  ## taken): the one float relation x86 cannot branch on with a single jump.
+  (ek == NeqC) == whenTrue and ek in {EqC, NeqC}
+
+proc emitFloatCmp*(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool;
+                   notTaken: SymId; notTakenUsed: var bool): X64Inst =
+  ## The float twin of `emitScalarCmp`: emit `comisd`/`comiss` and return the
+  ## `jcc` taken when the relation holds as `whenTrue`. Where "unordered" means
+  ## NOT taken but ZF reads it as taken (`==`-taken, `!=`-not-taken) it first
+  ## emits `jp notTaken` and sets `notTakenUsed`; the caller defines that label
+  ## after its jump. Where "unordered" means taken (`floatParityTaken`) the
+  ## caller owes a `jp` to its own target next to the returned jump.
+  ##
+  ## `comisd` reports an UNORDERED pair (either operand NaN) as ZF=PF=CF=1 —
+  ## which reads exactly like "equal" and like "below or equal" to the plain
+  ## unsigned tags. IEEE says every one of `==`, `<`, `<=` is FALSE against a
+  ## NaN (and `!=` is true), so the tags cannot be taken as-is:
+  ##   * `<` / `<=`: emit the compare with the operands SWAPPED and test the
+  ##     above/above-or-equal side. Those need CF=0, which unordered never
+  ##     produces, so the relation comes out false — no extra branch. The
+  ##     evaluation order of the operands is untouched; only the two register
+  ##     fields of the `comisd` trade places.
+  ##   * `==` / `!=`: ZF alone cannot separate "equal" from "unordered", so PF
+  ##     decides. `==`-taken needs one guard jump around the `je`; the three
+  ##     other combinations are a two-jump disjunction or a single jump.
+  let fbits = g.floatBits(aC)
+  let swapped = ek in {LtC, LeC}
+  # Both operands take the compare's OWN float slot rather than
+  # `dontCare`: a float LITERAL picks its bit pattern from the
+  # destination slot, so an unseeded one builds the DOUBLE pattern and
+  # the `comiss` below — correctly `fbits` wide — reads the wrong half
+  # of it. `f > 1.4'f32` compared garbage while `f > g` with a `float32`
+  # variable was right, since only the literal had no width to go on.
+  let cmpSlot = g.exprSlot(aC)
+  let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
+              else: dontCare)
+  var fa = seed
+  g.emitFValue(aC, fa)
+  var fb = seed
+  g.emitFValue(bC, fb)
+  assert fa.kind == InFReg and fb.kind == InFReg, "arkham x64n: float cmp operands"
+  g.ab.tree (if fbits == 32: ComissX64 else: ComisdX64):
+    if swapped: (g.emFReg fb.f; g.emFReg fa.f)
+    else:       (g.emFReg fa.f; g.emFReg fb.f)
+  case ek
+  of LtC: result = (if whenTrue: JaX64 else: JbeX64)    # a < b  ⟺  b > a (ordered)
+  of LeC: result = (if whenTrue: JaeX64 else: JbX64)    # a <= b ⟺  b >= a (ordered)
+  of EqC, NeqC:
+    let jumpOnEqual = (ek == EqC) == whenTrue
+    if jumpOnEqual:
+      g.emJcc(JpX64, notTaken)                          # unordered ⇒ not equal
+      notTakenUsed = true
+      result = JeX64
+    else:
+      result = JneX64                                   # + `jp` to the target: `floatParityTaken`
+  else: raiseAssert "arkham x64n: float relation " & $ek
+  g.freeVal(fb)
+  g.freeVal(fa)
+
 proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
   ## FUSED branch test: jump to `toLabel` when the condition holds
   ## (`whenTrue`) — short-circuit and/or/not, `cmp`/`jcc` relations, `(ovf)`,
@@ -2982,64 +3045,13 @@ proc emitCond*(g: var CodeGen; c: Cursor; toLabel: SymId; whenTrue: bool) =
         bC = cc; skip cc
         while cc.hasMore: skip cc
     if g.isFloatExpr(aC):
-      # FLOAT comparison: comisd/comiss; both operands in xmm registers.
-      #
-      # `comisd` reports an UNORDERED pair (either operand NaN) as ZF=PF=CF=1 —
-      # which reads exactly like "equal" and like "below or equal" to the plain
-      # unsigned tags. IEEE says every one of `==`, `<`, `<=` is FALSE against a
-      # NaN (and `!=` is true), so the tags cannot be taken as-is:
-      #   * `<` / `<=`: emit the compare with the operands SWAPPED and test the
-      #     above/above-or-equal side. Those need CF=0, which unordered never
-      #     produces, so the relation comes out false — no extra branch. The
-      #     evaluation order of the operands is untouched; only the two register
-      #     fields of the `comisd` trade places.
-      #   * `==` / `!=`: ZF alone cannot separate "equal" from "unordered", so PF
-      #     decides. `==`-taken needs one guard jump around the `je`; the three
-      #     other combinations are a two-jump disjunction or a single jump.
-      let fbits = g.floatBits(aC)
-      let swapped = ek in {LtC, LeC}
-      # Both operands take the compare's OWN float slot rather than
-      # `dontCare`: a float LITERAL picks its bit pattern from the
-      # destination slot, so an unseeded one builds the DOUBLE pattern and
-      # the `comiss` below — correctly `fbits` wide — reads the wrong half
-      # of it. `f > 1.4'f32` compared garbage while `f > g` with a `float32`
-      # variable was right, since only the literal had no width to go on.
-      let cmpSlot = g.exprSlot(aC)
-      let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
-                  else: dontCare)
-      var fa = seed
-      g.emitFValue(aC, fa)
-      var fb = seed
-      g.emitFValue(bC, fb)
-      assert fa.kind == InFReg and fb.kind == InFReg, "arkham x64n: float cmp operands"
-      g.ab.tree (if fbits == 32: ComissX64 else: ComisdX64):
-        if swapped: (g.emFReg fb.f; g.emFReg fa.f)
-        else:       (g.emFReg fa.f; g.emFReg fb.f)
-      case ek
-      of LtC:                                          # a < b  ⟺  b > a (ordered)
-        g.emJcc((if whenTrue: JaX64 else: JbeX64), toLabel)
-      of LeC:                                          # a <= b ⟺  b >= a (ordered)
-        g.emJcc((if whenTrue: JaeX64 else: JbX64), toLabel)
-      of EqC:
-        if whenTrue:
-          let lNot = g.freshLabel()
-          g.emJcc(JpX64, lNot)                         # unordered ⇒ not equal
-          g.emJcc(JeX64, toLabel)
-          g.emLab(lNot)
-        else:
-          g.emJcc(JneX64, toLabel)
-          g.emJcc(JpX64, toLabel)                      # unordered ⇒ take the false arm
-      else:                                            # NeqC
-        if whenTrue:
-          g.emJcc(JneX64, toLabel)
-          g.emJcc(JpX64, toLabel)                      # unordered ⇒ `!=` holds
-        else:
-          let lNot = g.freshLabel()
-          g.emJcc(JpX64, lNot)
-          g.emJcc(JeX64, toLabel)
-          g.emLab(lNot)
-      g.freeVal(fb)
-      g.freeVal(fa)
+      # See `emitFloatCmp` for what NaN does to the flags.
+      let lNot = g.freshLabel()
+      var lNotUsed = false
+      let tag = g.emitFloatCmp(aC, bC, ek, whenTrue, lNot, lNotUsed)
+      g.emJcc(tag, toLabel)
+      if floatParityTaken(ek, whenTrue): g.emJcc(JpX64, toLabel)   # unordered ⇒ taken
+      if lNotUsed: g.emLab(lNot)
       return
     let tag = g.emitScalarCmp(aC, bC, ek, whenTrue)
     g.emJcc(tag, toLabel)

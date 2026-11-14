@@ -85,32 +85,7 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
   var condC = default(Cursor)
   var thenAsgn = default(Cursor)
   var elseAsgn = default(Cursor)
-  var haveElif, haveElse = false
-  var ok = true
-  var cc = c
-  cc.into:
-    while cc.hasMore:
-      case cc.substructureKind
-      of ElifU:
-        if haveElif or haveElse: ok = false
-        var bc = sub(cc)                       # (elif COND ARM) — read only
-        condC = bc; skip bc
-        if not bc.hasMore: ok = false
-        else:
-          thenAsgn = bc; skip bc
-          if bc.hasMore: ok = false            # more than one statement in the arm
-        haveElif = true
-      of ElseU:
-        if not haveElif or haveElse: ok = false
-        var bc = sub(cc)                       # (else ARM)
-        if not bc.hasMore: ok = false
-        else:
-          elseAsgn = bc; skip bc
-          if bc.hasMore: ok = false
-        haveElse = true
-      else: ok = false
-      skip cc
-  if not (ok and haveElif and haveElse): return false
+  if not twoWayParts(c, condC, thenAsgn, elseAsgn) or not hasArm(elseAsgn): return false
   var thenBody = default(Cursor)
   var elseBody = default(Cursor)
   if not singleAsgnOf(thenAsgn, thenBody): return false

@@ -1242,8 +1242,47 @@ proc genWhile(g: var CodeGen; c: Cursor) =
   g.emLab(lEnd)
   discard g.loopEnds.pop()
 
+proc genIte(g: var CodeGen; c: Cursor) =
+  ## `(ite C T E|.)`.
+  let lElse = g.freshLabel("ielse")
+  var cc = c
+  cc.into:
+    let condC = cc; skip cc
+    g.emitCond(condC, lElse, whenTrue = false)
+    g.genStmt(cc); skip cc                          # then
+    if cc.hasMore and cc.kind != DotToken:
+      let lEnd = g.freshLabel("iend")
+      g.emJmp(lEnd)
+      g.emLab(lElse)
+      g.genStmt(cc)                                 # else
+      g.emLab(lEnd)
+    else:
+      g.emLab(lElse)
+    while cc.hasMore: skip cc
+
+proc genLoop(g: var CodeGen; c: Cursor) =
+  ## `(loop (stmts … (continue .X)))` — `genWhile` without the leading test; a
+  ## `(continue X)` leaves first when `X` is false.
+  let lEnd = g.freshLabel("lend")
+  g.loopEnds.add lEnd
+  g.ab.tree LoopAvr:
+    g.ab.tree StmtsAvr:
+      var cc = c
+      cc.into:
+        while cc.hasMore: (g.genStmt(cc); skip cc)
+  g.emLab(lEnd)
+  discard g.loopEnds.pop()
+
 proc genStmt(g: var CodeGen; c: Cursor) =
   case c.stmtKind
+  of IteS: g.genIte(c)
+  of LoopS: g.genLoop(c)
+  of ContinueS:
+    var cc = c
+    cc.into:
+      if cc.kind != DotToken:
+        g.emitCond(cc, g.loopEnds[^1], whenTrue = false)
+      while cc.hasMore: skip cc
   of StmtsS, ScopeS:
     var cc = c
     cc.into:

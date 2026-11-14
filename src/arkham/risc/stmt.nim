@@ -12,7 +12,7 @@
 ## and leaves the ordinary path to it when the shape is not exactly right, which
 ## is what keeps the recogniser honest about what it does not handle.
 
-import std / [assertions, tables]
+import std / [assertions, tables, envvars]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, constdata, exprpred,
@@ -139,6 +139,9 @@ proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## branch it would skip is dead either way.
   if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
 
+let rotateDisabled = existsEnv("ARKHAM_NO_ROTATE")
+  ## Bisection switch: every `(continue X)` leaves through a forward exit again.
+
 proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
   # Tail position, as the x64 twin tracks it. `TailStmt` is "falls THROUGH to the
@@ -213,6 +216,82 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
         while cc.hasMore: (g.genStmt(cc); skip cc)      # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
+  of LoopS:
+    # `(loop (stmts … (continue .X)))` — see the x64 twin, including the
+    # BOTTOM-TESTED form for one relation (a float one too: `emitFloatCmp`): `cmp` ends the body and nifasm's
+    # `(loop (stmts …) (b<cc>))` is the conditional back-edge. AArch64 only: the
+    # RV32 and Cortex-M nifasm loops do not take the trailing condition.
+    let lEnd = g.freshLabel()
+    g.loopEnds.add lEnd
+    var a, b = default(Cursor)
+    var ek = EqC
+    var bottom = false
+    var isFloat = false
+    var whenTrue = true
+    block bottomTest:
+      if g.md.arch != Arm64: break bottomTest
+      var last = default(Cursor)
+      var it = c.childCursor.childCursor
+      while it.hasMore: (last = it; skip it)
+      if cursorIsNil(last) or last.kind != TagLit or last.stmtKind != ContinueS: break bottomTest
+      var x = last.childCursor
+      while x.kind == TagLit and x.exprKind == NotC:
+        whenTrue = not whenTrue
+        x = x.childCursor
+      if x.kind != TagLit or x.exprKind notin {EqC, NeqC, LtC, LeC}: break bottomTest
+      var ops = x.childCursor
+      a = ops; skip ops
+      b = ops
+      ek = x.exprKind
+      isFloat = g.isFloatExpr(a)                     # one `b.cond` either way
+      bottom = true
+    if bottom and not rotateDisabled:
+      g.killAllMirrors()                             # the head is a merge point
+      var tag = BA64
+      g.ab.tree LoopA64:
+        g.ab.tree StmtsA64:
+          var cc = c.childCursor
+          cc.into:
+            while cc.hasMore:
+              if cc.kind == TagLit and cc.stmtKind == ContinueS:
+                # the flags the back-edge reads
+                tag = (if isFloat: g.emitFloatCmp(a, b, ek, whenTrue)
+                       else: g.emitScalarCmp(a, b, ek, whenTrue))
+              else:
+                g.genStmt(cc)
+              skip cc
+        g.ab.tree tag: discard
+    else:
+      g.emitLoop:
+        var cc = c
+        cc.into:
+          while cc.hasMore: (g.genStmt(cc); skip cc)
+    g.emLab(lEnd)
+    discard g.loopEnds.pop()
+  of ContinueS:
+    var cc = c
+    cc.into:
+      if cc.kind != DotToken:
+        g.emitCond(cc, g.loopEnds[^1], whenTrue = false)   # repeat only while it holds
+      while cc.hasMore: skip cc
+  of IteS:
+    # `(ite C T E|.)` — the `IfS` arm below with exactly one condition.
+    if CondSelect notin g.md.caps or not g.tryEmitCsel(c):
+      var condC, thenC, elseC = default(Cursor)
+      discard twoWayParts(c, condC, thenC, elseC)
+      var endC = c; skip endC                          # nothing follows the arms
+      let tailFlags = armFlags(flags, endC)
+      let lElse = g.freshLabel()
+      g.emitCond(condC, lElse, whenTrue = false)
+      g.genStmt(thenC, tailFlags)
+      if hasArm(elseC):
+        let lEnd = g.freshLabel()
+        if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
+        g.emLab(lElse)
+        g.genStmt(elseC, tailFlags)
+        g.emLab(lEnd)
+      else:
+        g.emLab(lElse)
   of IfS:
     # `csel` is AArch64's. ARMv7-M has no conditional select at all — its
     # equivalent is an IT block, which is a different shape and not one this

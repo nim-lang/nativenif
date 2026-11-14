@@ -1140,7 +1140,7 @@ proc planStmt(b: var Builder; n: var Cursor) =
       n.into:
         while n.hasMore: planStmt(b, n)
     else: inc n
-  of AsgnS, KeepovfS, WhileS, IfS, CaseS:
+  of AsgnS, KeepovfS, WhileS, IfS, CaseS, IteS, LoopS, ContinueS:
     n.into:
       while n.hasMore: planStmt(b, n)
   else:
