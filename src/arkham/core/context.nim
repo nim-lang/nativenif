@@ -415,9 +415,6 @@ type
     noReturnProcs*: HashSet[SymId]           ## pool ids of called `(attr "noreturn")` procs;
                                              ## a call to one is not a liveness call point.
                                              ## Computed once, alongside `cleanSigProcs`.
-    coldArms*: seq[(SymId, Cursor)]          ## AArch64: diverging `ite` arms (a bounds check's
-                                             ## `panic`) deferred past the epilogue, with the
-                                             ## label the guard branches to. See `isColdArm`.
     cleanSigComputed*: bool
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is

@@ -1575,6 +1575,32 @@ proc cleanSigProcs*(p: var Program): HashSet[SymId] =
     if nc.kind == SymbolDef and isCleanSigProc(p, decl):
       result.incl nc.symId
 
+proc jmpOnlyTarget*(arm: Cursor): SymId =
+  ## The label an `ite` arm does nothing but jump to, through `(stmts …)`/`(scope …)`
+  ## wrappers with one real child; `NoSymId` for any other arm. Every emitter lowers
+  ## `(ite C (jmp L) .)` as ONE conditional branch to `L`, not as a branch over an
+  ## unconditional one. It is the shape shoggoth's `coldguards` leaves for every
+  ## bounds check — the failure arm lives after the proc's last statement — and
+  ## the one an early exit has anyway.
+  result = NoSymId
+  var cur = arm
+  while cur.kind == TagLit and cur.stmtKind in {StmtsS, ScopeS}:
+    var it = cur
+    var only = default(Cursor)
+    var count = 0
+    it.into:
+      while it.hasMore:
+        if it.kind != DotToken:
+          only = it
+          inc count
+        skip it
+    if count != 1: return
+    cur = only
+  if cur.kind == TagLit and cur.stmtKind == JmpS:
+    var j = cur
+    inc j
+    if j.kind == Symbol: result = j.symId
+
 proc declIsNoReturn*(decl: Cursor): bool =
   ## True if the `(proc …)` declaration carries `(attr "noreturn")` — hexer's
   ## spelling for a proc that genuinely diverges (`panic`, `raiseAssert`, `quit`).
