@@ -12,7 +12,7 @@
 ## and leaves the ordinary path to it when the shape is not exactly right, which
 ## is what keeps the recogniser honest about what it does not handle.
 
-import std / [assertions, tables, envvars]
+import std / [assertions, tables, sets, envvars]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planner, programs, asmbuf,
                     context, diag, typeutil, constdata, exprpred,
@@ -138,6 +138,53 @@ proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## over the sibling arms — but `TailPos` does: a tail call never comes back, so the
   ## branch it would skip is dead either way.
   if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
+
+proc readsNoLocal(g: CodeGen; n: Cursor): bool =
+  ## No symbol in `n` is a local or param of the proc being emitted.
+  case n.kind
+  of Symbol: result = not g.plan.symPos.hasKey(n.symId)
+  of TagLit:
+    result = true
+    var c = n
+    c.into:
+      while c.hasMore:
+        if result and not g.readsNoLocal(c): result = false
+        skip c
+  else: result = true
+
+proc isColdArm(g: CodeGen; arm: Cursor): bool =
+  ## `arm` — through the `(stmts …)`/`(scope …)` wrappers hexer's inliner adds — is
+  ## ONE call to an `(attr "noreturn")` proc that reads no local or param: the
+  ## `panic` of a bounds check or `requires` guard, whose arguments are a string
+  ## literal. Such an arm can be emitted anywhere in the proc, in particular after
+  ## the epilogue, where no name is bound any more: nifasm tracks register bindings
+  ## in TEXT order, so an arm that read a local could not move.
+  ##
+  ## AArch64 only: `b.cond` reaches ±1 MiB there. RV32's conditional branches reach
+  ## ±4 KiB, which a guard at the top of a large proc can exceed.
+  result = false
+  if g.md.arch != Arm64: return
+  var cur = arm
+  for guard in 0 ..< 64:
+    if cur.kind != TagLit: return false
+    case cur.stmtKind
+    of CallS:
+      var callee = cur; inc callee
+      return callee.kind == Symbol and callee.symId in g.noReturnProcs and
+             g.readsNoLocal(cur)
+    of StmtsS, ScopeS:
+      # exactly one statement; a `(scope …)` may carry leading `.` slots
+      var only = default(Cursor)
+      var count = 0
+      var probe = cur
+      probe.into:
+        while probe.hasMore:
+          if probe.kind != DotToken:
+            only = probe; inc count
+          skip probe
+      if count != 1: return false
+      cur = only
+    else: return false
 
 let rotateDisabled = existsEnv("ARKHAM_NO_ROTATE")
   ## Bisection switch: every `(continue X)` leaves through a forward exit again.
@@ -281,17 +328,26 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       discard twoWayParts(c, condC, thenC, elseC)
       var endC = c; skip endC                          # nothing follows the arms
       let tailFlags = armFlags(flags, endC)
-      let lElse = g.freshLabel()
-      g.emitCond(condC, lElse, whenTrue = false)
-      g.genStmt(thenC, tailFlags)
-      if hasArm(elseC):
-        let lEnd = g.freshLabel()
-        if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
-        g.emLab(lElse)
-        g.genStmt(elseC, tailFlags)
-        g.emLab(lEnd)
+      if not hasArm(elseC) and g.isColdArm(thenC):
+        # A bounds check / `requires` guard: branch AWAY when the failure condition
+        # holds and fall through on the hot path. The arm is emitted after the
+        # epilogue (`emitColdArms`), so the loop around a check stays compact and
+        # takes no branch for it.
+        let lCold = g.freshLabel()
+        g.emitCond(condC, lCold, whenTrue = true)
+        g.coldArms.add (lCold, thenC)
       else:
-        g.emLab(lElse)
+        let lElse = g.freshLabel()
+        g.emitCond(condC, lElse, whenTrue = false)
+        g.genStmt(thenC, tailFlags)
+        if hasArm(elseC):
+          let lEnd = g.freshLabel()
+          if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
+          g.emLab(lElse)
+          g.genStmt(elseC, tailFlags)
+          g.emLab(lEnd)
+        else:
+          g.emLab(lElse)
   of IfS:
     # `csel` is AArch64's. ARMv7-M has no conditional select at all — its
     # equivalent is an IT block, which is a different shape and not one this
@@ -670,6 +726,22 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     else:
       g.movImm(R8, LinuxA64ExitNr.int64)
       g.ab.tree SvcA64: g.ab.intLit 0
+  # The deferred cold arms (`isColdArm`). Emitted now, while the frame is still
+  # being sized, but into their own buffer: it goes after the epilogue's `ret`, so
+  # nothing falls into it. Each is its own scope; an arm's own guards may queue more.
+  var cold = g.ab.sideBuf()
+  swap(g.ab, cold)
+  var ci = 0
+  while ci < g.coldArms.len:
+    let (lab, arm) = g.coldArms[ci]
+    g.emLab(lab)
+    g.ab.tree ScopeA64:
+      g.enterScope()
+      g.genStmt(arm)
+      g.exitScope()
+    inc ci
+  g.coldArms.setLen 0
+  swap(g.ab, cold)
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
   # The body is emitted — `plan.usedCallee`/`usedCalleeF`/`hasStackVars` are final.
   # Finalize the frame and write the prologue, then splice the body after it.
@@ -725,3 +797,4 @@ proc emitProcBody*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
         if g.hasFrame: framePop(g)
         if g.isInterrupt: g.ab.keyword MretRv
         else: g.ab.keyword RetA64
+      g.ab.append cold                            # never reached by falling through
