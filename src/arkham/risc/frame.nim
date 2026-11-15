@@ -908,6 +908,11 @@ proc copyStructThroughPtr*(g: var CodeGen; srcVar: SymId; typeSym: SymId; ptrReg
   let home = g.plan.homeOfSym(srcVar)
   if home.kind == InReg: g.movReg(sp, home.r)
   elif home.kind == StackPtr: g.emScalarLoad(sp, home.ptrName)
+  elif g.prog.globals.hasKey(srcVar) or isForeignSym(g.prog, srcVar):
+    # `return Black` of a module-level aggregate: a global/rodata label has no
+    # stack slot to `lea` — its address comes from `adr` (the x64 twin's
+    # `aggrSrcEnd` covers the same case).
+    g.emAdr(sp, g.prog.gvarRefName(srcVar))
   else:
     g.ab.tree LeaA64: (g.emReg sp; g.ab.sym srcVar)        # sp = &srcVar
   let tmp = g.takeBridge(avoid = sp)
