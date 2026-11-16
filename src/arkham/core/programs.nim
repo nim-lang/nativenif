@@ -1577,11 +1577,12 @@ proc cleanSigProcs*(p: var Program): HashSet[SymId] =
 
 proc jmpOnlyTarget*(arm: Cursor): SymId =
   ## The label an `ite` arm does nothing but jump to, through `(stmts …)`/`(scope …)`
-  ## wrappers with one real child; `NoSymId` for any other arm. Every emitter lowers
-  ## `(ite C (jmp L) .)` as ONE conditional branch to `L`, not as a branch over an
-  ## unconditional one. It is the shape shoggoth's `coldguards` leaves for every
-  ## bounds check — the failure arm lives after the proc's last statement — and
-  ## the one an early exit has anyway.
+  ## wrappers with exactly one child; `NoSymId` for any other arm. Every emitter
+  ## lowers `(ite C (jmp L) .)` as ONE conditional branch to `L`, not as a branch
+  ## over an unconditional one. It is the shape shoggoth's `coldguards` leaves for
+  ## every bounds check — the failure arm lives after the proc's last statement —
+  ## and the one an early exit has anyway. (Leng statement lists carry no `.`
+  ## holes, nimony#3027, so "one child" is the whole test.)
   result = NoSymId
   var cur = arm
   while cur.kind == TagLit and cur.stmtKind in {StmtsS, ScopeS}:
@@ -1590,9 +1591,8 @@ proc jmpOnlyTarget*(arm: Cursor): SymId =
     var count = 0
     it.into:
       while it.hasMore:
-        if it.kind != DotToken:
-          only = it
-          inc count
+        only = it
+        inc count
         skip it
     if count != 1: return
     cur = only
