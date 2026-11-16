@@ -281,17 +281,21 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       discard twoWayParts(c, condC, thenC, elseC)
       var endC = c; skip endC                          # nothing follows the arms
       let tailFlags = armFlags(flags, endC)
-      let lElse = g.freshLabel()
-      g.emitCond(condC, lElse, whenTrue = false)
-      g.genStmt(thenC, tailFlags)
-      if hasArm(elseC):
-        let lEnd = g.freshLabel()
-        if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
-        g.emLab(lElse)
-        g.genStmt(elseC, tailFlags)
-        g.emLab(lEnd)
+      let jmpTarget = if hasArm(elseC): NoSymId else: jmpOnlyTarget(thenC)
+      if jmpTarget != NoSymId:
+        g.emitCond(condC, jmpTarget, whenTrue = true)  # `(ite C (jmp L) .)`
       else:
-        g.emLab(lElse)
+        let lElse = g.freshLabel()
+        g.emitCond(condC, lElse, whenTrue = false)
+        g.genStmt(thenC, tailFlags)
+        if hasArm(elseC):
+          let lEnd = g.freshLabel()
+          if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
+          g.emLab(lElse)
+          g.genStmt(elseC, tailFlags)
+          g.emLab(lEnd)
+        else:
+          g.emLab(lElse)
   of IfS:
     # `csel` is AArch64's. ARMv7-M has no conditional select at all — its
     # equivalent is an IT block, which is a different shape and not one this

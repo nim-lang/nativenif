@@ -1244,8 +1244,16 @@ proc genWhile(g: var CodeGen; c: Cursor) =
 
 proc genIte(g: var CodeGen; c: Cursor) =
   ## `(ite C T E|.)`.
-  let lElse = g.freshLabel("ielse")
   var cc = c
+  block jmpOnly:
+    # `(ite C (jmp L) .)` is ONE conditional branch to `L` (see `jmpOnlyTarget`).
+    var condC, thenC, elseC = default(Cursor)
+    if not twoWayParts(c, condC, thenC, elseC) or hasArm(elseC): break jmpOnly
+    let target = jmpOnlyTarget(thenC)
+    if target == NoSymId: break jmpOnly
+    g.emitCond(condC, target, whenTrue = true)
+    return
+  let lElse = g.freshLabel("ielse")
   cc.into:
     let condC = cc; skip cc
     g.emitCond(condC, lElse, whenTrue = false)
