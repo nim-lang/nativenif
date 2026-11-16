@@ -352,20 +352,6 @@ proc emitAdd*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   dest.add(0x03) # ADD r64, r/m64
   dest.emitMem(int(reg), mem)
 
-proc emitAdd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit ADD instruction: ADD mem, reg
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(reg): rex.r = true
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x01) # ADD r/m64, r64
-  dest.emitMem(int(reg), mem)
-
 proc emitSub*(dest: var Bytes; a, b: Register) =
   ## Emit SUB instruction: SUB a, b (a = a - b)
   ## Opcode 0x29: SUB r/m64, r64 - reg field is source, r/m field is destination
@@ -393,20 +379,6 @@ proc emitSub*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
     dest.add(encodeRex(rex))
 
   dest.add(0x2B) # SUB r64, r/m64
-  dest.emitMem(int(reg), mem)
-
-proc emitSub*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit SUB instruction: SUB mem, reg
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(reg): rex.r = true
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x29) # SUB r/m64, r64
   dest.emitMem(int(reg), mem)
 
 proc emitImul*(dest: var Bytes; a, b: Register) =
@@ -566,16 +538,6 @@ proc emitInc*(dest: var Bytes; reg: Register) =
   dest.add(0xFF)  # INC r/m64 opcode
   dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
 
-proc emitInc*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit INC instruction: INC mem
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0xFF)
-  dest.emitMem(0, mem)
-
 proc emitDec*(dest: var Bytes; reg: Register) =
   ## Emit DEC instruction: DEC reg (decrement)
   var rex = RexPrefix(w: true)
@@ -588,16 +550,6 @@ proc emitDec*(dest: var Bytes; reg: Register) =
   dest.add(0xFF)  # DEC r/m64 opcode
   dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
 
-proc emitDec*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit DEC instruction: DEC mem
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0xFF)
-  dest.emitMem(1, mem)
-
 proc emitNeg*(dest: var Bytes; reg: Register) =
   ## Emit NEG instruction: NEG reg (negate)
   var rex = RexPrefix(w: true)
@@ -609,16 +561,6 @@ proc emitNeg*(dest: var Bytes; reg: Register) =
 
   dest.add(0xF7)  # NEG r/m64 opcode
   dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
-
-proc emitNeg*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit NEG instruction: NEG mem
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0xF7)
-  dest.emitMem(3, mem)
 
 proc emitCmp*(dest: var Bytes; a, b: Register) =
   ## Emit CMP instruction: CMP a, b (compare a with b, i.e., compute a - b and set flags)
@@ -862,6 +804,19 @@ proc emitUnarySizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
     dest.add(encodeRex(rex))
   dest.add(if bits == 8: 0xF6'u8 else: 0xF7)
   dest.add(encodeModRM(amDirect, digit, int(reg)))
+
+proc emitUnarySizedM*(dest: var Bytes; mem: MemoryOperand; opc8, opc: byte;
+                       digit: int; bits: int) =
+  ## Sized single-operand op on MEMORY: 0xFE/0xFF (INC /0, DEC /1) or
+  ## 0xF6/0xF7 (NOT /2, NEG /3); `bits` sizes the access like `emitAluSizedMR`.
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(if bits == 8: opc8 else: opc)
+  dest.emitMem(digit, mem)
 
 proc emitTest*(dest: var Bytes; a, b: Register) =
   ## Emit TEST instruction: TEST a, b (compute a AND b, set flags)
@@ -1200,16 +1155,6 @@ proc emitNot*(dest: var Bytes; reg: Register) =
 
   dest.add(0xF7)  # NOT r/m64 opcode
   dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
-
-proc emitNot*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit NOT instruction: NOT mem
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0xF7)
-  dest.emitMem(2, mem)
 
 proc emitBsf*(dest: var Bytes; destReg, srcReg: Register) =
   ## Emit BSF instruction: BSF destReg, srcReg (bit scan forward)
@@ -1624,14 +1569,14 @@ proc emitCmpxchg8b*(dest: var Bytes; reg: Register) =
   dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
 
 proc emitCmpxchg8b*(dest: var Bytes; mem: MemoryOperand) =
-  ## Emit CMPXCHG8B instruction: CMPXCHG8B mem
-  ## Note: With REX.W this is actually CMPXCHG16B on 64-bit processors
+  ## Emit CMPXCHG8B instruction: CMPXCHG8B mem. No REX.W: with it, the same
+  ## opcode is CMPXCHG16B (16 bytes, RDX:RAX, 16-byte alignment).
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  var rex = RexPrefix()
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
 
-  if rex.b or rex.x or rex.w:
+  if rex.b or rex.x:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
@@ -1681,86 +1626,16 @@ proc emitPause*(dest: var Bytes) =
   dest.add(0x90)  # NOP opcode
 
 # Memory ordering operations
-proc emitClflush*(dest: var Bytes; reg: Register) =
-  ## Emit CLFLUSH instruction: CLFLUSH reg (cache line flush)
+proc emit0FGroupMem*(dest: var Bytes; opc: byte; digit: int; mem: MemoryOperand) =
+  ## `0F opc /digit` on a memory operand: prefetch (0F 18), clflush (0F AE /7).
+  emitSegPrefix(dest, mem)
   var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0xAE)  # CLFLUSH opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-
-proc emitClflushopt*(dest: var Bytes; reg: Register) =
-  ## Emit CLFLUSHOPT instruction: CLFLUSHOPT reg (cache line flush optimized)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x66)  # CLFLUSHOPT prefix
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0xAE)  # CLFLUSHOPT opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-
-# Prefetch operations
-proc emitPrefetchT0*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT0 instruction: PREFETCHT0 reg (prefetch for all caches)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
-
-proc emitPrefetchT1*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT1 instruction: PREFETCHT1 reg (prefetch for L2 cache)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
-
-proc emitPrefetchT2*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHT2 instruction: PREFETCHT2 reg (prefetch for L3 cache)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
-
-proc emitPrefetchNta*(dest: var Bytes; reg: Register) =
-  ## Emit PREFETCHNTA instruction: PREFETCHNTA reg (prefetch non-temporal)
-  var rex = RexPrefix()
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0x18)  # PREFETCH opcode
-  dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
-
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x: dest.add(encodeRex(rex))
+  dest.add(0x0F)
+  dest.add(opc)
+  dest.emitMem(digit, mem)
 
 # Conditional set instructions
 proc emitSetcc(dest: var Bytes; code: byte; reg: Register) =
@@ -2078,17 +1953,6 @@ proc emitAnd*(dest: var Bytes; a, b: Register) =
   dest.add(0x21)  # AND r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitAnd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit AND instruction: AND mem, reg
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(reg): rex.r = true
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0x21)
-  dest.emitMem(int(reg), mem)
-
 proc emitOr*(dest: var Bytes; a, b: Register) =
   ## Emit OR instruction: OR a, b (a = a OR b)
   ## Opcode 0x09: OR r/m64, r64 - reg field is source, r/m field is destination
@@ -2104,17 +1968,6 @@ proc emitOr*(dest: var Bytes; a, b: Register) =
   dest.add(0x09)  # OR r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitOr*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit OR instruction: OR mem, reg
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(reg): rex.r = true
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0x09)
-  dest.emitMem(int(reg), mem)
-
 proc emitXor*(dest: var Bytes; a, b: Register) =
   ## Emit XOR instruction: XOR a, b (a = a XOR b)
   ## Opcode 0x31: XOR r/m64, r64 - reg field is source, r/m field is destination
@@ -2129,17 +1982,6 @@ proc emitXor*(dest: var Bytes; a, b: Register) =
 
   dest.add(0x31)  # XOR r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
-
-proc emitXor*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit XOR instruction: XOR mem, reg
-  emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(reg): rex.r = true
-  if needsRex(mem.base): rex.b = true
-  if mem.hasIndex and needsRex(mem.index): rex.x = true
-  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
-  dest.add(0x31)
-  dest.emitMem(int(reg), mem)
 
 # reg-destination, memory-SOURCE forms (`OP reg, [mem]`): the `0x0B/0x23/0x33`
 # opcodes (reg field = destination). Mirror `emitAdd(reg, mem)`; used when arkham

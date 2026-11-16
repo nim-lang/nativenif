@@ -1189,6 +1189,7 @@ exec "nim c -r src/nifasm/nifasm tests/hello.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_switch.nif"
 exec "nim c -r src/nifasm/nifasm tests/atomic_ops.nif"
+exec "nim c -r src/nifasm/nifasm tests/cmpxchg8b.nif"
 exec "nim c -r src/nifasm/nifasm tests/bitops_rotate_scan.nif"
 exec "nim c -r src/nifasm/nifasm tests/bitops_bittest.nif"
 exec "nim c -r src/nifasm/nifasm tests/unique_bind.nif"
@@ -1209,6 +1210,8 @@ exec "nim c -r src/nifasm/nifasm tests/jcc_sign.nif"
 exec "nim c -r src/nifasm/nifasm tests/ite_multi_stmt.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_subwidth.nif"
 exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
+exec "nim c -r src/nifasm/nifasm tests/lock_subwidth.nif"
+exec "nim c -r src/nifasm/nifasm tests/x64_clflush_mem.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
@@ -1241,6 +1244,9 @@ when defined(linux) and defined(amd64):
   # binaries have been built for linux only:
   exec "tests/hello"
   exec "tests/atomic_ops"
+  # cmpxchg8b without REX.W (which would make it cmpxchg16b): EDX:EAX matches the
+  # qword, so ZF is set; exits 0 only then.
+  execRun "tests/cmpxchg8b"
   # The new x86-64 bit instructions (rol/ror/rcl/rcr/bsf/bsr/bt/bts/btr/btc):
   # both binaries compute their checks and exit 0 only when every result matches.
   execRun "tests/bitops_rotate_scan"
@@ -1265,6 +1271,10 @@ when defined(linux) and defined(amd64):
   # Sized mem±reg ALU (32/8-bit add/or into a cast-typed slot; reg += mem32)
   # and rotate-by-CL.
   execRun "tests/alu_memreg"
+  # `(lock …)` RMW on a cast-sized memory operand touches only that width.
+  execRun "tests/lock_subwidth"
+  # `(clflush (mem …))` is CLFLUSH m8 (the register form does not exist).
+  execRun "tests/x64_clflush_mem"
   # `(lenient)` proc pragma: backward jump, raw r11, bare (call P), tail (jmp P)
   # inside one ported proc, called normally from a strict main.
   execRun "tests/lenient_port"
@@ -1305,6 +1315,14 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "U
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
 # A float parameter is checked for assignment like a GPR one.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_float_sig_missing.nif", "Missing argument: p0.0")
+# A gpr<->xmm convert or move takes a REGISTER on its gpr side, and a prefetch a
+# MEMORY operand: the other kind is refused, not encoded against rax / as a nop.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_cvtsi2sd_mem.nif", "cvtsi2sd/cvtsi2ss source must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_cvttsd2si_mem.nif", "cvttsd2si/cvttss2si destination must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_load.nif", "movfq/movfd source must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_store.nif", "movfq/movfd destination must be a register")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_prefetch_reg.nif", "prefetch operand must be a memory operand")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_clflush_reg.nif", "clflush operand must be a memory operand")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.
@@ -2456,7 +2474,7 @@ const cortexMUnsupported: seq[string] = @[
   # These are the fixtures it cannot serve, each parked under the reason, so that
   # any OTHER failure is fatal and a fixture that starts working is reported.
   # Every one of them refuses BY NAME (a compile-time error from arkham or
-  # nifasm); the single exception is called out at the bottom.
+  # nifasm); the exceptions are called out at the bottom.
 
   # ── memory size ─────────────────────────────────────────────────────────────
   # 2.4 MB arrays: nifasm refuses globals that reach the stack top of the
@@ -2474,7 +2492,7 @@ const cortexMUnsupported: seq[string] = @[
   "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
-  "store_forward", "uint_literal_to_float",
+  "store_forward", "uint_literal_to_float", "f32_literal_rounded",
   # The stack-passed-float fixtures are double precision; `tests/arkham_m/p32_*`
   # are their single-precision, 32-bit-int twins, and run here.
   "float_stack_args", "float_stack_forward", "float_stack_indirect",
@@ -2574,12 +2592,18 @@ const cortexMUnsupported: seq[string] = @[
   "assembler_a64",
 
   # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
-  # The one entry that does not refuse: it runs and returns the wrong exit code,
+  # An entry that does not refuse: it runs and returns the wrong exit code,
   # because what it asserts is not true of this target. `stack_array_align`
   # checks `addr big and 15 == 0` — a 16-byte stack alignment that SysV and
   # AAPCS64 happen to give it. AAPCS32 promises 8, and over-aligning every frame
   # to buy it back would cost stack on a device that has kilobytes of it.
   "stack_array_align",
+
+  # ── MISCOMPILE, parked ──────────────────────────────────────────────────────
+  # A `case` on a 64-bit selector compares only the low 32 bits of the selector
+  # and its labels (planetis-m/nimony-bugs-llms#233): two labels that differ only
+  # in the high word are taken (exit 242, not 42).
+  "case_suffixed_labels",
 ]
 
 proc arkhamCortexM64Tests() =

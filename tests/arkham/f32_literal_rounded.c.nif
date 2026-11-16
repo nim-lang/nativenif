@@ -1,0 +1,28 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :d.0 .
+    (f 64)
+    (conv
+     (f 64)
+     (suf 16777217.0 "f32")))
+   (var :r.0 .
+    (i 32)0)
+   (if
+    (elif
+     (eq d.0 16777216.0)
+     (stmts
+      (asgn r.0 42))))
+   (call exit.0 r.0))))

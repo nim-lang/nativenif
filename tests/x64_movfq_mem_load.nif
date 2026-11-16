@@ -1,0 +1,3 @@
+(.nif27)
+(.index)
+(stmts (proc :main.0 (params) (result) (clobber) (lenient) (stmts (movfq (xmm2) (cast (u 64) (mem (rsp)))))))

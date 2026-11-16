@@ -1,0 +1,83 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :slot.0
+    (s)
+    (i 64))
+   (mov
+    (rbx)4294967295)
+   (mov
+    (cast
+     (u 64)
+     (mem
+      (rsp)slot.0))
+    (rbx))
+   (mov
+    (rbx)1)
+   (lock
+    (add
+     (cast
+      (u 32)
+      (mem
+       (rsp)slot.0))
+     (cast
+      (u 32)
+      (rbx))))
+   (mov
+    (r8)
+    (cast
+     (u 64)
+     (mem
+      (rsp)slot.0)))
+   (cmp
+    (r8)0)
+   (jne fail.0)
+   (mov
+    (cast
+     (u 64)
+     (mem
+      (rsp)slot.0))255)
+   (lock
+    (inc
+     (cast
+      (u 8)
+      (mem
+       (rsp)slot.0))))
+   (mov
+    (r9)
+    (cast
+     (u 64)
+     (mem
+      (rsp)slot.0)))
+   (cmp
+    (r9)0)
+   (jne fail.0)
+   (lock
+    (not
+     (cast
+      (u 16)
+      (mem
+       (rsp)slot.0))))
+   (mov
+    (r10)
+    (cast
+     (u 64)
+     (mem
+      (rsp)slot.0)))
+   (cmp
+    (r10)65535)
+   (jne fail.0)
+   (mov
+    (rdi)0)
+   (jmp exit.0)
+   (lab :fail.0)
+   (mov
+    (rdi)1)
+   (lab :exit.0)
+   (mov
+    (rax)60)
+   (syscall))))

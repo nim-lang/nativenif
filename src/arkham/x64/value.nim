@@ -3681,10 +3681,13 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.extendTo(res2.r, srcW, signed = false)
   else:
     let targetW = intTypeWidth(tc)
-    if srcW < targetW:
-      let sgn = (not isCast) and srcSigned
-      if not g.arrivesNormalized(inner, srcW, sgn):
-        g.extendTo(res2.r, srcW, sgn)                                 # widen
+    let srcSgn = (not isCast) and srcSigned
+    # A widening extends the source, which is the target's value unless a signed
+    # source meets an unsigned target (`uint16(-2'i8)`): that one is truncated to
+    # the target like a narrowing.
+    if srcW < targetW and (not srcSgn or isSignedType(tc)):
+      if not g.arrivesNormalized(inner, srcW, srcSgn):
+        g.extendTo(res2.r, srcW, srcSgn)                                # widen
     else:
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):

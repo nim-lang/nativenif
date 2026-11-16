@@ -1,0 +1,20 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :slot.0
+    (s)
+    (i 64))
+   (clflush
+    (cast
+     (u 8)
+     (mem
+      (rsp)slot.0)))
+   (mov
+    (rdi)0)
+   (mov
+    (rax)60)
+   (syscall))))

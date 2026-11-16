@@ -2309,7 +2309,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let it = instTag
     inc n
     let d = parseXmmOperand(n, ctx)
-    let s = parseOperand(n, ctx).reg
+    let srcPos = n
+    let src = parseOperand(n, ctx)
+    if src.kind != okReg: error("cvtsi2sd/cvtsi2ss source must be a register", srcPos)
+    let s = src.reg
     if it == Cvtsi2sdX64: x86.emitCvtsi2sd(ctx.buf.data, d, s)
     else:                 x86.emitCvtsi2ss(ctx.buf.data, d, s)
 
@@ -2317,7 +2320,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # float -> int (truncating): `(cvttsd2si gprD (xmmS))`; GPR dest may be a local.
     let it = instTag
     inc n
-    let d = parseDest(n, ctx).reg
+    let dstPos = n
+    let dst = parseDest(n, ctx)
+    if dst.kind != okReg: error("cvttsd2si/cvttss2si destination must be a register", dstPos)
+    let d = dst.reg
     let s = parseXmmOperand(n, ctx)
     if it == Cvttsd2siX64: x86.emitCvttsd2si(ctx.buf.data, d, s)
     else:                  x86.emitCvttss2si(ctx.buf.data, d, s)
@@ -2337,11 +2343,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         let s = parseXmmOperand(n, ctx)
         x86.emitMovqXmmToXmm(ctx.buf.data, d, s)
       else:
-        let s = parseOperand(n, ctx).reg
+        let srcPos = n
+        let src = parseOperand(n, ctx)
+        if src.kind != okReg: error("movfq/movfd source must be a register", srcPos)
+        let s = src.reg
         if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
         else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
     else:
-      let d = parseDest(n, ctx).reg
+      let dstPos = n
+      let dst = parseDest(n, ctx)
+      if dst.kind != okReg: error("movfq/movfd destination must be a register", dstPos)
+      let d = dst.reg
       let s = parseXmmOperand(n, ctx)
       if it == MovfqX64: x86.emitMovqXmmToGpr(ctx.buf.data, d, s)
       else:              x86.emitMovdXmmToGpr(ctx.buf.data, d, s)
@@ -2368,7 +2380,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x00, 0x01, intMemAccess(dest.typ).bits)
     of SubX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2385,7 +2397,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitSub(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x28, 0x29, intMemAccess(dest.typ).bits)
     of AndX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2402,7 +2414,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x20, 0x21, intMemAccess(dest.typ).bits)
     of OrX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2419,7 +2431,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitOr(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x08, 0x09, intMemAccess(dest.typ).bits)
     of XorX64:
       inc n
       let dest = parseDest(n, ctx)
@@ -2436,35 +2448,35 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
-      x86.emitXor(ctx.buf.data, dest.mem, op.reg)
+      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x30, 0x31, intMemAccess(dest.typ).bits)
     of IncX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock inc", start)
       if dest.kind != okMem: error("Atomic INC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitInc(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xFE, 0xFF, 0, intMemAccess(dest.typ).bits)
     of DecX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock dec", start)
       if dest.kind != okMem: error("Atomic DEC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitDec(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xFE, 0xFF, 1, intMemAccess(dest.typ).bits)
     of NotX64:
       inc n
       let dest = parseDest(n, ctx)
       checkBitwiseType(dest.typ, "lock not", start)
       if dest.kind != okMem: error("Atomic NOT requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitNot(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xF6, 0xF7, 2, intMemAccess(dest.typ).bits)
     of NegX64:
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock neg", start)
       if dest.kind != okMem: error("Atomic NEG requires memory destination", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitNeg(ctx.buf.data, dest.mem)
+      x86.emitUnarySizedM(ctx.buf.data, dest.mem, 0xF6, 0xF7, 3, intMemAccess(dest.typ).bits)
     of XaddX64:
       # `lock xadd [mem], reg` — atomic exchange-and-add; reg receives the old value.
       inc n
@@ -2557,42 +2569,28 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     x86.emitPause(ctx.buf.data)
 
-  of ClflushX64:
+  of ClflushX64, ClflushoptX64:
+    # `[66] 0F AE /7 m8`: CLFLUSH has no register form (mod=11 is another opcode).
+    let it = instTag
     inc n
+    let opPos = n
     let op = parseDest(n, ctx)
-    if op.kind == okMem: error("CLFLUSH expects memory operand via register?", n)
-    # emitClflush(Register). x86.nim takes Register. CLFLUSH m8. ModRM encodes address.
-    # So it takes a register which holds the address? No, it takes an address.
-    # x86.nim implementation: emitClflush(reg) -> 0F AE /7 (CLFLUSH m8).
-    # encodeModRM(amDirect, 7, int(reg)).
-    # amDirect means register mode (11).
-    # CLFLUSH requires memory operand (ModRM != 11).
-    # So emitClflush in x86.nim is BUGGY if it uses amDirect!
-    # It should use amIndirect or whatever.
-    # If emitClflush(reg) means "flush address in reg", it should be [reg].
-    # I'll leave it for now but this looks suspicious.
-    x86.emitClflush(ctx.buf.data, op.reg)
-
-  of ClflushoptX64:
+    if op.kind != okMem: error("clflush operand must be a memory operand", opPos)
+    if it == ClflushoptX64: ctx.buf.data.add(0x66)
+    x86.emit0FGroupMem(ctx.buf.data, 0xAE, 7, op.mem)
+  of Prefetcht0X64, Prefetcht1X64, Prefetcht2X64, PrefetchntaX64:
+    # `0F 18 /digit m8`: a register operand would encode a hint NOP instead.
+    let it = instTag
     inc n
+    let opPos = n
     let op = parseDest(n, ctx)
-    x86.emitClflushopt(ctx.buf.data, op.reg)
-  of Prefetcht0X64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchT0(ctx.buf.data, op.reg)
-  of Prefetcht1X64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchT1(ctx.buf.data, op.reg)
-  of Prefetcht2X64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchT2(ctx.buf.data, op.reg)
-  of PrefetchntaX64:
-    inc n
-    let op = parseDest(n, ctx)
-    x86.emitPrefetchNta(ctx.buf.data, op.reg)
+    if op.kind != okMem: error("prefetch operand must be a memory operand", opPos)
+    let digit = case it
+                of Prefetcht0X64: 1
+                of Prefetcht1X64: 2
+                of Prefetcht2X64: 3
+                else: 0
+    x86.emit0FGroupMem(ctx.buf.data, 0x18, digit, op.mem)
 
 proc genInstNodeX64*(n: var Cursor; ctx: var GenContext) =
   withListingRow(ctx, n): genInstX64(n, ctx)
