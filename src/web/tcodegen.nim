@@ -152,30 +152,64 @@ console.log(U8[$6]);
   expect "engine reads the image back", strip(r.output),
     "14\nhello jorogumo\ntrue\n4294967296\n7,8,9\n1,0\n0"
 
-# Each fixture is a program that exits with the sum of the checks it passes, so
-# the engine is the judge: generate, render, run under node, compare the exit
-# code. What each fixture's code adds up:
+# Each fixture is a program run under node, so the engine is the judge:
+# generate, render, run, compare. An older fixture exits with the sum of the
+# checks it passes; a newer one prints one counter or value per line (an
+# `importjs` `console.log` splice) and exits 0, so no two failures can add up
+# to the expected code. What each fixture checks:
 #
 # * tsplice: the frame plan and the lowering walk the same tree. An `importjs`
 #   splice reserves no sret temporary; a reservation nobody took shifted every
 #   later temporary (a 12-byte constructor met an 8-byte slot). It splices a
 #   string, builds a pair of strings, calls a splice through `onerr` (which
 #   reaches it like a `call`, string argument and all) and passes a constructor
-#   to a call: 3 + 3 + (5 + 7 + 11).
+#   to a call: 3 + 3 + (5 + 7 + 11). The fixture stubs the runtime's string
+#   bridge entry points, which a string splice calls.
 # * tgrowstore: a store whose value is a call that grows linear memory must land
 #   in the NEW buffer, not the one JS read `DV` from before the call (5), and a
 #   load through a pointer such a call returns must read the new buffer (7),
 #   and so must a store through such a pointer (20). A lost store leaves the
 #   global 0; a stale load reads the 0 the old buffer still holds.
+#
+# The string fixtures below stub the runtime's entry points
+# (`nimStrBeginStore`, `nimStrEndStore`, `nimStrBridgeDestroy`,
+# `nimStrBridgeCstr`, `nimStrBridgeData`, `nimStrBridgeLen`) over a string
+# layout of their own, `(len, data)`, which is not the runtime's: the bridge
+# must build and read a string through them alone. `begin` heads each buffer
+# with a magic word and the address of the string it was built for, and
+# `destroy` counts as good only a string `begin` built at that very address and
+# not yet destroyed; anything else is a bad destroy.
+#
+# * tstrbridge: a string an `importjs` proc returns is an ordinary owned Nim
+#   string, built in a frame temporary of the caller and read back through
+#   `data`/`len` when it is a splice argument: 10 chars, 3, empty, and three
+#   two-byte UTF-8 chars (6 bytes); two live results of one expression do not
+#   share a slot (10 * 100 + 13); every begin has its end (6 and 6).
+# * toomstr: the runtime's `nimStrBeginStore` returns nil when the allocation
+#   failed and leaves the string as its OOM marker (here `len` -1). The bridge
+#   must then write no bytes (word 0 stays as it was) and not call `end`.
+# * tcbargs: a callback taking a `string` and a `cstring`, fired three times.
+#   It reads both right (1 + 2 each call, 9). The wrapper builds both as Nim
+#   strings in its frame (6 begins, 6 ends), passes the cstring through
+#   `nimStrBridgeCstr` (3) and destroys each string at its own address after
+#   the call (6 good destroys, 0 bad).
 type FixtureRun = object
   file, label: string
   exitCode: int
+  output: string    ## the expected output, when the fixture prints its checks
 
 const fixtureRuns = [
   FixtureRun(file: "tsplice", exitCode: 29,
              label: "splice then constructors: the plan matches the lowering"),
   FixtureRun(file: "tgrowstore", exitCode: 32,
-             label: "a load or store whose operand grows memory uses the live buffer")]
+             label: "a load or store whose operand grows memory uses the live buffer"),
+  FixtureRun(file: "tstrbridge", exitCode: 0,
+             output: "0123456789\nabc\n0\nαβγ\n6\n1013\n6\n6",
+             label: "bridged strings are built and read through the runtime's entry points"),
+  FixtureRun(file: "toomstr", exitCode: 0, output: "-1\n0\n0",
+             label: "a failed string allocation: no write through nil, no end"),
+  FixtureRun(file: "tcbargs", exitCode: 0, output: "9\n6\n6\n3\n6\n0",
+             label: "callback string and cstring arguments: owned by the wrapper, freed")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.
@@ -194,6 +228,8 @@ if nodeExe.len > 0:
     # The exit codes above are the POSIX status, the low 8 bits of what the
     # program passed to `exit`; node on Windows reports all 32 bits, so compare
     # the part every host reports.
-    check r.label, (code and 0xFF) == r.exitCode, "exit " & $code & "\n" & output
+    check r.label, (code and 0xFF) == r.exitCode and
+      (r.output.len == 0 or strip(output) == r.output),
+      "exit " & $code & "\n" & output
 
 echo "tcodegen: all checks passed"

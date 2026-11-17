@@ -240,53 +240,47 @@ function f32bits(x) { _FF[0] = x; return _FI[0]; }
 function bitsf32(i) { _FI[0] = i | 0; return _FF[0]; }
 function copyMem(d, s, n) { U8.copyWithin(d, s, s + n); }
 """
-  # The string bridge (M7 §6): a Nim `string` crossing an `importjs` splice.
-  # The representation is the SSO string of lib/std/system/stringimpl.nim for
-  # the 4-byte target: byte0 = slen (or the sentinel 254=static / 255=heap);
-  # slen <= PAYLOAD(6) keeps the chars inline at value+1; otherwise `more`
-  # (value+4) points to a LongString { fullLen@0, rc@4, capImpl@8, data@12 }.
-  # These mirror `len`/`rawData` exactly, so short, medium, long and static all
-  # decode correctly. TextEncoder/Decoder exist in both node and the browser.
+  # The string bridge (M7 §6): a Nim `string` crossing an `importjs` splice or
+  # a callback. JS does not know the string's layout: it reads one through
+  # `data(s)` and `len(s)`, the program's own `nimStrBridgeData` and
+  # `nimStrBridgeLen` (lib/std/system/stringimpl.nim), which codegen passes in
+  # with the string's address. TextEncoder/Decoder exist in both node and the
+  # browser.
   result.add """
-const __STR_PAYLOAD = 6, __STR_DATAOFF = 12, __STR_STATIC = 254;
-function nimStrToJs(s) {
-  const sl = U8[s];
-  if (sl <= __STR_PAYLOAD)
-    return new TextDecoder("utf-8").decode(U8.subarray(s + 1, s + 1 + sl));
-  const more = DV.getUint32(s + 4, true);
-  const n = DV.getInt32(more, true);
-  return new TextDecoder("utf-8").decode(U8.subarray(more + __STR_DATAOFF, more + __STR_DATAOFF + n));
+function nimStrToJs(s, data, len) {
+  const n = len(s);
+  const p = data(s);
+  return new TextDecoder("utf-8").decode(U8.subarray(p, p + n));
 }
 function cstrToJs(p) {
   let e = p; while (U8[e] !== 0) ++e;
   return new TextDecoder("utf-8").decode(U8.subarray(p, e));
 }
 """
-  # A JS string back to Nim as a STATIC string (byte0=254, capImpl=0): the GC's
-  # `=destroy` frees only a HeapSlen string, so a bridge result is never freed
-  # and never refcounted — it leaks rather than risk a bad refcount (plan §6
-  # first-cut liveness, matching the never-released handle table). The inline
-  # cache (first 3 chars at value+1) is synced so `==`/`hash` agree with a
-  # compiler literal of the same text.
+  # A JS string back to Nim as an ordinary OWNED `string` written into `dst`
+  # (a frame temporary of the caller, or of a callback wrapper): the Nim
+  # destructor frees it like any other. JS writes none of it but the bytes.
+  # `begin`/`end` are the program's own `nimStrBeginStore`/`nimStrEndStore`:
+  # `begin(dst, n)` makes the uninitialized slot `dst` a string of `n` bytes
+  # and returns the address of the first one (0 when the allocation failed,
+  # which leaves `dst` the runtime's OOM string), `end(dst)` finishes the
+  # write. `begin` may grow linear memory, so the bytes go through `U8` read
+  # AFTER it. The caller owns the result.
   result.add """
-function jsToNimStr(v) {
-  const enc = new TextEncoder().encode(typeof v === "string" ? v : String(v));
-  const n = enc.length;
-  const p = osalloc(0, __STR_DATAOFF + n + 1);
-  DV.setInt32(p + 0, n, true); DV.setInt32(p + 4, 0, true); DV.setInt32(p + 8, 0, true);
-  U8.set(enc, p + __STR_DATAOFF); U8[p + __STR_DATAOFF + n] = 0;
-  const val = osalloc(0, 8);
-  U8[val] = __STR_STATIC;
-  for (let i = 0; i < 3 && i < n; ++i) U8[val + 1 + i] = enc[i];
-  DV.setUint32(val + 4, p, true);
-  return val;
+function jsToNimStr(dst, begin, end, v) {
+  const enc = jsCstrEnc(v);
+  const p = begin(dst, enc.length);
+  if (p === 0) return dst;  // out of memory: `dst` is the sticky OOM string, nothing to fill
+  U8.set(enc, p);
+  end(dst);
+  return dst;
 }
+// A cstring a SPLICE returns has no owner to free it, so it is never freed. It
+// comes from the bump heap (`osalloc`), so total such traffic is capped by
+// SP_MIN.
 function jsToCstr(v) {
-  const enc = new TextEncoder().encode(typeof v === "string" ? v : String(v));
-  const n = enc.length;
-  const p = osalloc(0, n + 1);
-  U8.set(enc, p); U8[p + n] = 0;
-  return p;
+  const e = jsCstrEnc(v);
+  return jsCstrPut(osalloc(0, e.length + 1), e);
 }
 """
   # Length-based bridges, for the C shapes that are neither a Nim string nor
@@ -307,6 +301,15 @@ function strViewToJs(p, n) {
   return new TextDecoder("utf-8").decode(U8.subarray(p, p + n));
 }
 function memView(p, n) { return U8.subarray(p, p + n); }
+// `jsCstrEnc` encodes a JS value as UTF-8 bytes; `jsCstrPut` stores them and
+// a NUL at `d` and answers the address.
+function jsCstrEnc(v) {
+  return new TextEncoder().encode(typeof v === "string" ? v : String(v));
+}
+function jsCstrPut(d, e) {
+  U8.set(e, d); U8[d + e.length] = 0;
+  return d;
+}
 function fillMem(d, v, n) { U8.fill(v, d, d + n); }
 """
   # The portable bit rows. wasm has i32.ctz/clz/popcount; JS has Math.clz32

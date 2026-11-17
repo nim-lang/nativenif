@@ -1,12 +1,6 @@
 (.nif27)
 (stmts@,1,tsplice.nim
- (type :string.0.tsplice .
-  (object .
-   (fld :bytes.0 .
-    (u 32))
-   (fld :more.0 .
-    (ptr
-     (u 8)))))
+ (type :string.0.tsplice . (object . (fld :len.0 . (i 32)) (fld :data.0 . (ptr (u 8)))))
  (type :Pair.0.tsplice .
   (object .
    (fld :a.0 .
@@ -21,6 +15,25 @@
     (i 32))
    (fld :f2.0 .
     (i 32))))
+ (gvar :bump.0 . (i 32) 1048576)
+ (gvar :begins.0 . (i 32) 0)
+ (gvar :ends.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0. (params (param :s.0 . (ptr string.0.tsplice)) (param :n.0 . (i 32))) (ptr (u 8)) .
+  (stmts
+   (asgn begins.0 (add (i 32) begins.0 1))
+   (var :p.0 . (i 32) bump.0)
+   (asgn bump.0 (add (i 32) bump.0 (add (i 32) n.0 16)))
+   (asgn (deref (cast (ptr (i 32)) p.0)) 1414743380)
+   (asgn (deref (cast (ptr (i 32)) (add (i 32) p.0 4))) (cast (i 32) s.0))
+   (asgn (dot (deref s.0) len.0 0) n.0)
+   (asgn (dot (deref s.0) data.0 0) (cast (ptr (u 8)) (add (i 32) p.0 8)))
+   (ret (dot (deref s.0) data.0 0))))
+ (proc :nimStrEndStore.0. (params (param :s.0 . (ptr string.0.tsplice))) . .
+  (stmts (asgn ends.0 (add (i 32) ends.0 1))))
+ (proc :nimStrBridgeData.0. (params (param :s.0 . string.0.tsplice)) (ptr (u 8)) .
+  (stmts (ret (dot s.0 data.0 0))))
+ (proc :nimStrBridgeLen.0. (params (param :s.0 . string.0.tsplice)) (i 32) .
+  (stmts (ret (dot s.0 len.0 0))))
  (proc :s.0.
   (params)
   string.0.tsplice

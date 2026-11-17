@@ -1,0 +1,21 @@
+(.nif27)
+(stmts@,1,toomstr.nim
+ (type :string.0.toomstr . (object . (fld :len.0 . (i 32)) (fld :data.0 . (ptr (u 8)))))
+ (gvar :ends.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0. (params (param :s.0 . (ptr string.0.toomstr)) (param :n.0 . (i 32))) (ptr (u 8)) .
+  (stmts
+   (asgn (dot (deref s.0) len.0 0) -1)
+   (asgn (dot (deref s.0) data.0 0) (cast (ptr (u 8)) 0))
+   (ret (cast (ptr (u 8)) 0))))
+ (proc :nimStrEndStore.0. (params (param :s.0 . (ptr string.0.toomstr))) . .
+  (stmts (asgn ends.0 (add (i 32) ends.0 1))))
+ (proc :show.0. (params (param :n.0 . (i 32))) . (pragmas (importjs "console.log(#)")) (stmts .))
+ (proc :s.0. (params) string.0.toomstr (pragmas (importjs "'abcdefghij'")) (stmts .))
+ (proc :main.0. (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (var :w0.0 . (i 32) (deref (cast (ptr (i 32)) 0)))
+   (var :x.0 . string.0.toomstr (call s.0.))
+   (call show.0. (dot x.0 len.0 0))
+   (call show.0. ends.0)
+   (call show.0. (sub (i 32) (deref (cast (ptr (i 32)) 0)) w0.0))
+   (ret 0))))
