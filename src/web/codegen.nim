@@ -2608,12 +2608,12 @@ proc wrapParam(g: var WebGen; w: var CallbackWrap; pty: Cursor; i: int) =
     # exactly what the Nim-side fire splices do (they pass `cast[int](addr sv)`).
     w.argExprs.add a
   of jbHandle:
-    # A host that hands over a JS object gets an EXT handle for it. A
-    # number is already a raw value — a Nim address (userdata) or an
-    # interned handle — and must pass through untouched, so a pointer a
-    # Nim caller stored in `userdata` arrives as the same pointer.
-    w.argExprs.add "(typeof " & a & " === \"object\" && " & a &
-                   " !== null ? ewrap(" & a & ") : " & a & ")"
+    # `ewrap` is the one conversion of a host value to a handle: an object
+    # or function gets a handle, `null`/`undefined` are the nil handle 0, and
+    # a number is already a raw value (a Nim address passed as userdata, or a
+    # handle) that passes through untouched, so a pointer a Nim caller stored
+    # in `userdata` arrives as the same pointer.
+    w.argExprs.add "ewrap(" & a & ")"
     w.bridged = true
   of jbString:
     # The Nim parameter is borrowed, so the wrapper owns the string: it

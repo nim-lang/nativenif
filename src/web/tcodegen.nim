@@ -206,6 +206,11 @@ console.log(U8[$6]);
 #   returning either: nil twice), not the text "null". A callback fired with
 #   (null, undefined) gets the nil cstring and the empty string; the wrapper
 #   still destroys both slots (2 good destroys, 0 bad).
+# * tcallback: fires a named proc and a stored fn-ptr with `null`, `undefined`,
+#   an object, a function and a number: the first two must arrive as nil (+1
+#   each), the object and the function as handles (+2 each), the number
+#   untouched (+16). A JS function handed to a callback that returns it comes
+#   back as the same function (+32).
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -227,7 +232,9 @@ const fixtureRuns = [
              output: "alphabet\nalphabet\nzero\nzero\n6\n6\n6\n0",
              label: "string-result callbacks: the result slot first, destroyed after conversion"),
   FixtureRun(file: "tnull", exitCode: 0, output: "0\n0\n1\n1\n1\n0\n2\n0",
-             label: "JS null into Nim: the empty string, the nil cstring")]
+             label: "JS null into Nim: the empty string, the nil cstring"),
+  FixtureRun(file: "tcallback", exitCode: 54,
+             label: "handle callback arguments: null, undefined, object, function, number")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.
