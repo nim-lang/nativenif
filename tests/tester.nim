@@ -1328,6 +1328,8 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_load.nif", "mo
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_store.nif", "movfq/movfd destination must be a register")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_prefetch_reg.nif", "prefetch operand must be a memory operand")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_clflush_reg.nif", "clflush operand must be a memory operand")
+# x86-64 ALU instructions have no 64-bit immediate form.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_alu_imm64.nif", "Immediate too large (must fit in 32 bits)")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.
