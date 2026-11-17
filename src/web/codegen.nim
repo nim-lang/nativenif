@@ -2624,9 +2624,10 @@ proc wrapParam(g: var WebGen; w: var CallbackWrap; pty: Cursor; i: int) =
   of jbCstring:
     # Borrowed for the call too: the wrapper builds a Nim string in a slot,
     # passes its NUL-terminated bytes and destroys it after the call. The
-    # slot is one `string` whatever the text's length.
-    w.argExprs.add stringEntry(g, w.strModule, seCstr) & "(f + " &
-                   $(slotOffset(g, w, w.slotArgs.len)) & ")"
+    # slot is one `string` whatever the text's length. JS `null` and
+    # `undefined` are the nil cstring (their slot holds the empty string).
+    w.argExprs.add "(" & a & " == null ? 0 : " & stringEntry(g, w.strModule, seCstr) &
+                   "(f + " & $(slotOffset(g, w, w.slotArgs.len)) & "))"
     w.slotArgs.add a
     w.bridged = true
   of jbCallback:

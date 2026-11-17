@@ -201,6 +201,11 @@ console.log(U8[$6]);
 #   `destroy` checks the buffer, not the address it was built at, and empties
 #   the string: a result destroyed before its conversion would print empty.
 #   6 begins and ends (2 arguments, 4 results), 6 good destroys, 0 bad.
+# * tnull: JS `null` and `undefined` are the empty string (a string splice
+#   returning either: length 0 twice) and the nil cstring (a cstring splice
+#   returning either: nil twice), not the text "null". A callback fired with
+#   (null, undefined) gets the nil cstring and the empty string; the wrapper
+#   still destroys both slots (2 good destroys, 0 bad).
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -220,7 +225,9 @@ const fixtureRuns = [
              label: "callback string and cstring arguments: owned by the wrapper, freed"),
   FixtureRun(file: "tcbstring", exitCode: 0,
              output: "alphabet\nalphabet\nzero\nzero\n6\n6\n6\n0",
-             label: "string-result callbacks: the result slot first, destroyed after conversion")]
+             label: "string-result callbacks: the result slot first, destroyed after conversion"),
+  FixtureRun(file: "tnull", exitCode: 0, output: "0\n0\n1\n1\n1\n0\n2\n0",
+             label: "JS null into Nim: the empty string, the nil cstring")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

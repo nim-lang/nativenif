@@ -268,7 +268,8 @@ function cstrToJs(p) {
   # AFTER it. The caller owns the result.
   result.add """
 function jsToNimStr(dst, begin, end, v) {
-  const enc = jsCstrEnc(v);
+  // A Nim string has no nil: null and undefined are the empty string.
+  const enc = jsCstrEnc(v) || new Uint8Array(0);
   const p = begin(dst, enc.length);
   if (p === 0) return dst;  // out of memory: `dst` is the sticky OOM string, nothing to fill
   U8.set(enc, p);
@@ -277,10 +278,10 @@ function jsToNimStr(dst, begin, end, v) {
 }
 // A cstring a SPLICE returns has no owner to free it, so it is never freed. It
 // comes from the bump heap (`osalloc`), so total such traffic is capped by
-// SP_MIN.
+// SP_MIN. null and undefined are the nil cstring.
 function jsToCstr(v) {
   const e = jsCstrEnc(v);
-  return jsCstrPut(osalloc(0, e.length + 1), e);
+  return e === null ? 0 : jsCstrPut(osalloc(0, e.length + 1), e);
 }
 """
   # Length-based bridges, for the C shapes that are neither a Nim string nor
@@ -301,9 +302,11 @@ function strViewToJs(p, n) {
   return new TextDecoder("utf-8").decode(U8.subarray(p, p + n));
 }
 function memView(p, n) { return U8.subarray(p, p + n); }
-// `jsCstrEnc` encodes a JS value as UTF-8 bytes; `jsCstrPut` stores them and
-// a NUL at `d` and answers the address.
+// `jsCstrEnc` encodes a JS value as UTF-8 bytes, or answers null for null and
+// undefined; `jsCstrPut` stores the bytes and a NUL at `d` and answers the
+// address.
 function jsCstrEnc(v) {
+  if (v === null || v === undefined) return null;
   return new TextEncoder().encode(typeof v === "string" ? v : String(v));
 }
 function jsCstrPut(d, e) {
