@@ -70,7 +70,7 @@ proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
 proc emitWideCmp(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                   whenTrue: bool): RiscInst
 proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
-                      dest: var Location)
+                      dest: var Location; toBool: bool)
 proc wideRet*(g: var CodeGen; c: Cursor)
 proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): SymId
 proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
@@ -2833,6 +2833,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       tc = resolveType(g.prog, cc); skip cc
       inner = cc; skip cc
       while cc.hasMore: skip cc
+  let toBool = not isCast and slotOf(g.prog, tc).kind == ABool   # `x != 0`
   if g.isWideExpr(inner) and not g.isWideExpr(c) and
      not g.isFloatExpr(c):
     # The NARROWING direction: `int32(x64)` / `cast[uint](x64)`. The widening one
@@ -2840,7 +2841,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     # before this proc; `float(x64)` is not a narrowing at all and is refused a
     # few lines down (`isWideSlot` is about INTEGERS, so a 64-bit float does not
     # answer to it and would otherwise fall in here).
-    g.emitWideToNarrow(inner, targetCur, dest)
+    g.emitWideToNarrow(inner, targetCur, dest, toBool)
     return
   if g.isFloatExpr(c):                          # → float result
     if g.isWideExpr(inner):
@@ -2914,6 +2915,10 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
     if isCast:
       g.fmovToGpr(res.r, fv.f, fbits)
+    elif toBool:                                # the bits but the sign
+      g.fmovToGpr(res.r, fv.f, fbits)
+      g.binImm(LslA64, res.r, wordBits() + 1 - fbits)
+      g.nonZeroTo01(res.r)
     else:
       g.fcvtF2I(if isSignedType(tc): FcvtzsA64 else: FcvtzuA64, res.r, fv.f, fbits)
       if not isPtrType(tc):
@@ -3032,7 +3037,8 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     # A folded constant reinterprets freely, but a narrowing cast must keep only
     # the target width (`cast[byte](4000)` → 160), else a later `(mov (u 8) 4000)`
     # fails nifasm's literal-fits-width check.
-    if not isPtrType(tc):
+    if toBool: dest.ival = ord(dest.ival != 0)
+    elif not isPtrType(tc):
       let tw = intTypeWidth(tc)
       if tw < 64:
         dest.ival = truncateImm(dest.ival, tw, isSignedType(tc))
@@ -4898,11 +4904,19 @@ proc wideRet*(g: var CodeGen; c: Cursor) =
 
 # ── the narrowing direction ─────────────────────────────────────────────────
 
+proc wideNonZero(g: var CodeGen; r: Reg; src: WideRef) =
+  ## `r = ord(src != 0)` for a 64-bit `src` whose low word is already in `r`.
+  let h = g.takeBridge(avoid = r)
+  g.wideLoad(h, src, 1)
+  g.binReg(OrrA64, r, h)
+  g.dropBridge h
+  g.nonZeroTo01(r)
+
 proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
-                      dest: var Location) =
+                      dest: var Location; toBool: bool) =
   ## `(conv (i 32) <64-bit>)` and friends: the low word IS the answer, then
   ## re-normalized to the target's own width so a sub-word result stays
-  ## canonically extended in its register.
+  ## canonically extended in its register. A conversion to `bool` reads both.
   let src = g.wideValueSlot(innerC)
   g.forceRegDest(dest)
   if dest.kind != InReg:
@@ -4912,7 +4926,8 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
     g.bindTemp(b, ScalarSlot)
     g.wideLoad(b, src, 0)
     let tslot = slotOf(g.prog, targetC)
-    g.extendTo(b, tslot.size * 8, tslot.kind == AInt)
+    if toBool: g.wideNonZero(b, src)
+    else: g.extendTo(b, tslot.size * 8, tslot.kind == AInt)
     g.storeReg(dest, b)
     g.unbindTemp(b)
     return
@@ -4920,7 +4935,8 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
     g.bindTemp(dest.r, slotOf(g.prog, targetC))
   g.wideLoad(dest.r, src, 0)
   let tslot = slotOf(g.prog, targetC)
-  g.extendTo(dest.r, tslot.size * 8, tslot.kind == AInt)
+  if toBool: g.wideNonZero(dest.r, src)
+  else: g.extendTo(dest.r, tslot.size * 8, tslot.kind == AInt)
 
 proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): SymId =
   ## Produce a 64-bit value into a stack slot and hand back the slot's NAME.

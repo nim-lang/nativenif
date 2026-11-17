@@ -500,6 +500,7 @@ proc reReprCast*(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):
         g.extendTo(res.r, targetW, sgn)                              # narrow / equal
+    if not isCast and slotOf(g.prog, tc).kind == ABool: g.nonZeroTo01(res.r)  # `x != 0`
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened. `kindChange` already did it.
   if not kindChange:

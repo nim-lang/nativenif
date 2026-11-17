@@ -1658,6 +1658,7 @@ proc transparentCastInner*(g: var CodeGen; c: Cursor; home: Location): tuple[hit
   if innerLoc.kind != NamedStack or innerLoc.name != home.name: return
   let tc = resolveType(g.prog, tgtC)
   if isPtrType(tc) or isPtrType(resolveType(g.prog, g.getType(innerC))): return
+  if slotOf(g.prog, tc).kind == ABool and c.exprKind == ConvC: return   # `x != 0`
   let (srcW, _) = g.srcWidthSigned(innerC)
   if intTypeWidth(tc) >= srcW: result = (true, innerC)
 

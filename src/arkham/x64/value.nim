@@ -3418,6 +3418,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       tc = resolveType(g.prog, cc); skip cc              # target type (resolved)
       inner = cc; skip cc
       while cc.hasMore: skip cc
+  let toBool = not isCast and slotOf(g.prog, tc).kind == ABool   # `x != 0`
   if g.isFloatExpr(c):
     # conversion TO float: the result is an xmm (int source → cvtsi2sd; float
     # source → precision convert).
@@ -3501,6 +3502,10 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
     if isCast:
       g.fmovToGpr(res.r, fv.f, fbits)
+    elif toBool:                                         # the bits but the sign
+      g.fmovToGpr(res.r, fv.f, fbits)
+      g.binImm(ShlX64, res.r, 65 - fbits)
+      g.nonZeroTo01(res.r)
     else:
       g.fcvtF2I(res.r, fv.f, fbits)
       if not isPtrType(tc):
@@ -3638,7 +3643,8 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     # A folded constant reinterprets freely, but a narrowing cast must keep only
     # the target width (`cast[byte](4000)` → 160), else a later `(mov (u 8) 4000)`
     # fails nifasm's literal-fits-width check.
-    if not isPtrType(tc):
+    if toBool: dest.ival = ord(dest.ival != 0)
+    elif not isPtrType(tc):
       let tw = intTypeWidth(tc)
       if tw < 64:
         dest.ival = truncateImm(dest.ival, tw, isSignedType(tc))
@@ -3694,6 +3700,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):
         g.extendTo(res2.r, targetW, sgn)                              # narrow / equal
+    if toBool: g.nonZeroTo01(res2.r)
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened (see there). `kindChange` already did it.
   if not kindChange:
