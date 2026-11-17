@@ -217,7 +217,11 @@ console.log(U8[$6]);
 #   handed over with two signatures that bridge differently is two functions:
 #   as `proc (p: H): H` its result is the JS object again (+16), and cast to
 #   `proc (p: H): int` afterwards, a number (+32), not what the first site's
-#   wrapper made of it.
+#   wrapper made of it. A proc that needs no wrapper as `proc (o: int)`
+#   (fired with 7, so not nil: +64) and one as `proc (o: H)` (fired with null,
+#   so nil: +128) is two functions too, in that order.
+# * tnil: Nim nil into JS is null: a nil proc that needs no wrapper (+1), one
+#   that does (+2), and a nil cstring (+4).
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -242,8 +246,10 @@ const fixtureRuns = [
              label: "JS null into Nim: the empty string, the nil cstring"),
   FixtureRun(file: "tcallback", exitCode: 54,
              label: "handle callback arguments: null, undefined, object, function, number"),
-  FixtureRun(file: "tcbident", exitCode: 63,
-             label: "callback identity: one JS function per Nim proc")]
+  FixtureRun(file: "tcbident", exitCode: 255,
+             label: "callback identity: one JS function per Nim proc"),
+  FixtureRun(file: "tnil", exitCode: 7,
+             label: "Nim nil into JS: null for a nil proc and a nil cstring")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

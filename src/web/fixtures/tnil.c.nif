@@ -1,0 +1,18 @@
+(.nif27)
+(stmts@,1,tnil.nim
+ (type :Obj.0.tnil . (object . (fld :x.0 . (i 32))))
+ (type :CbS.0.tnil . (proctype . (params (param :x.0 . (i 32))) . .))
+ (type :CbH.0.tnil . (proctype . (params (param :p.0 . (ptr Obj.0.tnil))) . .))
+ (gvar :slotS.0 . CbS.0.tnil (nil))
+ (gvar :slotH.0 . CbH.0.tnil (nil))
+ (proc :isNullS.0. (params (param :cb.0 . CbS.0.tnil)) (i 32) (pragmas (importjs "(# === null ? 1 : 0)")) (stmts .))
+ (proc :isNullH.0. (params (param :cb.0 . CbH.0.tnil)) (i 32) (pragmas (importjs "(# === null ? 1 : 0)")) (stmts .))
+ (proc :csIsNull.0. (params (param :s.0 . (aptr (c 8)))) (i 32) (pragmas (importjs "(# === null ? 1 : 0)")) (stmts .))
+ (proc :main.0. (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (ret
+    (add (i 32)
+     (add (i 32)
+      (call isNullS.0. slotS.0)
+      (mul (i 32) (call isNullH.0. slotH.0) 2))
+     (mul (i 32) (call csIsNull.0. (nil)) 4))))))

@@ -2726,11 +2726,13 @@ proc callbackBridge(g: var WebGen; t: Cursor; pt: Cursor) =
   wrapResult(g, w, ret)
 
   if not w.bridged:
-    # Already JS-callable: hand over the function the table holds. Works for a
-    # symbol or a stored fn-ptr — the index is whatever the operand evaluates to.
-    g.outp.openTree Index
-    g.outp.ident "FTAB"
+    # Already JS-callable: `cbWrap` hands over the function the table holds (and
+    # null for the nil proc). Works for a symbol or a stored fn-ptr: the index
+    # is whatever the operand evaluates to.
+    g.outp.openTree Call
+    g.outp.ident "cbWrap"
     genExpr(g, t)
+    g.outp.ident "__cbSelf"
     g.outp.closeTag
     return
   # A wrapper bridges the JS call to the Nim proc. A named proc and a stored

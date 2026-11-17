@@ -32,6 +32,36 @@
   (pragmas
    (importjs "(typeof #({k: 1}) === 'number' ? 32 : 0)"))
   (stmts .))
+ (type :CbI.0.tcbident .
+  (proctype .
+   (params
+    (param :o.0 . (i 32))) . .))
+ (gvar :nilSeen.0 . (i 32) 0)
+ (proc :fireI.0.
+  (params
+   (param :cb.0 . CbI.0.tcbident))
+  .
+  (pragmas
+   (importjs "#(7)"))
+  (stmts .))
+ (proc :fireH.0.
+  (params
+   (param :cb.0 . Cb.0.tcbident))
+  .
+  (pragmas
+   (importjs "#(null)"))
+  (stmts .))
+ (proc :onEvent.0.
+  (params
+   (param :o.0 . H.0.tcbident))
+  . .
+  (stmts
+   (asgn nilSeen.0 0)
+   (if
+    (elif
+     (eq o.0 (nil))
+     (stmts
+      (asgn nilSeen.0 1))))))
  (proc :idH.0.
   (params
    (param :p.0 . H.0.tcbident))
@@ -67,6 +97,11 @@
    (exportc "main"))
   (stmts
    (asgn live.0 probe.0.)
+   (call fireI.0.
+    (cast CbI.0.tcbident onEvent.0.))
+   (var :seen1.0 . (i 32) nilSeen.0)
+   (call fireH.0. onEvent.0.)
+   (var :seen2.0 . (i 32) nilSeen.0)
    (var :mixed.0 . (i 32)
     (add
      (i 32)
@@ -75,6 +110,16 @@
       (cast CbHI.0.tcbident idH.0.))))
    (ret
     (add
+     (i 32)
+     (add
+      (i 32)
+      (mul
+       (i 32)
+       (sub
+        (i 32) 1 seen1.0) 64)
+      (mul
+       (i 32) seen2.0 128))
+     (add
      (i 32) mixed.0
      (add
      (i 32)
@@ -93,4 +138,4 @@
        (i 32)
        (sub
         (i 32) 1
-        (call same.0. probe.0. other.0.)) 8)))))))))
+        (call same.0. probe.0. other.0.)) 8))))))))))
