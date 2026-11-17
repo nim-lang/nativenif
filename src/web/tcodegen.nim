@@ -152,4 +152,41 @@ console.log(U8[$6]);
   expect "engine reads the image back", strip(r.output),
     "14\nhello jorogumo\ntrue\n4294967296\n7,8,9\n1,0\n0"
 
+# Each fixture is a program that exits with the sum of the checks it passes, so
+# the engine is the judge: generate, render, run under node, compare the exit
+# code. What each fixture's code adds up:
+#
+# * tsplice: the frame plan and the lowering walk the same tree. An `importjs`
+#   splice reserves no sret temporary; a reservation nobody took shifted every
+#   later temporary (a 12-byte constructor met an 8-byte slot). It splices a
+#   string, builds a pair of strings, calls a splice through `onerr` (which
+#   reaches it like a `call`, string argument and all) and passes a constructor
+#   to a call: 3 + 3 + (5 + 7 + 11).
+type FixtureRun = object
+  file, label: string
+  exitCode: int
+
+const fixtureRuns = [
+  FixtureRun(file: "tsplice", exitCode: 29,
+             label: "splice then constructors: the plan matches the lowering")]
+
+proc runFixture(dir, name, nodeExe: string): (string, int) =
+  ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.
+  let fixture = dir / name & ".c.nif"
+  var fbuf = parseFromFile(fixture, sharedTags = tags)
+  var fmod = default(WebModule)
+  var ftree = generate(fbuf, fixture, tags, wtJs, fmod)
+  let js = getTempDir() / "jorogumo_" & name & "_" & $getCurrentProcessId() & ".js"
+  writeFile(js, renderJs(ftree, fmod, 64 * 1024 * 1024, 64 * 1024))
+  defer: removeFile(js)
+  execCmdEx(nodeExe & " " & quoteShell(js))
+
+if nodeExe.len > 0:
+  for r in fixtureRuns:
+    let (output, code) = runFixture(path.parentDir, r.file, nodeExe)
+    # The exit codes above are the POSIX status, the low 8 bits of what the
+    # program passed to `exit`; node on Windows reports all 32 bits, so compare
+    # the part every host reports.
+    check r.label, (code and 0xFF) == r.exitCode, "exit " & $code & "\n" & output
+
 echo "tcodegen: all checks passed"
