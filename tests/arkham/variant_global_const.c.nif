@@ -1,0 +1,96 @@
+(.nif27)
+(stmts
+ (type :K.0 .
+  (enum
+   (u 8)
+   (efld :ka.0 0)
+   (efld :kb.0 1)))
+ (type :O.0 .
+  (object .
+   (fld :x.0 .
+    (i 32))
+   (fld :k.0 . K.0)
+   (union
+    (of
+     (ranges 0)
+     (object .
+      (fld :a.0 .
+       (i 16))))
+    (of
+     (ranges 1)
+     (object .
+      (fld :b.0 .
+       (i 64))
+      (fld :c.0 .
+       (i 64)))))
+   (fld :y.0 .
+    (i 32))))
+ (gvar :g.0 . O.0
+  (oconstr O.0
+   (kv x.0 3)
+   (kv k.0 1)
+   (kv b.0 20)
+   (kv c.0 10)
+   (kv y.0 9)))
+ (gvar :h.0 . O.0
+  (oconstr O.0
+   (kv x.0 1)
+   (kv k.0 0)
+   (kv a.0 5)
+   (kv y.0 2)))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :s.0 .
+    (i 64)
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot g.0 x.0 0))
+      (conv
+       (i 64)
+       (dot g.0 k.0 0)))
+     (add
+      (i 64)
+      (dot g.0 b.0 0)
+      (conv
+       (i 64)
+       (dot g.0 c.0 0)))))
+   (var :t.0 .
+    (i 64)
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot g.0 y.0 0))
+      (conv
+       (i 64)
+       (dot h.0 x.0 0)))
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot h.0 a.0 0))
+      (conv
+       (i 64)
+       (dot h.0 y.0 0)))))
+   (call exit.0
+    (conv
+     (i 32)
+     (add
+      (i 64) s.0 t.0))))))

@@ -235,51 +235,35 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     for k in count ..< n:                    # zero-fill trailing elements
       for i in 0 ..< esz: buf.add '\0'
   of ObjectT:
-    # Match each `(oconstr … (kv field value) …)` value to a type field
-    # *positionally* (hexer emits constructor fields in declaration order). This
-    # avoids decoding field-name symbols, which sidesteps the foreign-module
-    # string-pool of a cross-module type (the value literals live in *our* pool;
-    # the type only supplies sizes/offsets via `typeSizeAlign`). A trailing
-    # `flexarray` field (size 0) appends its bytes past the fixed part.
+    # Each `(kv field value)` is written at that field's offset in the runtime
+    # layout (`aggrLayout`), found by NAME: a variant's constructor names only the
+    # active branch's fields, so position says nothing. Fields it omits stay zero.
+    # A trailing `flexarray` field (size 0) extends the bytes past the fixed part.
+    var oc = rt
+    oc.into:
+      # An inherited type's constant is not implemented: fail loudly.
+      if oc.kind == Symbol:
+        raiseAssert "arkham: object constant of an inherited type not yet supported"
+      while oc.hasMore: skip oc
     let startLen = buf.len
-    var vals: seq[Cursor] = @[]
+    let lay = aggrLayout(p, typ.symId)       # an object type is always named
+    for i in 0 ..< typeSizeAlign(p, typ)[0]: buf.add '\0'
     var vc = val
     vc.into:
       skip vc                                # the constructed type
       while vc.hasMore:
         vc.into:                             # (kv field value)
-          inc vc                             # skip field name (atom → no pool)
-          vals.add vc
+          let field = vc.symId; inc vc
+          var at = startLen
+          for f in lay:
+            if f.name == field: at = startLen + f.off
+          var fbuf = ""
+          var frel: seq[(int, SymId)] = @[]
+          constToBytes(p, fieldType(p, rt, field), vc, fbuf, frel)
           while vc.hasMore: skip vc
-    var oc = rt
-    var off = 0
-    var maxAl = 1
-    var fi = 0
-    oc.into:
-      # An object *constant* of an inherited type would need the base's fields
-      # laid out first (positionally matched against the leading oconstr values),
-      # like objSizeAlign/aggrLayout do for runtime layout. Not yet implemented —
-      # fail loudly rather than emit silently-misaligned bytes.
-      if oc.kind == Symbol:
-        raiseAssert "arkham: object constant of an inherited type not yet supported"
-      skip oc                                # base / inheritance
-      while oc.hasMore:
-        oc.into:                             # (fld :name pragmas type)
-          inc oc                             # skip field name (atom → no pool)
-          skip oc                            # field pragmas
-          let ftype = oc
-          let (fsz, fal) = typeSizeAlign(p, oc)
-          skip oc
-          off = align(off, fal)
-          if fal > maxAl: maxAl = fal
-          while buf.len < startLen + off: buf.add '\0'   # pad to field offset
-          if fi < vals.len:
-            constToBytes(p, ftype, vals[fi], buf, relocs)
-          else:
-            for i in 0 ..< fsz: buf.add '\0'
-          inc fi
-          off += fsz
-    while (buf.len - startLen) < align(off, maxAl): buf.add '\0'  # tail padding
+          while buf.len < at + fbuf.len: buf.add '\0'
+          for i in 0 ..< fbuf.len: buf[at + i] = fbuf[i]
+          for (o, s) in frel: relocs.add (at + o, s)
   of UnionT:
     # A union CONSTANT names at most one member — `defaultvalues` skips the
     # siblings on purpose, because members share storage and a second designated
