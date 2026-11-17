@@ -193,6 +193,14 @@ console.log(U8[$6]);
 #   strings in its frame (6 begins, 6 ends), passes the cstring through
 #   `nimStrBridgeCstr` (3) and destroys each string at its own address after
 #   the call (6 good destroys, 0 bad).
+# * tcbstring: a callback that returns a `string`, an aggregate, so the Nim
+#   proc takes its result slot as a hidden first parameter; fired with a
+#   parameter and with none, each as a named proc and as a stored proc value.
+#   The host sees "alphabet" twice and "zero" twice. Each result is built by
+#   the callee and moved into the wrapper's result slot, so this fixture's
+#   `destroy` checks the buffer, not the address it was built at, and empties
+#   the string: a result destroyed before its conversion would print empty.
+#   6 begins and ends (2 arguments, 4 results), 6 good destroys, 0 bad.
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -209,7 +217,10 @@ const fixtureRuns = [
   FixtureRun(file: "toomstr", exitCode: 0, output: "-1\n0\n0",
              label: "a failed string allocation: no write through nil, no end"),
   FixtureRun(file: "tcbargs", exitCode: 0, output: "9\n6\n6\n3\n6\n0",
-             label: "callback string and cstring arguments: owned by the wrapper, freed")]
+             label: "callback string and cstring arguments: owned by the wrapper, freed"),
+  FixtureRun(file: "tcbstring", exitCode: 0,
+             output: "alphabet\nalphabet\nzero\nzero\n6\n6\n6\n0",
+             label: "string-result callbacks: the result slot first, destroyed after conversion")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

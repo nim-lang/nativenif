@@ -2588,6 +2588,8 @@ type
     slotSize: int            ## the frame bytes of one such `string`
     retBridge: string        ## the JS conversion of the result, if any
     retString: bool          ## the result is a `string`
+    sretSize: int            ## the bytes of the hidden result slot the callee
+                             ## takes first, 0 when it returns in a register
     bridged: bool            ## some parameter or the result needs a conversion
 
 proc slotOffset(g: var WebGen; w: var CallbackWrap; k: int): int =
@@ -2648,6 +2650,11 @@ proc wrapResult(g: var WebGen; w: var CallbackWrap; ret: Cursor) =
     w.bridged = true
   of jbCallback:
     err g, "a JS callback cannot return a Nim callback"
+  # The lowering's own sret rule (`lowerProc`, `declSignature`): a proc whose
+  # result is an aggregate takes the address of its result slot as a hidden
+  # first parameter. Of the results the wrapper accepts, only a `string` is.
+  if not ret.cursorIsNil and isAggType(g, ret):
+    w.sretSize = align(byteSize(g, ret), 8)
 
 proc wrapStringModule(g: var WebGen; ptypes: seq[Cursor]; ret: Cursor): string =
   ## The module whose `string` a wrapper for this signature builds and reads:
@@ -2666,27 +2673,40 @@ proc wrapStringModule(g: var WebGen; ptypes: seq[Cursor]; ret: Cursor): string =
 proc wrapBody(g: var WebGen; w: CallbackWrap; callee: string): string =
   ## The body of the JS function that calls the Nim proc `callee`. The wrapper
   ## owns a shadow stack frame of its own when it owns anything (a `string` or
-  ## `cstring` argument), because the JS host may call after the Nim caller's
-  ## frame is gone (a timer) or while another is live (reentrancy); otherwise
-  ## it just calls. The frame holds one `string` slot per such argument: the
-  ## Nim parameter is borrowed, so the wrapper owns the string `jsToNimStr`
-  ## built for it in slot `k` and destroys it after the call. A `cstring`
-  ## argument is that string's NUL-terminated bytes.
-  let call = callee & "(" & w.argExprs.join(", ") & ")"
-  let v = if w.retString:
-            w.retBridge & "(" & call & ", " & stringEntry(g, w.strModule, seData) &
-              ", " & stringEntry(g, w.strModule, seLen) & ")"
-          elif w.retBridge.len > 0: w.retBridge & "(" & call & ")"
-          else: call
-  if w.slotArgs.len == 0:
+  ## `cstring` argument, a `string` result), because the JS host may call
+  ## after the Nim caller's frame is gone (a timer) or while another is live
+  ## (reentrancy); otherwise it just calls. The frame holds one `string` slot
+  ## per such argument: the Nim parameter is borrowed, so the wrapper owns the
+  ## string `jsToNimStr` built for it in slot `k` and destroys it after the
+  ## call. A `cstring` argument is that string's NUL-terminated bytes. After
+  ## the argument slots comes the hidden result slot: the callee hands over
+  ## its result there, the wrapper converts it to a JS string and then
+  ## destroys it.
+  let resAt = "f + " & $(w.slotSize * w.slotArgs.len)
+  var args: seq[string] = @[]
+  if w.sretSize > 0: args.add resAt
+  for e in w.argExprs: args.add e
+  let call = callee & "(" & args.join(", ") & ")"
+  if w.slotArgs.len == 0 and w.sretSize == 0:
+    let v = if w.retBridge.len > 0: w.retBridge & "(" & call & ")" else: call
     return "return " & v & ";"
-  let store = stringEntry(g, w.strModule, seBegin) & ", " &
-              stringEntry(g, w.strModule, seEnd)
+  result = "const f = frame(" & $(w.slotSize * w.slotArgs.len + w.sretSize) & "); "
+  if w.slotArgs.len > 0:
+    let store = stringEntry(g, w.strModule, seBegin) & ", " &
+                stringEntry(g, w.strModule, seEnd)
+    for k, a in w.slotArgs:
+      result.add "jsToNimStr(f + " & $(w.slotSize * k) & ", " & store & ", " & a & "); "
   let destroy = stringEntry(g, w.strModule, seDestroy)
-  result = "const f = frame(" & $(w.slotSize * w.slotArgs.len) & "); "
-  for k, a in w.slotArgs:
-    result.add "jsToNimStr(f + " & $(w.slotSize * k) & ", " & store & ", " & a & "); "
-  result.add "const v = " & v & "; "
+  if w.retString:
+    assert w.sretSize > 0
+    result.add call & "; const v = nimStrToJs(" & resAt & ", " &
+               stringEntry(g, w.strModule, seData) & ", " &
+               stringEntry(g, w.strModule, seLen) & "); "
+    result.add destroy & "(" & resAt & "); "
+  elif w.retBridge.len > 0:
+    result.add "const v = " & w.retBridge & "(" & call & "); "
+  else:
+    result.add "const v = " & call & "; "
   for k in 0 ..< w.slotArgs.len:
     result.add destroy & "(f + " & $(w.slotSize * k) & "); "
   result.add "leave(); return v;"
@@ -2703,7 +2723,7 @@ proc callbackBridge(g: var WebGen; t: Cursor; pt: Cursor) =
   var w = CallbackWrap(argExprs: @[], slotArgs: @[],
                        strModule: wrapStringModule(g, ptypes, ret),
                        slotSize: 0, retBridge: "", retString: false,
-                       bridged: false)
+                       sretSize: 0, bridged: false)
   for i, pty in ptypes: wrapParam(g, w, pty, i)
   wrapResult(g, w, ret)
 
