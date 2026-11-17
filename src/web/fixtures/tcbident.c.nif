@@ -1,0 +1,96 @@
+(.nif27)
+(stmts@,1,tcbident.nim
+ (type :Obj.0.tcbident .
+  (object .
+   (fld :x.0 .
+    (i 32))))
+ (type :H.0.tcbident .
+  (ptr Obj.0.tcbident))
+ (type :Cb.0.tcbident .
+  (proctype .
+   (params
+    (param :p.0 . H.0.tcbident)) . .))
+ (type :CbHH.0.tcbident .
+  (proctype .
+   (params
+    (param :p.0 . H.0.tcbident)) H.0.tcbident .))
+ (type :CbHI.0.tcbident .
+  (proctype .
+   (params
+    (param :p.0 . H.0.tcbident)) (i 32) .))
+ (proc :fireHH.0.
+  (params
+   (param :cb.0 . CbHH.0.tcbident))
+  (i 32)
+  (pragmas
+   (importjs "(#({k: 1}).k === 1 ? 16 : 0)"))
+  (stmts .))
+ (proc :fireHI.0.
+  (params
+   (param :cb.0 . CbHI.0.tcbident))
+  (i 32)
+  (pragmas
+   (importjs "(typeof #({k: 1}) === 'number' ? 32 : 0)"))
+  (stmts .))
+ (proc :idH.0.
+  (params
+   (param :p.0 . H.0.tcbident))
+  H.0.tcbident .
+  (stmts
+   (ret p.0)))
+ (gvar :live.0 . Cb.0.tcbident
+  (nil))
+ (proc :same.0.
+  (params
+   (param :a.0 . Cb.0.tcbident)
+   (param :b.0 . Cb.0.tcbident))
+  (i 32)
+  (pragmas
+   (importjs "(# === # ? 1 : 0)"))
+  (stmts .))
+ (proc :probe.0.
+  (params
+   (param :p.0 . H.0.tcbident))
+  .
+  .
+  (stmts .))
+ (proc :other.0.
+  (params
+   (param :p.0 . H.0.tcbident))
+  .
+  .
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn live.0 probe.0.)
+   (var :mixed.0 . (i 32)
+    (add
+     (i 32)
+     (call fireHH.0. idH.0.)
+     (call fireHI.0.
+      (cast CbHI.0.tcbident idH.0.))))
+   (ret
+    (add
+     (i 32) mixed.0
+     (add
+     (i 32)
+     (add
+      (i 32)
+      (call same.0. probe.0. probe.0.)
+      (mul
+       (i 32)
+       (call same.0. live.0 probe.0.) 2))
+     (add
+      (i 32)
+      (mul
+       (i 32)
+       (call same.0. live.0 live.0) 4)
+      (mul
+       (i 32)
+       (sub
+        (i 32) 1
+        (call same.0. probe.0. other.0.)) 8)))))))))

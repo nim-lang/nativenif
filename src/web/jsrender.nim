@@ -313,6 +313,19 @@ function jsCstrPut(d, e) {
   U8.set(e, d); U8[d + e.length] = 0;
   return d;
 }
+// A Nim proc handed to JS as a callback through a wrapper: ONE JS function per
+// table slot and maker, however many sites hand it over (addEventListener,
+// then removeEventListener). `mk` is the maker of the site's wrapper (one per
+// distinct wrapper, so sites whose signatures bridge alike share it), called
+// on the Nim proc `FTAB[i]` the first time slot `i` crosses with it.
+const __cbMemo = new Map();
+function cbWrap(i, mk) {
+  let m = __cbMemo.get(mk);
+  if (m === undefined) { m = new Map(); __cbMemo.set(mk, m); }
+  let f = m.get(i);
+  if (f === undefined) { f = mk(FTAB[i]); m.set(i, f); }
+  return f;
+}
 function fillMem(d, v, n) { U8.fill(v, d, d + n); }
 """
   # The portable bit rows. wasm has i32.ctz/clz/popcount; JS has Math.clz32
@@ -1064,8 +1077,9 @@ proc renderJs*(tree: var TokenBuf; m: WebModule; memBytes, stackBytes: int;
     result.add "let " & gs.join(", ") & ";\n"
   result.add dataInitJs(m)
   result.add genJs(tree)
-  # JS wrappers bridging Nim procs used as `importjs` callbacks; all-scalar
-  # procs need none and pass through as FTAB entries, so this is often empty.
+  # The makers of the JS wrappers bridging Nim procs used as `importjs`
+  # callbacks; all-scalar procs need none and pass through as FTAB entries, so
+  # this is often empty.
   for cb in m.callbacks:
     result.add cb
   result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"

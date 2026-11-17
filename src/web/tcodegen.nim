@@ -211,6 +211,13 @@ console.log(U8[$6]);
 #   each), the object and the function as handles (+2 each), the number
 #   untouched (+16). A JS function handed to a callback that returns it comes
 #   back as the same function (+32).
+# * tcbident: a Nim proc that needs a wrapper is one JS function however it
+#   crosses: named twice (+1), as a stored value and by name (+2), as a stored
+#   value twice (+4); two different procs are two functions (+8). One proc
+#   handed over with two signatures that bridge differently is two functions:
+#   as `proc (p: H): H` its result is the JS object again (+16), and cast to
+#   `proc (p: H): int` afterwards, a number (+32), not what the first site's
+#   wrapper made of it.
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -234,7 +241,9 @@ const fixtureRuns = [
   FixtureRun(file: "tnull", exitCode: 0, output: "0\n0\n1\n1\n1\n0\n2\n0",
              label: "JS null into Nim: the empty string, the nil cstring"),
   FixtureRun(file: "tcallback", exitCode: 54,
-             label: "handle callback arguments: null, undefined, object, function, number")]
+             label: "handle callback arguments: null, undefined, object, function, number"),
+  FixtureRun(file: "tcbident", exitCode: 63,
+             label: "callback identity: one JS function per Nim proc")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.
