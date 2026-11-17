@@ -900,6 +900,11 @@ const arkhamStressKnown: seq[string] = @[
   # unstressed the fixture passes. Closing it means the enclosing step releasing
   # across the recursion (design.md, I1), not withholding rax.
   "array2d",
+  # The x64 division miscompile it pins (rax staged the divisor over the
+  # dividend) needs R11 held by the enclosing store's address while the
+  # computed index is produced into a spill; at k=2 that composition trips the
+  # I1 budget check first, before any division is emitted.
+  "div_dividend_staging",
 ]
 
 const arkhamStressA64Known: seq[string] = @[
@@ -2493,6 +2498,7 @@ const cortexMUnsupported: seq[string] = @[
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
   "store_forward", "uint_literal_to_float", "f32_literal_rounded",
+  "div_dividend_staging",
   # The stack-passed-float fixtures are double precision; `tests/arkham_m/p32_*`
   # are their single-precision, 32-bit-int twins, and run here.
   "float_stack_args", "float_stack_forward", "float_stack_indirect",

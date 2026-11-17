@@ -1,0 +1,34 @@
+(.nif27)
+(stmts
+ (type :V.0 . (object . (fld :x.0 . (f 64)) (fld :y.0 . (f 64))))
+ (type :Row.0 . (array (i 32) 4))
+ (type :Mat.0 . (array Row.0 3))
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit") (nodecl)) (stmts .))
+ (proc :t9.0 (params (param :p0.0 . (u 64)) (param :p1.0 . (f 64)) (param :p2.0 . (u 32)) (param :p4.0 . (i 32))) (i 32) .
+  (stmts
+   (var :a0.0 . (u 64) (add (u 64) p0.0 (conv (u 64) 1)))
+   (var :v.0 . V.0 (oconstr V.0 (kv x.0 0.0) (kv y.0 p1.0)))
+   (var :mat.0 . Mat.0
+    (aconstr Mat.0
+     (aconstr Row.0 p4.0 (suf 1 "i32") (suf 0 "i32") (suf 0 "i32"))
+     (aconstr Row.0 (suf 0 "i32") (suf 0 "i32") (suf 0 "i32") (suf 0 "i32"))
+     (aconstr Row.0 (suf 0 "i32") (suf 0 "i32") (suf 0 "i32") (suf 0 "i32"))))
+   (var :ii.4 . (i 64) 0)
+   (var :l0.0 . (i 64) (add (i 64) ii.4 0))
+   (var :l1.0 . (i 64) (add (i 64) ii.4 1))
+   (var :l2.0 . (i 64) (add (i 64) ii.4 2))
+   (var :l3.0 . (i 64) (add (i 64) ii.4 3))
+   (var :l4.0 . (i 64) (add (i 64) ii.4 4))
+   (asgn
+    (at (at mat.0 (conv (u 64) ii.4))
+     (bitand (u 64)
+      (div (u 64) (suf 0u "u64")
+       (bitor (u 64) (cast (u 64) (dot v.0 y.0 0)) (suf 1u "u64")))
+      (suf 3u "u64")))
+    (cast (i 32) p2.0))
+   (ret (add (i 32) (add (i 32) (add (i 32) (add (i 32) (add (i 32) (at (at mat.0 0) 1) (conv (i 32) (sub (i 64) l0.0 0))) (conv (i 32) (sub (i 64) l1.0 1))) (conv (i 32) (sub (i 64) l2.0 2))) (conv (i 32) (sub (i 64) l3.0 3))) (conv (i 32) (sub (i 64) l4.0 4))))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (if (elif (neq (call t9.0 3u 4294967296.0 7u -1000) 1) (stmts (call exit.0 11))))
+   (call exit.0 42)
+   (ret 0))))

@@ -2686,17 +2686,6 @@ proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
   if nR != NoReg: g.giveBack nR
   g.settleResultReg(dest, acc)
 
-proc subtreeHasDivMod(n: Cursor): bool =
-  ## Does the expression contain a `div`/`mod` (which runs through rax/rdx)?
-  result = false
-  if n.kind != TagLit: return
-  if n.exprKind in {DivC, ModC}: return true
-  var m = n
-  m.into:
-    while m.hasMore:
-      if subtreeHasDivMod(m): return true
-      skip m
-
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
   ## (never rax/rdx — the temp pools exclude both); the result (rax quotient /
@@ -2756,22 +2745,26 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
     return
   var aD = regLoc(acc, ScalarSlot)
   var dD = needsReg(ScalarSlot)
-  if subtreeHasDivMod(dvsC):
-    # The divisor is itself a division: it runs through rax/rdx, so a dividend
-    # parked in rax first would be overwritten by it (`p div ((p div q) or 1)`
-    # divided the INNER quotient). Evaluate the divisor first — into a pool
-    # register, which is never rax/rdx — then the dividend.
-    g.emitValue(dvsC, dD)                               # divisor → a register
-    g.emitValue(divC, aD)                               # dividend → rax
-  else:
-    g.emitValue(divC, aD)                               # dividend → rax
-    g.emitValue(dvsC, dD)                               # divisor → a register
+  # The divisor first, into a pool register (never rax/rdx) or, pool-dry, a
+  # stack slot; then the dividend into rax. The other order parks the dividend
+  # in rax across the divisor's evaluation, which may take rax for its own
+  # steps: a divisor that is itself a division runs through rax/rdx
+  # (`p div ((p div q) or 1)` divided the INNER quotient), and a pool-dry
+  # `cast[uint64](f) or 1` staged its bits in rax and divided itself.
+  g.emitValue(dvsC, dD)                                 # divisor → a register
+  g.emitValue(divC, aD)                                 # dividend → rax
   if dD.kind == InReg and (dD.r == g.md.intRetReg or dD.r == g.md.divRemReg):
     raiseAssert "arkham: div/mod divisor aliases rax/rdx"
   var dvsLoc = dD
   var dvsStaging = NoReg
-  if dvsLoc.kind != InReg:                              # spilled divisor → staging (not rax/rdx)
-    dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ)
+  # A spilled divisor is a 64-bit slot written by a full 64-bit store; nifasm's
+  # r/m64 `div` reads it as it stands, needing no (pool-dry: absent) staging reg.
+  let dvsInSlot = dvsLoc.kind == NamedStack and dvsLoc.typ.size in {4, 8}
+  if dvsLoc.kind != InReg and not dvsInSlot:            # other divisor → staging
+    g.rb.sealAccum g.md.intRetReg                       # not rax (the dividend),
+    dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ,
+                                     avoid = g.md.divRemReg)  # not rdx (div's high half)
+    g.rb.unsealAccums {g.md.intRetReg}
     g.emitLoadLoc(dvsLoc, dvsStaging)
     dvsLoc = regLoc(dvsStaging, dvsLoc.typ)
   # `idiv`/`div` WRITE rdx:rax, and nifasm spells those operands as the RAW
@@ -2796,7 +2789,11 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   g.ab.tree op:
     g.ab.rawReg g.md.divRemReg                             # (rdx): high half / remainder
     g.ab.rawReg g.md.intRetReg                             # (rax): low half / quotient
-    g.emReg dvsLoc.r                                    # divisor, by its bound name
+    if dvsInSlot:                                       # divisor, in its slot
+      g.ab.tree CastX:
+        g.ab.uintType(dvsLoc.typ.size * 8)
+        g.emStackMem(dvsLoc.name)
+    else: g.emReg dvsLoc.r                              # divisor, by its bound name
   if dvsStaging != NoReg: g.giveBack dvsStaging
   else: g.freeVal(dD)
   g.settleResultReg(dest, if wantRem: g.md.divRemReg else: g.md.intRetReg)
