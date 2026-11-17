@@ -1999,6 +1999,25 @@ proc objBodyHasUnion(p: var Program; bodyc: Cursor): bool =
       if oc.kind == TagLit and oc.typeKind == UnionT: result = true
       skip oc
 
+proc typeSymHasUnion*(p: var Program; s: SymId): bool =
+  ## Whether `s` is a union or an object that contains one, directly or through
+  ## inheritance. Resolves distinct / alias chains like `aggrLayout`.
+  ##
+  ## This is the question `constrFieldStores` asks before zeroing a constructor:
+  ## a variant object is not a top-level union, but its branch fields still share
+  ## storage, so a partial `oconstr` leaves the same kind of stale bytes.
+  var d = lookupType(p, s)
+  var body = default(Cursor)
+  d.into:
+    inc d; skip d                             # name, type-pragmas
+    body = d; skip d
+  if body.kind == Symbol: return typeSymHasUnion(p, body.symId)
+  if body.kind != TagLit: return false
+  case body.typeKind
+  of UnionT: result = true
+  of ObjectT: result = objBodyHasUnion(p, body)
+  else: result = false
+
 proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
   ## Every field of `typeSym`, at its byte offset. A variant type contributes
   ## each branch's fields at the SAME offset, so the result can hold two entries

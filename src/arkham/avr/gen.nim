@@ -929,10 +929,16 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: SymId) =
   ## `(oconstr T (kv f v)…)` / `(aconstr T v…)` into a frame slot, one field or
   ## element at a time.
   ##
-  ## A constructor is TOTAL — sem names every field of the type, in any order —
-  ## so nothing has to be zeroed first and nothing can be left uninitialized.
+  ## An ordinary object constructor is TOTAL — sem names every field, in any
+  ## order — so nothing has to be zeroed first. A union and a case object with a
+  ## runtime discriminator are the exception: only the active member is named, or
+  ## no branch at all, and the unnamed storage must start zeroed.
   case c.exprKind
   of OconstrC:
+    var tc = c
+    inc tc                                     # the constructed type
+    if tc.kind == Symbol and typeSymHasUnion(g.prog, tc.symId):
+      g.emitZeroFill(slot, g.aggrSize(c))
     var f = c
     f.into:
       skip f                                     # the type

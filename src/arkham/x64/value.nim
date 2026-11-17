@@ -1271,31 +1271,37 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
     base = regLoc(loaded, AddrSlot)
   var tc = c; inc tc                                    # the constructed type symbol
   let typeSym = tc.symId
-  # A UNION constructor is the one that is NOT total, and this is where that has
-  # to be paid for.
+  # A union or a variant object is the constructor that is NOT total, and this
+  # is where that has to be paid for.
   #
   # `(oconstr T …)` names every field of an object — that is what lets this back
   # end store exactly what is listed and zero nothing — but a union's members
   # share storage, so `doc/tags.md` makes it the stated exception: only the
-  # ACTIVE member is named. `hexer/defaultvalues` names NONE for a default, so
-  # `default(T)` left a union holding whatever the storage held. The C back end
-  # never noticed, because a designated initializer zeroes what it does not
-  # mention.
+  # ACTIVE member is named. A case object has the same storage sharing one level
+  # down, and with a runtime discriminator even the active branch is unknown, so
+  # `Node(k: kind)` names no branch field at all. `hexer/defaultvalues` names
+  # NONE for a default, so `default(T)` left a union holding whatever the storage
+  # held. The C back end never noticed, because a designated initializer zeroes
+  # what it does not mention.
   #
-  # `std/posix/io_uring`'s SQE is the case that found it: `getSqe` does
-  # `result[] = default(Sqe)`, the `opFlags` union kept stale bytes, and the
-  # kernel answered EINVAL to every submission after the first.
+  # `std/posix/io_uring`'s SQE is the case that found the top-level union:
+  # `getSqe` does `result[] = default(Sqe)`, the `opFlags` union kept stale
+  # bytes, and the kernel answered EINVAL to every submission after the first.
+  # A variant object owning a `seq` found the nested shape: the native
+  # `XmlNode(k: kind)` left the branch fields holding stack garbage and the
+  # first assignment crashed in its destructor.
   #
   # It goes HERE and not at the field store, even though that is where the union
   # lands: an aggregate constructor is first built into a temp and then copied,
   # so zeroing the destination is undone by the copy — the temp is the thing
   # nobody wrote. `constrFieldStores` is the one routine that builds either.
   #
-  # The whole extent, not the widest member: members overlap at offset 0, but
+  # The whole aggregate, not the widest member: members overlap at offset 0, but
   # the widest is not always a scalar (`InnerSqeCmd`'s is `array[2, uint64]`),
-  # so "store a zero into the biggest one" does not generalize. Whatever member
-  # the constructor names is stored on top, below.
-  if typeSymIsUnion(g.prog, typeSym):
+  # so "store a zero into the biggest one" does not generalize. A variant's
+  # union is not a separate aggregate we can address portably either, so zero
+  # the enclosing object; fields the constructor does list are stored on top.
+  if typeSymHasUnion(g.prog, typeSym):
     let un = aggrByteSize(g.prog, typeSym)
     if un > 0:
       let up = g.pickStagingSealed("a union constructor base", AddrSlot)
