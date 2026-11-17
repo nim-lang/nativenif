@@ -70,6 +70,14 @@ proc fixturePath: string =
   quit "tcodegen: fixtures/tdata1.c.nif not found"
 
 let tags = createLengTagPool()   # NOT the web IR pool: a buffer is Leng-tagged or JS-tagged, never both
+
+if paramCount() == 2 and paramStr(1) == "--generate":
+  # Child mode for the refusal checks: `refuse` quits, so a refusal is read off
+  # a process, not caught.
+  var cbuf = parseFromFile(paramStr(2), sharedTags = tags)
+  var cm = default(WebModule)
+  discard generate(cbuf, paramStr(2), tags, wtJs, cm)
+  quit 0
 let path = fixturePath()
 var buf = parseFromFile(path, sharedTags = tags)
 var g = createWebGen(buf, path, tags)
@@ -271,5 +279,25 @@ if nodeExe.len > 0:
     check r.label, (code and 0xFF) == r.exitCode and
       (r.output.len == 0 or strip(output) == r.output),
       "exit " & $code & "\n" & output
+
+# `refuse` quits, so a refusal is read off a process (`--generate`). A plain
+# aggregate has no JS spelling as a splice RESULT (an argument is its address):
+# refused, naming the proc, rather than read back as garbage.
+type Refusal = object
+  fixture, label: string
+  needles: seq[string]     ## what the message must contain
+
+proc refusal(fixture: string): (string, int) =
+  execCmdEx(quoteShell(getAppFilename()) & " --generate " &
+            quoteShell(path.parentDir / fixture & ".c.nif"),
+            options = {poStdErrToStdOut})
+
+for r in [Refusal(fixture: "tsplice_aggret", label: "aggregate splice result refused by name",
+                  needles: @["importjs proc `mk.0", "aggregate"])]:
+  let (output, code) = refusal(r.fixture)
+  var named = true
+  for needle in r.needles:
+    named = named and output.contains(needle)
+  check r.label, code != 0 and named, output
 
 echo "tcodegen: all checks passed"

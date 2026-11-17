@@ -2984,7 +2984,13 @@ proc genCallFrom(g: var WebGen; t: var Cursor; wantValue: bool) =
         g.outp.ident "jsToCstr"
       of jbHandle:
         g.outp.openTree EWrap
-      of jbNone: discard
+      of jbNone:
+        # A scalar passes through as the splice's own number. A plain aggregate
+        # has no JS spelling: the splice yields one JS value, where the
+        # caller expects the address of a filled struct.
+        if not rt.cursorIsNil and isAggType(g, rt):
+          err g, "an importjs proc `" & g.spell(nm) & "` cannot return an " &
+                 "aggregate (return a handle, a string or a scalar)"
       of jbCallback:
         # A splice handing a JS function back to Nim would need the reverse
         # bridge (a JS callable stored as a table-shaped value); nothing needs
