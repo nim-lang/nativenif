@@ -6,6 +6,7 @@
    (var :a.0 . (i 8) (suf -128 "i8"))
    (var :u.0 . (u 64) (suf 18446744073709551615u "u64"))
    (var :b.0 . (bool) (true))
+   (var :x.0 . (i 64) 5000000000)
    (var :r.0 . (i 32) 0)
    (case a.0
     (of (ranges (suf -128 "i8")) (stmts (asgn r.0 (add (i 32) r.0 2))))
@@ -24,4 +25,9 @@
    (case (suf 18446744069414584320u "u64")
     (of (ranges (suf 0u "u64")) (stmts (asgn r.0 (add (i 32) r.0 100))))
     (else (stmts .)))
+   (case x.0
+    (of (ranges (range -9223372036854775808 -5000000000)) (stmts (asgn r.0 (add (i 32) r.0 100))))
+    (of (ranges 9294967296) (stmts (asgn r.0 (add (i 32) r.0 100))))
+    (of (ranges 5000000000) (stmts (asgn r.0 (add (i 32) r.0 1))))
+    (else (stmts (asgn r.0 (add (i 32) r.0 100)))))
    (call exit.0 r.0))))
