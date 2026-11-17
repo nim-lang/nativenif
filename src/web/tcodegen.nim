@@ -162,13 +162,20 @@ console.log(U8[$6]);
 #   string, builds a pair of strings, calls a splice through `onerr` (which
 #   reaches it like a `call`, string argument and all) and passes a constructor
 #   to a call: 3 + 3 + (5 + 7 + 11).
+# * tgrowstore: a store whose value is a call that grows linear memory must land
+#   in the NEW buffer, not the one JS read `DV` from before the call (5), and a
+#   load through a pointer such a call returns must read the new buffer (7),
+#   and so must a store through such a pointer (20). A lost store leaves the
+#   global 0; a stale load reads the 0 the old buffer still holds.
 type FixtureRun = object
   file, label: string
   exitCode: int
 
 const fixtureRuns = [
   FixtureRun(file: "tsplice", exitCode: 29,
-             label: "splice then constructors: the plan matches the lowering")]
+             label: "splice then constructors: the plan matches the lowering"),
+  FixtureRun(file: "tgrowstore", exitCode: 32,
+             label: "a load or store whose operand grows memory uses the live buffer")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

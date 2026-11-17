@@ -26,8 +26,8 @@
 ##   division-by-zero checks are the GENERATOR's job, not the renderer's:
 ##   codegen emits `b & 63` / the `divByZero` check, the renderer renders.
 ##
-## `indent` counts nesting levels (two spaces each) and is threaded through
-## expressions as well as statements: an `arrow` body is a statement list
+## `RenderState.indent` counts nesting levels (two spaces each) and is threaded
+## through expressions as well as statements: an `arrow` body is a statement list
 ## inside an expression and must line up with the statement that holds it.
 
 import std / [strutils, base64, assertions]
@@ -118,8 +118,9 @@ const __internExt = ewrap; // splice-facing alias: intern a host value as a hand
   #
   # `memoryGrow` is wasm `memory.grow`'s twin: append `pages` 64 KiB pages,
   # contents intact, return the OLD page count or -1. Pointers are offsets, so
-  # the copy keeps every one valid; the views are rebound to the new buffer,
-  # and every reader goes through the live binding.
+  # the copy keeps every one valid; the views are rebound to the new buffer.
+  # A load or store that read a view BEFORE the grow still holds the old one:
+  # the renderer sends those through `__ld*`/`__st*` below.
   result.add """
 function memorySize() { return JMEM.byteLength >> 16; }
 function memoryGrow(pages) {
@@ -139,6 +140,16 @@ function memoryGrow(pages) {
   return old;
 }
 """
+  # Loads and stores whose operands may GROW memory. JS reads `DV` (or `U8`, ...)
+  # BEFORE it evaluates the arguments, so `DV.setUint32(a, f(), true)` with an
+  # `f` that grows memory stores into the old, abandoned buffer and the write
+  # vanishes. These helpers take the evaluated operands first and read the live
+  # view inside.
+  for w in wI8 .. wF64:
+    let ld = if w in {wI8, wU8}: viewNames[w] & "[a]" else: "DV." & dvGet[w] & "(a, true)"
+    let st = if w in {wI8, wU8}: viewNames[w] & "[a] = v" else: "DV." & dvSet[w] & "(a, v, true)"
+    result.add "function __ld" & viewNames[w] & "(a) { return " & ld & "; }\n"
+    result.add "function __st" & viewNames[w] & "(a, v) { " & st & "; }\n"
   # The static image: the wasm data section's twin. Base64 because the image
   # is arbitrary bytes and a JS string literal is not.
   result.add """
@@ -457,10 +468,27 @@ proc wrapNarrow(text: string; w: WidthCode): string =
 # its case — the operand texts are in hand there, so a wrap never has to
 # hunt down what was already emitted.
 
-proc exprText(c: Cursor; indent: int): string
-proc stmtText*(c: Cursor; indent: int): string
+type
+  RenderState = object
+    indent: int      ## nesting level of the block being rendered (two spaces each)
+    growSites: int   ## how many nodes that can grow linear memory (and so
+                     ## rebind the views) have been printed so far: a call of
+                     ## any kind, a splice or the grow node itself. A load or
+                     ## store compares it before and after its operands,
+                     ## which is one walk however deep the tree, where asking
+                     ## each operand's subtree would rescan it under every
+                     ## enclosing load.
+
+proc exprText(c: Cursor; s: var RenderState): string
+proc stmtText(c: Cursor; s: var RenderState): string
   ## Forward decls — `arrow` bodies are statements, and statements embed
   ## expressions, so the two walks are mutually recursive.
+
+proc nestedText(c: Cursor; s: var RenderState): string =
+  ## One statement one nesting level deeper than the block `s` is in.
+  inc s.indent
+  result = stmtText(c, s)
+  dec s.indent
 
 proc nameOf(c: Cursor): string =
   ## The bare text of a name-ish token: a symbol, a raw `ident`, or a `str`.
@@ -562,16 +590,16 @@ proc pairWidths(c: Cursor): (WidthCode, WidthCode) =
     raiseAssert "jsrender: `" & $webTagOf(c) & "` has no destination width"
   result = (src, WidthCode(it.intVal))
 
-proc operandTexts(c: Cursor; indent: int; w: out WidthCode): seq[string] =
+proc operandTexts(c: Cursor; s: var RenderState; w: out WidthCode): seq[string] =
   result = @[]
   var it = c.firstChild
   w = opWidth(c)
   skip it
   while it.hasMore:
-    result.add exprText(it, indent)
+    result.add exprText(it, s)
     skip it
 
-proc exprText(c: Cursor; indent: int): string =
+proc exprText(c: Cursor; s: var RenderState): string =
   case c.kind
   of Symbol, SymbolDef, Ident: return nameOf(c)
   of IntLit: return $intVal(c)
@@ -599,34 +627,35 @@ proc exprText(c: Cursor; indent: int): string =
   of InfLit: result = "Infinity"
   # ── composites
   of Call:
+    inc s.growSites
     var it = c.firstChild
-    var fn = exprText(it, indent)
+    var fn = exprText(it, s)
     if webTagOf(it) == Arrow:
       fn = "(" & fn & ")"                        # an immediately-invoked arrow
                                                  # needs grouping: `(() => {…})(…)`
     skip it
     var args: seq[string] = @[]
     while it.hasMore:
-      args.add exprText(it, indent)
+      args.add exprText(it, s)
       skip it
     result = fn & "(" & args.join(", ") & ")"
   of Index:
     var it = c.firstChild
-    let arr = exprText(it, indent)
+    let arr = exprText(it, s)
     skip it
-    result = arr & "[" & exprText(it, indent) & "]"
+    result = arr & "[" & exprText(it, s) & "]"
   of Assign:
     var it = c.firstChild
-    let lhs = exprText(it, indent)
+    let lhs = exprText(it, s)
     skip it
-    result = "(" & lhs & " = " & exprText(it, indent) & ")"
+    result = "(" & lhs & " = " & exprText(it, s) & ")"
   of Cond:
     var it = c.firstChild
-    let a = exprText(it, indent)
+    let a = exprText(it, s)
     skip it
-    let b = exprText(it, indent)
+    let b = exprText(it, s)
     skip it
-    result = "(" & a & " ? " & b & " : " & exprText(it, indent) & ")"
+    result = "(" & a & " ? " & b & " : " & exprText(it, s) & ")"
   of Seq:
     # The comma operator: every part runs, the last one is the value. An
     # aggregate is a LOCATION, so a constructor compiles to a run of stores
@@ -634,27 +663,29 @@ proc exprText(c: Cursor; indent: int): string =
     var parts: seq[string] = @[]
     var it = c.firstChild
     while it.hasMore:
-      parts.add exprText(it, indent)
+      parts.add exprText(it, s)
       skip it
     assert parts.len > 0, "jsrender: empty seq"
     result = "(" & parts.join(", ") & ")"
   of ICall:
     # (icall SIG TARGET ARG*) — the function-table slot; JS does not check
     # the signature, wasm's `call_indirect` does.
+    inc s.growSites
     var it = c.firstChild
     skip it                                      # the signature
-    let fn = exprText(it, indent)
+    let fn = exprText(it, s)
     skip it
     var args: seq[string] = @[]
     while it.hasMore:
-      args.add exprText(it, indent)
+      args.add exprText(it, s)
       skip it
     result = "FTAB[" & fn & "](" & args.join(", ") & ")"
   of MemCopy, MemFill, MemGrow, Frame:
+    if webTagOf(c) == MemGrow: inc s.growSites
     var args: seq[string] = @[]
     var it = c.firstChild
     while it.hasMore:
-      args.add exprText(it, indent)
+      args.add exprText(it, s)
       skip it
     let fn = case webTagOf(c)
              of MemCopy: "copyMem"
@@ -672,7 +703,7 @@ proc exprText(c: Cursor; indent: int): string =
                of Ctz: "ctz"
                of Clz: "clz"
                else: "popcnt"
-    result = base & (if w.isBig: "64(" else: "32(") & exprText(it, indent) & ")"
+    result = base & (if w.isBig: "64(" else: "32(") & exprText(it, s) & ")"
   of Arrow:
     var it = c.firstChild
     var ps: seq[string] = @[]
@@ -684,35 +715,40 @@ proc exprText(c: Cursor; indent: int): string =
       skip it
     result = "(" & ps.join(", ") & ") => {\n"
     while it.hasMore:
-      result.add stmtText(it, indent + 1) & '\n'
+      result.add nestedText(it, s) & '\n'
       skip it
-    result.add pad(indent) & "}"
+    result.add pad(s.indent) & "}"
   # ── linear memory
   of HLoad:
     var it = c.firstChild
     let w = opWidth(c)
     skip it
-    let at = exprText(it, indent)
-    let s = scaleOf(w)
+    let sitesBefore = s.growSites
+    let at = exprText(it, s)
+    let sc = scaleOf(w)
+    if s.growSites != sitesBefore: return "__ld" & viewNames[w] & "(" & at & ")"
     # Width 2+ goes through the DataView: a typed array at a fractional index
     # reads `undefined` and the store below vanishes — silent wrong code, the
     # one outcome worse than wasm's trap. The DataView needs no alignment and
     # costs nothing extra on aligned access; the byte views stay direct.
-    if s == 1: result = viewNames[w] & "[" & at & "]"
+    if sc == 1: result = viewNames[w] & "[" & at & "]"
     else: result = "DV." & dvGet[w] & "(" & at & ", true)"
   of HStore:
     var it = c.firstChild
     let w = opWidth(c)
     skip it
-    let at = exprText(it, indent)
+    let sitesBefore = s.growSites
+    let at = exprText(it, s)
     skip it
-    let s = scaleOf(w)
-    let val = exprText(it, indent)
-    if s == 1: result = "(" & viewNames[w] & "[" & at & "] = " & val & ")"
+    let sc = scaleOf(w)
+    let val = exprText(it, s)
+    if s.growSites != sitesBefore:
+      return "__st" & viewNames[w] & "(" & at & ", " & val & ")"
+    if sc == 1: result = "(" & viewNames[w] & "[" & at & "] = " & val & ")"
     else: result = "(DV." & dvSet[w] & "(" & at & ", " & val & ", true))"
   # ── extern bridge
-  of EWrap: result = "ewrap(" & exprText(c.firstChild, indent) & ")"
-  of EUnwrap: result = "eunwrap(" & exprText(c.firstChild, indent) & ")"
+  of EWrap: result = "ewrap(" & exprText(c.firstChild, s) & ")"
+  of EUnwrap: result = "eunwrap(" & exprText(c.firstChild, s) & ")"
   of EStrLit: result = "ewrap(" & escapeJsString(strVal(c.firstChild)) & ")"
   of Cvt:
     # (cvt FROM TO VALUE) — the two numeric worlds of §1. The pair decides:
@@ -723,40 +759,40 @@ proc exprText(c: Cursor; indent: int): string =
     var it = c.firstChild
     skip it
     skip it
-    let v = exprText(it, indent)
+    let v = exprText(it, s)
     let fromBig = fromW in {wI64, wU64}
     let toBig = toW in {wI64, wU64}
     let fromFl = fromW in {wF32, wF64}
     let toFl = toW in {wF32, wF64}
-    var s = v
+    var r = v
     if fromBig and not toBig:
       if toW in {wI8, wU8, wI16, wU16, wI32, wU32}:
         # Narrow INSIDE BigInt first: `Number(big)` rounds to the nearest
         # double, and the low bits the narrow must keep are exactly what
         # rounding past 2^53 throws away.
         let bits = if toW in {wI8, wU8}: 8 elif toW in {wI16, wU16}: 16 else: 32
-        s = (if toW in {wI8, wI16, wI32}: "BigInt.asIntN(" & $bits & ", "
-             else: "BigInt.asUintN(" & $bits & ", ") & s & ")"
-      s = "Number(" & s & ")"
+        r = (if toW in {wI8, wI16, wI32}: "BigInt.asIntN(" & $bits & ", "
+             else: "BigInt.asUintN(" & $bits & ", ") & r & ")"
+      r = "Number(" & r & ")"
     elif toBig and not fromBig:
-      s = (if fromFl: s                        # see below: the trapping form
-           elif fromW == wU8: "BigInt((" & s & ") & 0xFF)"
-           elif fromW == wU16: "BigInt((" & s & ") & 0xFFFF)"
-           else: "BigInt(" & s & ")")
+      r = (if fromFl: r                        # see below: the trapping form
+           elif fromW == wU8: "BigInt((" & r & ") & 0xFF)"
+           elif fromW == wU16: "BigInt((" & r & ") & 0xFFFF)"
+           else: "BigInt(" & r & ")")
     elif fromFl and not toFl:
-      s = case toW
-          of wI8, wI16, wI32: "ftoi(" & s & ", -2147483648, 2147483648)"
-          of wU8, wU16, wU32: "ftoi(" & s & ", 0, 4294967296)"
-          else: s
+      r = case toW
+          of wI8, wI16, wI32: "ftoi(" & r & ", -2147483648, 2147483648)"
+          of wU8, wU16, wU32: "ftoi(" & r & ", 0, 4294967296)"
+          else: r
     if fromFl and toBig:
-      s = (if toW == wI64: "BigInt(ftoi(" & v & ", -9223372036854775808, 9223372036854775808))"
+      r = (if toW == wI64: "BigInt(ftoi(" & v & ", -9223372036854775808, 9223372036854775808))"
            else: "BigInt(ftoi(" & v & ", 0, 18446744073709551616))")
-    result = if toW == wF32: "(Math.fround(" & s & "))"
-             elif toW == wU64: "(" & s & " & 0xFFFF_FFFF_FFFF_FFFFn)"
+    result = if toW == wF32: "(Math.fround(" & r & "))"
+             elif toW == wU64: "(" & r & " & 0xFFFF_FFFF_FFFF_FFFFn)"
              # u64 -> i64 reinterprets the top bit as the sign: 2^63 is minI64.
-             elif toW == wI64 and fromW == wU64: "BigInt.asIntN(64, " & s & ")"
-             elif toBig or toFl: "(" & s & ")"
-             else: wrapNarrow(s, toW)
+             elif toW == wI64 and fromW == wU64: "BigInt.asIntN(64, " & r & ")"
+             elif toBig or toFl: "(" & r & ")"
+             else: wrapNarrow(r, toW)
   of Reint:
     # (reint FROM TO VALUE) — the same scratch cell, the other view. codegen
     # has already rejected the pairs that have no bit-for-bit reading.
@@ -764,7 +800,7 @@ proc exprText(c: Cursor; indent: int): string =
     var it = c.firstChild
     skip it
     skip it
-    let v = exprText(it, indent)
+    let v = exprText(it, s)
     result = case fromW
       of wF64: (if toW == wU64: "(f64bits(" & v & ") & 0xFFFF_FFFF_FFFF_FFFFn)"
                 else: "f64bits(" & v & ")")
@@ -776,6 +812,7 @@ proc exprText(c: Cursor; indent: int): string =
   of Raw:
     # (raw NAME TPL ARG*) — NAME is also the `EXT` entry it lowers to, so
     # splicing here yields exactly what codegen would have emitted inline.
+    inc s.growSites
     var it = c.firstChild
     let name = nameOf(it)
     skip it
@@ -783,7 +820,7 @@ proc exprText(c: Cursor; indent: int): string =
     skip it
     var args: seq[string] = @[]
     while it.hasMore:
-      args.add exprText(it, indent)
+      args.add exprText(it, s)
       skip it
     # `$1`/`$#` want the Nim source name, not the symbol `NAME` carries — see
     # `externName`. `#`-only templates never look at it, which is why this gap
@@ -793,7 +830,7 @@ proc exprText(c: Cursor; indent: int): string =
   of Add, Sub, Mul, Div, Mod, Shl, Shr, And, Or, Xor, LAnd, LOr,
      Not, Neg, BNot, Eq, Neq, Lt, Le, Gt, Ge:
     var w: WidthCode
-    let ops = operandTexts(c, indent, w)
+    let ops = operandTexts(c, s, w)
     let is64 = w in {wI64, wU64}
     # arity is verified once here so every branch below stays a single
     # expression — the width-wrap template must compose, not statement.
@@ -867,16 +904,16 @@ proc exprText(c: Cursor; indent: int): string =
 
 # ── statements ──────────────────────────────────────────────────────────────
 # `stmtText` renders one statement, possibly multi-line, WITHOUT a trailing
-# newline; `indent` is the nesting level of the block it sits in.
+# newline; `s.indent` is the nesting level of the block it sits in.
 
-proc blockText(c: Cursor; indent: int): string =
-  ## The statement children of `c` rendered inside `{ … }` at `indent+1`.
+proc blockText(c: Cursor; s: var RenderState): string =
+  ## The statement children of `c` rendered inside `{ … }` one level deeper.
   result = "{\n"
   var it = c.sub()
   while it.hasMore:
-    result.add stmtText(it, indent + 1) & '\n'
+    result.add nestedText(it, s) & '\n'
     skip it
-  result.add pad(indent) & "}"
+  result.add pad(s.indent) & "}"
 
 proc paramName(c: Cursor): string =
   ## The name of a `(param NAME W)` — or of a bare name, as an arrow's
@@ -903,8 +940,8 @@ proc zeroOf(w: WidthCode): string =
   ## A fresh local's value: zero in its own numeric world.
   if w.isBig: "0n" else: "0"
 
-proc stmtText*(c: Cursor; indent: int): string =
-  let p = pad(indent)
+proc stmtText(c: Cursor; s: var RenderState): string =
+  let p = pad(s.indent)
   case webTagOf(c)
   of NoTag:
     raiseAssert "jsrender: not a jsnif statement: " & $c.kind
@@ -927,17 +964,17 @@ proc stmtText*(c: Cursor; indent: int): string =
       skip li
     skip it
     if lets.len > 0:
-      result.add pad(indent + 1) & "let " & lets.join(", ") & ";\n"
+      result.add pad(s.indent + 1) & "let " & lets.join(", ") & ";\n"
     while it.hasMore:
-      result.add stmtText(it, indent + 1) & '\n'
+      result.add nestedText(it, s) & '\n'
       skip it
-    result.add pad(indent) & "}"
+    result.add pad(s.indent) & "}"
   of Params, Param, Locals, Sig:
     raiseAssert "jsrender: `" & $webTagOf(c) & "` outside a func"
   of Leave:
     result = p & "leave();"
   of Block:
-    result = p & blockText(c, indent)
+    result = p & blockText(c, s)
   of Label:
     var it = c.firstChild
     let name = nameOf(it)
@@ -947,44 +984,44 @@ proc stmtText*(c: Cursor; indent: int): string =
     skip bodyIt
     result = p & name & ": {\n"
     while bodyIt.hasMore:
-      result.add stmtText(bodyIt, indent + 1) & '\n'
+      result.add nestedText(bodyIt, s) & '\n'
       skip bodyIt
-    result.add pad(indent) & "}"
+    result.add pad(s.indent) & "}"
   of Break:
     let lab = c.firstChild
     result = if lab.hasMore: p & "break " & nameOf(lab) & ";"
              else: p & "break;"
   of If:
     var it = c.firstChild
-    let cond = exprText(it, indent)
+    let cond = exprText(it, s)
     skip it
     # then-branch: children until an `Else` tree or a trailing dot
     var thenBuf = ""
     while it.hasMore and webTagOf(it) != Else:
       if it.kind == DotToken: break
-      thenBuf.add stmtText(it, indent + 1) & '\n'
+      thenBuf.add nestedText(it, s) & '\n'
       skip it
-    result = p & "if (" & cond & ") {\n" & thenBuf & pad(indent) & "}"
+    result = p & "if (" & cond & ") {\n" & thenBuf & pad(s.indent) & "}"
     if it.hasMore and webTagOf(it) == Else:
       # the `else` tree's children ARE its statements
-      result.add " else " & blockText(it, indent)
+      result.add " else " & blockText(it, s)
   of Else:
     raiseAssert "jsrender: `else` outside `if`"
   of While:
     var it = c.firstChild
-    let cond = exprText(it, indent)
+    let cond = exprText(it, s)
     skip it
     result = p & "while (" & cond & ") {\n"
     while it.hasMore:
-      result.add stmtText(it, indent + 1) & '\n'
+      result.add nestedText(it, s) & '\n'
       skip it
-    result.add pad(indent) & "}"
+    result.add pad(s.indent) & "}"
   of Return:
     let v = c.firstChild
     result = if not v.hasMore: p & "return;"
-             else: p & "return " & exprText(v, indent) & ";"
+             else: p & "return " & exprText(v, s) & ";"
   of ExprStmt:
-    result = p & exprText(c.firstChild, indent) & ";"
+    result = p & exprText(c.firstChild, s) & ";"
   else:
     raiseAssert "jsrender: expression where a statement was expected: " & $webTagOf(c)
 
@@ -994,9 +1031,10 @@ proc genJs*(buf: var TokenBuf): string =
   result = ""
   var c = beginRead(buf)
   assert webTagOf(c) == Top, "jsrender: genJs expects a `top` root, got " & $webTagOf(c)
+  var s = RenderState()
   var it = c.sub()
   while it.hasMore:
-    result.add stmtText(it, 0) & '\n'
+    result.add stmtText(it, s) & '\n'
     skip it
 
 proc dataInitJs*(m: WebModule): string =
