@@ -230,6 +230,10 @@ console.log(U8[$6]);
 #   so nil: +128) is two functions too, in that order.
 # * tnil: Nim nil into JS is null: a nil proc that needs no wrapper (+1), one
 #   that does (+2), and a nil cstring (+4).
+# * tcbthrow: a callback with a 4 KiB frame throws into a JS host that catches
+#   it 1000 times (4 MiB of frames on a 64 KiB stack). The host boundary
+#   restores SP, so the loop survives and SP is back where it started (1, plus
+#   4 from main). Without the restore it dies of "stack overflow".
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -257,7 +261,9 @@ const fixtureRuns = [
   FixtureRun(file: "tcbident", exitCode: 255,
              label: "callback identity: one JS function per Nim proc"),
   FixtureRun(file: "tnil", exitCode: 7,
-             label: "Nim nil into JS: null for a nil proc and a nil cstring")]
+             label: "Nim nil into JS: null for a nil proc and a nil cstring"),
+  FixtureRun(file: "tcbthrow", exitCode: 5,
+             label: "a callback that throws into a catching host leaves SP restored")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

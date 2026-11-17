@@ -223,6 +223,17 @@ function frame(n) {
   _SPF.push(SP); SP = f; return f;
 }
 function leave() { SP = _SPF.pop(); }
+// A Nim proc the HOST calls (a callback, an export). A throw crossing the Nim
+// frames (a panic, a trap, nim_exit in a browser) skips their leave(), so SP
+// would stay low and a host that catches and calls again would run out of
+// stack. The host boundary restores SP and the frame stack itself.
+function hostCall(f) {
+  return function () {
+    const sp = SP, d = _SPF.length;
+    try { return f.apply(undefined, arguments); }
+    catch (e) { SP = sp; _SPF.length = d; throw e; }
+  };
+}
 """
   # Bit-level reinterpretation (`cast` between a float and an integer of the
   # same size). One scratch cell, read back through the other view; the program
@@ -327,7 +338,7 @@ function cbWrap(i, mk) {
   let m = __cbMemo.get(mk);
   if (m === undefined) { m = new Map(); __cbMemo.set(mk, m); }
   let f = m.get(i);
-  if (f === undefined) { f = mk(FTAB[i]); m.set(i, f); }
+  if (f === undefined) { f = hostCall(mk(FTAB[i])); m.set(i, f); }
   return f;
 }
 function fillMem(d, v, n) { U8.fill(v, d, d + n); }
@@ -1110,7 +1121,7 @@ proc renderJs*(tree: var TokenBuf; m: WebModule; memBytes, stackBytes: int;
     # classic <script>, so it lands on globalThis.NIF.
     var ex = (if browser: "globalThis.NIF = {" else: "module.exports = {")
     for (cName, f) in m.exports:
-      ex &= "\n  " & cName & ": " & f & ","
+      ex &= "\n  " & cName & ": hostCall(" & f & "),"
     # The host reads results straight out of linear memory. `memory.buffer`
     # mirrors the wasm export, so the JS engine is a drop-in for the wasm one;
     # it is a getter because memoryGrow REPLACES JMEM.
