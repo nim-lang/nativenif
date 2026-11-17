@@ -234,6 +234,9 @@ console.log(U8[$6]);
 #   it 1000 times (4 MiB of frames on a 64 KiB stack). The host boundary
 #   restores SP, so the loop survives and SP is back where it started (1, plus
 #   4 from main). Without the restore it dies of "stack overflow".
+# * thandle: one JS value has one handle: `globalThis` twice is the same
+#   handle (+1), two fresh objects are two (+2), and a handle that goes through
+#   an `importjs` identity splice comes back equal (+4).
 type FixtureRun = object
   file, label: string
   exitCode: int
@@ -263,7 +266,9 @@ const fixtureRuns = [
   FixtureRun(file: "tnil", exitCode: 7,
              label: "Nim nil into JS: null for a nil proc and a nil cstring"),
   FixtureRun(file: "tcbthrow", exitCode: 5,
-             label: "a callback that throws into a catching host leaves SP restored")]
+             label: "a callback that throws into a catching host leaves SP restored"),
+  FixtureRun(file: "thandle", exitCode: 7,
+             label: "handle identity: one JS value, one handle")]
 
 proc runFixture(dir, name, nodeExe: string): (string, int) =
   ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.

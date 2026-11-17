@@ -101,11 +101,14 @@ let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),
 const EXT = [];  // extern value table: handle -> real JS value (§6)
 const FTAB = []; // function table: slot -> JS function; 0 is the null pointer
 let JSP = [null];  // the same table, grown by ewrap
+const JMAP = new Map();  // value -> handle: one JS value has one handle, so `==` is identity
 function ewrap(v) {
   if (typeof v === "number" || typeof v === "bigint") return v;
   if (typeof v === "boolean") return v ? 1 : 0;
   if (v === null || v === undefined) return 0;
-  const h = JSP.length; JSP.push(v); return h | 0;
+  let h = JMAP.get(v);
+  if (h === undefined) { h = JSP.length; JSP.push(v); JMAP.set(v, h); }
+  return h;
 }
 function eunwrap(h) {
   if (typeof h === "bigint") return Number(h);
