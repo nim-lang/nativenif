@@ -2363,7 +2363,12 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     # nifasm rejects as a register collision (a dropped source operand), which is
     # the check worth keeping. (Integer only: `emitBin` never sees floats.)
     if ek == SubC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
-    else: g.emitValue(lhsC, dest)
+    else:
+      # Into a register of its own unless the caller pinned one: a bare symbol
+      # would hand up `x`'s home, and a consumer that re-represents a computed
+      # operand in place (`int8(x and x)`'s extend) would rewrite `x` itself.
+      g.forceRegDest(dest)
+      g.emitValue(lhsC, dest)
     return
   let isShift = ek in {ShlC, ShrC}
   let varShift = isShift and g.md.shiftCountReg != NoReg and not isConstShiftCount(rhsC)

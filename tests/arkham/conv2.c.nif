@@ -1,5 +1,4 @@
 (.nif27)
-(.indexat 381              )
 (stmts
  (proc :exit.0
   (params
@@ -24,4 +23,22 @@
     (i 64)
     (neg
      (i 64)b.0))
-   (call exit.0 c.0))))(.index)
+   (var :d.0 .
+    (i 8)
+    (add
+     (i 8)
+     (conv
+      (i 8)
+      (bitand
+       (i 64)a.0 a.0))
+     (bitnot
+      (i 8)b.0)))
+   (call exit.0
+    (add
+     (i 64)
+     (add
+      (i 64)c.0
+      (conv
+       (i 64)d.0))
+     (div
+      (i 64)a.0 2))))))
