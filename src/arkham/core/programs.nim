@@ -113,6 +113,9 @@ type
     sysNrA64*: int           ## AArch64 number (`-1` if none on that arch)
 
   Program* = object
+    facts*: seq[string]                     ## platform facts (`--os`/`--cpu`/`--plat`):
+                                            ## an `(ite (defined "a" ...) T E)` is only
+                                            ## its taken arm (`nifcdecl.platformArm`)
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
     foreignVarargs*: seq[Extern]            ## `{.varargs.}` externs OTHER modules declare that
                                             ## this one calls (e.g. after cross-module inlining):
@@ -832,7 +835,7 @@ proc checkImportLib*(tgt: CallTarget) =
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
               darwin = false; windows = false; crtEntry = false;
-              freebsd = false): Program =
+              freebsd = false; facts: seq[string] = @[]): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -853,7 +856,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    loaded: initTable[string, ForeignModule](),
                    gvarCName: initTable[SymId, SymId](),
                    importcOnlyGvars: initHashSet[SymId](),
-                   scheme: splitModulePath(inputPath), tags: tags,
+                   scheme: splitModulePath(inputPath), tags: tags, facts: facts,
                    pool: buf.pool, thisModule: buf.pool.strings.getOrIncl(
                      splitModulePath(inputPath).name),
                    darwin: darwin, windows: windows, crtEntry: crtEntry,
@@ -1620,18 +1623,22 @@ proc declIsNoReturn*(decl: Cursor): bool =
     while c.hasMore: skip c                     # body — `into` requires a full drain
 
 proc collectCallees(n: Cursor; seen: var HashSet[SymId];
-                    order: var seq[SymId]) =
+                    order: var seq[SymId]; facts: seq[string]) =
   ## Every DIRECT call target in the subtree (`(call SYM …)`), deduped — as pool
   ## ids, which is all the resolution below needs.
   var n = n
   if n.kind != TagLit: return
+  var arm = default(Cursor)
+  if n.stmtKind == IteS and platformArm(n, facts, arm):
+    collectCallees(arm, seen, order, facts)     # the other arm is not code
+    return
   if n.stmtKind == CallS:
     let probe = sub(n)                          # read-only peek at the callee
     if probe.hasMore and probe.kind == Symbol:
       let id = probe.symId
       if not seen.containsOrIncl(id): order.add id
   n.loopInto:
-    collectCallees(n, seen, order)
+    collectCallees(n, seen, order, facts)
     skip n
 
 proc noReturnProcs*(p: var Program): HashSet[SymId] =
@@ -1659,7 +1666,7 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
     var b = pi.decl
     b.into:
       inc b; skip b; skip b; skip b             # name, params, ret, pragmas
-      while b.hasMore: (collectCallees(b, seen, callees); skip b)
+      while b.hasMore: (collectCallees(b, seen, callees, p.facts); skip b)
   var localDecl = initTable[SymId, Cursor]()
   for pi in p.procs:
     var nc = pi.decl; inc nc
@@ -1673,17 +1680,21 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
       if found and d.stmtKind == ProcS and declIsNoReturn(d): result.incl id
 
 proc collectInstrCallees(n: Cursor; seen: var HashSet[SymId];
-                         order: var seq[SymId]) =
+                         order: var seq[SymId]; facts: seq[string]) =
   ## Every `(instr SYM …)` callee in the subtree, deduped.
   var n = n
   if n.kind != TagLit: return
+  var arm = default(Cursor)
+  if n.stmtKind == IteS and platformArm(n, facts, arm):
+    collectInstrCallees(arm, seen, order, facts) # the other arm is not code
+    return
   if n.stmtKind == InstrS or n.exprKind == InstrC:
     let probe = sub(n)
     if probe.kind == Symbol:
       let id = probe.symId
       if not seen.containsOrIncl(id): order.add id
   n.loopInto:
-    collectInstrCallees(n, seen, order)
+    collectInstrCallees(n, seen, order, facts)
     skip n
 
 proc memIntrinsicProcs*(p: var Program): Table[SymId, IntrinsicOp] =
@@ -1699,7 +1710,7 @@ proc memIntrinsicProcs*(p: var Program): Table[SymId, IntrinsicOp] =
     var b = pi.decl
     b.into:
       inc b; skip b; skip b; skip b             # name, params, ret, pragmas
-      while b.hasMore: (collectInstrCallees(b, seen, callees); skip b)
+      while b.hasMore: (collectInstrCallees(b, seen, callees, p.facts); skip b)
   for id in callees:
     let op = instrTargetOf(p, id).op
     if op.isMemOp: result[id] = op

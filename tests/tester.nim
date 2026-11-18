@@ -846,12 +846,13 @@ proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
        skipped, " known-unsupported skipped)"
 
 proc arkhamPlatfactsTests(arch = (when defined(macosx): "arm64" else: "x64")) =
-  ## Leng `(defined "a" "b")` is folded by arkham against its platform facts
-  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`), and an `ite` it decides is
-  ## replaced by its taken branch. One fixture, run once per fact set: an
-  ## `elif` chain (`fact_c` beats `fact_b`), a nested test, and `and`/`not`
-  ## over `defined`. The never-taken first branch calls a proc that does not
-  ## exist, so the fixture only compiles if dead branches are really dropped.
+  ## An `(ite (defined "a" "b") T E)` is decided by arkham's platform facts
+  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`), and is
+  ## only its taken arm: the code generator collapses it. One fixture, run
+  ## once per fact set: an `elif` chain (`fact_c` beats `fact_b`), a nested
+  ## test, and one without an `else`. The never-taken first arm calls a proc
+  ## that does not exist, so the fixture only compiles if dead arms are never
+  ## looked at.
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let dir = "tests" / "arkham_platfacts"
@@ -863,7 +864,7 @@ proc arkhamPlatfactsTests(arch = (when defined(macosx): "arm64" else: "x64")) =
     ("--plat:fact_b --plat:inner", 30),
     ("--plat:fact_c --plat:fact_b", 2),
     ("--plat:fact_d", 104),
-    ("--plat:fact_d --plat:fact_e", 4)]
+    ("--plat:fact_d --plat:fact_b", 103)]
   var passed = 0
   for (plats, expected) in cases:
     let asmNif = workDir / "platfacts.asm.nif"

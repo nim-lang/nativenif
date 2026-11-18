@@ -173,6 +173,8 @@ type
 
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
+    facts: seq[string]         ## platform facts: an `(ite (defined ...) T E)` is
+                               ## only its taken arm (`nifcdecl.platformArm`)
     inCold: int                ## depth of enclosing COLD blocks: a branch body that ends
                                ## in a diverging call (`panic`, `raiseIndexError3`, an
                                ## `assert`'s failure arm). Every bounds check has one, so
@@ -768,13 +770,19 @@ proc analyse(c: var Context; n: var Cursor) =
     of IteS:
       # `(ite C T E|.)`: the arms get the cold-branch treatment `elif`/`else` get (see
       # `endsDiverging` in the `NoExpr` case); the condition runs on the hot path.
-      n.into:
-        analyse(c, n)                   # the condition
-        while n.hasMore:
-          let cold = n.kind == TagLit and endsDiverging(c, n)
-          if cold: inc c.inCold
-          analyse(c, n)
-          if cold: dec c.inCold
+      var platArm = default(Cursor)
+      if platformArm(n, c.facts, platArm):
+        # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is code
+        if platArm.kind != DotToken: analyse(c, platArm)
+        skip n
+      else:
+        n.into:
+          analyse(c, n)                 # the condition
+          while n.hasMore:
+            let cold = n.kind == TagLit and endsDiverging(c, n)
+            if cold: inc c.inCold
+            analyse(c, n)
+            if cold: dec c.inCold
     of WhileS, LoopS:
       # Treat `while cond: body` as `loop: (if cond: body else break)` — condition and
       # body are one loop body under a back-edge (no prepass; the traversal just reads it
@@ -909,13 +917,14 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   cleanCallees: HashSet[SymId] = initHashSet[SymId]();
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
-                  memCallees: Table[SymId, IntrinsicOp] = initTable[SymId, IntrinsicOp]()): ProcAnalysis =
+                  memCallees: Table[SymId, IntrinsicOp] = initTable[SymId, IntrinsicOp]();
+                  facts: seq[string] = @[]): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   noReturnCallees: noReturnCallees, memCallees: memCallees,
-                  procIsClean: procIsClean, buf: addr buf)
+                  procIsClean: procIsClean, buf: addr buf, facts: facts)
   var n = procDecl
   assert n.stmtKind == ProcS
   when defined(arkhamPeakLive):

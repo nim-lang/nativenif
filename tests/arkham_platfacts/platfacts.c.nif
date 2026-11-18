@@ -38,10 +38,7 @@
         (stmts
          (asgn n.0 4)))))))
    (ite
-    (and
-     (defined "fact_d")
-     (not
-      (defined "fact_e")))
+    (defined "fact_d")
     (stmts
      (asgn n.0
       (add

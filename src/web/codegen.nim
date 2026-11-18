@@ -788,7 +788,8 @@ const
                               ## no Nim symbol can land on it)
 
 proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                   target = wtJs; hostImports = false): WebGen =
+                   target = wtJs; hostImports = false;
+                   facts: seq[string] = @[]): WebGen =
   setTargetWord Wasm32               # the linear-memory model: 4-byte pointers
   result = default(WebGen)
   result.tags = tags
@@ -824,7 +825,7 @@ proc createWebGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result.emitted = initHashSet[SymId]()
   result.p.symType = initTable[SymId, Cursor]()
   result.p.locals = initTable[SymId, LocalSlot]()
-  result.prog = collect(buf, inputPath, tags)
+  result.prog = collect(buf, inputPath, tags, facts = facts)
   result.callTarget = result.prog.callTarget
   for name, decl in result.prog.globals:
     result.globals[name] = decl
@@ -3557,18 +3558,24 @@ proc genStmt(g: var WebGen; c: var Cursor) =
       while t.hasMore: skip t
   of IteS:
     # `(ite C T E|.)` → `if (C) T else E`.
-    g.outp.openTree If
-    var t = c
-    t.into:
-      genExpr(g, t)                            # the condition
-      skip t
-      genStmt(g, t)                            # then
-      if t.hasMore and t.kind != DotToken:
-        g.outp.openTree Else
-        genStmt(g, t)                          # else
-        g.outp.closeTag
-      while t.hasMore: skip t
-    g.outp.closeTag
+    var platArm = default(Cursor)
+    if platformArm(c, g.prog.facts, platArm):
+      # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is
+      # code; the other may name what does not exist on this target.
+      if platArm.kind != DotToken: genStmt(g, platArm)
+    else:
+      g.outp.openTree If
+      var t = c
+      t.into:
+        genExpr(g, t)                          # the condition
+        skip t
+        genStmt(g, t)                          # then
+        if t.hasMore and t.kind != DotToken:
+          g.outp.openTree Else
+          genStmt(g, t)                        # else
+          g.outp.closeTag
+        while t.hasMore: skip t
+      g.outp.closeTag
   of BreakS:
     # An unnamed break: the innermost enclosing JS loop, which is the innermost
     # enclosing Leng loop because a `case` became an `if` chain.
@@ -3867,10 +3874,10 @@ proc lowerThunk(g: var WebGen; thunk, sym: SymId; decl: Cursor) =
 
 proc generate*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                target: WebTarget; module: var WebModule;
-               hostImports = false): TokenBuf =
+               hostImports = false; facts: seq[string] = @[]): TokenBuf =
   ## The whole program as web IR (the returned `(top …)` tree) plus the facts
   ## both renderers need besides code (`module`).
-  var g = createWebGen(buf, inputPath, tags, target, hostImports)
+  var g = createWebGen(buf, inputPath, tags, target, hostImports, facts)
   layoutProgram(g)
   var entryDecl: Cursor = default(Cursor)
   var haveEntry = false

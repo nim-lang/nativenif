@@ -17,7 +17,6 @@ import std / [parseopt, strutils, syncio]
 import nifcoreparse
 import "../arkham/core" / lengdecl
 import "../web" / [webnif, diag, codegen, jsrender, wasmrender]
-import platfacts                 # resolvePlatformFacts: the `--plat` facts
 
 const
   Version = "0.1.0"
@@ -29,7 +28,7 @@ Usage:
 
 Options:
   -o:file, --output:file   output file (default: <input>.js / <input>.wasm)
-  --plat:FACT              add a platform fact for folding Leng `(defined ...)`
+  --plat:FACT              add a platform fact for Leng `(defined ...)`
                            (repeatable; Nimony passes them)
   -h, --help               show this help
 
@@ -75,15 +74,15 @@ proc run(target: Target; input, output: string; memBytes: int; browser,
   # with the web IR pool. A buffer speaks one dialect, never both.
   let tags = lengdecl.createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  resolvePlatformFacts(buf, facts)
   var m = default(WebModule)
   case target
   of tJs:
-    var tree = generate(buf, input, tags, wtJs, m)
+    var tree = generate(buf, input, tags, wtJs, m, facts = facts)
     writeOut output, renderJs(tree, m, memBytes, ShadowStackSize,
                               browser = browser)
   of tWasm:
-    var tree = generate(buf, input, tags, wtWasm, m, hostImports = hostImports)
+    var tree = generate(buf, input, tags, wtWasm, m, hostImports = hostImports,
+                        facts = facts)
     let code = renderWasm(tree, m, ShadowStackSize, exportAll = exportAll)
     var s = newString(code.len)
     for i, b in code: s[i] = char(b)
@@ -151,7 +150,6 @@ proc main() =
   # the exit code. `diag.refuse` prints it and quits at the site, so the file it
   # names has to be handed over first.
   setInputFile input
-  setPlatformFacts(facts) # foreign decls `programs.nim` loads resolve too
   run(target, input, output, memBytes, browser, hostImports, exportAll, facts)
 
 when isMainModule:

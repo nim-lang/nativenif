@@ -18,7 +18,6 @@
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import core/lengdecl             # createLengTagPool
-import platfacts                 # resolvePlatformFacts: `--os`/`--cpu`/`--plat` facts
 import core/layout               # the --layout: board file
 import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
                                 # which is why it reads as an unused import
@@ -42,7 +41,7 @@ Options:
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr | riscv32
                            (default: host)
-  --plat:FACT              add a platform fact for folding Leng `(defined ...)`
+  --plat:FACT              add a platform fact for Leng `(defined ...)`
                            (repeatable). `--os:x` and `--cpu:x` imply the fact
                            `x`; Nimony passes the rest (`posix`, `bsd`, ...)
   --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
@@ -143,20 +142,17 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool;
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  # `(defined ...)` is folded before anything looks at the module; foreign
-  # decls are folded as `programs.nim` loads them (`setPlatformFacts`).
-  resolvePlatformFacts(buf, facts)
   let code = case arch
-             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
-             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
-             of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true)
-             of "arm64", "aarch64", "": generateA64(buf, input, tags)
-             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true, crtEntry = crt)
+             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt, facts = facts)
+             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt, facts = facts)
+             of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true, facts = facts)
+             of "arm64", "aarch64", "": generateA64(buf, input, tags, facts = facts)
+             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true, crtEntry = crt, facts = facts)
              of "cortex_m", "cortexm", "thumbm":
-               generateCortexM(buf, input, tags, board)
-             of "avr": generateAvr(buf, input, tags)
+               generateCortexM(buf, input, tags, board, facts)
+             of "avr": generateAvr(buf, input, tags, facts)
              of "riscv32", "rv32":
-               generateRv32(buf, input, tags, board)
+               generateRv32(buf, input, tags, board, facts)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   onRaiseQuit writeFile(output, code)
 
@@ -202,7 +198,6 @@ proc main() =
     # `--os:x`/`--cpu:x` imply the platform fact `x`
     facts.add os
     facts.add cpu
-  setPlatformFacts(facts)
   run(input, output, arch, board, crt, facts)
   when defined(arkhamTempDbg): dumpTempStats()
 

@@ -522,28 +522,36 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   of IteS:
     # `(ite C T E|.)`. Same rules as the `IfS` arm below: a fused condition skips the
     # cmov attempt, an arm in tail position may return instead of jumping to `lEnd`.
-    let fusedSym = g.condFuseSym(c)
-    let isFused = fusedSym != NoSymId and g.condFuse.tag.hasKey(fusedSym)
-    if isFused or not g.tryEmitCmov(c):
-      var condC, thenC, elseC = default(Cursor)
-      discard twoWayParts(c, condC, thenC, elseC)
-      var endC = c; skip endC                          # nothing follows the arms
-      let tailFlags = armFlags(flags, endC)
-      let jmpTarget = if hasArm(elseC): NoSymId else: jmpOnlyTarget(thenC)
-      if jmpTarget != NoSymId:
-        g.emitCond(condC, jmpTarget, whenTrue = true)  # `(ite C (jmp L) .)`
-      else:
-        let lElse = g.freshLabel()
-        g.emitCond(condC, lElse, whenTrue = false)
-        g.genStmt(thenC, tailFlags)
-        if hasArm(elseC):
-          let lEnd = g.freshLabel()
-          if not (TailPos in flags and g.emReturnHere()): g.emJmp(lEnd)
-          g.emLab(lElse)
-          g.genStmt(elseC, tailFlags)
-          g.emLab(lEnd)
+    var platArm = default(Cursor)
+    if platformArm(c, g.prog.facts, platArm):
+      # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is
+      # code; the other may name what does not exist on this target.
+      if platArm.kind != DotToken:
+        var endC = c; skip endC
+        g.genStmt(platArm, armFlags(flags, endC))
+    else:
+      let fusedSym = g.condFuseSym(c)
+      let isFused = fusedSym != NoSymId and g.condFuse.tag.hasKey(fusedSym)
+      if isFused or not g.tryEmitCmov(c):
+        var condC, thenC, elseC = default(Cursor)
+        discard twoWayParts(c, condC, thenC, elseC)
+        var endC = c; skip endC                          # nothing follows the arms
+        let tailFlags = armFlags(flags, endC)
+        let jmpTarget = if hasArm(elseC): NoSymId else: jmpOnlyTarget(thenC)
+        if jmpTarget != NoSymId:
+          g.emitCond(condC, jmpTarget, whenTrue = true)  # `(ite C (jmp L) .)`
         else:
-          g.emLab(lElse)
+          let lElse = g.freshLabel()
+          g.emitCond(condC, lElse, whenTrue = false)
+          g.genStmt(thenC, tailFlags)
+          if hasArm(elseC):
+            let lEnd = g.freshLabel()
+            if not (TailPos in flags and g.emReturnHere()): g.emJmp(lEnd)
+            g.emLab(lElse)
+            g.genStmt(elseC, tailFlags)
+            g.emLab(lEnd)
+          else:
+            g.emLab(lElse)
   of IfS:
     # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
     # select on — the answer is in the flags and only `emitCond` knows how to spend it.
