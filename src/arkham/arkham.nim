@@ -18,7 +18,7 @@
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import core/lengdecl             # createLengTagPool
-import whenplat                  # resolveWhenplats: `--os`/`--cpu`/`--plat` facts
+import platfacts                 # resolvePlatformFacts: `--os`/`--cpu`/`--plat` facts
 import core/layout               # the --layout: board file
 import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
                                 # which is why it reads as an unused import
@@ -42,7 +42,7 @@ Options:
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr | riscv32
                            (default: host)
-  --plat:FACT              add a platform fact for resolving Leng `whenplat`
+  --plat:FACT              add a platform fact for folding Leng `(defined ...)`
                            (repeatable). `--os:x` and `--cpu:x` imply the fact
                            `x`; Nimony passes the rest (`posix`, `bsd`, ...)
   --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
@@ -143,10 +143,9 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool;
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  # `whenplat` is resolved before anything looks at the module; foreign decls
-  # are resolved as `programs.nim` loads them (`setPlatformFacts`).
-  let platErr = resolveWhenplats(buf, facts)
-  if platErr.len > 0: quit("arkham: " & platErr, QuitFailure)
+  # `(defined ...)` is folded before anything looks at the module; foreign
+  # decls are folded as `programs.nim` loads them (`setPlatformFacts`).
+  resolvePlatformFacts(buf, facts)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)

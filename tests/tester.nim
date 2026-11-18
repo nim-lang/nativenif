@@ -845,40 +845,38 @@ proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
   echo passed, " / ", total - skipped, " arkham ", label, "tests successful (",
        skipped, " known-unsupported skipped)"
 
-proc arkhamWhenplatTests(arch = (when defined(macosx): "arm64" else: "x64")) =
-  ## Leng `whenplat` is resolved by arkham against its platform facts
-  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`). One fixture, run once per fact
-  ## set: the first branch with a matching label wins (`fact_c` beats `fact_b`),
-  ## else the `else` branch, and a `whenplat` nested in the taken branch is
-  ## resolved too. A `whenplat` with no match and no `else` does not compile.
+proc arkhamPlatfactsTests(arch = (when defined(macosx): "arm64" else: "x64")) =
+  ## Leng `(defined "a" "b")` is folded by arkham against its platform facts
+  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`), and an `ite` it decides is
+  ## replaced by its taken branch. One fixture, run once per fact set: an
+  ## `elif` chain (`fact_c` beats `fact_b`), a nested test, and `and`/`not`
+  ## over `defined`. The never-taken first branch calls a proc that does not
+  ## exist, so the fixture only compiles if dead branches are really dropped.
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
-  let dir = "tests" / "arkham_whenplat"
+  let dir = "tests" / "arkham_platfacts"
   let workDir = dir / "nimcache"
   createDir workDir
   const cases = [
     ("", 4),
     ("--plat:fact_b", 3),
     ("--plat:fact_b --plat:inner", 30),
-    ("--plat:fact_c --plat:fact_b", 2)]
+    ("--plat:fact_c --plat:fact_b", 2),
+    ("--plat:fact_d", 104),
+    ("--plat:fact_d --plat:fact_e", 4)]
   var passed = 0
   for (plats, expected) in cases:
-    let asmNif = workDir / "whenplat.asm.nif"
-    let exe = workDir / "whenplat.out"
+    let asmNif = workDir / "platfacts.asm.nif"
+    let exe = workDir / "platfacts.out"
     exec quoteShell(arkham) & " -a:" & arch & " " & plats & " -o:" &
-         quoteShell(asmNif) & " " & quoteShell(dir / "whenplat.c.nif")
+         quoteShell(asmNif) & " " & quoteShell(dir / "platfacts.c.nif")
     exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
     let (po, pc) = runProgram(exe)
     if pc != expected:
-      quit "FAILURE whenplat [" & plats & "]: exitcode " & $expected &
+      quit "FAILURE platfacts [" & plats & "]: exitcode " & $expected &
            " expected but got " & $pc & "\n" & po
     inc passed
-  execExpectFailure(quoteShell(arkham) & " --os:linux --cpu:amd64 -o:" &
-                    quoteShell(workDir / "err_nomatch.asm.nif") & " " &
-                    quoteShell(dir / "err_nomatch.c.nif"),
-                    "no `whenplat` branch matches the platform facts [linux, amd64]")
-  inc passed
-  echo passed, " / ", cases.len + 1, " arkham whenplat tests successful"
+  echo passed, " / ", cases.len, " arkham platform-fact tests successful"
 
 # ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
 #
@@ -2791,7 +2789,7 @@ arkhamAvrRejections()
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
-  arkhamWhenplatTests()
+  arkhamPlatfactsTests()
   arkhamPtrCmpTests()
   # The same corpus again, against a starved register file. Every argument is
   # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes
