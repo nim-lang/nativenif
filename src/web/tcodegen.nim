@@ -70,6 +70,14 @@ proc fixturePath: string =
   quit "tcodegen: fixtures/tdata1.c.nif not found"
 
 let tags = createLengTagPool()   # NOT the web IR pool: a buffer is Leng-tagged or JS-tagged, never both
+
+if paramCount() == 2 and paramStr(1) == "--generate":
+  # Child mode for the refusal checks: `refuse` quits, so a refusal is read off
+  # a process, not caught.
+  var cbuf = parseFromFile(paramStr(2), sharedTags = tags)
+  var cm = default(WebModule)
+  discard generate(cbuf, paramStr(2), tags, wtJs, cm)
+  quit 0
 let path = fixturePath()
 var buf = parseFromFile(path, sharedTags = tags)
 var g = createWebGen(buf, path, tags)
@@ -151,5 +159,156 @@ console.log(U8[$6]);
   let r = execCmdEx(nodeExe & " " & quoteShell(jsPath))
   expect "engine reads the image back", strip(r.output),
     "14\nhello jorogumo\ntrue\n4294967296\n7,8,9\n1,0\n0"
+
+# Each fixture is a program run under node, so the engine is the judge:
+# generate, render, run, compare. An older fixture exits with the sum of the
+# checks it passes; a newer one prints one counter or value per line (an
+# `importjs` `console.log` splice) and exits 0, so no two failures can add up
+# to the expected code. What each fixture checks:
+#
+# * tsplice: the frame plan and the lowering walk the same tree. An `importjs`
+#   splice reserves no sret temporary; a reservation nobody took shifted every
+#   later temporary (a 12-byte constructor met an 8-byte slot). It splices a
+#   string, builds a pair of strings, calls a splice through `onerr` (which
+#   reaches it like a `call`, string argument and all) and passes a constructor
+#   to a call: 3 + 3 + (5 + 7 + 11). The fixture stubs the runtime's string
+#   bridge entry points, which a string splice calls.
+# * tgrowstore: a store whose value is a call that grows linear memory must land
+#   in the NEW buffer, not the one JS read `DV` from before the call (5), and a
+#   load through a pointer such a call returns must read the new buffer (7),
+#   and so must a store through such a pointer (20). A lost store leaves the
+#   global 0; a stale load reads the 0 the old buffer still holds.
+#
+# The string fixtures below stub the runtime's entry points
+# (`nimStrBeginStore`, `nimStrEndStore`, `nimStrBridgeDestroy`,
+# `nimStrBridgeCstr`, `nimStrBridgeData`, `nimStrBridgeLen`) over a string
+# layout of their own, `(len, data)`, which is not the runtime's: the bridge
+# must build and read a string through them alone. `begin` heads each buffer
+# with a magic word and the address of the string it was built for, and
+# `destroy` counts as good only a string `begin` built at that very address and
+# not yet destroyed; anything else is a bad destroy.
+#
+# * tstrbridge: a string an `importjs` proc returns is an ordinary owned Nim
+#   string, built in a frame temporary of the caller and read back through
+#   `data`/`len` when it is a splice argument: 10 chars, 3, empty, and three
+#   two-byte UTF-8 chars (6 bytes); two live results of one expression do not
+#   share a slot (10 * 100 + 13); every begin has its end (6 and 6).
+# * toomstr: the runtime's `nimStrBeginStore` returns nil when the allocation
+#   failed and leaves the string as its OOM marker (here `len` -1). The bridge
+#   must then write no bytes (word 0 stays as it was) and not call `end`.
+# * tcbargs: a callback taking a `string` and a `cstring`, fired three times.
+#   It reads both right (1 + 2 each call, 9). The wrapper builds both as Nim
+#   strings in its frame (6 begins, 6 ends), passes the cstring through
+#   `nimStrBridgeCstr` (3) and destroys each string at its own address after
+#   the call (6 good destroys, 0 bad).
+# * tcbstring: a callback that returns a `string`, an aggregate, so the Nim
+#   proc takes its result slot as a hidden first parameter; fired with a
+#   parameter and with none, each as a named proc and as a stored proc value.
+#   The host sees "alphabet" twice and "zero" twice. Each result is built by
+#   the callee and moved into the wrapper's result slot, so this fixture's
+#   `destroy` checks the buffer, not the address it was built at, and empties
+#   the string: a result destroyed before its conversion would print empty.
+#   6 begins and ends (2 arguments, 4 results), 6 good destroys, 0 bad.
+# * tnull: JS `null` and `undefined` are the empty string (a string splice
+#   returning either: length 0 twice) and the nil cstring (a cstring splice
+#   returning either: nil twice), not the text "null". A callback fired with
+#   (null, undefined) gets the nil cstring and the empty string; the wrapper
+#   still destroys both slots (2 good destroys, 0 bad).
+# * tcallback: fires a named proc and a stored fn-ptr with `null`, `undefined`,
+#   an object, a function and a number: the first two must arrive as nil (+1
+#   each), the object and the function as handles (+2 each), the number
+#   untouched (+16). A JS function handed to a callback that returns it comes
+#   back as the same function (+32).
+# * tcbident: a Nim proc that needs a wrapper is one JS function however it
+#   crosses: named twice (+1), as a stored value and by name (+2), as a stored
+#   value twice (+4); two different procs are two functions (+8). One proc
+#   handed over with two signatures that bridge differently is two functions:
+#   as `proc (p: H): H` its result is the JS object again (+16), and cast to
+#   `proc (p: H): int` afterwards, a number (+32), not what the first site's
+#   wrapper made of it. A proc that needs no wrapper as `proc (o: int)`
+#   (fired with 7, so not nil: +64) and one as `proc (o: H)` (fired with null,
+#   so nil: +128) is two functions too, in that order.
+# * tnil: Nim nil into JS is null: a nil proc that needs no wrapper (+1), one
+#   that does (+2), and a nil cstring (+4).
+# * tcbthrow: a callback with a 4 KiB frame throws into a JS host that catches
+#   it 1000 times (4 MiB of frames on a 64 KiB stack). The host boundary
+#   restores SP, so the loop survives and SP is back where it started (1, plus
+#   4 from main). Without the restore it dies of "stack overflow".
+# * thandle: one JS value has one handle: `globalThis` twice is the same
+#   handle (+1), two fresh objects are two (+2), and a handle that goes through
+#   an `importjs` identity splice comes back equal (+4).
+type FixtureRun = object
+  file, label: string
+  exitCode: int
+  output: string    ## the expected output, when the fixture prints its checks
+
+const fixtureRuns = [
+  FixtureRun(file: "tsplice", exitCode: 29,
+             label: "splice then constructors: the plan matches the lowering"),
+  FixtureRun(file: "tgrowstore", exitCode: 32,
+             label: "a load or store whose operand grows memory uses the live buffer"),
+  FixtureRun(file: "tstrbridge", exitCode: 0,
+             output: "0123456789\nabc\n0\nαβγ\n6\n1013\n6\n6",
+             label: "bridged strings are built and read through the runtime's entry points"),
+  FixtureRun(file: "toomstr", exitCode: 0, output: "-1\n0\n0",
+             label: "a failed string allocation: no write through nil, no end"),
+  FixtureRun(file: "tcbargs", exitCode: 0, output: "9\n6\n6\n3\n6\n0",
+             label: "callback string and cstring arguments: owned by the wrapper, freed"),
+  FixtureRun(file: "tcbstring", exitCode: 0,
+             output: "alphabet\nalphabet\nzero\nzero\n6\n6\n6\n0",
+             label: "string-result callbacks: the result slot first, destroyed after conversion"),
+  FixtureRun(file: "tnull", exitCode: 0, output: "0\n0\n1\n1\n1\n0\n2\n0",
+             label: "JS null into Nim: the empty string, the nil cstring"),
+  FixtureRun(file: "tcallback", exitCode: 54,
+             label: "handle callback arguments: null, undefined, object, function, number"),
+  FixtureRun(file: "tcbident", exitCode: 255,
+             label: "callback identity: one JS function per Nim proc"),
+  FixtureRun(file: "tnil", exitCode: 7,
+             label: "Nim nil into JS: null for a nil proc and a nil cstring"),
+  FixtureRun(file: "tcbthrow", exitCode: 5,
+             label: "a callback that throws into a catching host leaves SP restored"),
+  FixtureRun(file: "thandle", exitCode: 7,
+             label: "handle identity: one JS value, one handle")]
+
+proc runFixture(dir, name, nodeExe: string): (string, int) =
+  ## Generate `name`.c.nif in `dir`, render it as JS and run it under node.
+  let fixture = dir / name & ".c.nif"
+  var fbuf = parseFromFile(fixture, sharedTags = tags)
+  var fmod = default(WebModule)
+  var ftree = generate(fbuf, fixture, tags, wtJs, fmod)
+  let js = getTempDir() / "jorogumo_" & name & "_" & $getCurrentProcessId() & ".js"
+  writeFile(js, renderJs(ftree, fmod, 64 * 1024 * 1024, 64 * 1024))
+  defer: removeFile(js)
+  execCmdEx(nodeExe & " " & quoteShell(js))
+
+if nodeExe.len > 0:
+  for r in fixtureRuns:
+    let (output, code) = runFixture(path.parentDir, r.file, nodeExe)
+    # The exit codes above are the POSIX status, the low 8 bits of what the
+    # program passed to `exit`; node on Windows reports all 32 bits, so compare
+    # the part every host reports.
+    check r.label, (code and 0xFF) == r.exitCode and
+      (r.output.len == 0 or strip(output) == r.output),
+      "exit " & $code & "\n" & output
+
+# `refuse` quits, so a refusal is read off a process (`--generate`). A plain
+# aggregate has no JS spelling as a splice RESULT (an argument is its address):
+# refused, naming the proc, rather than read back as garbage.
+type Refusal = object
+  fixture, label: string
+  needles: seq[string]     ## what the message must contain
+
+proc refusal(fixture: string): (string, int) =
+  execCmdEx(quoteShell(getAppFilename()) & " --generate " &
+            quoteShell(path.parentDir / fixture & ".c.nif"),
+            options = {poStdErrToStdOut})
+
+for r in [Refusal(fixture: "tsplice_aggret", label: "aggregate splice result refused by name",
+                  needles: @["importjs proc `mk.0", "aggregate"])]:
+  let (output, code) = refusal(r.fixture)
+  var named = true
+  for needle in r.needles:
+    named = named and output.contains(needle)
+  check r.label, code != 0 and named, output
 
 echo "tcodegen: all checks passed"

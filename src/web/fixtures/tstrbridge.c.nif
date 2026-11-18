@@ -1,0 +1,65 @@
+(.nif27)
+(stmts@,1,tstrbridge.nim
+ (type :string.0.tstrbridge . (object . (fld :len.0 . (i 32)) (fld :data.0 . (ptr (u 8)))))
+ (gvar :bump.0 . (i 32) 1048576)
+ (gvar :begins.0 . (i 32) 0)
+ (gvar :ends.0 . (i 32) 0)
+ (gvar :goodDestroys.0 . (i 32) 0)
+ (gvar :badDestroys.0 . (i 32) 0)
+ (gvar :cstrs.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0. (params (param :s.0 . (ptr string.0.tstrbridge)) (param :n.0 . (i 32))) (ptr (u 8)) .
+  (stmts
+   (asgn begins.0 (add (i 32) begins.0 1))
+   (var :p.0 . (i 32) bump.0)
+   (asgn bump.0 (add (i 32) bump.0 (add (i 32) n.0 16)))
+   (asgn (deref (cast (ptr (i 32)) p.0)) 1414743380)
+   (asgn (deref (cast (ptr (i 32)) (add (i 32) p.0 4))) (cast (i 32) s.0))
+   (asgn (dot (deref s.0) len.0 0) n.0)
+   (asgn (dot (deref s.0) data.0 0) (cast (ptr (u 8)) (add (i 32) p.0 8)))
+   (ret (dot (deref s.0) data.0 0))))
+ (proc :nimStrEndStore.0. (params (param :s.0 . (ptr string.0.tstrbridge))) . .
+  (stmts (asgn ends.0 (add (i 32) ends.0 1))))
+ (proc :nimStrBridgeDestroy.0. (params (param :s.0 . (ptr string.0.tstrbridge))) . .
+  (stmts
+   (var :h.0 . (i 32) (sub (i 32) (cast (i 32) (dot (deref s.0) data.0 0)) 8))
+   (if
+    (elif
+     (and (le 1048576 h.0) (and (lt h.0 bump.0)
+      (and (eq (deref (cast (ptr (i 32)) h.0)) 1414743380)
+       (eq (deref (cast (ptr (i 32)) (add (i 32) h.0 4))) (cast (i 32) s.0)))))
+     (stmts
+      (asgn goodDestroys.0 (add (i 32) goodDestroys.0 1))
+      (asgn (deref (cast (ptr (i 32)) h.0)) 0)))
+    (else (stmts (asgn badDestroys.0 (add (i 32) badDestroys.0 1)))))))
+ (proc :nimStrBridgeCstr.0. (params (param :s.0 . (ptr string.0.tstrbridge))) (aptr (c 8)) .
+  (stmts
+   (asgn cstrs.0 (add (i 32) cstrs.0 1))
+   (ret (cast (aptr (c 8)) (dot (deref s.0) data.0 0)))))
+ (proc :nimStrBridgeData.0. (params (param :s.0 . string.0.tstrbridge)) (ptr (u 8)) .
+  (stmts (ret (dot s.0 data.0 0))))
+ (proc :nimStrBridgeLen.0. (params (param :s.0 . string.0.tstrbridge)) (i 32) .
+  (stmts (ret (dot s.0 len.0 0))))
+ (proc :show.0. (params (param :n.0 . (i 32))) . (pragmas (importjs "console.log(#)")) (stmts .))
+ (proc :lng.0. (params) string.0.tstrbridge (pragmas (importjs "'0123456789'")) (stmts .))
+ (proc :lng2.0. (params) string.0.tstrbridge (pragmas (importjs "'abcdefghijklm'")) (stmts .))
+ (proc :sht.0. (params) string.0.tstrbridge (pragmas (importjs "'abc'")) (stmts .))
+ (proc :emp.0. (params) string.0.tstrbridge (pragmas (importjs "''")) (stmts .))
+ (proc :uni.0. (params) string.0.tstrbridge (pragmas (importjs "'αβγ'")) (stmts .))
+ (proc :say.0. (params (param :v.0 . string.0.tstrbridge)) . (pragmas (importjs "console.log(#)")) (stmts .))
+ (proc :len.0. (params (param :v.0 . string.0.tstrbridge)) (i 32) (pragmas (importjs "#.length")) (stmts .))
+ (proc :sum2.0. (params (param :a.0 . string.0.tstrbridge) (param :b.0 . string.0.tstrbridge)) (i 32) (pragmas (importjs "(#.length * 100 + #.length)")) (stmts .))
+ (proc :main.0. (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (var :x.0 . string.0.tstrbridge (call lng.0.))
+   (var :y.0 . string.0.tstrbridge (call sht.0.))
+   (var :z.0 . string.0.tstrbridge (call emp.0.))
+   (var :u.0 . string.0.tstrbridge (call uni.0.))
+   (call say.0. x.0)
+   (call say.0. y.0)
+   (call show.0. (call len.0. z.0))
+   (call say.0. u.0)
+   (call show.0. (dot u.0 len.0 0))
+   (call show.0. (call sum2.0. (call lng.0.) (call lng2.0.)))
+   (call show.0. begins.0)
+   (call show.0. ends.0)
+   (ret 0))))

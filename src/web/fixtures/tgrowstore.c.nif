@@ -1,0 +1,58 @@
+(.nif27)
+(stmts@,1,tgrowstore.nim
+ (gvar :h.0 . (i 32) 0)
+ (gvar :k.0 . (i 32) 0)
+ (gvar :m.0 . (i 32) 0)
+ (proc :exit.0
+  (params
+   (param :code.0 . (i 32)))
+  .
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :grow.0.
+  (params)
+  .
+  (pragmas
+   (importjs "memoryGrow(1)"))
+  (stmts .))
+ (proc :five.0.
+  (params)
+  (i 32) .
+  (stmts
+   (call grow.0.)
+   (ret 5)))
+ (proc :kAddr.0.
+  (params)
+  (ptr (i 32)) .
+  (stmts
+   (call grow.0.)
+   (asgn k.0 7)
+   (ret
+    (addr k.0))))
+ (proc :mAddr.0.
+  (params)
+  (ptr (i 32)) .
+  (stmts
+   (call grow.0.)
+   (ret
+    (addr m.0))))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn h.0
+    (call five.0.))
+   (asgn
+    (deref
+     (call mAddr.0.)) 20)
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32) h.0
+      (deref
+       (call kAddr.0.))) m.0))
+   (ret 0))))

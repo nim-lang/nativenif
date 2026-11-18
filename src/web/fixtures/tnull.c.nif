@@ -1,0 +1,66 @@
+(.nif27)
+(stmts@,1,tnull.nim
+ (type :string.0.tnull . (object . (fld :len.0 . (i 32)) (fld :data.0 . (ptr (u 8)))))
+ (gvar :bump.0 . (i 32) 1048576)
+ (gvar :begins.0 . (i 32) 0)
+ (gvar :ends.0 . (i 32) 0)
+ (gvar :goodDestroys.0 . (i 32) 0)
+ (gvar :badDestroys.0 . (i 32) 0)
+ (gvar :cstrs.0 . (i 32) 0)
+ (proc :nimStrBeginStore.0. (params (param :s.0 . (ptr string.0.tnull)) (param :n.0 . (i 32))) (ptr (u 8)) .
+  (stmts
+   (asgn begins.0 (add (i 32) begins.0 1))
+   (var :p.0 . (i 32) bump.0)
+   (asgn bump.0 (add (i 32) bump.0 (add (i 32) n.0 16)))
+   (asgn (deref (cast (ptr (i 32)) p.0)) 1414743380)
+   (asgn (deref (cast (ptr (i 32)) (add (i 32) p.0 4))) (cast (i 32) s.0))
+   (asgn (dot (deref s.0) len.0 0) n.0)
+   (asgn (dot (deref s.0) data.0 0) (cast (ptr (u 8)) (add (i 32) p.0 8)))
+   (ret (dot (deref s.0) data.0 0))))
+ (proc :nimStrEndStore.0. (params (param :s.0 . (ptr string.0.tnull))) . .
+  (stmts (asgn ends.0 (add (i 32) ends.0 1))))
+ (proc :nimStrBridgeDestroy.0. (params (param :s.0 . (ptr string.0.tnull))) . .
+  (stmts
+   (var :h.0 . (i 32) (sub (i 32) (cast (i 32) (dot (deref s.0) data.0 0)) 8))
+   (if
+    (elif
+     (and (le 1048576 h.0) (and (lt h.0 bump.0)
+      (and (eq (deref (cast (ptr (i 32)) h.0)) 1414743380)
+       (eq (deref (cast (ptr (i 32)) (add (i 32) h.0 4))) (cast (i 32) s.0)))))
+     (stmts
+      (asgn goodDestroys.0 (add (i 32) goodDestroys.0 1))
+      (asgn (deref (cast (ptr (i 32)) h.0)) 0)))
+    (else (stmts (asgn badDestroys.0 (add (i 32) badDestroys.0 1)))))))
+ (proc :nimStrBridgeCstr.0. (params (param :s.0 . (ptr string.0.tnull))) (aptr (c 8)) .
+  (stmts
+   (asgn cstrs.0 (add (i 32) cstrs.0 1))
+   (ret (cast (aptr (c 8)) (dot (deref s.0) data.0 0)))))
+ (proc :nimStrBridgeData.0. (params (param :s.0 . string.0.tnull)) (ptr (u 8)) .
+  (stmts (ret (dot s.0 data.0 0))))
+ (proc :nimStrBridgeLen.0. (params (param :s.0 . string.0.tnull)) (i 32) .
+  (stmts (ret (dot s.0 len.0 0))))
+ (proc :show.0. (params (param :n.0 . (i 32))) . (pragmas (importjs "console.log(#)")) (stmts .))
+ (type :Cb.0.tnull . (proctype . (params (param :c.0 . (aptr (c 8))) (param :s.0 . string.0.tnull)) . .))
+ (proc :nullStr.0. (params) string.0.tnull (pragmas (importjs "null")) (stmts .))
+ (proc :undefStr.0. (params) string.0.tnull (pragmas (importjs "undefined")) (stmts .))
+ (proc :undefCs.0. (params) (aptr (c 8)) (pragmas (importjs "undefined")) (stmts .))
+ (proc :nullCs.0. (params) (aptr (c 8)) (pragmas (importjs "null")) (stmts .))
+ (proc :fireNull.0. (params (param :cb.0 . Cb.0.tnull)) . (pragmas (importjs "#(null, undefined)")) (stmts .))
+ (proc :isNil.0. (params (param :c.0 . (aptr (c 8)))) (i 32) .
+  (stmts (if (elif (eq c.0 (nil)) (stmts (ret 1)))) (ret 0)))
+ (proc :probe.0. (params (param :c.0 . (aptr (c 8))) (param :s.0 . string.0.tnull)) . .
+  (stmts
+   (call show.0. (call isNil.0. c.0))
+   (call show.0. (dot s.0 len.0 0))))
+ (proc :main.0. (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (var :a.0 . string.0.tnull (call nullStr.0.))
+   (var :b.0 . string.0.tnull (call undefStr.0.))
+   (call show.0. (dot a.0 len.0 0))
+   (call show.0. (dot b.0 len.0 0))
+   (call show.0. (call isNil.0. (call undefCs.0.)))
+   (call show.0. (call isNil.0. (call nullCs.0.)))
+   (call fireNull.0. probe.0.)
+   (call show.0. goodDestroys.0)
+   (call show.0. badDestroys.0)
+   (ret 0))))
