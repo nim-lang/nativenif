@@ -28,4 +28,47 @@
     (i 64)
     (conv
      (i 64)h.0))
+   (var :z.0 .
+    (bool)
+    (conv
+     (bool)
+     (div
+      (f 64)d.0 14.0)))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 64)z.0)1)
+     (stmts
+      (call exit.0 11))))
+   (if
+    (elif
+     (not
+      (conv
+       (bool)
+       (div
+        (f 64)d.0 28.0)))
+     (stmts
+      (call exit.0 12))))
+   (var :q.0 .
+    (f 32)
+    (conv
+     (f 32)
+     (div
+      (f 64)d.0 14.0)))
+   (if
+    (elif
+     (not
+      (conv
+       (bool)q.0))
+     (stmts
+      (call exit.0 13))))
+   (if
+    (elif
+     (conv
+      (bool)
+      (mul
+       (f 64)d.0 -0.0))
+     (stmts
+      (call exit.0 14))))
    (call exit.0 r.0))))(.index)

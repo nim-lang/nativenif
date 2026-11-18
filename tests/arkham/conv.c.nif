@@ -24,4 +24,28 @@
     (i 64)
     (cast
      (i 64)b.0))
+   (var :w.0 .
+    (i 32)256)
+   (var :t.0 .
+    (bool)
+    (conv
+     (bool)w.0))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 32)t.0)1)
+     (stmts
+      (call exit.0 11))))
+   (var :k.0 .
+    (bool)
+    (conv
+     (bool)2))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 32)k.0)1)
+     (stmts
+      (call exit.0 12))))
    (call exit.0 c.0))))(.index)

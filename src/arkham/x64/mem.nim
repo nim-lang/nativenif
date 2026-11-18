@@ -209,6 +209,12 @@ proc cmpZero*(g: var CodeGen; r: Reg) =
   ## any condition code. 2326 sites in a self-hosted image.
   g.binReg(TestX64, r, r)
 
+proc nonZeroTo01*(g: var CodeGen; r: Reg) =
+  ## `r = ord(r != 0)`: what a conversion to `bool` makes of the value.
+  g.cmpZero r
+  g.ab.tree SetneX64: g.emReg r
+  g.binImm(AndX64, r, 1)                      # `setne` writes the low byte only
+
 proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: SymId) =
   ## `dest ← &global` — RIP-relative `lea` (nifasm resolves the gvar to a
   ## `.bss`/`.data` address). An importc/exportc gvar is referenced by its bare C name

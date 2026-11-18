@@ -1945,6 +1945,7 @@ proc genExpr(g: var WebGen; c: Cursor) =
       var t = c
       t.into:
         let dst = widthOf(g, t)
+        let toBool = c.exprKind == ConvC and slotOf(g.prog, t).kind == ABool   # `x != 0`
         skip t
         let src = litWidth(g, t)
         # `cast` reinterprets the BIT PATTERN, so widening it zero-extends
@@ -1964,6 +1965,12 @@ proc genExpr(g: var WebGen; c: Cursor) =
             err g, "cast between " & $src & " and " & $dst & " of different sizes"
           g.outp.reintNode(src, dst):
             genExpr(g, t)
+        elif toBool:
+          g.outp.openTree Neq
+          g.outp.width src
+          g.genExprCoerced(t, src)
+          intLitAs(g, 0, false, src)
+          g.outp.closeTag
         elif fromW == dst and src == dst:
           genExpr(g, t)
         else:

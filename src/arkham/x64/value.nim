@@ -2363,7 +2363,12 @@ proc emitBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     # nifasm rejects as a register collision (a dropped source operand), which is
     # the check worth keeping. (Integer only: `emitBin` never sees floats.)
     if ek == SubC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
-    else: g.emitValue(lhsC, dest)
+    else:
+      # Into a register of its own unless the caller pinned one: a bare symbol
+      # would hand up `x`'s home, and a consumer that re-represents a computed
+      # operand in place (`int8(x and x)`'s extend) would rewrite `x` itself.
+      g.forceRegDest(dest)
+      g.emitValue(lhsC, dest)
     return
   let isShift = ek in {ShlC, ShrC}
   let varShift = isShift and g.md.shiftCountReg != NoReg and not isConstShiftCount(rhsC)
@@ -2686,17 +2691,6 @@ proc emitDivByMagic(g: var CodeGen; divC: Cursor; dval: int64;
   if nR != NoReg: g.giveBack nR
   g.settleResultReg(dest, acc)
 
-proc subtreeHasDivMod(n: Cursor): bool =
-  ## Does the expression contain a `div`/`mod` (which runs through rax/rdx)?
-  result = false
-  if n.kind != TagLit: return
-  if n.exprKind in {DivC, ModC}: return true
-  var m = n
-  m.into:
-    while m.hasMore:
-      if subtreeHasDivMod(m): return true
-      skip m
-
 proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
   ## (never rax/rdx — the temp pools exclude both); the result (rax quotient /
@@ -2756,22 +2750,26 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
     return
   var aD = regLoc(acc, ScalarSlot)
   var dD = needsReg(ScalarSlot)
-  if subtreeHasDivMod(dvsC):
-    # The divisor is itself a division: it runs through rax/rdx, so a dividend
-    # parked in rax first would be overwritten by it (`p div ((p div q) or 1)`
-    # divided the INNER quotient). Evaluate the divisor first — into a pool
-    # register, which is never rax/rdx — then the dividend.
-    g.emitValue(dvsC, dD)                               # divisor → a register
-    g.emitValue(divC, aD)                               # dividend → rax
-  else:
-    g.emitValue(divC, aD)                               # dividend → rax
-    g.emitValue(dvsC, dD)                               # divisor → a register
+  # The divisor first, into a pool register (never rax/rdx) or, pool-dry, a
+  # stack slot; then the dividend into rax. The other order parks the dividend
+  # in rax across the divisor's evaluation, which may take rax for its own
+  # steps: a divisor that is itself a division runs through rax/rdx
+  # (`p div ((p div q) or 1)` divided the INNER quotient), and a pool-dry
+  # `cast[uint64](f) or 1` staged its bits in rax and divided itself.
+  g.emitValue(dvsC, dD)                                 # divisor → a register
+  g.emitValue(divC, aD)                                 # dividend → rax
   if dD.kind == InReg and (dD.r == g.md.intRetReg or dD.r == g.md.divRemReg):
     raiseAssert "arkham: div/mod divisor aliases rax/rdx"
   var dvsLoc = dD
   var dvsStaging = NoReg
-  if dvsLoc.kind != InReg:                              # spilled divisor → staging (not rax/rdx)
-    dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ)
+  # A spilled divisor is a 64-bit slot written by a full 64-bit store; nifasm's
+  # r/m64 `div` reads it as it stands, needing no (pool-dry: absent) staging reg.
+  let dvsInSlot = dvsLoc.kind == NamedStack and dvsLoc.typ.size in {4, 8}
+  if dvsLoc.kind != InReg and not dvsInSlot:            # other divisor → staging
+    g.rb.sealAccum g.md.intRetReg                       # not rax (the dividend),
+    dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ,
+                                     avoid = g.md.divRemReg)  # not rdx (div's high half)
+    g.rb.unsealAccums {g.md.intRetReg}
     g.emitLoadLoc(dvsLoc, dvsStaging)
     dvsLoc = regLoc(dvsStaging, dvsLoc.typ)
   # `idiv`/`div` WRITE rdx:rax, and nifasm spells those operands as the RAW
@@ -2796,7 +2794,11 @@ proc emitDivMod(g: var CodeGen; c: Cursor; dest: var Location) =
   g.ab.tree op:
     g.ab.rawReg g.md.divRemReg                             # (rdx): high half / remainder
     g.ab.rawReg g.md.intRetReg                             # (rax): low half / quotient
-    g.emReg dvsLoc.r                                    # divisor, by its bound name
+    if dvsInSlot:                                       # divisor, in its slot
+      g.ab.tree CastX:
+        g.ab.uintType(dvsLoc.typ.size * 8)
+        g.emStackMem(dvsLoc.name)
+    else: g.emReg dvsLoc.r                              # divisor, by its bound name
   if dvsStaging != NoReg: g.giveBack dvsStaging
   else: g.freeVal(dD)
   g.settleResultReg(dest, if wantRem: g.md.divRemReg else: g.md.intRetReg)
@@ -3416,6 +3418,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       tc = resolveType(g.prog, cc); skip cc              # target type (resolved)
       inner = cc; skip cc
       while cc.hasMore: skip cc
+  let toBool = not isCast and slotOf(g.prog, tc).kind == ABool   # `x != 0`
   if g.isFloatExpr(c):
     # conversion TO float: the result is an xmm (int source → cvtsi2sd; float
     # source → precision convert).
@@ -3499,6 +3502,10 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
     if isCast:
       g.fmovToGpr(res.r, fv.f, fbits)
+    elif toBool:                                         # the bits but the sign
+      g.fmovToGpr(res.r, fv.f, fbits)
+      g.binImm(ShlX64, res.r, 65 - fbits)
+      g.nonZeroTo01(res.r)
     else:
       g.fcvtF2I(res.r, fv.f, fbits)
       if not isPtrType(tc):
@@ -3636,7 +3643,8 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
     # A folded constant reinterprets freely, but a narrowing cast must keep only
     # the target width (`cast[byte](4000)` → 160), else a later `(mov (u 8) 4000)`
     # fails nifasm's literal-fits-width check.
-    if not isPtrType(tc):
+    if toBool: dest.ival = ord(dest.ival != 0)
+    elif not isPtrType(tc):
       let tw = intTypeWidth(tc)
       if tw < 64:
         dest.ival = truncateImm(dest.ival, tw, isSignedType(tc))
@@ -3692,6 +3700,7 @@ proc emitCast*(g: var CodeGen; c: Cursor; dest: var Location) =
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):
         g.extendTo(res2.r, targetW, sgn)                              # narrow / equal
+    if toBool: g.nonZeroTo01(res2.r)
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened (see there). `kindChange` already did it.
   if not kindChange:

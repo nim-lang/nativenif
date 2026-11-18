@@ -1148,6 +1148,13 @@ proc emLab*(g: var CodeGen; name: SymId) =
   g.killAllMirrors()
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
 
+proc nonZeroTo01*(g: var CodeGen; r: Reg) =
+  ## `r = ord(r != 0)`: what a conversion to `bool` makes of the value.
+  let lZero = g.freshLabel()
+  g.ab.tree CbzA64: (g.emReg r; g.ab.sym lZero)
+  g.movImm(r, 1)
+  g.emLab lZero
+
 proc emBr*(g: var CodeGen; tag: RiscInst; name: SymId) =
   g.ab.tree tag: g.ab.sym name              # (b L) / (beq L) / …
 

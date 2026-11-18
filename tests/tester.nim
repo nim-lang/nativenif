@@ -900,6 +900,11 @@ const arkhamStressKnown: seq[string] = @[
   # unstressed the fixture passes. Closing it means the enclosing step releasing
   # across the recursion (design.md, I1), not withholding rax.
   "array2d",
+  # The x64 division miscompile it pins (rax staged the divisor over the
+  # dividend) needs R11 held by the enclosing store's address while the
+  # computed index is produced into a spill; at k=2 that composition trips the
+  # I1 budget check first, before any division is emitted.
+  "div_dividend_staging",
 ]
 
 const arkhamStressA64Known: seq[string] = @[
@@ -1323,6 +1328,8 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_load.nif", "mo
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_movfq_mem_store.nif", "movfq/movfd destination must be a register")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_prefetch_reg.nif", "prefetch operand must be a memory operand")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_clflush_reg.nif", "clflush operand must be a memory operand")
+# x86-64 ALU instructions have no 64-bit immediate form.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_alu_imm64.nif", "Immediate too large (must fit in 32 bits)")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.
@@ -2493,6 +2500,7 @@ const cortexMUnsupported: seq[string] = @[
   "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
   "global_init_float", "noreturn_float_arg_cycle", "spill_produce_float",
   "store_forward", "uint_literal_to_float", "f32_literal_rounded",
+  "div_dividend_staging",
   # The stack-passed-float fixtures are double precision; `tests/arkham_m/p32_*`
   # are their single-precision, 32-bit-int twins, and run here.
   "float_stack_args", "float_stack_forward", "float_stack_indirect",

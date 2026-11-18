@@ -790,6 +790,12 @@ proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.data[immPos + 3] = byte((nv shr 24) and 0xFF)
     ctx.buf.fixedRanges.add (slotsStart, slotsStart + bounds.len * slotSize)
 
+proc imm32(v: int64; n: Cursor): int32 =
+  ## x86-64 ALU instructions take at most a sign-extended 32-bit immediate.
+  if v < low(int32) or v > high(int32):
+    error("Immediate too large (must fit in 32 bits)", n)
+  result = int32(v)
+
 proc checkSubWidthImm(imm: int64; bits: int; n: Cursor) =
   ## The immediate must fit the operation width under EITHER signedness —
   ## only its low `bits` reach the hardware, so `(cmp (cast (u 8) r) 255)`
@@ -982,7 +988,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saAdd, start)
     elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # ADD m, imm (sized)
+        x86.emitAddImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)  # ADD m, imm (sized)
       elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
       elif op.kind == okMem:
@@ -994,9 +1000,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAddImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
-        x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitAddImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okImm:
-        x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitAddImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
         if ctx.inPrologue and dest.reg == ctx.argBaseReg:
           ctx.prologueOp = true      # completes the stack-args base — see `genMovX64`
       elif op.kind == okMem:
@@ -1018,7 +1024,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saSub, start)
     elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # SUB m, imm (sized)
+        x86.emitSubImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)  # SUB m, imm (sized)
       elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
       elif op.kind == okMem:
@@ -1033,9 +1039,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
           # delta filled in at proc end; `frameImm` keeps the pad `(popframe)` needs
           ctx.cfiStep(0, [], ssizeSlot = true, frameImm = int32(op.immVal))
       elif op.kind == okCsize:
-        x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitSubImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okImm:
-        x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitSubImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
         if ctx.inPrologue and dest.reg == x86.RSP:
           # the alignment-pad-only frame (`hasStackVars` false, `framePad` 8)
           ctx.cfiStep(int32(op.immVal), frameImm = int32(op.immVal))
@@ -1059,8 +1065,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if intMemAccess(dest.typ).bits != 64: error(what & " needs a 64-bit operand", n)
       if op.kind == okImm:
-        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.mem, int32(op.immVal))
-        else: x86.emitSbbImm(ctx.buf.data, dest.mem, int32(op.immVal))
+        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.mem, imm32(op.immVal, start))
+        else: x86.emitSbbImm(ctx.buf.data, dest.mem, imm32(op.immVal, start))
       elif op.kind == okMem:
         error("Cannot " & what & " memory to memory", n)
       elif op.kind == okReg:
@@ -1070,8 +1076,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         error(what & ": unsupported source operand", n)
     else:
       if op.kind == okImm:
-        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.reg, int32(op.immVal))
-        else: x86.emitSbbImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        if isAdc: x86.emitAdcImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
+        else: x86.emitSbbImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okMem:
         if intMemAccess(op.typ).bits != 64: error(what & " needs a 64-bit operand", n)
         if isAdc: x86.emitAdc(ctx.buf.data, dest.reg, op.mem)
@@ -1105,10 +1111,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       # (imul D S imm)
       if op.kind != okReg: error("3-operand imul source must be a register", n)
       let bits = if dest.castBits != 0: dest.castBits else: 64
-      x86.emitImulImm3(ctx.buf.data, dest.reg, op.reg, int32(getInt(n)), bits)
+      x86.emitImulImm3(ctx.buf.data, dest.reg, op.reg, imm32(getInt(n), start), bits)
       inc n
     elif op.kind == okImm:
-      x86.emitImulImm(ctx.buf.data, dest.reg, int32(op.immVal))
+      x86.emitImulImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
     elif op.kind == okMem:
       x86.emitImul(ctx.buf.data, dest.reg, op.mem)
     else:
@@ -1168,14 +1174,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saAnd, start)
     elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # AND m, imm (sized)
+        x86.emitAndImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)  # AND m, imm (sized)
       elif op.kind == okMem:
         error("Cannot AND memory to memory", n)
       else:
         x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x20, 0x21, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
-        x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitAndImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okMem:
         x86.emitAndMem(ctx.buf.data, dest.reg, op.mem)   # and reg, [mem]
       else:
@@ -1193,14 +1199,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saOr, start)
     elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)   # OR m, imm (sized)
+        x86.emitOrImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)   # OR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot OR memory to memory", n)
       else:
         x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x08, 0x09, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
-        x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitOrImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okMem:
         x86.emitOrMem(ctx.buf.data, dest.reg, op.mem)    # or reg, [mem]
       else:
@@ -1218,14 +1224,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saXor, start)
     elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # XOR m, imm (sized)
+        x86.emitXorImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)  # XOR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot XOR memory to memory", n)
       else:
         x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x30, 0x31, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
-        x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitXorImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okMem:
         x86.emitXorMem(ctx.buf.data, dest.reg, op.mem)   # xor reg, [mem]
       else:
@@ -1435,7 +1441,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       genAluSubWidth(ctx, dest, op, saCmp, start)
     elif dest.kind == okMem:
       if op.kind == okImm:
-        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # CMP m, imm (sized)
+        x86.emitCmpImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)  # CMP m, imm (sized)
       elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
@@ -1445,7 +1451,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitCmpSized(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
-        x86.emitCmpImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        x86.emitCmpImm(ctx.buf.data, dest.reg, imm32(op.immVal, start))
       elif op.kind == okMem:
         x86.emitCmpSized(ctx.buf.data, dest.reg, op.mem, intMemAccess(op.typ).bits)
       else:
@@ -1492,7 +1498,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     elif dest.kind == okMem:
       if op.kind == okImm:
         # TEST mem, imm — 0xF6/0xF7 /0, sized by the memory operand's type.
-        x86.emitTestImmSizedM(ctx.buf.data, dest.mem, int32(op.immVal),
+        x86.emitTestImmSizedM(ctx.buf.data, dest.mem, imm32(op.immVal, start),
                               intMemAccess(dest.typ).bits)
       elif op.kind == okReg:
         # TEST mem, reg — sized by the memory operand's type (0x84/0x85 MR).
@@ -1733,7 +1739,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     if op.kind == okImm:
-      x86.emitPush(ctx.buf.data, int32(op.immVal))
+      x86.emitPush(ctx.buf.data, imm32(op.immVal, start))
     elif op.kind == okMem:
       error("PUSH memory not supported yet", n)
     else:
@@ -2377,7 +2383,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lock <alu> [mem], imm` — the sized imm emitters already exist;
         # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
         x86.emitLock(ctx.buf.data)
-        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        x86.emitAddImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
       x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x00, 0x01, intMemAccess(dest.typ).bits)
@@ -2394,7 +2400,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lock <alu> [mem], imm` — the sized imm emitters already exist;
         # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
         x86.emitLock(ctx.buf.data)
-        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        x86.emitSubImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
       x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x28, 0x29, intMemAccess(dest.typ).bits)
@@ -2411,7 +2417,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lock <alu> [mem], imm` — the sized imm emitters already exist;
         # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
         x86.emitLock(ctx.buf.data)
-        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        x86.emitAndImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
       x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x20, 0x21, intMemAccess(dest.typ).bits)
@@ -2428,7 +2434,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lock <alu> [mem], imm` — the sized imm emitters already exist;
         # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
         x86.emitLock(ctx.buf.data)
-        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        x86.emitOrImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
       x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x08, 0x09, intMemAccess(dest.typ).bits)
@@ -2445,7 +2451,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # `lock <alu> [mem], imm` — the sized imm emitters already exist;
         # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
         x86.emitLock(ctx.buf.data)
-        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        x86.emitXorImm(ctx.buf.data, dest.mem, imm32(op.immVal, start), intMemAccess(dest.typ).bits)
         return
       x86.emitLock(ctx.buf.data)
       x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x30, 0x31, intMemAccess(dest.typ).bits)

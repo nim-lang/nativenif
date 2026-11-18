@@ -116,23 +116,31 @@ proc genVarDecl*(g: var CodeGen; c: Cursor) =
         g.emRegLocalVar(nm, loc.r, typeCur)   # unreachable (callInit implies hasVal)
       while cc.hasMore: skip cc
 
+proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
+  ## `cmp` takes a sign-extended imm32; a wider label goes through a register.
+  if v >= low(int32).int64 and v <= high(int32).int64:
+    g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit v)
+  else:
+    let t = g.pickStagingSealed("a case imm64 label", ScalarSlot, avoid = selReg)
+    g.movImm(t, v)
+    g.binReg(CmpX64, selReg, t)
+    g.giveBack t
+
 proc emitCaseTest*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: SymId; signed: bool) =
-  ## One `case` BranchRange against `selReg`; jump to `lBody` on a match. The gate
-  ## (`caseRangeModeled`) guarantees small-immediate bounds, so every `cmp` folds the
-  ## bound inline (no scratch register — the pure emitter cannot borrow one).
+  ## One `case` BranchRange against `selReg`; jump to `lBody` on a match.
   if c.kind == TagLit and c.substructureKind == RangeU:
     c.into:
       let lo = branchImm(c)
       let hi = branchImm(c)
       let lSkip = g.freshLabel()                        # match iff lo <= sel <= hi
-      g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit lo)
+      g.cmpImm(selReg, lo)
       g.emJcc(if signed: JlX64 else: JbX64, lSkip)
-      g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit hi)
+      g.cmpImm(selReg, hi)
       g.emJcc(if signed: JgX64 else: JaX64, lSkip)
       g.emJmp(lBody)
       g.emLab(lSkip)
   else:
-    g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit branchImm(c))
+    g.cmpImm(selReg, branchImm(c))
     g.emJcc(JeX64, lBody)
 
 proc cmovTagFor(jccTag: X64Inst): X64Inst =
