@@ -845,6 +845,41 @@ proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
   echo passed, " / ", total - skipped, " arkham ", label, "tests successful (",
        skipped, " known-unsupported skipped)"
 
+proc arkhamWhenplatTests(arch = (when defined(macosx): "arm64" else: "x64")) =
+  ## Leng `whenplat` is resolved by arkham against its platform facts
+  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`). One fixture, run once per fact
+  ## set: the first branch with a matching label wins (`fact_c` beats `fact_b`),
+  ## else the `else` branch, and a `whenplat` nested in the taken branch is
+  ## resolved too. A `whenplat` with no match and no `else` does not compile.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let dir = "tests" / "arkham_whenplat"
+  let workDir = dir / "nimcache"
+  createDir workDir
+  const cases = [
+    ("", 4),
+    ("--plat:fact_b", 3),
+    ("--plat:fact_b --plat:inner", 30),
+    ("--plat:fact_c --plat:fact_b", 2)]
+  var passed = 0
+  for (plats, expected) in cases:
+    let asmNif = workDir / "whenplat.asm.nif"
+    let exe = workDir / "whenplat.out"
+    exec quoteShell(arkham) & " -a:" & arch & " " & plats & " -o:" &
+         quoteShell(asmNif) & " " & quoteShell(dir / "whenplat.c.nif")
+    exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+    let (po, pc) = runProgram(exe)
+    if pc != expected:
+      quit "FAILURE whenplat [" & plats & "]: exitcode " & $expected &
+           " expected but got " & $pc & "\n" & po
+    inc passed
+  execExpectFailure(quoteShell(arkham) & " --os:linux --cpu:amd64 -o:" &
+                    quoteShell(workDir / "err_nomatch.asm.nif") & " " &
+                    quoteShell(dir / "err_nomatch.c.nif"),
+                    "no `whenplat` branch matches the platform facts [linux, amd64]")
+  inc passed
+  echo passed, " / ", cases.len + 1, " arkham whenplat tests successful"
+
 # ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
 #
 # The corpus above never runs a pool dry, so the emitters' pool-dry arms
@@ -2756,6 +2791,7 @@ arkhamAvrRejections()
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+  arkhamWhenplatTests()
   arkhamPtrCmpTests()
   # The same corpus again, against a starved register file. Every argument is
   # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes

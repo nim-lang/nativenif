@@ -1,0 +1,41 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n.0 .
+    (i 64)0)
+   (whenplat
+    (of
+     (ranges "nosuchplatform")
+     (stmts
+      (asgn n.0 1)))
+    (of
+     (ranges "fact_a" "fact_c")
+     (stmts
+      (asgn n.0 2)))
+    (of
+     (ranges "fact_b")
+     (stmts
+      (whenplat
+       (of
+        (ranges "inner")
+        (stmts
+         (asgn n.0 30)))
+       (else
+        (stmts
+         (asgn n.0 3))))))
+    (else
+     (stmts
+      (asgn n.0 4))))
+   (call exit.0 n.0))))

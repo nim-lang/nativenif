@@ -18,6 +18,7 @@
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import core/lengdecl             # createLengTagPool
+import whenplat                  # resolveWhenplats: `--os`/`--cpu`/`--plat` facts
 import core/layout               # the --layout: board file
 import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
                                 # which is why it reads as an unused import
@@ -41,6 +42,9 @@ Options:
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr | riscv32
                            (default: host)
+  --plat:FACT              add a platform fact for resolving Leng `whenplat`
+                           (repeatable). `--os:x` and `--cpu:x` imply the fact
+                           `x`; Nimony passes the rest (`posix`, `bsd`, ...)
   --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
                            region each section lives in, the stack slots and
                            their thread-local reservation, and the heap. A `(layout …)` NIF tree; see doc/layout.md.
@@ -132,12 +136,17 @@ proc archOf(os, cpu: string): string =
          " embedded/arm32, embedded/avr, embedded/riscv32)",
          QuitFailure)
 
-proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
+proc run(input, output, arch: string; board: layout.Layout; crt: bool;
+         facts: seq[string]) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
+  # `whenplat` is resolved before anything looks at the module; foreign decls
+  # are resolved as `programs.nim` loads them (`setPlatformFacts`).
+  let platErr = resolveWhenplats(buf, facts)
+  if platErr.len > 0: quit("arkham: " & platErr, QuitFailure)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
@@ -154,6 +163,7 @@ proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
 
 proc main() =
   var input, output, arch, os, cpu = ""
+  var facts: seq[string] = @[]
   var board = Layout()
   var crt = false
   for kind, key, val in getopt():
@@ -166,6 +176,7 @@ proc main() =
       of "arch", "a": arch = val
       of "os": os = val
       of "cpu": cpu = val
+      of "plat": facts.add val
       of "crt": crt = true
       of "layout":
         board = parseLayout(val)
@@ -189,7 +200,11 @@ proc main() =
     if os.len == 0: os = hostOS
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
-  run(input, output, arch, board, crt)
+    # `--os:x`/`--cpu:x` imply the platform fact `x`
+    facts.add os
+    facts.add cpu
+  setPlatformFacts(facts)
+  run(input, output, arch, board, crt, facts)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:
