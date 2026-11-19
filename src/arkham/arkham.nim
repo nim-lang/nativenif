@@ -41,6 +41,9 @@ Options:
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr | riscv32
                            (default: host)
+  --plat:FACT              add a platform fact for Leng `(defined ...)`
+                           (repeatable). `--os:x` and `--cpu:x` imply the fact
+                           `x`; Nimony passes the rest (`posix`, `bsd`, ...)
   --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
                            region each section lives in, the stack slots and
                            their thread-local reservation, and the heap. A `(layout …)` NIF tree; see doc/layout.md.
@@ -132,28 +135,30 @@ proc archOf(os, cpu: string): string =
          " embedded/arm32, embedded/avr, embedded/riscv32)",
          QuitFailure)
 
-proc run(input, output, arch: string; board: layout.Layout; crt: bool) =
+proc run(input, output, arch: string; board: layout.Layout; crt: bool;
+         facts: seq[string]) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
   let code = case arch
-             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt)
-             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt)
-             of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true)
-             of "arm64", "aarch64", "": generateA64(buf, input, tags)
-             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true, crtEntry = crt)
+             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, crtEntry = crt, facts = facts)
+             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true, crtEntry = crt, facts = facts)
+             of "freebsd_x64": generateX64(buf, input, tags, crtEntry = crt, freebsd = true, facts = facts)
+             of "arm64", "aarch64", "": generateA64(buf, input, tags, facts = facts)
+             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true, crtEntry = crt, facts = facts)
              of "cortex_m", "cortexm", "thumbm":
-               generateCortexM(buf, input, tags, board)
-             of "avr": generateAvr(buf, input, tags)
+               generateCortexM(buf, input, tags, board, facts)
+             of "avr": generateAvr(buf, input, tags, facts)
              of "riscv32", "rv32":
-               generateRv32(buf, input, tags, board)
+               generateRv32(buf, input, tags, board, facts)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   onRaiseQuit writeFile(output, code)
 
 proc main() =
   var input, output, arch, os, cpu = ""
+  var facts: seq[string] = @[]
   var board = Layout()
   var crt = false
   for kind, key, val in getopt():
@@ -166,6 +171,7 @@ proc main() =
       of "arch", "a": arch = val
       of "os": os = val
       of "cpu": cpu = val
+      of "plat": facts.add val
       of "crt": crt = true
       of "layout":
         board = parseLayout(val)
@@ -189,7 +195,10 @@ proc main() =
     if os.len == 0: os = hostOS
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
-  run(input, output, arch, board, crt)
+    # `--os:x`/`--cpu:x` imply the platform fact `x`
+    facts.add os
+    facts.add cpu
+  run(input, output, arch, board, crt, facts)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:

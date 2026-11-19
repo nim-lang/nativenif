@@ -1140,7 +1140,16 @@ proc planStmt(b: var Builder; n: var Cursor) =
       n.into:
         while n.hasMore: planStmt(b, n)
     else: inc n
-  of AsgnS, KeepovfS, WhileS, IfS, CaseS, IteS, LoopS, ContinueS:
+  of IteS:
+    var platArm = default(Cursor)
+    if platformArm(n, b.prog[].facts, platArm):
+      # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is code
+      if platArm.kind != DotToken: planStmt(b, platArm)
+      skip n
+    else:
+      n.into:
+        while n.hasMore: planStmt(b, n)
+  of AsgnS, KeepovfS, WhileS, IfS, CaseS, LoopS, ContinueS:
     n.into:
       while n.hasMore: planStmt(b, n)
   else:

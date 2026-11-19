@@ -845,6 +845,40 @@ proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
   echo passed, " / ", total - skipped, " arkham ", label, "tests successful (",
        skipped, " known-unsupported skipped)"
 
+proc arkhamPlatfactsTests(arch = (when defined(macosx): "arm64" else: "x64")) =
+  ## An `(ite (defined "a" "b") T E)` is decided by arkham's platform facts
+  ## (`--plat:x`; `--os:x`/`--cpu:x` imply `x`), and is
+  ## only its taken arm: the code generator collapses it. One fixture, run
+  ## once per fact set: an `elif` chain (`fact_c` beats `fact_b`), a nested
+  ## test, and one without an `else`. The never-taken first arm calls a proc
+  ## that does not exist, so the fixture only compiles if dead arms are never
+  ## looked at.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let dir = "tests" / "arkham_platfacts"
+  let workDir = dir / "nimcache"
+  createDir workDir
+  const cases = [
+    ("", 4),
+    ("--plat:fact_b", 3),
+    ("--plat:fact_b --plat:inner", 30),
+    ("--plat:fact_c --plat:fact_b", 2),
+    ("--plat:fact_d", 104),
+    ("--plat:fact_d --plat:fact_b", 103)]
+  var passed = 0
+  for (plats, expected) in cases:
+    let asmNif = workDir / "platfacts.asm.nif"
+    let exe = workDir / "platfacts.out"
+    exec quoteShell(arkham) & " -a:" & arch & " " & plats & " -o:" &
+         quoteShell(asmNif) & " " & quoteShell(dir / "platfacts.c.nif")
+    exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+    let (po, pc) = runProgram(exe)
+    if pc != expected:
+      quit "FAILURE platfacts [" & plats & "]: exitcode " & $expected &
+           " expected but got " & $pc & "\n" & po
+    inc passed
+  echo passed, " / ", cases.len, " arkham platform-fact tests successful"
+
 # ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
 #
 # The corpus above never runs a pool dry, so the emitters' pool-dry arms
@@ -2764,6 +2798,7 @@ arkhamAvrRejections()
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+  arkhamPlatfactsTests()
   arkhamPtrCmpTests()
   # The same corpus again, against a starved register file. Every argument is
   # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes

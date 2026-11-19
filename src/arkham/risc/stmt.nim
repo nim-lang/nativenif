@@ -276,26 +276,34 @@ proc genStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       while cc.hasMore: skip cc
   of IteS:
     # `(ite C T E|.)` — the `IfS` arm below with exactly one condition.
-    if CondSelect notin g.md.caps or not g.tryEmitCsel(c):
-      var condC, thenC, elseC = default(Cursor)
-      discard twoWayParts(c, condC, thenC, elseC)
-      var endC = c; skip endC                          # nothing follows the arms
-      let tailFlags = armFlags(flags, endC)
-      let jmpTarget = if hasArm(elseC): NoSymId else: jmpOnlyTarget(thenC)
-      if jmpTarget != NoSymId:
-        g.emitCond(condC, jmpTarget, whenTrue = true)  # `(ite C (jmp L) .)`
-      else:
-        let lElse = g.freshLabel()
-        g.emitCond(condC, lElse, whenTrue = false)
-        g.genStmt(thenC, tailFlags)
-        if hasArm(elseC):
-          let lEnd = g.freshLabel()
-          if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
-          g.emLab(lElse)
-          g.genStmt(elseC, tailFlags)
-          g.emLab(lEnd)
+    var platArm = default(Cursor)
+    if platformArm(c, g.prog.facts, platArm):
+      # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is
+      # code; the other may name what does not exist on this target.
+      if platArm.kind != DotToken:
+        var endC = c; skip endC
+        g.genStmt(platArm, armFlags(flags, endC))
+    else:
+      if CondSelect notin g.md.caps or not g.tryEmitCsel(c):
+        var condC, thenC, elseC = default(Cursor)
+        discard twoWayParts(c, condC, thenC, elseC)
+        var endC = c; skip endC                          # nothing follows the arms
+        let tailFlags = armFlags(flags, endC)
+        let jmpTarget = if hasArm(elseC): NoSymId else: jmpOnlyTarget(thenC)
+        if jmpTarget != NoSymId:
+          g.emitCond(condC, jmpTarget, whenTrue = true)  # `(ite C (jmp L) .)`
         else:
-          g.emLab(lElse)
+          let lElse = g.freshLabel()
+          g.emitCond(condC, lElse, whenTrue = false)
+          g.genStmt(thenC, tailFlags)
+          if hasArm(elseC):
+            let lEnd = g.freshLabel()
+            if not (TailPos in flags and g.emReturnHere()): g.emBr(BA64, lEnd)
+            g.emLab(lElse)
+            g.genStmt(elseC, tailFlags)
+            g.emLab(lEnd)
+          else:
+            g.emLab(lElse)
   of IfS:
     # `csel` is AArch64's. ARMv7-M has no conditional select at all — its
     # equivalent is an IT block, which is a different shape and not one this

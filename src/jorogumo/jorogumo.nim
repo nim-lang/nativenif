@@ -28,6 +28,8 @@ Usage:
 
 Options:
   -o:file, --output:file   output file (default: <input>.js / <input>.wasm)
+  --plat:FACT              add a platform fact for Leng `(defined ...)`
+                           (repeatable; Nimony passes them)
   -h, --help               show this help
 
 JavaScript (`j`) only:
@@ -67,7 +69,7 @@ proc writeOut(path, content: string) =
     quitErr "jorogumo: cannot write " & path, QuitFailure
 
 proc run(target: Target; input, output: string; memBytes: int; browser,
-         hostImports, exportAll: bool) =
+         hostImports, exportAll: bool; facts: seq[string]) =
   # One Leng tag pool for the input; `generate` builds its output in a buffer
   # with the web IR pool. A buffer speaks one dialect, never both.
   let tags = lengdecl.createLengTagPool()
@@ -75,11 +77,12 @@ proc run(target: Target; input, output: string; memBytes: int; browser,
   var m = default(WebModule)
   case target
   of tJs:
-    var tree = generate(buf, input, tags, wtJs, m)
+    var tree = generate(buf, input, tags, wtJs, m, facts = facts)
     writeOut output, renderJs(tree, m, memBytes, ShadowStackSize,
                               browser = browser)
   of tWasm:
-    var tree = generate(buf, input, tags, wtWasm, m, hostImports = hostImports)
+    var tree = generate(buf, input, tags, wtWasm, m, hostImports = hostImports,
+                        facts = facts)
     let code = renderWasm(tree, m, ShadowStackSize, exportAll = exportAll)
     var s = newString(code.len)
     for i, b in code: s[i] = char(b)
@@ -91,6 +94,7 @@ proc main() =
   var browser = false
   var hostImports = false
   var exportAll = false
+  var facts: seq[string] = @[]
   var target = tJs
   var haveTarget = false
   for kind, key, val in getopt():
@@ -126,6 +130,7 @@ proc main() =
       of "browser": browser = true
       of "hostimports": hostImports = true
       of "exportall": exportAll = true
+      of "plat": facts.add val
       of "help", "h": quitErr(Usage, QuitSuccess)
     of cmdEnd: discard
   if not haveTarget or input.len == 0: quitErr(Usage, QuitSuccess)
@@ -145,7 +150,7 @@ proc main() =
   # the exit code. `diag.refuse` prints it and quits at the site, so the file it
   # names has to be handed over first.
   setInputFile input
-  run(target, input, output, memBytes, browser, hostImports, exportAll)
+  run(target, input, output, memBytes, browser, hostImports, exportAll, facts)
 
 when isMainModule:
   main()

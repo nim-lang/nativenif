@@ -52,14 +52,15 @@ proc rejectForAvr(g: CodeGen) =
     lengError default(Cursor),
       "AVR is a bare-metal target: there is no OS to call into"
 
-proc generateAvr*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
+proc generateAvr*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                  facts: seq[string] = @[]): string =
   ## Compile a parsed Leng module to AVR asm-NIF, which nifasm's `avr` target
   ## assembles into a bare-metal firmware image.
   setTargetWord Word16             # 2-byte pointers, 2-byte platform int
   var g = newCodeGen(buf, avrMachine, machine.regName)
                                    # render a slot as the PAIR it is: `(rpN)`
   g.ab.arch = "avr"                # no BodyLib entries apply to this target yet
-  g.prog = collect(buf, inputPath, tags)
+  g.prog = collect(buf, inputPath, tags, facts = facts)
   g.rejectForAvr()
   g.adoptProgram()
   g.ab.tree StmtsAvr:

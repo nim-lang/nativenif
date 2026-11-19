@@ -57,7 +57,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
-                       memCallees = g.prog.memIntrinsics)
+                       memCallees = g.prog.memIntrinsics,
+                       facts = g.prog.facts)
   g.varType.clear()
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false
@@ -243,7 +244,7 @@ proc genTvar*(g: var CodeGen; name: SymId; decl: Cursor) =
     while c.hasMore: skip c
 
 proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                      board = layout.Layout()): string =
+                      board = layout.Layout(); facts: seq[string] = @[]): string =
   ## Compile a parsed Leng module to Cortex-M (ARMv7E-M) asm-NIF, which nifasm's
   ## `cortex_m` target assembles into a bare-metal firmware image.
   ##
@@ -265,7 +266,7 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   # anything to run on.
   g.oneThread = not board.given or board.slotCount <= 1
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
-  g.prog = collect(buf, inputPath, tags, darwin = false)
+  g.prog = collect(buf, inputPath, tags, darwin = false, facts = facts)
   cortexm.rejectUnsupported(g)
   g.adoptProgram()
   g.ab.tree StmtsA64:
@@ -336,7 +337,7 @@ proc generateCortexM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result = g.ab.render("." & g.prog.thisModuleSuffix)
 
 proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                   board = layout.Layout()): string =
+                   board = layout.Layout(); facts: seq[string] = @[]): string =
   ## Compile a parsed Leng module to RV32IMAFD asm-NIF, which nifasm's `riscv32`
   ## target assembles into a bare-metal firmware image.
   ##
@@ -359,7 +360,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.rvStackTop = if board.given: int64(board.sramStart) + int64(board.sramSize)
                  else: rv32.DefaultStackTop
   g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
-  g.prog = collect(buf, inputPath, tags, darwin = false)
+  g.prog = collect(buf, inputPath, tags, darwin = false, facts = facts)
   # No `rv32.rejectUnsupported` twin of `cortexm.rejectUnsupported`: RV32IMAFD
   # has both float precisions, hardware divide and self-ordering atomics, so what
   # it lacks is refused per intrinsic (`BitScanOps`, narrow atomics) instead.
@@ -402,7 +403,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result = g.ab.render("." & g.prog.thisModuleSuffix)
 
 proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  linux = false; crtEntry = false): string =
+                  linux = false; crtEntry = false; facts: seq[string] = @[]): string =
   ## Compile a parsed Leng module to AArch64 asm-NIF text — Darwin/Mach-O by
   ## default, or Linux/ELF when `linux` (svc-based syscalls, static, no dyld/TLV),
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
@@ -419,7 +420,8 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.entryExits = linux and not crt
   g.oneThread = linux and not crt
   g.ab.arch = "a64"                # BodyLib entries this target may splice
-  g.prog = collect(buf, inputPath, tags, darwin = not linux, crtEntry = crt)
+  g.prog = collect(buf, inputPath, tags, darwin = not linux, crtEntry = crt,
+                   facts = facts)
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")

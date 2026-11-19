@@ -1,0 +1,46 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n.0 .
+    (i 64)0)
+   (ite
+    (defined "nosuchplatform")
+    (stmts
+     (asgn n.0 1)
+     (call doesNotExist.0))
+    (stmts
+     (ite
+      (defined "fact_a" "fact_c")
+      (stmts
+       (asgn n.0 2))
+      (stmts
+       (ite
+        (defined "fact_b")
+        (stmts
+         (ite
+          (defined "inner")
+          (stmts
+           (asgn n.0 30))
+          (stmts
+           (asgn n.0 3))))
+        (stmts
+         (asgn n.0 4)))))))
+   (ite
+    (defined "fact_d")
+    (stmts
+     (asgn n.0
+      (add
+       (i 64) n.0 100))) .)
+   (call exit.0 n.0))))

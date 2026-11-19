@@ -97,7 +97,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
-                       memCallees = g.prog.memIntrinsics)
+                       memCallees = g.prog.memIntrinsics,
+                       facts = g.prog.facts)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false
@@ -284,7 +285,8 @@ proc genGlobal*(g: var CodeGen; nifName: SymId; decl: Cursor) =
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  windows = false; crtEntry = false; freebsd = false): string =
+                  windows = false; crtEntry = false; freebsd = false;
+                  facts: seq[string] = @[]): string =
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
   ## `.exe` whose imports bind through the import table (each extern's own
@@ -309,7 +311,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows, crtEntry = crtEntry,
-                   freebsd = freebsd)
+                   freebsd = freebsd, facts = facts)
   g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD:

@@ -1244,6 +1244,12 @@ proc genWhile(g: var CodeGen; c: Cursor) =
 
 proc genIte(g: var CodeGen; c: Cursor) =
   ## `(ite C T E|.)`.
+  var platArm = default(Cursor)
+  if platformArm(c, g.prog.facts, platArm):
+    # `(ite (defined "a" ...) T E)`: only the arm the platform facts pick is
+    # code; the other may name what does not exist on this target.
+    if platArm.kind != DotToken: g.genStmt(platArm)
+    return
   var cc = c
   block jmpOnly:
     # `(ite C (jmp L) .)` is ONE conditional branch to `L` (see `jmpOnlyTarget`).
@@ -1452,7 +1458,7 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   g.retLabel2 = g.lengSym(SynthMark & "epi.0")
   g.retLabelUsed2 = false
 
-  let an = analyseProc(g.buf[], info.decl)
+  let an = analyseProc(g.buf[], info.decl, facts = g.prog.facts)
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, avrMachine, avrMachine, g.typeCtx)
 
   let params = g.collectParams(info.decl)
