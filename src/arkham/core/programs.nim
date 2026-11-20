@@ -1579,19 +1579,23 @@ proc cleanSigProcs*(p: var Program): HashSet[SymId] =
       result.incl nc.symId
 
 proc jmpOnlyTarget*(arm: Cursor): SymId =
-  ## The label an `ite` arm starts by jumping to, through `(stmts …)`/`(scope …)`
-  ## wrappers; `NoSymId` for any other arm. Whatever follows the `jmp` is dead, so
-  ## the arm is that jump. Every emitter lowers `(ite C (jmp L) .)` as ONE
-  ## conditional branch to `L`, not as a branch over an unconditional one. It is
-  ## the shape shoggoth's `coldguards` leaves for every bounds check — the failure
-  ## arm lives after the proc's last statement — and the one an early exit has
-  ## anyway. (Leng statement lists carry no `.` holes, nimony#3027, so the first
+  ## The label an `ite` arm that is nothing but a jump goes to, through
+  ## `(stmts …)`/`(scope …)` wrappers that hold one child each; `NoSymId` for any
+  ## other arm. Code after the `jmp` may hold the `lab` of a jump inside the arm
+  ## (`block B: break B` and more code), so such an arm is not a jump. Every
+  ## emitter lowers `(ite C (jmp L) .)` as ONE conditional branch to `L`, not as
+  ## a branch over an unconditional one. It is the shape shoggoth's `coldguards`
+  ## leaves for every bounds check — the failure arm lives after the proc's last
+  ## statement — and the one an early exit has anyway. (Leng statement lists carry no `.` holes, nimony#3027, so the first
   ## child is a statement.)
   result = NoSymId
   var cur = arm
   while cur.kind == TagLit and cur.stmtKind in {StmtsS, ScopeS}:
     cur = sub(cur)
     if not cur.hasMore: return
+    var rest = cur
+    skip rest
+    if rest.hasMore: return
   if cur.kind == TagLit and cur.stmtKind == JmpS:
     var j = cur
     inc j
