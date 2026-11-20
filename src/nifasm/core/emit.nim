@@ -75,6 +75,8 @@ proc shiftCodePositions*(ctx: var GenContext; at, by: int) =
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
     if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+  for k in 0 ..< ctx.buf.data.tlsSites.len:   # x64 `--emit-obj` `R_X86_64_TPOFF32` sites
+    if ctx.buf.data.tlsSites[k] >= at: ctx.buf.data.tlsSites[k] += by
   # An EXTERNAL call's `bl` is not a reloc — its position is recorded per extproc and
   # patched at image layout — so it needs rebasing here too. Missing it left the `bl`
   # unpatched (a branch to itself) and wrote the IAT displacement over whatever had
