@@ -1,0 +1,14 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (var :r.0 . (i 32) 0)
+   (var :n.0 . (i 32) 1)
+   (ite (lt n.0 7)
+    (stmts (scope (scope (jmp inner.0)) (lab :inner.0) (asgn r.0 (add (i 32) r.0 40))))
+    .)
+   (ite (lt n.0 7)
+    (stmts (jmp same.0) (lab :same.0) (asgn r.0 (add (i 32) r.0 2)))
+    .)
+   (call exit.0 r.0))))
