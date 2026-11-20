@@ -536,6 +536,32 @@ proc arkhamWinTvarFieldTests() =
          " (want 41 = tv.data survived the block walk and derefed)"
   echo "1 / 1 arkham win64 thread-local field tests successful"
 
+proc crtTests(label, arch, linker, linkFlags, runner: string;
+              fixtures: openArray[(string, int)]) =
+  ## `arkham --crt`, `nifasm --emit-obj`, then `linker` as the system linker;
+  ## each `tests/<name>.c.nif` must exit with its code. `runner` prefixes the
+  ## executable (`wine` for win_x64 off Windows).
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  var total, passed = 0
+  for (name, want) in fixtures:
+    inc total
+    let asmNif = workDir / (name & ".crt.asm.nif")
+    let obj = workDir / (name & ".crt.o")
+    let exe = workDir / (name & ".crt.exe")
+    exec quoteShell(arkham) & " -a:" & arch & " --crt -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / (name & ".c.nif"))
+    exec quoteShell(nifasm) & " --emit-obj -o:" & quoteShell(obj) & " " & quoteShell(asmNif)
+    exec quoteShell(linker) & linkFlags & " -o " & quoteShell(exe) & " " & quoteShell(obj)
+    let (_, code) = if runner.len > 0: runProgram(runner, [exe]) else: runProgram(exe)
+    if code != want:
+      quit "FAILURE arkham " & label & " crt " & name & ": exit code " & $code &
+           " (want " & $want & ")"
+    inc passed
+  echo passed, " / ", total, " arkham ", label, " crt tests successful"
+
 proc arkhamWinCrtTests() =
   ## win_x64 linked with the C runtime: `arkham --crt`, `nifasm --emit-obj` (a COFF
   ## object), then MinGW's gcc as the system linker — the Windows twin of Linux's
@@ -552,31 +578,13 @@ proc arkhamWinCrtTests() =
   if gcc.len == 0:
     echo "0 / 0 arkham win64 crt tests (no MinGW gcc)"
     return
+  let runner = when defined(windows): "" else: findExe("wine")
   when not defined(windows):
-    if findExe("wine").len == 0:
+    if runner.len == 0:
       echo "0 / 0 arkham win64 crt tests (wine not installed)"
       return
-  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
-  let workDir = "tests" / "arkham" / "nimcache"
-  createDir workDir
-  var total, passed = 0
-  for (name, want) in [("win_crt", 31), ("win_tls", 7), ("win_tvar_field", 41)]:
-    inc total
-    let asmNif = workDir / (name & ".crt.asm.nif")
-    let obj = workDir / (name & ".crt.o")
-    let exe = workDir / (name & ".crt.exe")
-    exec quoteShell(arkham) & " -a:win_x64 --crt -o:" & quoteShell(asmNif) & " " &
-         quoteShell("tests" / (name & ".c.nif"))
-    exec quoteShell(nifasm) & " --emit-obj -o:" & quoteShell(obj) & " " & quoteShell(asmNif)
-    exec quoteShell(gcc) & " -o " & quoteShell(exe) & " " & quoteShell(obj)
-    let (_, code) = when defined(windows): runProgram(exe)
-                    else: runProgram(findExe("wine"), [exe])
-    if code != want:
-      quit "FAILURE arkham win64 crt " & name & ": exit code " & $code & " (want " &
-           $want & ")"
-    inc passed
-  echo passed, " / ", total, " arkham win64 crt tests successful"
+  crtTests("win64", "win_x64", gcc, "", runner,
+           [("win_crt", 31), ("win_tls", 7), ("win_tvar_field", 41)])
 
 proc buildToolchain() =
   ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
@@ -2835,6 +2843,11 @@ when defined(linux) and defined(amd64):
   # built; the AArch64 half of the same tables is covered by the qemu pass only
   # as far as "the program still runs" — a host GDB cannot read its registers.
   arkhamDebugInfoTests()
+  # `nimony n -d:useLibc`: an ELF object linked by `cc`. `linux_crt_tvar_casejmp`
+  # writes a thread-local in a `casejmp` slot that is not the last one, so the
+  # slot padding moves its `R_X86_64_TPOFF32` site.
+  crtTests("linux", "x64", findExe("cc"), " -no-pie -pthread", "",
+           [("linux_crt_tvar_casejmp", 42)])
 
 # The Win64 suites ask WINE to be the authority, and wine decides for itself
 # whether it can run an x86-64 PE on this host (it skips with a message when it is
