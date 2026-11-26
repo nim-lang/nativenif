@@ -2256,7 +2256,7 @@ proc emitMod(g: var CodeGen; c: Cursor; dest: var Location) =
     if k > 0:
       g.emitModPow2(c, rt, divC, k, dest)
       return
-  var lD = needsReg(g.valueSlot(divC))
+  var lD = needsReg(g.binResultSlot(rt))
   g.emitValue(divC, lD)
   var rD0 = needsReg(g.valueSlot(dvsC))
   g.emitValue(dvsC, rD0)
