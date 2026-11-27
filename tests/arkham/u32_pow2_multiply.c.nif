@@ -1,0 +1,23 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :reuse.0 (params (param :x.0 . (u 32))) (u 32) .
+  (stmts
+   (asgn x.0 (mul (u 32) x.0 2))
+   (ret x.0)))
+ (proc :live.0 (params (param :x.1 . (u 32))) (u 32) .
+  (stmts
+   (var :r.0 . (u 32) (mul (u 32) x.1 2))
+   (if (elif (neq x.1 2147483649) (stmts (call exit.0 9))))
+   (ret r.0)))
+ (proc :high.0 (params (param :x.2 . (u 32))) (u 32) .
+  (stmts (ret (mul (u 32) x.2 2147483648))))
+ (proc :wide.0 (params (param :x.3 . (u 64))) (u 64) .
+  (stmts (ret (mul (u 64) x.3 2))))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (if (elif (neq (call reuse.0 2147483649) 2) (stmts (call exit.0 1))))
+   (if (elif (neq (call live.0 2147483649) 2) (stmts (call exit.0 2))))
+   (if (elif (neq (call high.0 2) 0) (stmts (call exit.0 3))))
+   (if (elif (neq (call wide.0 2147483649) 4294967298) (stmts (call exit.0 4))))
+   (call exit.0 42))))

@@ -600,6 +600,7 @@ proc foldRhs(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: Cu
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
   ## large/non-add immediate goes through a bridge). `dest` already holds the lhs.
   ## `w32` selects the 32-bit W-form tag for add/sub/mul (see wForm/emitBin).
+  ## Keep W-form multiplication: a 64-bit shift would retain overflow bits
   case rhsLoc.kind
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
@@ -609,7 +610,7 @@ proc foldRhs(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: Cu
       # `extendTo` already emits — so a constant shift amount folds in place rather
       # than being materialized into a bridge register (`mov b, #n; lsl x, b`).
       g.binImm(op, dest, rhsLoc.ival)
-    elif op == MulA64 and rhsLoc.ival >= 2 and (rhsLoc.ival and (rhsLoc.ival - 1)) == 0:
+    elif op == MulA64 and not w32 and rhsLoc.ival >= 2 and (rhsLoc.ival and (rhsLoc.ival - 1)) == 0:
       var k = 0'i64
       var t = rhsLoc.ival
       while t > 1: (t = t shr 1; inc k)
@@ -642,7 +643,7 @@ proc foldRhs3(g: var CodeGen; op: RiscInst; dest, rn: Reg; rhsLoc: Location; rhs
       g.binImm3(op, dest, rn, rhsLoc.ival, w32)
     elif op in {LslA64, LsrA64, AsrA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 63:
       g.binImm3(op, dest, rn, rhsLoc.ival)
-    elif op == MulA64 and rhsLoc.ival >= 2 and (rhsLoc.ival and (rhsLoc.ival - 1)) == 0:
+    elif op == MulA64 and not w32 and rhsLoc.ival >= 2 and (rhsLoc.ival and (rhsLoc.ival - 1)) == 0:
       var k = 0'i64
       var t = rhsLoc.ival
       while t > 1: (t = t shr 1; inc k)
