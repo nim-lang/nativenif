@@ -1,0 +1,15 @@
+(.nif27)
+(stmts
+ (proc :exit.0 (params (param :code.0 . (i 32))) . (pragmas (importc "exit")) (stmts .))
+ (proc :rem32.0 (params (param :d.0 . (u 32))) (u 32) .
+  (stmts (var :r.0 . (u 32) (mod (u 32) 4294967295 d.0)) (ret r.0)))
+ (proc :rem16.0 (params (param :d.1 . (u 16))) (u 16) .
+  (stmts (var :r.1 . (u 16) (mod (u 16) 65535 d.1)) (ret r.1)))
+ (proc :rem8.0 (params (param :d.2 . (u 8))) (u 8) .
+  (stmts (var :r.2 . (u 8) (mod (u 8) 255 d.2)) (ret r.2)))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (if (elif (neq (call rem32.0 7) 3) (stmts (call exit.0 1))))
+   (if (elif (neq (call rem16.0 7) 1) (stmts (call exit.0 2))))
+   (if (elif (neq (call rem8.0 7) 3) (stmts (call exit.0 3))))
+   (call exit.0 42))))
